@@ -2,9 +2,14 @@
 //! pointed at a fresh `tempfile::TempDir`, and assert on real process
 //! behaviour (log output, file permissions, exit codes).
 //!
-//! Each test uses its own ephemeral high port (bound briefly to confirm
-//! it's free, then released) written into a config file ahead of time,
-//! so parallel test runs never collide on `127.0.0.1:4812`.
+//! Tests that don't need to pre-know the daemon's port use
+//! `listen_addr = "127.0.0.1:0"`: the kernel picks a free ephemeral port
+//! at bind time, so there is no bind-then-release window for another
+//! parallel test to steal the same port number (the bug that made this
+//! suite flaky — see `listener_failure_reports_clear_error_and_nonzero_exit`
+//! for the one test that *does* need a specific, collision-free port:
+//! it binds that port itself and holds it open continuously, with no
+//! release gap, until the daemon's own bind attempt against it fails).
 
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -14,14 +19,14 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Picks a free high port by binding briefly and releasing it. Small
-/// window for a race with another process, but combined with each test
-/// using a *different* randomly-chosen port, collisions in practice are
-/// not observed.
-fn free_port() -> u16 {
-    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    listener.local_addr().unwrap().port()
-}
+/// `listen_addr` for tests that don't care which port the daemon binds,
+/// only that it binds *some* port and logs it. Port 0 means "ask the
+/// kernel for a free ephemeral port at bind time", which sidesteps any
+/// possibility of colliding with another parallel test's daemon: unlike
+/// picking a port number ahead of time (bind-then-release, then bind
+/// again later), there is no window between choosing the number and the
+/// real daemon process claiming it.
+const EPHEMERAL_ADDR: &str = "127.0.0.1:0";
 
 fn tephrad_bin() -> &'static str {
     env!("CARGO_BIN_EXE_tephrad")
@@ -195,18 +200,13 @@ fn first_run_binds_listener_and_creates_token_with_mode_0600() {
     let home = tempfile::tempdir().expect("tempdir");
     let config_path = home.path().join(".config/tephra/config.toml");
     let data_dir = home.path().join(".local/share/tephra");
-    let port = free_port();
-    let listen_addr = format!("127.0.0.1:{port}");
-    write_config(&config_path, &data_dir, &listen_addr);
+    write_config(&config_path, &data_dir, EPHEMERAL_ADDR);
 
     let mut process = TephradProcess::spawn(home.path(), &config_path);
-    let found = process.wait_for_line(
-        &format!("listening on 127.0.0.1:{port}"),
-        Duration::from_secs(10),
-    );
+    let found = process.wait_for_line("listening on 127.0.0.1:", Duration::from_secs(10));
     assert!(
         found,
-        "expected a 'listening on 127.0.0.1:{port}' line, got: {:?}",
+        "expected a 'listening on 127.0.0.1:<port>' line, got: {:?}",
         process.captured_stderr_lines()
     );
 
@@ -244,18 +244,13 @@ fn token_never_leaks_on_stdout_or_stderr_at_trace_level() {
     let home = tempfile::tempdir().expect("tempdir");
     let config_path = home.path().join(".config/tephra/config.toml");
     let data_dir = home.path().join(".local/share/tephra");
-    let port = free_port();
-    let listen_addr = format!("127.0.0.1:{port}");
-    write_config_with_level(&config_path, &data_dir, &listen_addr, "trace");
+    write_config_with_level(&config_path, &data_dir, EPHEMERAL_ADDR, "trace");
 
     let mut process = TephradProcess::spawn(home.path(), &config_path);
-    let found = process.wait_for_line(
-        &format!("listening on 127.0.0.1:{port}"),
-        Duration::from_secs(10),
-    );
+    let found = process.wait_for_line("listening on 127.0.0.1:", Duration::from_secs(10));
     assert!(
         found,
-        "expected a 'listening on 127.0.0.1:{port}' line, got: {:?}",
+        "expected a 'listening on 127.0.0.1:<port>' line, got: {:?}",
         process.captured_stderr_lines()
     );
 
@@ -288,24 +283,34 @@ fn second_run_reuses_token_unchanged() {
     let home = tempfile::tempdir().expect("tempdir");
     let config_path = home.path().join(".config/tephra/config.toml");
     let data_dir = home.path().join(".local/share/tephra");
-    let port = free_port();
-    let listen_addr = format!("127.0.0.1:{port}");
-    write_config(&config_path, &data_dir, &listen_addr);
+    // Port 0 both times: each run independently asks the kernel for a
+    // free ephemeral port at bind time, so there is no gap during which
+    // a specific port number needs to stay free between the two runs.
+    write_config(&config_path, &data_dir, EPHEMERAL_ADDR);
 
     let mut process = TephradProcess::spawn(home.path(), &config_path);
     let found = process.wait_for_line("listening on", Duration::from_secs(10));
-    assert!(found, "first run should reach the listening line");
+    assert!(
+        found,
+        "first run should reach the listening line, got stderr: {:?}",
+        process.captured_stderr_lines()
+    );
     process.terminate_and_wait(Duration::from_secs(5));
 
     let token_path = data_dir.join("token");
     let first_contents = fs::read_to_string(&token_path).unwrap();
     let first_mtime = fs::metadata(&token_path).unwrap().modified().unwrap();
 
-    // Second run against the same HOME and same port (now free again
-    // since the first process was terminated).
+    // Second run against the same HOME. Binding port 0 again picks a
+    // fresh free ephemeral port (which may or may not be the same
+    // number as before); nothing here depends on it being the same.
     let mut process2 = TephradProcess::spawn(home.path(), &config_path);
     let found2 = process2.wait_for_line("listening on", Duration::from_secs(10));
-    assert!(found2, "second run should also reach the listening line");
+    assert!(
+        found2,
+        "second run should also reach the listening line, got stderr: {:?}",
+        process2.captured_stderr_lines()
+    );
     process2.terminate_and_wait(Duration::from_secs(5));
 
     let second_contents = fs::read_to_string(&token_path).unwrap();
@@ -328,16 +333,15 @@ fn startup_log_lines_are_in_the_documented_order() {
     let home = tempfile::tempdir().expect("tempdir");
     let config_path = home.path().join(".config/tephra/config.toml");
     let data_dir = home.path().join(".local/share/tephra");
-    let port = free_port();
-    let listen_addr = format!("127.0.0.1:{port}");
-    write_config(&config_path, &data_dir, &listen_addr);
+    write_config(&config_path, &data_dir, EPHEMERAL_ADDR);
 
     let mut process = TephradProcess::spawn(home.path(), &config_path);
-    let found = process.wait_for_line(
-        &format!("listening on 127.0.0.1:{port}"),
-        Duration::from_secs(10),
+    let found = process.wait_for_line("listening on 127.0.0.1:", Duration::from_secs(10));
+    assert!(
+        found,
+        "expected the listening line to appear, got stderr: {:?}",
+        process.captured_stderr_lines()
     );
-    assert!(found, "expected the listening line to appear");
     process.terminate_and_wait(Duration::from_secs(5));
 
     let lines = process.captured_stderr_lines();
@@ -369,12 +373,15 @@ fn listener_failure_reports_clear_error_and_nonzero_exit() {
     let home = tempfile::tempdir().expect("tempdir");
     let config_path = home.path().join(".config/tephra/config.toml");
     let data_dir = home.path().join(".local/share/tephra");
-    let port = free_port();
-    let listen_addr = format!("127.0.0.1:{port}");
-    write_config(&config_path, &data_dir, &listen_addr);
 
-    // Hold the configured port open so tephrad's own bind fails.
-    let _held = StdTcpListener::bind(&listen_addr).expect("bind held port");
+    // Bind the port we're going to hand to tephrad ourselves, and read
+    // back its *actual* address from the listener we just created —
+    // there is no bind-then-release gap (unlike picking a port number
+    // first and binding it again later), so no other parallel test can
+    // ever steal it between "choosing" the port and holding it open.
+    let held = StdTcpListener::bind("127.0.0.1:0").expect("bind a port to hold");
+    let listen_addr = held.local_addr().unwrap().to_string();
+    write_config(&config_path, &data_dir, &listen_addr);
 
     let output = Command::new(tephrad_bin())
         .arg("--config")
@@ -384,6 +391,10 @@ fn listener_failure_reports_clear_error_and_nonzero_exit() {
         .env_remove("XDG_DATA_HOME")
         .output()
         .expect("run tephrad");
+
+    // Keep `held` alive (and thus the port occupied) across the whole
+    // run above; drop it explicitly now that we're done with it.
+    drop(held);
 
     assert!(
         !output.status.success(),
@@ -403,8 +414,10 @@ fn directory_stage_failure_reports_clear_error() {
     let readonly_parent = home.path().join("readonly-parent");
     fs::create_dir_all(&readonly_parent).unwrap();
     let data_dir = readonly_parent.join("data");
-    let port = free_port();
-    write_config(&config_path, &data_dir, &format!("127.0.0.1:{port}"));
+    // This test's startup never reaches the listener stage (it fails
+    // earlier, at directory creation), so the port value is irrelevant;
+    // 0 means the kernel picks one if we ever get that far.
+    write_config(&config_path, &data_dir, EPHEMERAL_ADDR);
 
     // Make the parent directory read-only so data_dir creation fails.
     use std::os::unix::fs::PermissionsExt;
@@ -461,8 +474,7 @@ fn data_dir_is_created_non_world_writable_under_permissive_umask() {
     let home = tempfile::tempdir().expect("tempdir");
     let config_path = home.path().join(".config/tephra/config.toml");
     let data_dir = home.path().join(".local/share/tephra");
-    let port = free_port();
-    write_config(&config_path, &data_dir, &format!("127.0.0.1:{port}"));
+    write_config(&config_path, &data_dir, EPHEMERAL_ADDR);
 
     let shell_cmd = format!(
         "umask 000 && exec {bin} --config {config}",
@@ -498,7 +510,11 @@ fn data_dir_is_created_non_world_writable_under_permissive_umask() {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert!(found, "expected the listening line to appear");
+    assert!(
+        found,
+        "expected the listening line to appear, got: {:?}",
+        lines.lock().unwrap().clone()
+    );
 
     use std::os::unix::fs::PermissionsExt;
     let mode = fs::metadata(&data_dir).unwrap().permissions().mode() & 0o777;
@@ -647,13 +663,9 @@ fn invalid_log_level_fails_startup_with_clear_error_not_silence() {
     let home = tempfile::tempdir().expect("tempdir");
     let config_path = home.path().join(".config/tephra/config.toml");
     let data_dir = home.path().join(".local/share/tephra");
-    let port = free_port();
-    write_config_with_level(
-        &config_path,
-        &data_dir,
-        &format!("127.0.0.1:{port}"),
-        "loud",
-    );
+    // This run is expected to fail at the config stage, before the
+    // listener stage is ever reached, so the port value is irrelevant.
+    write_config_with_level(&config_path, &data_dir, EPHEMERAL_ADDR, "loud");
 
     let output = Command::new(tephrad_bin())
         .arg("--config")
