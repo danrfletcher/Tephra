@@ -7,7 +7,7 @@
 use std::fmt;
 use std::fs;
 use std::io;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use rand::rngs::OsRng;
@@ -17,6 +17,13 @@ const TOKEN_FILE_NAME: &str = "token";
 const TOKEN_MODE: u32 = 0o600;
 const DATA_DIR_MODE: u32 = 0o700;
 const TOKEN_HEX_LEN: usize = 64;
+/// Bits that make a token file "looser than 0600" per F5/C10: any
+/// group or world permission (read, write, or execute).
+const TOKEN_LOOSE_MASK: u32 = 0o077;
+/// Bits that make a directory world/group-writable, the only thing
+/// F5/C12 requires `ensure_data_dir` to strip from a pre-existing,
+/// user-configured `data_dir`.
+const DIR_WRITE_MASK: u32 = 0o022;
 
 #[derive(Debug)]
 pub enum TokenError {
@@ -95,15 +102,46 @@ pub fn ensure_token(data_dir: &Path) -> Result<EnsureOutcome, TokenError> {
     })
 }
 
-/// Ensures `data_dir` exists with mode `0700`, whether or not it already
-/// existed before this call. Idempotent and safe to call from multiple
-/// startup stages (e.g. both the directory-creation stage in `main.rs`
-/// and this module's own token-ensure stage), so that the data directory
-/// is non-world-writable regardless of which stage created it first.
+/// Ensures `data_dir` exists and is non-world-writable, whether or not
+/// it already existed before this call. Idempotent and safe to call
+/// from multiple startup stages (e.g. both the directory-creation stage
+/// in `main.rs` and this module's own token-ensure stage).
+///
+/// `data_dir` is user-configurable, so the two cases are handled
+/// differently:
+/// - If it does not exist, it (and any missing parents) is created with
+///   mode `0700` directly via `DirBuilder`, rather than `create_dir_all`
+///   followed by a separate `chmod`. That avoids a window, under a
+///   permissive umask, where the directory briefly exists world- or
+///   group-writable before the mode is tightened.
+/// - If it already exists, only group/other write bits are stripped
+///   (`mode & !0o022`); the directory's other permission bits (e.g. an
+///   owner-only `0750`, or extra read/execute bits) are left as the
+///   user configured them. A warning is logged when the mode actually
+///   changes. Forcing an existing, pre-populated directory to `0700`
+///   unconditionally would silently clobber permissions the user set up
+///   for reasons unrelated to tephrad.
 pub fn ensure_data_dir(data_dir: &Path) -> io::Result<()> {
-    fs::create_dir_all(data_dir)?;
-    fs::set_permissions(data_dir, fs::Permissions::from_mode(DATA_DIR_MODE))?;
-    Ok(())
+    if data_dir.exists() {
+        let metadata = fs::metadata(data_dir)?;
+        let mode = metadata.permissions().mode() & 0o777;
+        let tightened = mode & !DIR_WRITE_MASK;
+        if tightened != mode {
+            fs::set_permissions(data_dir, fs::Permissions::from_mode(tightened))?;
+            tracing::warn!(
+                path = %data_dir.display(),
+                old_mode = format!("{mode:03o}"),
+                new_mode = format!("{tightened:03o}"),
+                "data directory was group/world-writable; tightened"
+            );
+        }
+        return Ok(());
+    }
+
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(DATA_DIR_MODE)
+        .create(data_dir)
 }
 
 /// Generates a 256-bit token from an OS CSPRNG, hex-encoded to 64 chars.
@@ -165,12 +203,16 @@ fn write_token_file(path: &Path, token: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Returns `true` if the file's permissions were found looser than 0600
-/// and have been tightened.
+/// Returns `true` if the file's permissions were found looser than
+/// `0600` — any group or world bit set (`mode & 0o077 != 0`) — and have
+/// been tightened. A mode that differs from `0600` only in owner bits
+/// (e.g. `0400`, already at least as restrictive) is left untouched:
+/// C10 requires repairing only modes "looser than 0600 (group/world
+/// readable)", not any deviation from the exact value.
 fn repair_permissions_if_loose(path: &Path) -> io::Result<bool> {
     let metadata = fs::metadata(path)?;
     let mode = metadata.permissions().mode() & 0o777;
-    if mode != TOKEN_MODE {
+    if mode & TOKEN_LOOSE_MASK != 0 {
         fs::set_permissions(path, fs::Permissions::from_mode(TOKEN_MODE))?;
         return Ok(true);
     }
@@ -271,6 +313,64 @@ mod tests {
 
         let result = ensure_token(&data_dir);
         assert!(matches!(result, Err(TokenError::InvalidTokenContents)));
+    }
+
+    #[test]
+    fn restrictive_0400_token_file_is_left_alone() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+
+        let first = ensure_token(&data_dir).expect("first call");
+        let token_path = data_dir.join("token");
+
+        // 0400 (owner read-only) is already at least as restrictive as
+        // 0600 (owner read-write) in the dimension C10 cares about:
+        // group/world access. It must not be "repaired".
+        fs::set_permissions(&token_path, fs::Permissions::from_mode(0o400)).unwrap();
+
+        let second = ensure_token(&data_dir).expect("second call");
+
+        assert!(!second.generated);
+        assert!(
+            !second.permissions_repaired,
+            "0400 must not be reported or treated as a repair"
+        );
+        assert_eq!(first.token, second.token);
+
+        let mode = fs::metadata(&token_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o400, "0400 permissions must be left untouched");
+    }
+
+    #[test]
+    fn ensure_data_dir_leaves_existing_0755_dir_unchanged() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        ensure_data_dir(&data_dir).expect("ensure_data_dir");
+
+        // 0755 has no group/other write bits, so it's already
+        // non-world-writable; a pre-existing, user-configured data_dir
+        // must not be unconditionally forced to 0700.
+        let mode = fs::metadata(&data_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
+    }
+
+    #[test]
+    fn ensure_data_dir_strips_write_bits_from_existing_world_writable_dir() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o777)).unwrap();
+
+        ensure_data_dir(&data_dir).expect("ensure_data_dir");
+
+        let mode = fs::metadata(&data_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o755,
+            "group/other write bits must be stripped, other bits left alone"
+        );
     }
 
     #[test]
