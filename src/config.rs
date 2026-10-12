@@ -39,6 +39,12 @@ pub enum ConfigError {
     /// is not a loopback address. tephrad's RPC server will perform disk
     /// mutations (a later PR), so only loopback addresses are accepted.
     InvalidListenAddr(String),
+    /// `log_level` is not one of the five values tephrad documents and
+    /// accepts. Left unvalidated, `tracing_subscriber::EnvFilter`
+    /// happily parses an arbitrary word (e.g. a typo like "infoo") as a
+    /// target directive instead of a level, silently enabling no
+    /// output at all rather than falling back to `info`.
+    InvalidLogLevel(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -47,6 +53,7 @@ impl fmt::Display for ConfigError {
             ConfigError::Io(e) => write!(f, "{e}"),
             ConfigError::Parse(e) => write!(f, "{e}"),
             ConfigError::InvalidListenAddr(reason) => write!(f, "{reason}"),
+            ConfigError::InvalidLogLevel(reason) => write!(f, "{reason}"),
         }
     }
 }
@@ -63,6 +70,37 @@ impl From<toml::de::Error> for ConfigError {
     fn from(e: toml::de::Error) -> Self {
         ConfigError::Parse(e)
     }
+}
+
+/// The five `log_level` values tephrad documents and accepts, matching
+/// the generated config's comment and the `tracing` level names.
+const VALID_LOG_LEVELS: [&str; 5] = ["trace", "debug", "info", "warn", "error"];
+
+/// Validates that `level` is one of [`VALID_LOG_LEVELS`]. Rejecting
+/// anything else here — rather than handing an arbitrary string to
+/// `tracing_subscriber::EnvFilter`, which parses unrecognized words as
+/// target directives and so silently filters out all output — ensures
+/// an invalid level is a loud startup failure instead of a daemon that
+/// runs with no logs at all.
+fn validate_log_level(level: &str) -> Result<(), ConfigError> {
+    if VALID_LOG_LEVELS.contains(&level) {
+        Ok(())
+    } else {
+        Err(ConfigError::InvalidLogLevel(format!(
+            "log_level \"{level}\" is not one of: {levels}",
+            levels = VALID_LOG_LEVELS.join(", ")
+        )))
+    }
+}
+
+/// Validates every field of `config` that load-time checks can catch
+/// before the rest of startup proceeds: `listen_addr` must be a
+/// loopback socket address, and `log_level` must be one of the
+/// documented values.
+fn validate_config(config: &Config) -> Result<(), ConfigError> {
+    validate_listen_addr(&config.listen_addr)?;
+    validate_log_level(&config.log_level)?;
+    Ok(())
 }
 
 /// Validates that `addr` parses as a socket address and that its IP is a
@@ -132,7 +170,7 @@ pub fn load_or_create(path: &Path, default_data_dir: PathBuf) -> Result<Loaded, 
     if path.exists() {
         let raw = fs::read_to_string(path)?;
         let config: Config = toml::from_str(&raw)?;
-        validate_listen_addr(&config.listen_addr)?;
+        validate_config(&config)?;
         return Ok(Loaded {
             config,
             defaults_written: false,
@@ -140,7 +178,7 @@ pub fn load_or_create(path: &Path, default_data_dir: PathBuf) -> Result<Loaded, 
     }
 
     let config = Config::defaults(default_data_dir);
-    validate_listen_addr(&config.listen_addr)?;
+    validate_config(&config)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -259,6 +297,31 @@ mod tests {
 
         let result = load_or_create(&config_path, dir.path().join("data"));
         assert!(matches!(result, Err(ConfigError::InvalidListenAddr(_))));
+    }
+
+    #[test]
+    fn invalid_log_level_is_rejected() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            "listen_addr = \"127.0.0.1:4812\"\n\
+             data_dir = \"/tmp/tephra-data\"\n\
+             log_level = \"loud\"\n",
+        )
+        .unwrap();
+
+        let result = load_or_create(&config_path, dir.path().join("data"));
+        match result {
+            Err(ConfigError::InvalidLogLevel(reason)) => {
+                assert!(reason.contains("loud"));
+            }
+            other => panic!("expected ConfigError::InvalidLogLevel, got {other:?}"),
+        }
+
+        // The user's file must not have been overwritten.
+        let raw = fs::read_to_string(&config_path).unwrap();
+        assert!(raw.contains("loud"));
     }
 
     #[test]

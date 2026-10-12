@@ -634,3 +634,48 @@ fn help_flag_exits_zero_without_touching_disk_or_binding() {
     assert!(!config_dir.exists(), "--help must not touch disk");
     assert!(!data_dir.exists(), "--help must not touch disk");
 }
+
+#[test]
+fn invalid_log_level_fails_startup_with_clear_error_not_silence() {
+    // Before this was fixed, an invalid log_level (e.g. a typo like
+    // "loud") was handed straight to `tracing_subscriber::EnvFilter`,
+    // which happily parsed it as a target directive rather than a
+    // level. That silently filtered out *all* output instead of
+    // falling back to info, so the process produced a successful,
+    // totally silent run with no "listening on" line. It must instead
+    // fail loudly at the config stage.
+    let home = tempfile::tempdir().expect("tempdir");
+    let config_path = home.path().join(".config/tephra/config.toml");
+    let data_dir = home.path().join(".local/share/tephra");
+    let port = free_port();
+    write_config_with_level(
+        &config_path,
+        &data_dir,
+        &format!("127.0.0.1:{port}"),
+        "loud",
+    );
+
+    let output = Command::new(tephrad_bin())
+        .arg("--config")
+        .arg(&config_path)
+        .env("HOME", home.path())
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .output()
+        .expect("run tephrad");
+
+    assert!(
+        !output.status.success(),
+        "startup with an invalid log_level should exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("tephrad: config failed:"),
+        "expected a config-stage error message, got stderr: {stderr:?}, stdout: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        !stderr.is_empty(),
+        "stderr must not be silently empty on an invalid log_level"
+    );
+}

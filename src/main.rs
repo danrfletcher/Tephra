@@ -154,8 +154,11 @@ async fn wait_for_shutdown_signal() {
 }
 
 /// Initializes `tracing` exactly once, human-readable to stderr, at the
-/// configured `log_level`. If the level string is invalid, falls back to
-/// `info` rather than panicking.
+/// configured `log_level`. `log_level` is validated against the five
+/// documented values at the config stage (`config::validate_config`)
+/// before this is ever called, so it should always parse; the `info`
+/// fallback below is defense-in-depth only, not the primary guard
+/// against an invalid level silently disabling all output.
 fn init_tracing(log_level: &str) {
     use tracing_subscriber::EnvFilter;
 
