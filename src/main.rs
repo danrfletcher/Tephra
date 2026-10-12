@@ -67,8 +67,12 @@ fn main() -> ExitCode {
         tracing::info!(path = %config_path.display(), "loaded config");
     }
 
-    // Stage 2: directory creation.
-    if let Err(e) = std::fs::create_dir_all(&cfg.data_dir) {
+    // Stage 2: directory creation. Delegates to `token::ensure_data_dir`
+    // (rather than a bare `create_dir_all`) so the directory is created
+    // mode 0700 regardless of which startup stage creates it first —
+    // otherwise the token-ensure stage below would see the directory
+    // already existing and skip hardening its permissions.
+    if let Err(e) = token::ensure_data_dir(&cfg.data_dir) {
         return fail(stage::DIRECTORY, e);
     }
     tracing::info!(path = %cfg.data_dir.display(), "data directory ready");

@@ -16,16 +16,26 @@ use rand::RngCore;
 const TOKEN_FILE_NAME: &str = "token";
 const TOKEN_MODE: u32 = 0o600;
 const DATA_DIR_MODE: u32 = 0o700;
+const TOKEN_HEX_LEN: usize = 64;
 
 #[derive(Debug)]
 pub enum TokenError {
     Io(io::Error),
+    /// The existing token file's contents are not a 64-character hex
+    /// string (e.g. empty, truncated, or corrupted). Rather than reuse
+    /// an invalid value — which could let an empty bearer token through
+    /// a later auth check — this is treated as a hard startup failure.
+    InvalidTokenContents,
 }
 
 impl fmt::Display for TokenError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TokenError::Io(e) => write!(f, "{e}"),
+            TokenError::InvalidTokenContents => write!(
+                f,
+                "token file contents are not a valid {TOKEN_HEX_LEN}-character hex token"
+            ),
         }
     }
 }
@@ -54,7 +64,9 @@ pub struct EnsureOutcome {
 /// exists inside it with mode `0600`, generating one from an OS CSPRNG if
 /// absent. On an existing token file, permissions are checked and
 /// tightened back to `0600` if found looser; the token value itself is
-/// read and reused unchanged — never regenerated.
+/// read, validated, and reused unchanged — never regenerated. A token
+/// file whose contents are not a valid 64-hex-char value is treated as a
+/// hard error rather than silently accepted.
 ///
 /// The token value is never logged by this function; callers must also
 /// avoid logging it.
@@ -65,7 +77,8 @@ pub fn ensure_token(data_dir: &Path) -> Result<EnsureOutcome, TokenError> {
 
     if token_path.exists() {
         let permissions_repaired = repair_permissions_if_loose(&token_path)?;
-        let token = fs::read_to_string(&token_path)?.trim().to_string();
+        let raw = fs::read_to_string(&token_path)?;
+        let token = validate_token(&raw)?;
         return Ok(EnsureOutcome {
             token,
             generated: false,
@@ -82,12 +95,14 @@ pub fn ensure_token(data_dir: &Path) -> Result<EnsureOutcome, TokenError> {
     })
 }
 
-fn ensure_data_dir(data_dir: &Path) -> io::Result<()> {
-    let existed = data_dir.exists();
+/// Ensures `data_dir` exists with mode `0700`, whether or not it already
+/// existed before this call. Idempotent and safe to call from multiple
+/// startup stages (e.g. both the directory-creation stage in `main.rs`
+/// and this module's own token-ensure stage), so that the data directory
+/// is non-world-writable regardless of which stage created it first.
+pub fn ensure_data_dir(data_dir: &Path) -> io::Result<()> {
     fs::create_dir_all(data_dir)?;
-    if !existed {
-        fs::set_permissions(data_dir, fs::Permissions::from_mode(DATA_DIR_MODE))?;
-    }
+    fs::set_permissions(data_dir, fs::Permissions::from_mode(DATA_DIR_MODE))?;
     Ok(())
 }
 
@@ -98,12 +113,55 @@ fn generate_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Validates that `raw` (after trimming surrounding whitespace) is
+/// exactly [`TOKEN_HEX_LEN`] hex characters, returning the trimmed value.
+fn validate_token(raw: &str) -> Result<String, TokenError> {
+    let trimmed = raw.trim();
+    if trimmed.len() == TOKEN_HEX_LEN && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(trimmed.to_string())
+    } else {
+        Err(TokenError::InvalidTokenContents)
+    }
+}
+
+/// Writes `token` to `path` atomically: the value is written to a
+/// sibling temp file created with mode `0600` (so the token is never
+/// briefly world-readable), fsynced to disk, then renamed into place.
+/// `rename` on POSIX filesystems is an atomic replace, so a crash
+/// between the write and the rename leaves either the old state (no
+/// file) or the new one — never a truncated or empty token file.
 fn write_token_file(path: &Path, token: &str) -> io::Result<()> {
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true).mode(TOKEN_MODE);
-    let mut file = options.open(path)?;
-    use std::io::Write;
-    file.write_all(token.as_bytes())?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(TOKEN_FILE_NAME);
+
+    let mut suffix_bytes = [0u8; 8];
+    OsRng.fill_bytes(&mut suffix_bytes);
+    let suffix: String = suffix_bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let tmp_path = parent.join(format!(".{file_name}.tmp-{suffix}"));
+
+    let write_result = (|| -> io::Result<()> {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true).mode(TOKEN_MODE);
+        let mut file = options.open(&tmp_path)?;
+        use std::io::Write;
+        file.write_all(token.as_bytes())?;
+        file.sync_all()?;
+        Ok(())
+    })();
+
+    if let Err(e) = write_result {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
+    if let Err(e) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
     Ok(())
 }
 
@@ -182,5 +240,53 @@ mod tests {
 
         let mode = fs::metadata(&data_dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn empty_token_file_is_rejected_not_reused() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        ensure_data_dir(&data_dir).unwrap();
+        let token_path = data_dir.join("token");
+        fs::write(&token_path, "").unwrap();
+        fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let result = ensure_token(&data_dir);
+        match result {
+            Err(TokenError::InvalidTokenContents) => {}
+            Ok(_) => panic!("expected TokenError::InvalidTokenContents, got Ok"),
+            Err(other) => panic!("expected TokenError::InvalidTokenContents, got {other}"),
+        }
+    }
+
+    #[test]
+    fn truncated_token_file_is_rejected_not_reused() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        ensure_data_dir(&data_dir).unwrap();
+        let token_path = data_dir.join("token");
+        // Only 10 hex chars, not the required 64.
+        fs::write(&token_path, "deadbeef00").unwrap();
+        fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let result = ensure_token(&data_dir);
+        assert!(matches!(result, Err(TokenError::InvalidTokenContents)));
+    }
+
+    #[test]
+    fn write_token_file_leaves_no_temp_file_behind() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        ensure_token(&data_dir).expect("ensure_token");
+
+        let leftovers: Vec<_> = fs::read_dir(&data_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp file(s) left behind: {leftovers:?}"
+        );
     }
 }
