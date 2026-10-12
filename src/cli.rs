@@ -1,8 +1,10 @@
 //! Minimal CLI flag parsing: `--config <path>` and `-h`/`--help`.
 //!
 //! Deliberately hand-rolled rather than pulling in an argument-parsing
-//! crate, since this PR pins `tokio`, `serde`, `toml`, `rand`, and
-//! `tracing` as its only runtime dependencies.
+//! crate, to keep this PR's dependency footprint small. Runtime
+//! dependencies are `tokio`, `serde`, `toml`, `rand`, `tracing`, and
+//! `tracing-subscriber` (see `Cargo.toml`); the last of these formats
+//! and filters the `tracing` output by the configured `log_level`.
 
 use std::fmt;
 use std::path::PathBuf;
