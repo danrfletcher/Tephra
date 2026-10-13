@@ -329,7 +329,7 @@ fn second_run_reuses_token_unchanged() {
 #[test]
 fn startup_log_lines_are_in_the_documented_order() {
     // GP1's documented order: config -> directory creation -> token
-    // ensure -> listener bind -> ready log.
+    // ensure -> cache open/schema check -> listener bind -> ready log.
     let home = tempfile::tempdir().expect("tempdir");
     let config_path = home.path().join(".config/tephra/config.toml");
     let data_dir = home.path().join(".local/share/tephra");
@@ -353,19 +353,73 @@ fn startup_log_lines_are_in_the_documented_order() {
     let token_idx = index_of("generated new auth token")
         .or_else(|| index_of("reusing existing auth token"))
         .or_else(|| index_of("token file permissions were loosened"));
+    let cache_idx = index_of("cache ready");
     let listening_idx = index_of("listening on");
 
-    let (config_idx, dir_idx, token_idx, listening_idx) = (
+    let (config_idx, dir_idx, token_idx, cache_idx, listening_idx) = (
         config_idx.expect("config-stage log line"),
         dir_idx.expect("directory-stage log line"),
         token_idx.expect("token-stage log line"),
+        cache_idx.expect("cache-stage log line"),
         listening_idx.expect("listening log line"),
     );
 
     assert!(
-        config_idx < dir_idx && dir_idx < token_idx && token_idx < listening_idx,
-        "expected config < directory < token < listening, got indices {config_idx}, {dir_idx}, {token_idx}, {listening_idx} in: {lines:?}"
+        config_idx < dir_idx
+            && dir_idx < token_idx
+            && token_idx < cache_idx
+            && cache_idx < listening_idx,
+        "expected config < directory < token < cache < listening, got indices {config_idx}, {dir_idx}, {token_idx}, {cache_idx}, {listening_idx} in: {lines:?}"
     );
+}
+
+/// G5: `cache.db` is created at `<data_dir>/cache.db` on first daemon
+/// start, with the six documented tables (`sources`, `units`, `links`,
+/// `tags`, `blocks`, `schema_version`) present.
+#[test]
+fn first_run_creates_cache_db_with_six_tables() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let config_path = home.path().join(".config/tephra/config.toml");
+    let data_dir = home.path().join(".local/share/tephra");
+    write_config(&config_path, &data_dir, EPHEMERAL_ADDR);
+
+    let mut process = TephradProcess::spawn(home.path(), &config_path);
+    let found = process.wait_for_line("cache ready", Duration::from_secs(10));
+    assert!(
+        found,
+        "expected a 'cache ready' line, got: {:?}",
+        process.captured_stderr_lines()
+    );
+
+    let db_path = data_dir.join("cache.db");
+    assert!(db_path.exists(), "cache.db should have been created");
+
+    let conn = rusqlite::Connection::open(&db_path).expect("open cache.db read-only check");
+    let mut stmt = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+        .unwrap();
+    let mut rows = stmt.query([]).unwrap();
+    let mut tables = Vec::new();
+    while let Some(row) = rows.next().unwrap() {
+        tables.push(row.get::<_, String>(0).unwrap());
+    }
+
+    for expected in [
+        "sources",
+        "units",
+        "links",
+        "tags",
+        "blocks",
+        "schema_version",
+    ] {
+        assert!(
+            tables.iter().any(|t| t == expected),
+            "expected table \"{expected}\" to exist, got tables: {tables:?}"
+        );
+    }
+
+    let code = process.terminate_and_wait(Duration::from_secs(5));
+    assert_eq!(code, Some(0), "expected clean exit after SIGTERM");
 }
 
 #[test]

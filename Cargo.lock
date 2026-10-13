@@ -464,8 +464,10 @@ name = "tephrad"
 version = "0.1.0"
 dependencies = [
  "rand",
+ "rusqlite",
  "serde",
  "tempfile",
+ "tephra-cache",
  "tokio",
  "toml",
  "tracing",
