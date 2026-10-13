@@ -20,6 +20,15 @@
 //! wiped (E2) — the tables are still genuinely dropped and recreated
 //! (satisfying F2's "no incremental migration path"), the offline
 //! rows are just carried across that drop/recreate rather than lost.
+//!
+//! That carry-over is itself gated by [`offline_rows_are_carryable`]:
+//! an older cache file, opened by a newer build after the schema
+//! grew a column, may be missing a column the current snapshot query
+//! names, which would otherwise fail to even prepare. In that case
+//! the carry-over is skipped (not attempted at all) rather than
+//! erroring the whole rebuild out — the source's `sources` row and
+//! status are still preserved either way; only its cached rows are
+//! lost in that degraded case, same as for any non-offline source.
 
 use rusqlite::Connection;
 
@@ -133,12 +142,76 @@ pub(crate) fn create_core_tables(conn: &Connection) -> Result<(), CacheError> {
 /// unconditionally dropped and recreated (F2) — the rebuild still has
 /// exactly one code path; this is a snapshot/restore wrapped around
 /// it, not a second mutation path.
+///
+/// Callers must first confirm [`offline_rows_are_carryable`] returns
+/// `true` for the connection's *current* (pre-drop) table shapes.
+/// This function's `SELECT`s name every column the current schema
+/// expects (e.g. `u.frontmatter_json`); against an older cache opened
+/// by a newer build, one of those columns may not exist yet, and a
+/// statement naming a nonexistent column fails to even *prepare* —
+/// before the `WHERE status = 'offline'` filter could matter, even
+/// when nothing is offline. [`offline_rows_are_carryable`] checks
+/// column presence first so that case is skipped (no snapshot
+/// attempted, and so no error) rather than bricking the rebuild.
 #[derive(Debug, Default)]
 pub(crate) struct OfflineRows {
     units: Vec<UnitRow>,
     links: Vec<LinkRow>,
     tags: Vec<TagRow>,
     blocks: Vec<BlockRow>,
+}
+
+/// The exact column names [`snapshot_offline_rows`]'s `SELECT`s and
+/// [`restore_offline_rows`]'s `INSERT`s reference, by table, in the
+/// current schema (see the `CREATE_*` constants above). Checked via
+/// `PRAGMA table_info` against the *old*, pre-rebuild table shapes
+/// before a rebuild ever attempts to snapshot offline rows.
+const UNITS_SNAPSHOT_COLUMNS: [&str; 5] =
+    ["id", "source_id", "rel_path", "mtime", "frontmatter_json"];
+const LINKS_SNAPSHOT_COLUMNS: [&str; 5] = ["id", "from_unit_id", "to_raw", "to_unit_id", "kind"];
+const TAGS_SNAPSHOT_COLUMNS: [&str; 3] = ["id", "unit_id", "tag"];
+const BLOCKS_SNAPSHOT_COLUMNS: [&str; 4] = ["id", "unit_id", "block_id", "line"];
+
+/// Whether `table` exists and has every column named in `columns`,
+/// checked via `PRAGMA table_info` rather than assumed. `table` is
+/// always one of this module's own fixed internal table names, never
+/// caller- or network-supplied input.
+fn table_has_columns(conn: &Connection, table: &str, columns: &[&str]) -> Result<bool, CacheError> {
+    let sql = format!("PRAGMA table_info({table})");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut existing: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        existing.insert(row.get::<_, String>(1)?);
+    }
+    if existing.is_empty() {
+        // `PRAGMA table_info` returns zero rows both when the table
+        // genuinely doesn't exist and when it exists but has no
+        // columns (impossible for a real table) — either way, this
+        // old table's rows can't be carried across.
+        return Ok(false);
+    }
+    Ok(columns.iter().all(|c| existing.contains(*c)))
+}
+
+/// Gate for [`snapshot_offline_rows`]: `true` only if the *current*
+/// (pre-drop) `units`/`links`/`tags`/`blocks` tables already have
+/// every column this crate's current schema expects. `false` means an
+/// older cache file (opened by a newer build after the schema grew a
+/// column, as in the R1 review repro: a `units` table with no
+/// `frontmatter_json`) is being rebuilt — in that case the rebuild
+/// still proceeds (drop, recreate, rewrite `schema_version`; F2's
+/// single code path is unaffected), it just skips the offline-row
+/// carry-over rather than failing outright. A source's `sources` row
+/// and its `offline`/`stale`/`active` status are preserved either way
+/// (`perform_rebuild` never touches `sources`); only that source's
+/// `units`/`links`/`tags`/`blocks` rows are lost in this degraded
+/// path, same as for a non-offline source today.
+pub(crate) fn offline_rows_are_carryable(conn: &Connection) -> Result<bool, CacheError> {
+    Ok(table_has_columns(conn, "units", &UNITS_SNAPSHOT_COLUMNS)?
+        && table_has_columns(conn, "links", &LINKS_SNAPSHOT_COLUMNS)?
+        && table_has_columns(conn, "tags", &TAGS_SNAPSHOT_COLUMNS)?
+        && table_has_columns(conn, "blocks", &BLOCKS_SNAPSHOT_COLUMNS)?)
 }
 
 pub(crate) fn snapshot_offline_rows(conn: &Connection) -> Result<OfflineRows, CacheError> {

@@ -284,14 +284,34 @@ fn apply_pragmas(conn: &Connection) -> Result<(), CacheError> {
 /// is exactly one rebuild code path in the crate (F2). `injector` is
 /// the test-only fault-injection seam; every production call site
 /// passes [`FaultInjector::none()`].
+///
+/// Offline-row carry-over is attempted only when
+/// [`schema::offline_rows_are_carryable`] confirms the *old* (pre-drop)
+/// tables already have every column the current schema's snapshot
+/// query expects (R1 review finding). An older cache file opened by a
+/// newer build — e.g. a `units` table from before `frontmatter_json`
+/// existed — fails that check, so the snapshot is skipped rather than
+/// attempted: the rebuild still unconditionally completes (drop,
+/// recreate, rewrite `schema_version`), it just degrades to "a
+/// currently-offline source's `sources` row and status survive, but
+/// its cached `units`/`links`/`tags`/`blocks` rows don't" instead of
+/// erroring `Cache::open` out entirely (which, before this fix, left
+/// `schema_version` untouched and so failed identically on every
+/// subsequent start).
 fn perform_rebuild(tx: &rusqlite::Transaction, injector: &FaultInjector) -> Result<(), CacheError> {
-    let preserved = schema::snapshot_offline_rows(tx)?;
+    let preserved = if schema::offline_rows_are_carryable(tx)? {
+        Some(schema::snapshot_offline_rows(tx)?)
+    } else {
+        None
+    };
     schema::drop_core_tables(tx)?;
     if injector.fail_after_drop {
         return Err(CacheError::FaultInjected);
     }
     schema::create_core_tables(tx)?;
-    schema::restore_offline_rows(tx, &preserved)?;
+    if let Some(preserved) = preserved {
+        schema::restore_offline_rows(tx, &preserved)?;
+    }
     schema::write_schema_version(tx, CURRENT_SCHEMA_VERSION)?;
     Ok(())
 }
