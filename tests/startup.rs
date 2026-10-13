@@ -629,6 +629,98 @@ fn corrupt_config_exits_non_zero_and_is_not_overwritten() {
 }
 
 #[test]
+fn config_flag_overrides_xdg_config_home_resolution() {
+    // T1 (checklist review): C25 launches tephrad with an explicit
+    // `--config /tmp/tephra-test/config.toml`, while C27 cats
+    // `$XDG_CONFIG_HOME/tephra/config.toml` — a different file, since
+    // `--config` always takes precedence over XDG config-dir resolution
+    // (`paths::default_config_path()` is only consulted when no
+    // `--config` flag is given — see `cli.rs`). This test locks in that
+    // precedence at the binary level: with `XDG_CONFIG_HOME` pointing at
+    // one directory and `--config` pointing at a config file outside it,
+    // tephrad must load only the `--config` path.
+    let home = tempfile::tempdir().expect("tempdir");
+
+    // A config file sitting at the XDG-resolved location, deliberately
+    // corrupt: if tephrad read it instead of (or as well as) the
+    // `--config` path, startup would fail at the config stage rather
+    // than reach "listening on".
+    let xdg_config_home = home.path().join("xdg-config");
+    let xdg_config_path = xdg_config_home.join("tephra/config.toml");
+    fs::create_dir_all(xdg_config_path.parent().unwrap()).unwrap();
+    fs::write(&xdg_config_path, "this [ is not valid toml {{{").unwrap();
+
+    // The real config, at an explicit path outside the XDG tree, naming
+    // a distinct data_dir so we can tell afterwards which file was used.
+    let explicit_config_path = home.path().join("explicit/config.toml");
+    let explicit_data_dir = home.path().join("explicit-data");
+    write_config(&explicit_config_path, &explicit_data_dir, EPHEMERAL_ADDR);
+
+    let mut child = Command::new(tephrad_bin())
+        .arg("--config")
+        .arg(&explicit_config_path)
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", &xdg_config_home)
+        .env_remove("XDG_DATA_HOME")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn tephrad");
+
+    let stderr = child.stderr.take().expect("stderr piped");
+    let (lines, thread) = spawn_line_drain(stderr);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut found = false;
+    while Instant::now() < deadline {
+        if lines
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("listening on"))
+        {
+            found = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // Terminate and clean up regardless of the assertion outcome below.
+    let pid = child.id() as i32;
+    unsafe {
+        extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        kill(pid, 15 /* SIGTERM */);
+    }
+    let _ = child.wait();
+    let _ = thread.join();
+
+    let captured = lines.lock().unwrap().clone();
+    assert!(
+        found,
+        "expected startup to succeed using the --config path, ignoring the corrupt XDG-resolved config; got: {captured:?}"
+    );
+
+    // The data_dir named in the --config file was used: its token file
+    // exists. This can only be true if tephrad parsed the --config
+    // file (the corrupt XDG-resolved one would have aborted startup
+    // before reaching the token stage).
+    assert!(
+        explicit_data_dir.join("token").exists(),
+        "expected the token to be created under the --config file's data_dir"
+    );
+
+    // The decoy XDG-resolved config must be left untouched: not parsed,
+    // and not overwritten as a "default" target either.
+    let xdg_raw = fs::read_to_string(&xdg_config_path).unwrap();
+    assert_eq!(
+        xdg_raw, "this [ is not valid toml {{{",
+        "the XDG-resolved config file must not be read or rewritten when --config is given"
+    );
+}
+
+#[test]
 fn help_flag_exits_zero_without_touching_disk_or_binding() {
     let home = tempfile::tempdir().expect("tempdir");
 
