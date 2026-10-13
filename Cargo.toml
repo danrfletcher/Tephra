@@ -3,4 +3,5 @@ resolver = "2"
 members = [
     "crates/tephrad",
     "crates/tephra-cache",
+    "crates/tephra-parser",
 ]
