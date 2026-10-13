@@ -197,9 +197,25 @@ pub fn parse_unit(path: &Path, content: &str) -> ParsedUnit {
     let (frontmatter, body, body_start_line) = frontmatter::extract(content, &mut diagnostics);
 
     let pass = markdown_pass::run(body, body_start_line, &mut diagnostics);
-    let wikilinks = wikilinks::scan(body, body_start_line, &pass.fenced_ranges, &mut diagnostics);
-    let tags = tags::scan(body, body_start_line, &pass.fenced_ranges);
-    let blocks = blocks::scan(body, body_start_line, &pass.fenced_ranges, &mut diagnostics);
+    let (wikilinks, wikilink_spans) = wikilinks::scan(
+        body,
+        body_start_line,
+        &pass.excluded_ranges,
+        &mut diagnostics,
+    );
+    let tags = tags::scan(
+        body,
+        body_start_line,
+        &pass.excluded_ranges,
+        &wikilink_spans,
+        &pass.link_destination_ranges,
+    );
+    let blocks = blocks::scan(
+        body,
+        body_start_line,
+        &pass.excluded_ranges,
+        &mut diagnostics,
+    );
 
     ParsedUnit {
         path: path.to_path_buf(),

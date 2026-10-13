@@ -17,7 +17,7 @@
 use serde::Serialize;
 
 use crate::diagnostics::{Diagnostic, DiagnosticKind};
-use crate::fences::in_any_range;
+use crate::fences::FenceCursor;
 use crate::line_index::LineIndex;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -39,18 +39,25 @@ pub struct WikiLink {
     pub line: usize,
 }
 
+/// Scans `body` for `[[wikilinks]]`. Returns the parsed links
+/// alongside the full raw byte span (including both pairs of
+/// brackets) of every successfully-closed `[[...]]` occurrence, so
+/// callers such as the tag scanner can skip over them too (a `#` in
+/// `[[Note#Heading]]`'s heading anchor is never a `#tag`).
 pub(crate) fn scan(
     body: &str,
     body_start_line: usize,
-    fenced_ranges: &[(usize, usize)],
+    excluded_ranges: &[(usize, usize)],
     diagnostics: &mut Vec<Diagnostic>,
-) -> Vec<WikiLink> {
+) -> (Vec<WikiLink>, Vec<(usize, usize)>) {
     let mut out = Vec::new();
+    let mut spans = Vec::new();
     let bytes = body.as_bytes();
     let line_index = LineIndex::new(body);
+    let mut cursor = FenceCursor::new(excluded_ranges);
     let mut i = 0usize;
     while i + 1 < bytes.len() {
-        if bytes[i] == b'[' && bytes[i + 1] == b'[' && !in_any_range(fenced_ranges, i) {
+        if bytes[i] == b'[' && bytes[i + 1] == b'[' && !cursor.contains(i) {
             let open_at = i;
             let line = body_start_line - 1 + line_index.line_number(open_at);
             let content_start = i + 2;
@@ -79,6 +86,7 @@ pub(crate) fn scan(
                     } else {
                         out.push(parse_inner(inner, line));
                     }
+                    spans.push((open_at, close_at + 2));
                     i = close_at + 2;
                     continue;
                 }
@@ -95,7 +103,7 @@ pub(crate) fn scan(
         }
         i += 1;
     }
-    out
+    (out, spans)
 }
 
 fn parse_inner(inner: &str, line: usize) -> WikiLink {
