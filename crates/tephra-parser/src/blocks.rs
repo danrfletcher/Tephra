@@ -2,13 +2,14 @@
 //!
 //! A block anchor is a trailing `^id` token at the end of a line
 //! (optionally preceded by whitespace), where `id` is one or more
-//! ASCII letters/digits/hyphens. Anchors inside fenced code blocks
-//! are skipped.
+//! ASCII letters/digits/hyphens. Anchors inside fenced/indented code
+//! blocks, inline code spans, or HTML blocks/inline HTML are
+//! skipped.
 
 use serde::Serialize;
 
 use crate::diagnostics::{Diagnostic, DiagnosticKind};
-use crate::fences::in_any_range;
+use crate::fences::FenceCursor;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct BlockAnchor {
@@ -25,11 +26,12 @@ fn is_block_id_char(c: char) -> bool {
 pub(crate) fn scan(
     body: &str,
     body_start_line: usize,
-    fenced_ranges: &[(usize, usize)],
+    excluded_ranges: &[(usize, usize)],
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Vec<BlockAnchor> {
     let mut out = Vec::new();
     let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut cursor = FenceCursor::new(excluded_ranges);
 
     let mut line_start = 0usize;
     let mut line_no = 0usize;
@@ -50,7 +52,7 @@ pub(crate) fn scan(
             if preceded_ok
                 && !id.is_empty()
                 && id.chars().all(is_block_id_char)
-                && !in_any_range(fenced_ranges, line_start)
+                && !cursor.contains(line_start)
             {
                 let absolute_line = body_start_line - 1 + line_no;
                 if let Some(&first_line) = seen.get(id) {

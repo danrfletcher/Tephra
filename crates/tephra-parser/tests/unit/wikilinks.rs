@@ -83,3 +83,23 @@ fn an_unterminated_wikilink_literally_at_the_very_end_of_file_does_not_panic() {
         .iter()
         .any(|d| d.kind == DiagnosticKind::UnterminatedWikilink));
 }
+
+#[test]
+fn a_wikilink_inside_an_inline_code_span_is_never_a_wikilink() {
+    let unit = parse_unit(Path::new("t.md"), "See `[[InCode]]` for details.");
+    assert!(unit.wikilinks.is_empty(), "got {:?}", unit.wikilinks);
+}
+
+#[test]
+fn a_wikilink_inside_an_indented_code_block_is_never_a_wikilink() {
+    let content = "Some text.\n\n    #indented [[Ind]] ^ind\n\nMore text.\n";
+    let unit = parse_unit(Path::new("t.md"), content);
+    assert!(unit.wikilinks.is_empty(), "got {:?}", unit.wikilinks);
+}
+
+#[test]
+fn a_wikilink_inside_an_html_comment_is_never_a_wikilink() {
+    let content = "Before.\n\n<!-- #hidden [[Hid]] -->\n\nAfter.\n";
+    let unit = parse_unit(Path::new("t.md"), content);
+    assert!(unit.wikilinks.is_empty(), "got {:?}", unit.wikilinks);
+}
