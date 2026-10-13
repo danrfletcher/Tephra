@@ -209,6 +209,13 @@ impl Cache {
         units::count_rows(&self.conn, "sources")
     }
 
+    /// Row count for one of the fixed internal table names (`sources`,
+    /// `units`, `links`, `tags`, `blocks`, `schema_version`). `table`
+    /// is checked against that closed allow-list and rejected with
+    /// [`CacheError::InvalidTableName`] for anything else — this
+    /// method is `pub` (tests and a future RPC layer call it), so the
+    /// check is a real, always-enforced guard rather than a
+    /// debug-only assertion.
     pub fn table_row_count(&self, table: &str) -> Result<i64, CacheError> {
         units::count_rows(&self.conn, table)
     }

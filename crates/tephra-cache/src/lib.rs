@@ -53,6 +53,11 @@ pub enum CacheError {
     CorruptStatus(String),
     /// `register_source` was called with a `name` that already exists.
     DuplicateSource(String),
+    /// [`Cache::table_row_count`] was called with a table name outside
+    /// the closed allow-list of real tables this crate owns. Returned
+    /// as an error rather than letting the name reach SQL at all — see
+    /// `units::count_rows`'s allow-list check.
+    InvalidTableName(String),
 }
 
 impl fmt::Display for CacheError {
@@ -75,6 +80,9 @@ impl fmt::Display for CacheError {
             }
             CacheError::DuplicateSource(name) => {
                 write!(f, "a source named \"{name}\" is already registered")
+            }
+            CacheError::InvalidTableName(name) => {
+                write!(f, "\"{name}\" is not a recognized cache table name")
             }
         }
     }

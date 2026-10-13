@@ -166,14 +166,27 @@ pub(crate) fn units_with_status_for_source(
     Ok(out)
 }
 
+/// The closed set of real table names this crate ever counts rows in.
+/// [`count_rows`] checks `table` against this allow-list with a real,
+/// always-enforced `if` (not a `debug_assert!`, which compiles out of
+/// release builds) before it ever reaches `format!`'d SQL: `table` is
+/// documented as always being one of these fixed internal names, but
+/// [`crate::Cache::table_row_count`] is `pub` and reachable from a
+/// future RPC layer, so an unexpected value must be rejected rather
+/// than merely asserted against in debug builds.
+const ALLOWED_TABLE_NAMES: [&str; 6] = [
+    "sources",
+    "units",
+    "links",
+    "tags",
+    "blocks",
+    "schema_version",
+];
+
 pub(crate) fn count_rows(conn: &Connection, table: &str) -> Result<i64, CacheError> {
-    // `table` is always one of the fixed internal names below, never
-    // user/network input, so string interpolation here is not a SQL
-    // injection risk.
-    debug_assert!(matches!(
-        table,
-        "sources" | "units" | "links" | "tags" | "blocks" | "schema_version"
-    ));
+    if !ALLOWED_TABLE_NAMES.contains(&table) {
+        return Err(CacheError::InvalidTableName(table.to_string()));
+    }
     let sql = format!("SELECT COUNT(*) FROM {table}");
     let count: i64 = conn.query_row(&sql, [], |row| row.get(0))?;
     Ok(count)
