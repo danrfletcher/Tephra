@@ -52,7 +52,7 @@ pub(crate) fn scan(
             if preceded_ok
                 && !id.is_empty()
                 && id.chars().all(is_block_id_char)
-                && !cursor.contains(line_start)
+                && !cursor.contains(line_start + caret_rel)
             {
                 let absolute_line = body_start_line - 1 + line_no;
                 if let Some(&first_line) = seen.get(id) {
