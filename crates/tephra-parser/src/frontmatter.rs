@@ -1,12 +1,16 @@
 //! Frontmatter delimiter detection and YAML parsing.
 //!
 //! Delimiter rule: the file's very first line must be exactly `---`
-//! (ignoring a trailing `\r`); the frontmatter block then runs until
-//! the next line that is exactly `---`. If no such closing line is
-//! ever found, there is no frontmatter at all — the whole file,
-//! including that leading `---`, is ordinary body content (this is
-//! deliberately lenient: an unterminated block never errors, it just
-//! isn't frontmatter).
+//! (ignoring a trailing `\r`, and ignoring a leading UTF-8 BOM
+//! (`\u{FEFF}`) on the very first line only — common from Windows
+//! editors; the content hash in `lib.rs` still covers the raw bytes
+//! including that BOM, since this stripping is local to delimiter
+//! detection); the frontmatter block then runs until the next line
+//! that is exactly `---`. If no such closing line is ever found,
+//! there is no frontmatter at all — the whole file, including that
+//! leading `---`, is ordinary body content (this is deliberately
+//! lenient: an unterminated block never errors, it just isn't
+//! frontmatter).
 
 use serde::Serialize;
 
@@ -40,6 +44,16 @@ pub(crate) fn extract<'a>(
     content: &'a str,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> (Option<Frontmatter>, &'a str, usize) {
+    // A leading BOM is invisible in every editor that doesn't show
+    // it, so a vault note saved by a Windows/legacy editor often has
+    // one; strip it before any delimiter comparison so it doesn't
+    // turn a real `---` frontmatter block into ordinary body text.
+    // This is just a different starting slice of the same `'a`
+    // input — the content hash computed in `lib.rs` is taken from
+    // the original, un-stripped `content` argument to `parse_unit`,
+    // so it still covers the raw bytes including the BOM.
+    let content = content.strip_prefix('\u{FEFF}').unwrap_or(content);
+
     let Some(first_line_end) = content.find('\n') else {
         // Single-line (or empty) file: a bare "---" with nothing
         // after it can't contain a closing delimiter either way.
@@ -95,11 +109,23 @@ pub(crate) fn extract<'a>(
     let json = match serde_yaml::from_str::<serde_json::Value>(&raw) {
         Ok(value) => serde_json::to_string(&value).ok(),
         Err(e) => {
-            let loc_line = e.location().map(|l| l.line()).unwrap_or(1);
-            // serde_yaml's location is 1-indexed within `raw`; map it
-            // onto the absolute file line, clamped to the frontmatter
-            // block so a trailing "unexpected end of stream" (which
-            // can point one line past the block) still lands inside
+            let message = e.to_string();
+            // serde_yaml's error message typically has two "at line
+            // N column M" clauses: the first is where the parser
+            // gave up (often "unexpected end of stream", which can
+            // land past the whole block), and the second — "while
+            // scanning/parsing ... at line N column M" — is where
+            // the offending construct (e.g. an unterminated quoted
+            // scalar) actually started. Prefer that second, later
+            // clause; it is the more useful line to report. Both are
+            // 1-indexed within `raw`. Fall back to `e.location()`
+            // (the first clause) if the message has only one, or
+            // none at all.
+            let loc_line = last_at_line(&message)
+                .or_else(|| e.location().map(|l| l.line()))
+                .unwrap_or(1);
+            // Map onto the absolute file line, clamped to the
+            // frontmatter block so a wild value still lands inside
             // or immediately after a real line of this file.
             let absolute = (raw_start_line + loc_line.saturating_sub(1)).min(end_line);
             diagnostics.push(Diagnostic::new(
@@ -121,6 +147,26 @@ pub(crate) fn extract<'a>(
         body,
         body_start_line,
     )
+}
+
+/// Finds the last "at line N" occurrence in a serde_yaml error
+/// message and returns `N`. serde_yaml messages are typically shaped
+/// like `"found unexpected end of stream at line 3 column 1, while
+/// scanning a quoted scalar at line 1 column 8"`: the last "at line"
+/// clause (here, "at line 1") is the one that points at where the
+/// offending construct actually started, which is more useful than
+/// the first (where the parser gave up).
+fn last_at_line(message: &str) -> Option<usize> {
+    const MARKER: &str = "at line ";
+    let start = message.rfind(MARKER)? + MARKER.len();
+    let rest = &message[start..];
+    let digits_end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    if digits_end == 0 {
+        return None;
+    }
+    rest[..digits_end].parse::<usize>().ok()
 }
 
 /// Flags a top-level key (column 0, `key:` form) that appears more

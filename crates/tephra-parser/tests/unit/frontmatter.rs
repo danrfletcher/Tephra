@@ -32,7 +32,8 @@ fn valid_frontmatter_is_extracted_and_parsed_to_json() {
 }
 
 #[test]
-fn unbalanced_quote_yields_diagnostic_with_line_number_but_rest_of_file_still_parses() {
+fn unbalanced_quote_yields_diagnostic_with_the_exact_offending_line_but_rest_of_file_still_parses()
+{
     let content = fixture("invalid_yaml.md");
     let unit = parse_unit(Path::new("invalid_yaml.md"), &content);
 
@@ -47,13 +48,22 @@ fn unbalanced_quote_yields_diagnostic_with_line_number_but_rest_of_file_still_pa
         .iter()
         .find(|d| d.kind == DiagnosticKind::InvalidFrontmatterYaml)
         .expect("a diagnostic must be recorded");
-    // The diagnostic must point somewhere inside (or immediately
-    // after) the frontmatter block, not line 0 or a fabricated value.
-    assert!(diag.line >= fm.start_line && diag.line <= fm.end_line + 1);
+    // The unbalanced quote starts on line 2 of the fixture (`title:
+    // "Unbalanced quote`); the diagnostic must point exactly there —
+    // where the quoted scalar actually started — not at the closing
+    // "---" delimiter line that the YAML parser gave up at.
+    assert_eq!(diag.line, 2);
 
     // The rest of the file after the malformed block still parses:
-    // one bad frontmatter block never discards the rest of the file.
-    assert!(content.contains("Body after malformed frontmatter."));
+    // one bad frontmatter block never discards the rest of the
+    // file's headings/links/tags/blocks.
+    assert!(unit
+        .headings
+        .iter()
+        .any(|h| h.text == "Heading after malformed frontmatter"));
+    assert!(unit.wikilinks.iter().any(|w| w.target == "WikiLink"));
+    assert!(unit.tags.iter().any(|t| t.tag == "tag"));
+    assert!(unit.blocks.iter().any(|b| b.block_id == "anchor-id"));
 }
 
 #[test]
@@ -86,7 +96,7 @@ fn frontmatter_only_file_yields_empty_body_ast() {
 }
 
 #[test]
-fn duplicate_top_level_keys_are_flagged_with_a_line_number() {
+fn duplicate_top_level_keys_are_flagged_with_a_line_number_and_body_still_parses() {
     let content = fixture("duplicate_keys.md");
     let unit = parse_unit(Path::new("duplicate_keys.md"), &content);
 
@@ -97,4 +107,45 @@ fn duplicate_top_level_keys_are_flagged_with_a_line_number() {
         .expect("duplicate key diagnostic");
     assert!(diag.line > 0);
     assert!(diag.message.contains("title"));
+
+    assert!(unit
+        .headings
+        .iter()
+        .any(|h| h.text == "Heading after duplicate keys"));
+    assert!(unit.wikilinks.iter().any(|w| w.target == "WikiLink"));
+    assert!(unit.tags.iter().any(|t| t.tag == "tag"));
+    assert!(unit.blocks.iter().any(|b| b.block_id == "anchor-id"));
+}
+
+#[test]
+fn a_leading_utf8_bom_is_stripped_before_delimiter_detection() {
+    let content = fixture("bom.md");
+    let unit = parse_unit(Path::new("bom.md"), &content);
+
+    let fm = unit
+        .frontmatter
+        .expect("frontmatter must still be detected despite the leading BOM");
+    let json = fm.json.expect("valid YAML parses to JSON");
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["title"], "bom");
+    assert!(unit
+        .headings
+        .iter()
+        .any(|h| h.text == "Heading after BOM frontmatter"));
+
+    // The content hash must still cover the raw bytes, BOM included:
+    // re-parsing the BOM-stripped content directly must hash
+    // differently.
+    let stripped = content.strip_prefix('\u{FEFF}').unwrap();
+    let without_bom = parse_unit(Path::new("bom.md"), stripped);
+    assert_ne!(unit.content_hash, without_bom.content_hash);
+}
+
+#[test]
+fn a_leading_utf8_bom_with_no_frontmatter_does_not_corrupt_the_first_heading() {
+    let content = "\u{FEFF}# Heading after bom\n";
+    let unit = parse_unit(Path::new("bom-no-frontmatter.md"), content);
+
+    assert!(unit.frontmatter.is_none());
+    assert!(unit.headings.iter().any(|h| h.text == "Heading after bom"));
 }

@@ -1,21 +1,46 @@
 {
   "path": "tests/fixtures/units/malformed-frontmatter.md",
-  "content_hash": "94a709d66e55e4b526fc2fa598df2dfdcd79341c42c072a9ef3e06342966a9fd",
+  "content_hash": "0eb93d7bce8bc7e5763b962644edfbe27448d4e665d6d625d0863a6246c39dcc",
   "frontmatter": {
     "raw": "title: \"Unbalanced\nstatus: active\n",
     "json": null,
     "start_line": 1,
     "end_line": 4
   },
-  "headings": [],
-  "wikilinks": [],
+  "headings": [
+    {
+      "level": 1,
+      "text": "Heading after malformed frontmatter",
+      "line": 6
+    }
+  ],
+  "wikilinks": [
+    {
+      "source_prefix": null,
+      "target": "WikiLink",
+      "anchor": null,
+      "alias": null,
+      "raw": "WikiLink",
+      "line": 8
+    }
+  ],
   "markdown_links": [],
-  "tags": [],
-  "blocks": [],
+  "tags": [
+    {
+      "tag": "tag",
+      "line": 8
+    }
+  ],
+  "blocks": [
+    {
+      "block_id": "anchor-id",
+      "line": 8
+    }
+  ],
   "diagnostics": [
     {
       "kind": "invalid_frontmatter_yaml",
-      "line": 4,
+      "line": 2,
       "message": "malformed frontmatter YAML: found unexpected end of stream at line 3 column 1, while scanning a quoted scalar at line 1 column 8"
     }
   ]

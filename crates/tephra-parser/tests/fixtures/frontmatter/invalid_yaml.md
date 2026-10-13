@@ -3,4 +3,6 @@ title: "Unbalanced quote
 status: active
 ---
 
-Body after malformed frontmatter.
+# Heading after malformed frontmatter
+
+Body after malformed frontmatter, with a [[WikiLink]], a #tag, and a block anchor. ^anchor-id
