@@ -1,0 +1,16 @@
+{
+  "path": "tests/fixtures/units/frontmatter-only.md",
+  "content_hash": "d496fb2b0647ce71148c14d52b1d72214b8405ab01821a9a54743d78f41ab7b1",
+  "frontmatter": {
+    "raw": "title: Only frontmatter\n",
+    "json": "{\"title\":\"Only frontmatter\"}",
+    "start_line": 1,
+    "end_line": 3
+  },
+  "headings": [],
+  "wikilinks": [],
+  "markdown_links": [],
+  "tags": [],
+  "blocks": [],
+  "diagnostics": []
+}

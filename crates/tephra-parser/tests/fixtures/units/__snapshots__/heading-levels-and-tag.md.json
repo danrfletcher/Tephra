@@ -1,0 +1,57 @@
+{
+  "path": "tests/fixtures/units/heading-levels-and-tag.md",
+  "content_hash": "875e801d382e6b3d8cbd625d7a639575a9fb74d432a5d2509f0a3bbb6c1f2b14",
+  "frontmatter": null,
+  "headings": [
+    {
+      "level": 1,
+      "text": "H1",
+      "line": 1
+    },
+    {
+      "level": 2,
+      "text": "H2",
+      "line": 3
+    },
+    {
+      "level": 3,
+      "text": "H3",
+      "line": 5
+    },
+    {
+      "level": 4,
+      "text": "H4",
+      "line": 7
+    },
+    {
+      "level": 5,
+      "text": "H5",
+      "line": 9
+    },
+    {
+      "level": 6,
+      "text": "H6",
+      "line": 11
+    },
+    {
+      "level": 1,
+      "text": "Repeated",
+      "line": 15
+    },
+    {
+      "level": 1,
+      "text": "Repeated",
+      "line": 19
+    }
+  ],
+  "wikilinks": [],
+  "markdown_links": [],
+  "tags": [
+    {
+      "tag": "justtag",
+      "line": 13
+    }
+  ],
+  "blocks": [],
+  "diagnostics": []
+}

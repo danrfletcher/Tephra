@@ -1,0 +1,26 @@
+{
+  "path": "tests/fixtures/units/duplicate-blocks.md",
+  "content_hash": "6ad851514c21d4b3729c3a3637bcb68e1b63858fd6135694c121bfa1a2cb4e38",
+  "frontmatter": null,
+  "headings": [],
+  "wikilinks": [],
+  "markdown_links": [],
+  "tags": [],
+  "blocks": [
+    {
+      "block_id": "dup-id",
+      "line": 1
+    },
+    {
+      "block_id": "dup-id",
+      "line": 3
+    }
+  ],
+  "diagnostics": [
+    {
+      "kind": "duplicate_block_id",
+      "line": 3,
+      "message": "duplicate block id \"^dup-id\" (first seen on line 1)"
+    }
+  ]
+}
