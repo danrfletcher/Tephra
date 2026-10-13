@@ -29,6 +29,18 @@
 //! erroring the whole rebuild out — the source's `sources` row and
 //! status are still preserved either way; only its cached rows are
 //! lost in that degraded case, same as for any non-offline source.
+//!
+//! A column-compatible old table can still hold *data* the current
+//! schema's stricter constraints reject: a NULL in a column that is
+//! now `NOT NULL`, or two rows that collide under a `UNIQUE` the new
+//! schema added. [`snapshot_offline_rows`] and [`restore_offline_rows`]
+//! can therefore still fail even when [`offline_rows_are_carryable`]
+//! returned `true`. The caller (`cache::perform_rebuild`) treats a
+//! snapshot failure the same as "not carryable" (skips the
+//! carry-over), and runs the restore inside its own SAVEPOINT so a
+//! restore failure only discards that partial restore rather than the
+//! whole rebuild — see that function's doc comment for the full
+//! picture.
 
 use rusqlite::Connection;
 
@@ -153,6 +165,14 @@ pub(crate) fn create_core_tables(conn: &Connection) -> Result<(), CacheError> {
 /// when nothing is offline. [`offline_rows_are_carryable`] checks
 /// column presence first so that case is skipped (no snapshot
 /// attempted, and so no error) rather than bricking the rebuild.
+///
+/// Even when every expected column is present, a row's *value* can
+/// still be incompatible with the current schema (e.g. a NULL in
+/// `blocks.line`, which is `NOT NULL` in the current schema and so
+/// fails `row.get::<i64>`). The caller treats any `Err` from this
+/// function identically to a failed [`offline_rows_are_carryable`]
+/// check: the carry-over is skipped and the rebuild proceeds with
+/// empty core tables for the affected source rather than failing.
 #[derive(Debug, Default)]
 pub(crate) struct OfflineRows {
     units: Vec<UnitRow>,
@@ -296,6 +316,16 @@ pub(crate) fn snapshot_offline_rows(conn: &Connection) -> Result<OfflineRows, Ca
 /// set to `NULL` instead — it becomes a dangling/unresolved link
 /// rather than a foreign-key violation, consistent with how an
 /// unresolved link is represented elsewhere in this schema.
+///
+/// A row that was successfully snapshotted can still fail to insert
+/// here if it violates a constraint the *current* schema added that
+/// the old one didn't have (e.g. two old `units` rows sharing a
+/// `(source_id, rel_path)` that only the current schema's `UNIQUE`
+/// rejects). The caller (`cache::perform_rebuild`) runs this function
+/// inside a SAVEPOINT and rolls back to it on error, so such a
+/// failure discards only this partial restore rather than the whole
+/// rebuild; this function itself has no partial-success behavior — it
+/// either inserts everything in `rows` or returns the first error.
 pub(crate) fn restore_offline_rows(
     conn: &Connection,
     rows: &OfflineRows,

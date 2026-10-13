@@ -117,8 +117,8 @@ impl Cache {
     /// [`Cache::open`]'s automatic version-mismatch handling and direct
     /// test calls go through this same function.
     pub fn rebuild(&mut self, injector: &FaultInjector) -> Result<(), CacheError> {
-        let tx = self.conn.transaction()?;
-        perform_rebuild(&tx, injector)?;
+        let mut tx = self.conn.transaction()?;
+        perform_rebuild(&mut tx, injector)?;
         tx.commit()?;
         Ok(())
     }
@@ -298,9 +298,32 @@ fn apply_pragmas(conn: &Connection) -> Result<(), CacheError> {
 /// erroring `Cache::open` out entirely (which, before this fix, left
 /// `schema_version` untouched and so failed identically on every
 /// subsequent start).
-fn perform_rebuild(tx: &rusqlite::Transaction, injector: &FaultInjector) -> Result<(), CacheError> {
+///
+/// A column-compatible old schema can still hold *data* the current
+/// schema's stricter constraints reject (R4 review finding): a NULL
+/// in a column that is now `NOT NULL` (snapshot fails reading the
+/// row), or two old rows that collide under a `UNIQUE` the new schema
+/// added (restore fails inserting the row). Both are handled the same
+/// way the column-shape mismatch above is, so the rebuild still
+/// always completes:
+/// - If [`schema::snapshot_offline_rows`] itself returns `Err`, that
+///   is treated exactly like "not carryable" — the carry-over is
+///   skipped (`preserved = None`) rather than propagated.
+/// - [`schema::restore_offline_rows`] runs inside its own SAVEPOINT.
+///   If it errors, the SAVEPOINT is rolled back (discarding only the
+///   partial restore) and the rebuild continues with empty core
+///   tables for the degraded source; the outer transaction is
+///   unaffected and `schema_version` is still rewritten below.
+fn perform_rebuild(
+    tx: &mut rusqlite::Transaction,
+    injector: &FaultInjector,
+) -> Result<(), CacheError> {
     let preserved = if schema::offline_rows_are_carryable(tx)? {
-        Some(schema::snapshot_offline_rows(tx)?)
+        // `.ok()`, not `?`: a column-compatible old table can still
+        // hold data the current schema rejects while reading it back
+        // (e.g. a NULL in a now-`NOT NULL` column) — that must not
+        // brick the rebuild either, see the doc comment above.
+        schema::snapshot_offline_rows(tx).ok()
     } else {
         None
     };
@@ -310,7 +333,11 @@ fn perform_rebuild(tx: &rusqlite::Transaction, injector: &FaultInjector) -> Resu
     }
     schema::create_core_tables(tx)?;
     if let Some(preserved) = preserved {
-        schema::restore_offline_rows(tx, &preserved)?;
+        let mut savepoint = tx.savepoint()?;
+        match schema::restore_offline_rows(&savepoint, &preserved) {
+            Ok(()) => savepoint.commit()?,
+            Err(_) => savepoint.rollback()?,
+        }
     }
     schema::write_schema_version(tx, CURRENT_SCHEMA_VERSION)?;
     Ok(())
@@ -341,8 +368,8 @@ fn ensure_schema(conn: &Connection) -> Result<(), CacheError> {
             schema::create_core_tables_if_not_exists(conn)?;
         }
         Some(_) => {
-            let tx = conn.unchecked_transaction()?;
-            perform_rebuild(&tx, &FaultInjector::none())?;
+            let mut tx = conn.unchecked_transaction()?;
+            perform_rebuild(&mut tx, &FaultInjector::none())?;
             tx.commit()?;
         }
     }

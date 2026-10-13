@@ -162,6 +162,234 @@ fn open_completes_against_old_shape_schema_with_an_offline_source() {
     );
 }
 
+/// Hand-builds a cache file whose core tables' *column lists* already
+/// match the current schema exactly (so
+/// `offline_rows_are_carryable` returns `true` and a snapshot is
+/// attempted) but whose *data* violates a constraint only the current
+/// schema enforces — the R4 review finding: a column-name check alone
+/// doesn't catch a NULL in a column that is now `NOT NULL`, or
+/// duplicate rows that would violate a new `UNIQUE`. `schema_version`
+/// is seeded one behind `CURRENT_SCHEMA_VERSION` so `Cache::open`
+/// takes the rebuild path. The single seeded source is `offline` and
+/// owns the incompatible row(s), exactly like the reviewer's repro.
+enum DataIncompatibility {
+    /// Old `blocks` has every current column name, including `line`,
+    /// but `line` is nullable there (it is `NOT NULL` in the current
+    /// schema) and the seeded row's `line` is `NULL`.
+    NullBlockLine,
+    /// Old `units` has every current column name, including the
+    /// paired `(source_id, rel_path)`, but has no `UNIQUE` constraint
+    /// on that pair (the current schema does), and two seeded rows
+    /// share the same `(source_id, rel_path)`.
+    DuplicateUnitPath,
+}
+
+fn seed_data_incompatible_db(db_path: &std::path::Path, variant: DataIncompatibility) {
+    let conn = Connection::open(db_path).expect("open raw connection");
+
+    conn.execute(
+        "CREATE TABLE sources (\
+            id INTEGER PRIMARY KEY AUTOINCREMENT, \
+            name TEXT NOT NULL UNIQUE, \
+            path TEXT NOT NULL, \
+            status TEXT NOT NULL CHECK (status IN ('active', 'stale', 'offline')), \
+            last_scanned_at INTEGER \
+        )",
+        [],
+    )
+    .unwrap();
+    conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)", [])
+        .unwrap();
+    conn.execute(
+        "INSERT INTO schema_version (version) VALUES (?1)",
+        [CURRENT_SCHEMA_VERSION - 1],
+    )
+    .unwrap();
+
+    let units_ddl = match variant {
+        // Same column list as the current schema, but no UNIQUE.
+        DataIncompatibility::DuplicateUnitPath => {
+            "CREATE TABLE units (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                source_id INTEGER NOT NULL, \
+                rel_path TEXT NOT NULL, \
+                mtime INTEGER, \
+                frontmatter_json TEXT \
+            )"
+        }
+        DataIncompatibility::NullBlockLine => {
+            "CREATE TABLE units (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                source_id INTEGER NOT NULL, \
+                rel_path TEXT NOT NULL, \
+                mtime INTEGER, \
+                frontmatter_json TEXT, \
+                UNIQUE(source_id, rel_path) \
+            )"
+        }
+    };
+    conn.execute(units_ddl, []).unwrap();
+    conn.execute(
+        "CREATE TABLE links (\
+            id INTEGER PRIMARY KEY AUTOINCREMENT, \
+            from_unit_id INTEGER NOT NULL, \
+            to_raw TEXT NOT NULL, \
+            to_unit_id INTEGER, \
+            kind TEXT NOT NULL \
+        )",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "CREATE TABLE tags (\
+            id INTEGER PRIMARY KEY AUTOINCREMENT, \
+            unit_id INTEGER NOT NULL, \
+            tag TEXT NOT NULL \
+        )",
+        [],
+    )
+    .unwrap();
+    let blocks_ddl = match variant {
+        // Same column list as the current schema, but `line` is
+        // nullable instead of `NOT NULL`.
+        DataIncompatibility::NullBlockLine => {
+            "CREATE TABLE blocks (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                unit_id INTEGER NOT NULL, \
+                block_id TEXT NOT NULL, \
+                line INTEGER \
+            )"
+        }
+        DataIncompatibility::DuplicateUnitPath => {
+            "CREATE TABLE blocks (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                unit_id INTEGER NOT NULL, \
+                block_id TEXT NOT NULL, \
+                line INTEGER NOT NULL \
+            )"
+        }
+    };
+    conn.execute(blocks_ddl, []).unwrap();
+
+    conn.execute(
+        "INSERT INTO sources (name, path, status, last_scanned_at) VALUES ('notes', '/vault/notes', 'offline', NULL)",
+        [],
+    )
+    .unwrap();
+
+    match variant {
+        DataIncompatibility::NullBlockLine => {
+            conn.execute(
+                "INSERT INTO units (id, source_id, rel_path, mtime, frontmatter_json) \
+                 VALUES (1, 1, 'one.md', 1700000000, NULL)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO blocks (id, unit_id, block_id, line) VALUES (1, 1, 'abcd1234', NULL)",
+                [],
+            )
+            .unwrap();
+        }
+        DataIncompatibility::DuplicateUnitPath => {
+            conn.execute(
+                "INSERT INTO units (id, source_id, rel_path, mtime, frontmatter_json) \
+                 VALUES (1, 1, 'one.md', 1700000000, NULL)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO units (id, source_id, rel_path, mtime, frontmatter_json) \
+                 VALUES (2, 1, 'one.md', 1700000001, NULL)",
+                [],
+            )
+            .unwrap();
+        }
+    }
+}
+
+#[test]
+fn open_completes_when_offline_block_row_has_a_null_now_not_null_column() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("cache.db");
+    seed_data_incompatible_db(&db_path, DataIncompatibility::NullBlockLine);
+
+    // Before the R4 fix, `snapshot_offline_rows` failed on
+    // `row.get::<i64>` for the NULL `line` value and `Cache::open`
+    // returned `Err`, leaving `schema_version` at the old value so
+    // every subsequent open failed identically.
+    let cache = Cache::open(&db_path)
+        .expect("open must complete even when offline data violates a new NOT NULL column");
+
+    assert_eq!(
+        cache.schema_version().unwrap(),
+        Some(CURRENT_SCHEMA_VERSION)
+    );
+    assert_eq!(cache.source_row_count().unwrap(), 1);
+    let source = cache.get_source("notes").unwrap().expect("source row");
+    assert_eq!(
+        source.status,
+        tephra_cache::SourceStatus::Offline,
+        "the source's offline status must survive even in this degraded path"
+    );
+    // The snapshot itself failed, so the carry-over is skipped
+    // entirely: no units/blocks rows survive for this source.
+    assert_eq!(cache.table_row_count("units").unwrap(), 0);
+    assert_eq!(cache.table_row_count("blocks").unwrap(), 0);
+
+    // Reopening must also succeed and be a no-op.
+    drop(cache);
+    let cache = Cache::open(&db_path).expect("second open must also complete");
+    assert_eq!(
+        cache.schema_version().unwrap(),
+        Some(CURRENT_SCHEMA_VERSION)
+    );
+}
+
+#[test]
+fn open_completes_when_offline_units_violate_a_new_unique_constraint() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("cache.db");
+    seed_data_incompatible_db(&db_path, DataIncompatibility::DuplicateUnitPath);
+
+    // Before the R4 fix, the snapshot succeeded (both old rows read
+    // back fine), but `restore_offline_rows` failed inserting the
+    // second row into the new, now-UNIQUE-constrained `units` table,
+    // and `Cache::open` returned `Err` with `schema_version` left at
+    // the old value.
+    let cache = Cache::open(&db_path).expect(
+        "open must complete even when offline data violates a new UNIQUE constraint on restore",
+    );
+
+    assert_eq!(
+        cache.schema_version().unwrap(),
+        Some(CURRENT_SCHEMA_VERSION)
+    );
+    assert_eq!(cache.source_row_count().unwrap(), 1);
+    let source = cache.get_source("notes").unwrap().expect("source row");
+    assert_eq!(
+        source.status,
+        tephra_cache::SourceStatus::Offline,
+        "the source's offline status must survive even in this degraded path"
+    );
+    // The restore failed partway through (on the second row) and was
+    // rolled back via SAVEPOINT, so neither row survives — not just
+    // the second one that collided.
+    assert_eq!(
+        cache.table_row_count("units").unwrap(),
+        0,
+        "a failed restore must be rolled back in full, not left partially applied"
+    );
+
+    // Reopening must also succeed and be a no-op.
+    drop(cache);
+    let cache = Cache::open(&db_path).expect("second open must also complete");
+    assert_eq!(
+        cache.schema_version().unwrap(),
+        Some(CURRENT_SCHEMA_VERSION)
+    );
+}
+
 #[test]
 fn reopen_after_a_clean_mismatch_rebuild_still_carries_offline_rows() {
     // Control case: when the old and current table shapes *do* match,
