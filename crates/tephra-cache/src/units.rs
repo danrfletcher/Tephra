@@ -1,0 +1,180 @@
+//! `units`/`links`/`tags`/`blocks` row types and insert/query helpers.
+//!
+//! All four tables carry a foreign key back toward `sources`: `units`
+//! directly via `source_id`, and `links`/`tags`/`blocks` indirectly —
+//! every `unit_id` (or `from_unit_id`/`to_unit_id`) they reference must
+//! itself belong to a real `units` row, which in turn must belong to a
+//! real `sources` row. `PRAGMA foreign_keys = ON` (set on every
+//! connection open, see `cache.rs`) enforces every link in that chain.
+
+use rusqlite::{Connection, OptionalExtension};
+
+use crate::sources::SourceStatus;
+use crate::CacheError;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnitRow {
+    pub id: i64,
+    pub source_id: i64,
+    pub rel_path: String,
+    pub mtime: Option<i64>,
+    pub frontmatter_json: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct NewUnit<'a> {
+    pub source_id: i64,
+    pub rel_path: &'a str,
+    pub mtime: Option<i64>,
+    pub frontmatter_json: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinkRow {
+    pub id: i64,
+    pub from_unit_id: i64,
+    pub to_raw: String,
+    pub to_unit_id: Option<i64>,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct NewLink<'a> {
+    pub from_unit_id: i64,
+    pub to_raw: &'a str,
+    pub to_unit_id: Option<i64>,
+    pub kind: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TagRow {
+    pub id: i64,
+    pub unit_id: i64,
+    pub tag: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct NewTag<'a> {
+    pub unit_id: i64,
+    pub tag: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlockRow {
+    pub id: i64,
+    pub unit_id: i64,
+    pub block_id: String,
+    pub line: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct NewBlock<'a> {
+    pub unit_id: i64,
+    pub block_id: &'a str,
+    pub line: i64,
+}
+
+/// A `units` row paired with its owning source's current status, so a
+/// caller querying across an offline source can tell the rows are
+/// cached-but-stale (E2) rather than current.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnitWithSourceStatus {
+    pub unit: UnitRow,
+    pub source_status: SourceStatus,
+}
+
+pub(crate) fn insert_unit(conn: &Connection, new: &NewUnit) -> Result<i64, CacheError> {
+    conn.execute(
+        "INSERT INTO units (source_id, rel_path, mtime, frontmatter_json) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![new.source_id, new.rel_path, new.mtime, new.frontmatter_json],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub(crate) fn insert_link(conn: &Connection, new: &NewLink) -> Result<i64, CacheError> {
+    conn.execute(
+        "INSERT INTO links (from_unit_id, to_raw, to_unit_id, kind) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![new.from_unit_id, new.to_raw, new.to_unit_id, new.kind],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub(crate) fn insert_tag(conn: &Connection, new: &NewTag) -> Result<i64, CacheError> {
+    conn.execute(
+        "INSERT INTO tags (unit_id, tag) VALUES (?1, ?2)",
+        rusqlite::params![new.unit_id, new.tag],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub(crate) fn insert_block(conn: &Connection, new: &NewBlock) -> Result<i64, CacheError> {
+    conn.execute(
+        "INSERT INTO blocks (unit_id, block_id, line) VALUES (?1, ?2, ?3)",
+        rusqlite::params![new.unit_id, new.block_id, new.line],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub(crate) fn get_unit(conn: &Connection, id: i64) -> Result<Option<UnitRow>, CacheError> {
+    conn.query_row(
+        "SELECT id, source_id, rel_path, mtime, frontmatter_json FROM units WHERE id = ?1",
+        [id],
+        |row| {
+            Ok(UnitRow {
+                id: row.get(0)?,
+                source_id: row.get(1)?,
+                rel_path: row.get(2)?,
+                mtime: row.get(3)?,
+                frontmatter_json: row.get(4)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(CacheError::from)
+}
+
+/// Every `units` row belonging to the source named `source_name`,
+/// each paired with that source's current status. Returns cached rows
+/// for an offline source too (E2) rather than an empty result — the
+/// WHERE clause filters only by source name, never by status.
+pub(crate) fn units_with_status_for_source(
+    conn: &Connection,
+    source_name: &str,
+) -> Result<Vec<UnitWithSourceStatus>, CacheError> {
+    let mut stmt = conn.prepare(
+        "SELECT u.id, u.source_id, u.rel_path, u.mtime, u.frontmatter_json, s.status \
+         FROM units u JOIN sources s ON s.id = u.source_id \
+         WHERE s.name = ?1 ORDER BY u.id",
+    )?;
+    let mut rows = stmt.query([source_name])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        let status_raw: String = row.get(5)?;
+        let source_status = SourceStatus::parse(&status_raw)
+            .ok_or_else(|| CacheError::CorruptStatus(status_raw.clone()))?;
+        out.push(UnitWithSourceStatus {
+            unit: UnitRow {
+                id: row.get(0)?,
+                source_id: row.get(1)?,
+                rel_path: row.get(2)?,
+                mtime: row.get(3)?,
+                frontmatter_json: row.get(4)?,
+            },
+            source_status,
+        });
+    }
+    Ok(out)
+}
+
+pub(crate) fn count_rows(conn: &Connection, table: &str) -> Result<i64, CacheError> {
+    // `table` is always one of the fixed internal names below, never
+    // user/network input, so string interpolation here is not a SQL
+    // injection risk.
+    debug_assert!(matches!(
+        table,
+        "sources" | "units" | "links" | "tags" | "blocks" | "schema_version"
+    ));
+    let sql = format!("SELECT COUNT(*) FROM {table}");
+    let count: i64 = conn.query_row(&sql, [], |row| row.get(0))?;
+    Ok(count)
+}
