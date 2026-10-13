@@ -28,9 +28,11 @@ redeclared here), once a caller knows the owning unit's row id.
 ## Tests
 
 - `tests/unit/*.rs` — one file per extraction category (frontmatter,
-  headings, wikilinks, markdown links, tags, blocks, determinism) plus
-  `robustness.rs` for the empty-file/non-UTF-8/large-file edge cases.
-  Aggregated into a single test binary via `tests/unit.rs`.
+  headings, wikilinks, markdown links, tags, blocks, determinism)
+  plus `robustness.rs` for the empty-file/non-UTF-8 edge cases and
+  `large_file.rs` for the bounded-time/bounded-memory, multi-megabyte
+  (fence-free and fence-heavy) cases. Aggregated into a single test
+  binary via `tests/unit.rs`.
 - `tests/integration/parse_unit_fixtures.rs` — snapshot tests over the
   fixture corpus in `tests/fixtures/units/*.md`, each asserted against
   a committed golden JSON file in `tests/fixtures/units/__snapshots__/`.

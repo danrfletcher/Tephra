@@ -11,6 +11,8 @@ mod determinism;
 mod frontmatter;
 #[path = "unit/headings.rs"]
 mod headings;
+#[path = "unit/large_file.rs"]
+mod large_file;
 #[path = "unit/markdown_links.rs"]
 mod markdown_links;
 #[path = "unit/robustness.rs"]
