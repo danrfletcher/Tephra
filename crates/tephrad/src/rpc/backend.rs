@@ -123,15 +123,42 @@ impl GraphBackend for SharedGraph {
 /// every request handler can own one without borrowing from
 /// [`crate::rpc::server::AppState`] across an `.await`/`spawn_blocking`
 /// boundary.
+///
+/// R9 fix: `rebuild_lock` serializes the *entire* body of
+/// [`GraphRefresh::refresh`] (cache open, rebuild, and
+/// [`SharedGraph::replace`]) across every clone, rather than letting
+/// several rebuilds run concurrently. Without it, two overlapping
+/// `source.*` mutations (or a mutation racing a watcher-driven
+/// refresh) could each read the cache and build a fresh graph in
+/// parallel, and whichever `replace()` call happened to *finish*
+/// last would win — even if it had started reading the cache
+/// *before* the other rebuild's underlying mutation had committed.
+/// That could install a snapshot missing a source whose `source.*`
+/// call had already returned success (reproducing R1's
+/// `unit.resolve_link` -> "no source named ... is registered" error
+/// under concurrent use). Serializing the whole read-build-replace
+/// sequence makes this impossible: whichever rebuild acquires the
+/// lock *last* always opens the cache strictly after every earlier
+/// rebuild's own triggering mutation has committed (that mutation
+/// necessarily finished before the earlier rebuild's own call was
+/// even made, which in turn finished — lock released — before the
+/// later rebuild could acquire it), so the last one in is always the
+/// most complete, and it is also always the last one to call
+/// `replace()`.
 #[derive(Clone)]
 pub struct GraphRefresh {
     shared: Arc<SharedGraph>,
     cache_path: PathBuf,
+    rebuild_lock: Arc<std::sync::Mutex<()>>,
 }
 
 impl GraphRefresh {
     pub fn new(shared: Arc<SharedGraph>, cache_path: PathBuf) -> Self {
-        GraphRefresh { shared, cache_path }
+        GraphRefresh {
+            shared,
+            cache_path,
+            rebuild_lock: Arc::new(std::sync::Mutex::new(())),
+        }
     }
 
     /// Rebuilds a fresh [`UnitGraph`] from the current contents of the
@@ -142,7 +169,17 @@ impl GraphRefresh {
     /// `server.rs`/`main.rs` always run this inside
     /// `tokio::task::spawn_blocking`, never directly on an async
     /// worker thread (R6).
+    ///
+    /// Holds `rebuild_lock` for the full duration (cache open through
+    /// `replace()`), so concurrent calls on different `GraphRefresh`
+    /// clones are fully serialized rather than racing (R9) — see this
+    /// struct's doc comment for why that ordering guarantee is what
+    /// prevents a stale rebuild from clobbering a newer one.
     pub fn refresh(&self) -> Result<(), String> {
+        let _guard = self
+            .rebuild_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let cache = Cache::open(&self.cache_path).map_err(|e| e.to_string())?;
         let graph = UnitGraph::build_from_cache(&cache).map_err(|e| e.to_string())?;
         self.shared.replace(graph);
