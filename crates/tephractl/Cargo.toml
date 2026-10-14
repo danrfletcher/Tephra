@@ -19,3 +19,8 @@ serde_json = "1.0.154"
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }
+axum = { version = "0.8.9", features = ["ws"] }
+tephrad = { path = "../tephrad" }
+tephra-cache = { path = "../tephra-cache" }
+tephra-graph = { path = "../tephra-graph" }

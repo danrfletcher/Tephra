@@ -1875,10 +1875,15 @@ dependencies = [
 name = "tephractl"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "reqwest",
  "serde",
  "serde_json",
  "tempfile",
+ "tephra-cache",
+ "tephra-graph",
+ "tephrad",
+ "tokio",
 ]
 
 [[package]]
