@@ -100,6 +100,18 @@ fn a_concurrent_in_process_writer_lands_mid_scan_every_time() {
         stats
     });
 
+    // R19: the small source's file is rewritten with new content —
+    // including a tag absent from what it was registered with —
+    // *before* the writer loop below even starts firing batch-apply
+    // attempts, so proving a later success actually indexed this new
+    // content (rather than merely reporting `Ok` on an unindexed
+    // no-op) requires checking the resulting tag row, not just the
+    // source's `status` field.
+    small_fixture.write(
+        "small.md",
+        "# Small\n\nEdited while the big scan was running. #during\n",
+    );
+
     let mut changed = HashSet::new();
     changed.insert(small_root.join("small.md"));
 
@@ -153,77 +165,144 @@ fn a_concurrent_in_process_writer_lands_mid_scan_every_time() {
         "sanity: the small-source writer loop must have actually run (attempts={attempts}, successes={successes})"
     );
 
-    // And the edit itself must actually have landed in the small
-    // source's cache rows, not merely reported `Ok` without writing
-    // anything.
-    let tags = small_cache
+    let sources = small_cache
         .list_sources()
         .expect("list_sources")
         .into_iter()
         .find(|s| s.name == "small")
         .expect("small source listed");
-    assert_eq!(tags.status, SourceStatus::Active);
+    assert_eq!(sources.status, SourceStatus::Active);
+
+    // R19: the edit itself must actually have landed in the small
+    // source's cache rows, not merely reported `Ok` without writing
+    // anything — check the real content change (the new `#during`
+    // tag) rather than just the source's status flag.
+    let unit = small_cache
+        .get_unit_by_rel_path(small_source_id, "small.md")
+        .expect("get_unit_by_rel_path")
+        .expect("small.md must have a unit row after a successful batch-apply");
+    let tag_count: i64 = small_cache
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM tags WHERE unit_id = ?1 AND tag = ?2",
+            rusqlite::params![unit.id, "during"],
+            |r| r.get(0),
+        )
+        .expect("query tag count");
+    assert_eq!(
+        tag_count, 1,
+        "small.md's post-edit #during tag must be indexed, proving the batch-apply that \
+         succeeded mid-scan actually parsed and wrote the new content rather than a stale \
+         or no-op row"
+    );
 }
 
-/// R18: an uncontended multi-chunk scan must not pay a fixed,
-/// chunk-count-scaled tax for a hand-off nothing is waiting on.
+/// R18/R19: an uncontended multi-chunk scan must not pay a fixed,
+/// per-chunk-count-scaled tax for a hand-off nothing is waiting on.
 ///
-/// Before this fix, `walk_and_write` slept `CHUNK_COMMIT_YIELD`
-/// (10ms) after every `SCAN_COMMIT_CHUNK_SIZE`th file regardless of
-/// contention, so an N-chunk scan always cost at least
-/// `N * CHUNK_COMMIT_YIELD` beyond its own real work — and on macOS,
-/// timer coalescing turned each nominal 10ms sleep into roughly
-/// 60-80ms, measured 5.3x slower end to end on a 100k-file scan. This
-/// test is intentionally far smaller (so it stays fast and reliable
-/// in CI) but asserts the same property: enough chunks that the old,
-/// unconditional sleep would have added a clearly measurable amount
-/// of wall time on *any* platform, with nothing else ever touching
-/// this cache database, must not come anywhere close to that.
+/// Before the R18 fix, `walk_and_write` slept a fixed duration after
+/// every `SCAN_COMMIT_CHUNK_SIZE`th file regardless of contention, so
+/// an N-chunk scan always cost at least `N * sleep` beyond its own
+/// real work. The first version of this test (R18) only bounded the
+/// *total* wall time against a generous absolute constant (3s); that
+/// left so much headroom above both the sleep-free and
+/// sleep-reintroduced cases that a scratch-copy probe confirmed the
+/// test kept passing even with the fixed per-chunk sleep put back
+/// (R19 review finding).
+///
+/// This version instead self-calibrates on the same run: it first
+/// times two scans small enough that `walk_and_write` never hits an
+/// interior chunk boundary at all (under `SCAN_COMMIT_CHUNK_SIZE`
+/// files, so zero chunk hand-offs occur beyond the single initial and
+/// final commit every scan pays regardless), and uses the *marginal*
+/// per-file cost between those two points — which cancels out each
+/// run's fixed one-time setup cost (opening a cache, registering a
+/// source, loading ignore rules) rather than being thrown off by it —
+/// to project what an uncontended, many-chunk scan of the same shape
+/// *should* cost if chunk hand-offs are genuinely free. The real
+/// many-chunk scan is then compared against that projection as a
+/// ratio, not an absolute bound: a ratio close to 1 means chunking
+/// itself added (almost) nothing beyond the real per-file work; a
+/// fixed per-chunk sleep inflates it sharply regardless of how fast
+/// or slow the underlying machine is, since the sleep scales with
+/// chunk count while the projection does not.
+///
+/// Measured on this suite's own dev machine: the current (sleep-free)
+/// implementation's ratio is consistently under 1.5; a scratch copy
+/// with `std::thread::sleep(Duration::from_millis(10))` reinstated
+/// right after the per-chunk permit drop in `scan.rs::walk_and_write`
+/// consistently measured a ratio above 3.5 — confirmed by rerunning
+/// this exact test against that scratch copy. [`TAX_RATIO_BOUND`]
+/// sits well clear of both.
 #[test]
 fn an_uncontended_multi_chunk_scan_pays_no_fixed_per_chunk_tax() {
-    // 20 * SCAN_COMMIT_CHUNK_SIZE (500) = 10,000 files, so the old
-    // fixed sleep would have added at least 20 * 10ms = 200ms (and,
-    // per the R18 measurement's macOS coalescing, plausibly well
-    // over a second) purely from chunk hand-offs, on top of the
-    // walk's own real work.
-    const FILE_COUNT: usize = 10_000;
+    /// Below `scan::SCAN_COMMIT_CHUNK_SIZE` (500): `walk_and_write`
+    /// commits exactly once (the final commit after the walk loop
+    /// ends), with no interior chunk-boundary hand-off at all, so a
+    /// scan at or under this size can never include any per-chunk
+    /// tax — making it a clean, tax-free calibration point.
+    const CALIBRATION_LOW: usize = 50;
+    const CALIBRATION_HIGH: usize = 450;
 
-    let fixture = fixtures::empty_source();
-    for i in 0..FILE_COUNT {
-        fixture.write(
-            &format!("notes/note-{i:05}.md"),
-            &format!("# Note {i}\n\nSome content for note {i}.\n"),
-        );
+    /// 40 * `SCAN_COMMIT_CHUNK_SIZE` (500) = 20,000 files, so this
+    /// scan commits (and hands the gate off) roughly 40 times —
+    /// enough chunk boundaries that a fixed per-chunk sleep would
+    /// show up clearly against the calibration's projection.
+    const MANY_CHUNK_COUNT: usize = 20_000;
+
+    /// How far the many-chunk scan's actual time may exceed the
+    /// tax-free projection before this test treats it as a
+    /// reintroduced per-chunk tax rather than ordinary variance.
+    /// Chosen with real margin on both sides of this suite's own
+    /// measurements (sleep-free ratios under 1.5, sleep-reintroduced
+    /// ratios above 3.5 — see the function doc comment).
+    const TAX_RATIO_BOUND: f64 = 2.2;
+
+    fn timed_scan(file_count: usize) -> Duration {
+        let fixture = fixtures::empty_source();
+        for i in 0..file_count {
+            fixture.write(
+                &format!("notes/note-{i:05}.md"),
+                &format!("# Note {i}\n\nSome content for note {i}.\n"),
+            );
+        }
+        let cache_dir = tempfile::tempdir().expect("cache tempdir");
+        let cache_path = cache_dir.path().join("cache.db");
+        let cache = Cache::open(&cache_path).expect("open cache");
+        let source_id = cache
+            .register_source(
+                "notes",
+                &fixture.root().to_string_lossy(),
+                SourceStatus::Active,
+            )
+            .expect("register_source");
+        let ignore_rules = tephrad::ignore::IgnoreRules::load(fixture.root()).expect("load ignore");
+
+        let started = Instant::now();
+        let stats = tephrad::scan::scan_source(&cache, source_id, fixture.root(), &ignore_rules)
+            .expect("scan_source");
+        let elapsed = started.elapsed();
+
+        assert_eq!(stats.units_written, file_count);
+        elapsed
     }
 
-    let cache_dir = tempfile::tempdir().expect("cache tempdir");
-    let cache_path = cache_dir.path().join("cache.db");
-    let cache = Cache::open(&cache_path).expect("open cache");
-    let source_id = cache
-        .register_source(
-            "notes",
-            &fixture.root().to_string_lossy(),
-            SourceStatus::Active,
-        )
-        .expect("register_source");
-    let ignore_rules = tephrad::ignore::IgnoreRules::load(fixture.root()).expect("load ignore");
+    let low = timed_scan(CALIBRATION_LOW).as_secs_f64();
+    let high = timed_scan(CALIBRATION_HIGH).as_secs_f64();
+    // Marginal tax-free per-file cost, derived from two points that
+    // both ran with zero interior chunk boundaries — any fixed setup
+    // cost common to both runs cancels out of this slope.
+    let marginal_per_file = (high - low) / (CALIBRATION_HIGH as f64 - CALIBRATION_LOW as f64);
+    let projected = high + marginal_per_file * (MANY_CHUNK_COUNT as f64 - CALIBRATION_HIGH as f64);
 
-    let started = Instant::now();
-    let stats = tephrad::scan::scan_source(&cache, source_id, fixture.root(), &ignore_rules)
-        .expect("scan_source");
-    let elapsed = started.elapsed();
+    let actual = timed_scan(MANY_CHUNK_COUNT).as_secs_f64();
+    let ratio = actual / projected;
 
-    assert_eq!(stats.units_written, FILE_COUNT);
-    // Generous bound: 20 chunk boundaries at the old fixed 10ms
-    // (never mind macOS's observed 60-80ms per sleep) alone would
-    // already be 200ms; this scan's own real work (parsing and
-    // writing 10,000 tiny markdown files) is itself well under a
-    // second on any reasonable machine. Three seconds leaves ample
-    // headroom for a slow CI runner while still clearly failing if
-    // a fixed per-chunk sleep were reintroduced.
     assert!(
-        elapsed < Duration::from_secs(3),
-        "an uncontended {FILE_COUNT}-file scan (20 chunks) took {elapsed:?}; a fixed \
-         per-chunk sleep would show up here as a tax proportional to the chunk count"
+        ratio < TAX_RATIO_BOUND,
+        "a {MANY_CHUNK_COUNT}-file uncontended scan (~40 chunks) took {actual:.3}s against a \
+         tax-free projection of {projected:.3}s (ratio {ratio:.2}, bound {TAX_RATIO_BOUND}); a \
+         fixed per-chunk sleep reintroduced into walk_and_write would show up here as a ratio \
+         scaled by chunk count, not as ordinary machine-speed variance"
     );
 }
