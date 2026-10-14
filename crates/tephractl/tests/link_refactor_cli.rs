@@ -16,6 +16,22 @@
 //! rationale ("a mocked backend can't prove the real engine's file
 //! reads/writes ... actually happen") from the client side of the
 //! same wire.
+//!
+//! R11 review finding: the original version of this file called
+//! every one of these with `json=true`, so neither
+//! `render::render_refactor_preview`'s human-readable diff nor
+//! `render::render_refactor_apply`'s human-readable summary was ever
+//! asserted against a real daemon response — only their JSON-shape
+//! cousins. Its "staleness" step also never actually reached the
+//! staleness gate at all: calling `link.apply_refactor` a second
+//! time straight after a successful apply hits "no prior
+//! preview_refactor call" (the stored preview is consumed by the
+//! first apply), an unrelated error path, not an "aborted" result.
+//! Both are fixed below: dedicated `json=false` tests assert the
+//! rendered text, and the staleness scenario takes a fresh preview,
+//! bumps the referring file's mtime with `filetime` (as
+//! `tephrad/tests/link_refactor_integration.rs`'s own staleness test
+//! does) to simulate a real external edit, and only then applies.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -241,11 +257,191 @@ fn link_refactor_preview_then_apply_then_staleness_against_a_real_daemon() {
         "the real daemon must have rewritten Journal.md through tephractl's own apply call"
     );
 
-    // 3. Staleness (E3): the *first* preview (taken before the
-    // rename above) is now stale. Applying it again — exactly as a
-    // user re-running an old shell history entry would — must abort
-    // cleanly rather than silently corrupt the now-renamed file.
+    // 3. Staleness (E3): preview a *second*, still-valid rename
+    // (`NewDoc.md` -> `FinalDoc.md`), then simulate a real external
+    // edit to the referring file between preview and apply by
+    // bumping its mtime with `filetime` (content unchanged) — this
+    // is what actually reaches the staleness gate's "aborted"
+    // result, unlike re-running the already-consumed first preview.
+    let stale_preview_outcome = commands::execute(
+        &Command::LinkRefactor {
+            source: "notes".to_string(),
+            old_path: "NewDoc.md".to_string(),
+            new_path: "FinalDoc.md".to_string(),
+            apply: false,
+            yes: false,
+        },
+        true,
+        &client,
+        &mut std::io::empty(),
+    );
+    assert_eq!(
+        stale_preview_outcome.exit_code, 0,
+        "second preview failed: {}",
+        stale_preview_outcome.stderr
+    );
+    let stale_preview_json: serde_json::Value = serde_json::from_str(&stale_preview_outcome.stdout)
+        .expect("second preview stdout is valid JSON");
+    assert_eq!(stale_preview_json["changes"].as_array().unwrap().len(), 1);
+
+    let journal_path = source.path().join("Journal.md");
+    let bumped =
+        filetime::FileTime::from_unix_time(filetime::FileTime::now().unix_seconds() + 3600, 0);
+    filetime::set_file_mtime(&journal_path, bumped).expect("bump Journal.md's mtime");
+
+    // Non-JSON here (R11): asserts the real daemon's rendered abort
+    // text, not just its JSON shape.
     let stale_apply_outcome = commands::execute(
+        &Command::LinkRefactor {
+            source: "notes".to_string(),
+            old_path: "NewDoc.md".to_string(),
+            new_path: "FinalDoc.md".to_string(),
+            apply: true,
+            yes: true,
+        },
+        false,
+        &client,
+        &mut std::io::empty(),
+    );
+    assert_ne!(
+        stale_apply_outcome.exit_code, 0,
+        "re-applying against a now-stale preview must exit non-zero, not succeed"
+    );
+    assert_eq!(
+        stale_apply_outcome.stdout, "",
+        "a failed apply must print nothing to stdout"
+    );
+    assert!(
+        stale_apply_outcome
+            .stderr
+            .contains("Refactor aborted: file modified since preview"),
+        "stderr must contain the real daemon's staleness abort reason, rendered \
+         human-readably, not a generic or JSON-shaped error: {}",
+        stale_apply_outcome.stderr
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(source.path().join("Journal.md")).unwrap(),
+        "See [[NewDoc]] for details.\n",
+        "Journal.md must be exactly as the first, real apply left it"
+    );
+
+    daemon.stop();
+}
+
+/// R11 review finding: every call in the golden-path test above
+/// passes `json=true`, so `render::render_refactor_preview`'s
+/// human-readable diff rendering is never exercised against a real
+/// daemon response — only its JSON shape. Drives the same preview
+/// with `json=false` and asserts the rendered diff text itself.
+#[test]
+fn link_refactor_preview_renders_a_human_readable_diff_against_a_real_daemon() {
+    let daemon = RealDaemon::start();
+    let client = daemon.client();
+
+    let source = tempfile::tempdir().expect("source tempdir");
+    std::fs::write(source.path().join("OldDoc.md"), "# Old Doc\n").expect("write OldDoc.md");
+    std::fs::write(
+        source.path().join("Journal.md"),
+        "See [[OldDoc]] for details.\n",
+    )
+    .expect("write Journal.md");
+
+    let register_outcome = commands::execute(
+        &Command::SourceAdd {
+            name: "notes".to_string(),
+            path: source.path().to_string_lossy().to_string(),
+        },
+        true,
+        &client,
+        &mut std::io::empty(),
+    );
+    assert_eq!(register_outcome.exit_code, 0, "{}", register_outcome.stderr);
+
+    let preview_outcome = commands::execute(
+        &Command::LinkRefactor {
+            source: "notes".to_string(),
+            old_path: "OldDoc.md".to_string(),
+            new_path: "NewDoc.md".to_string(),
+            apply: false,
+            yes: false,
+        },
+        false,
+        &client,
+        &mut std::io::empty(),
+    );
+    assert_eq!(preview_outcome.exit_code, 0, "{}", preview_outcome.stderr);
+    assert!(
+        preview_outcome.stdout.contains("1 affected link(s):"),
+        "stdout: {}",
+        preview_outcome.stdout
+    );
+    assert!(
+        preview_outcome
+            .stdout
+            .contains("@notes:Journal.md:1  - [[OldDoc]]"),
+        "stdout: {}",
+        preview_outcome.stdout
+    );
+    assert!(
+        preview_outcome
+            .stdout
+            .contains("@notes:Journal.md:1  + [[NewDoc]]"),
+        "stdout: {}",
+        preview_outcome.stdout
+    );
+    assert_eq!(
+        std::fs::read_to_string(source.path().join("Journal.md")).unwrap(),
+        "See [[OldDoc]] for details.\n",
+        "a non-JSON preview must never write either"
+    );
+
+    daemon.stop();
+}
+
+/// R11 review finding: companion to the diff-rendering test above —
+/// `render::render_refactor_apply`'s human-readable "files changed"
+/// summary, also never exercised against a real daemon with
+/// `json=false`.
+#[test]
+fn link_refactor_apply_renders_a_human_readable_summary_against_a_real_daemon() {
+    let daemon = RealDaemon::start();
+    let client = daemon.client();
+
+    let source = tempfile::tempdir().expect("source tempdir");
+    std::fs::write(source.path().join("OldDoc.md"), "# Old Doc\n").expect("write OldDoc.md");
+    std::fs::write(
+        source.path().join("Journal.md"),
+        "See [[OldDoc]] for details.\n",
+    )
+    .expect("write Journal.md");
+
+    let register_outcome = commands::execute(
+        &Command::SourceAdd {
+            name: "notes".to_string(),
+            path: source.path().to_string_lossy().to_string(),
+        },
+        true,
+        &client,
+        &mut std::io::empty(),
+    );
+    assert_eq!(register_outcome.exit_code, 0, "{}", register_outcome.stderr);
+
+    let preview_outcome = commands::execute(
+        &Command::LinkRefactor {
+            source: "notes".to_string(),
+            old_path: "OldDoc.md".to_string(),
+            new_path: "NewDoc.md".to_string(),
+            apply: false,
+            yes: false,
+        },
+        true,
+        &client,
+        &mut std::io::empty(),
+    );
+    assert_eq!(preview_outcome.exit_code, 0, "{}", preview_outcome.stderr);
+
+    let apply_outcome = commands::execute(
         &Command::LinkRefactor {
             source: "notes".to_string(),
             old_path: "OldDoc.md".to_string(),
@@ -253,26 +449,19 @@ fn link_refactor_preview_then_apply_then_staleness_against_a_real_daemon() {
             apply: true,
             yes: true,
         },
-        true,
+        false,
         &client,
         &mut std::io::empty(),
     );
-    assert_ne!(
-        stale_apply_outcome.exit_code, 0,
-        "re-applying a now-stale rename must exit non-zero, not succeed a second time"
+    assert_eq!(apply_outcome.exit_code, 0, "{}", apply_outcome.stderr);
+    assert_eq!(
+        apply_outcome.stdout,
+        "Refactor applied: 1 file(s) changed\n"
     );
-    assert!(
-        !stale_apply_outcome
-            .stdout
-            .contains("\"status\":\"applied\""),
-        "a second, now-stale apply of the same rename must not report success: {}",
-        stale_apply_outcome.stdout
-    );
-
     assert_eq!(
         std::fs::read_to_string(source.path().join("Journal.md")).unwrap(),
         "See [[NewDoc]] for details.\n",
-        "Journal.md must be exactly as the first, real apply left it"
+        "the real daemon must have rewritten Journal.md through tephractl's own apply call"
     );
 
     daemon.stop();
