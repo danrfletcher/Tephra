@@ -304,10 +304,32 @@ impl From<crate::refactor::LinkChange> for LinkChangeWire {
     }
 }
 
-/// `link.preview_refactor`'s result shape: `{"changes": [...]}`.
+/// `link.preview_refactor`'s result shape: `{"changes": [...], "skipped": [...]}`.
+/// R10 review finding: `skipped` names every referring file the
+/// preview could not read or stat at all — never silently narrowing
+/// `changes` with no indication anything was left out.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct RefactorPreviewWire {
     pub changes: Vec<LinkChangeWire>,
+    pub skipped: Vec<SkippedFileWire>,
+}
+
+/// One file [`crate::refactor::RefactorEngine::preview`] could not
+/// read or stat — field-for-field mirror of
+/// [`crate::refactor::SkippedFile`] (R10 review finding).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SkippedFileWire {
+    pub file: String,
+    pub error: String,
+}
+
+impl From<crate::refactor::SkippedFile> for SkippedFileWire {
+    fn from(s: crate::refactor::SkippedFile) -> Self {
+        SkippedFileWire {
+            file: s.file,
+            error: s.error,
+        }
+    }
 }
 
 /// One failed file in a `"partial"` `link.apply_refactor` result —
@@ -412,8 +434,17 @@ impl RefactorBackend for crate::refactor::RefactorEngine {
         new_path: &str,
     ) -> Result<RefactorPreviewWire, String> {
         self.preview(source, old_path, new_path)
-            .map(|changes| RefactorPreviewWire {
-                changes: changes.into_iter().map(LinkChangeWire::from).collect(),
+            .map(|result| RefactorPreviewWire {
+                changes: result
+                    .changes
+                    .into_iter()
+                    .map(LinkChangeWire::from)
+                    .collect(),
+                skipped: result
+                    .skipped
+                    .into_iter()
+                    .map(SkippedFileWire::from)
+                    .collect(),
             })
     }
     fn apply_refactor(

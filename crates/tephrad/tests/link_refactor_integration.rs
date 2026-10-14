@@ -47,6 +47,23 @@ struct TestDaemon {
 impl TestDaemon {
     async fn start() -> Self {
         let cache_dir = tempfile::tempdir().expect("cache dir");
+        Self::start_in(cache_dir).await
+    }
+
+    /// Starts a daemon against an already-existing data directory
+    /// (reusing its `cache.db`, hence any already-registered
+    /// sources) rather than creating a brand-new one — used to
+    /// simulate `tephrad` being killed and restarted against the
+    /// exact same on-disk state (R8), as opposed to
+    /// `start()`'s always-fresh cache.
+    ///
+    /// Mirrors `main.rs`'s real startup sequence, including the R8
+    /// fix: every already-registered source's root is swept for
+    /// stale `.{name}.tephra-tmp-{n}` leftovers (see
+    /// `tephrad::scan::sweep_stale_temp_files`) before the daemon
+    /// starts serving — so a test using this exercises the real fix,
+    /// not a hand-rolled approximation of it.
+    async fn start_in(cache_dir: tempfile::TempDir) -> Self {
         let cache_path = cache_dir.path().join("cache.db");
         let token_path = cache_dir.path().join("token");
         let token = "c".repeat(64);
@@ -54,6 +71,12 @@ impl TestDaemon {
 
         let registry_cache = Cache::open(&cache_path).expect("open cache for registry");
         let registry = Arc::new(SourceRegistry::new(registry_cache).expect("new registry"));
+
+        if let Ok(rows) = registry.list() {
+            for row in rows {
+                let _ = tephrad::scan::sweep_stale_temp_files(std::path::Path::new(&row.path));
+            }
+        }
 
         let graph_cache = Cache::open(&cache_path).expect("open cache for graph");
         let initial_graph = UnitGraph::build_from_cache(&graph_cache).expect("build initial graph");
@@ -119,6 +142,16 @@ impl TestDaemon {
 
     fn stop(self) {
         self.server.abort();
+    }
+
+    /// Like [`Self::stop`], but keeps this daemon's backing data
+    /// directory alive and hands it back, instead of dropping (and
+    /// so deleting) it — for a test that starts a *second* `TestDaemon`
+    /// against the exact same `cache.db`/token via [`Self::start_in`],
+    /// simulating `tephrad` being killed and restarted (R8).
+    fn stop_keep_cache_dir(self) -> tempfile::TempDir {
+        self.server.abort();
+        self._cache_dir
     }
 }
 
@@ -598,6 +631,74 @@ async fn a_file_that_becomes_unreadable_between_preview_and_apply_is_reported_no
     daemon.stop();
 }
 
+/// R10 review finding, direct reproduction against the real daemon:
+/// a referring file that is unreadable *at preview time* (unlike the
+/// test above, which chmods between preview and apply) must still be
+/// named, with its error, in `link.preview_refactor`'s own result —
+/// not just silently missing from `changes` with the response
+/// otherwise looking complete.
+#[tokio::test]
+async fn preview_refactor_names_an_unreadable_referring_file_as_skipped() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let daemon = TestDaemon::start().await;
+    let notes = fixtures::empty_source();
+    notes.write("OldDoc.md", "# Old Doc\n");
+    notes.write("Journal.md", "See [[OldDoc]] here.\n");
+    notes.write("Secret.md", "Also see [[OldDoc]].\n");
+
+    daemon
+        .call(
+            "source.register",
+            json!({"name": "notes", "root": notes.root().to_string_lossy()}),
+        )
+        .await;
+
+    let secret_path = notes.root().join("Secret.md");
+    let mut perms = std::fs::metadata(&secret_path).unwrap().permissions();
+    perms.set_mode(0o000);
+    std::fs::set_permissions(&secret_path, perms).expect("chmod 000");
+
+    let preview = daemon
+        .call(
+            "link.preview_refactor",
+            json!({"source": "notes", "old_path": "OldDoc.md", "new_path": "NewDoc.md"}),
+        )
+        .await;
+
+    // Restore permissions immediately so the fixture tempdir can be
+    // cleaned up regardless of the assertion outcome below.
+    let mut restore = std::fs::metadata(&secret_path).unwrap().permissions();
+    restore.set_mode(0o644);
+    std::fs::set_permissions(&secret_path, restore).expect("restore permissions");
+
+    // Root running as uid 0 (some CI containers) bypasses the 0000
+    // permission bits entirely; skip the assertion in that
+    // environment rather than fail on an untestable precondition.
+    if unsafe { libc::geteuid() } == 0 {
+        daemon.stop();
+        return;
+    }
+
+    let changes = preview["result"]["changes"]
+        .as_array()
+        .expect("changes array");
+    assert_eq!(changes.len(), 1, "{preview:?}");
+    assert_eq!(changes[0]["file"], json!("@notes:Journal.md"));
+
+    let skipped = preview["result"]["skipped"]
+        .as_array()
+        .expect("skipped array");
+    assert_eq!(skipped.len(), 1, "{preview:?}");
+    assert_eq!(skipped[0]["file"], json!("@notes:Secret.md"));
+    assert!(
+        !skipped[0]["error"].as_str().unwrap_or_default().is_empty(),
+        "{preview:?}"
+    );
+
+    daemon.stop();
+}
+
 /// F5: both RPC methods reject a request with no/invalid bearer
 /// token with the same 401-equivalent error PR-6 uses for every
 /// other method — no new unauthenticated code path for disk
@@ -1063,6 +1164,85 @@ async fn a_temp_file_left_by_a_simulated_kill_is_swept_on_the_next_register() {
     );
 
     daemon.stop();
+}
+
+/// R8 review finding, direct reproduction: `SourceRegistry::new`
+/// only re-reads existing cache rows — it never walks the
+/// filesystem — and re-registering an already-registered source is
+/// refused, so the sweep above (which runs on `source.register`) can
+/// never fire on a plain restart. Unlike that test, which simulates
+/// a "restart" with a brand-new, never-registered cache, this one
+/// registers `notes` for real, plants the stray file afterwards
+/// (simulating a kill mid-`apply_refactor` sometime during that
+/// daemon's life, not during its initial scan), kills the daemon
+/// while keeping its `cache.db` intact, and starts a second daemon
+/// against that exact same persisted cache with no RPC call of any
+/// kind in between — confirming the fix actually covers a real
+/// restart, not just another register.
+#[tokio::test]
+async fn a_temp_file_left_by_a_kill_is_swept_on_the_next_real_restart() {
+    let notes = fixtures::empty_source();
+    notes.write("OldDoc.md", "# Old Doc\n");
+    notes.write("Journal.md", "See [[OldDoc]] here.\n");
+
+    let daemon1 = TestDaemon::start().await;
+    let register = daemon1
+        .call(
+            "source.register",
+            json!({"name": "notes", "root": notes.root().to_string_lossy()}),
+        )
+        .await;
+    assert!(register.get("error").is_none(), "{register:?}");
+
+    // Plant the stray temp file *after* register's own initial-scan
+    // sweep already ran — this is not the scenario the register-time
+    // sweep itself exercises.
+    let stray = notes.root().join(".Journal.md.tephra-tmp-777777");
+    std::fs::write(&stray, "partially written garbage").unwrap();
+    assert!(
+        stray.exists(),
+        "the stray temp file must exist right after being planted"
+    );
+
+    // "Kill" daemon1, but keep its cache.db/token directory intact —
+    // a real restart reuses the same on-disk state.
+    let cache_dir = daemon1.stop_keep_cache_dir();
+    assert!(
+        stray.exists(),
+        "killing the daemon must not itself sweep anything"
+    );
+
+    // Start a second daemon against that exact same persisted cache.
+    // No RPC call happens in between: re-registering "notes" would
+    // be refused as a duplicate, and there is no rescan command.
+    let daemon2 = TestDaemon::start_in(cache_dir).await;
+
+    assert!(
+        !stray.exists(),
+        "a plain daemon restart must sweep stale refactor temp files for every \
+         already-registered source, with no register/rescan call needed"
+    );
+    assert_eq!(
+        std::fs::read_to_string(notes.root().join("Journal.md")).unwrap(),
+        "See [[OldDoc]] here.\n",
+        "the startup sweep must not touch real file content"
+    );
+    assert_eq!(
+        std::fs::read_to_string(notes.root().join("OldDoc.md")).unwrap(),
+        "# Old Doc\n"
+    );
+
+    // The source is still fully usable after the restart: a fresh
+    // preview against it works with no re-register needed.
+    let preview = daemon2
+        .call(
+            "link.preview_refactor",
+            json!({"source": "notes", "old_path": "OldDoc.md", "new_path": "NewDoc.md"}),
+        )
+        .await;
+    assert_eq!(preview["result"]["changes"].as_array().unwrap().len(), 1);
+
+    daemon2.stop();
 }
 
 /// R6(c): two `apply_refactor` calls targeting overlapping files

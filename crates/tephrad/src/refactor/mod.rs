@@ -190,11 +190,24 @@ fn locate_and_diff(
                     // rather than guess.
                     continue;
                 };
+                // R9 review finding: `m.span` (and hence `before`)
+                // covers only the destination text itself — never a
+                // surrounding `(`/`)`, a title, or a `<`/`>`
+                // destination's own brackets — since that's the only
+                // text `tephra_parser` actually recorded a byte-exact
+                // span for. Wrapping `before`/`after` in literal
+                // parens here (as a prior version of this function
+                // did) silently promised a rewrite this function
+                // could never perform for a titled, angle-bracket, or
+                // paren-containing destination: `apply_changes_to_content`'s
+                // byte-exact check against the recorded span would
+                // always fail, because the span never covered the
+                // title/brackets wrapped into `before`.
                 out.push(LinkChange {
                     file: file_id.to_string(),
                     line: m.line,
-                    before: format!("({old_raw})"),
-                    after: format!("({new_raw})"),
+                    before: old_raw.to_string(),
+                    after: new_raw.to_string(),
                     byte_start,
                     byte_end,
                 });
@@ -742,6 +755,33 @@ struct StoredPreview {
     mtimes: HashMap<String, SystemTime>,
 }
 
+/// One referring file [`RefactorEngine::preview`] could not read or
+/// stat, and therefore could not scan for incoming links at all.
+///
+/// R10 review finding: a prior version of `preview` silently `continue`d
+/// past a file it couldn't read, stat, or get an mtime for — the
+/// `changes` list (and the `apply` result later derived from it)
+/// never mentioned the file at all, so its stale links stayed stale
+/// with no indication anything had been left out, contradicting G7's
+/// "computes the full set of files". Every file skipped for any of
+/// those reasons is now named here instead, alongside why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SkippedFile {
+    pub file: String,
+    pub error: String,
+}
+
+/// [`RefactorEngine::preview`]'s full result: the changes it would
+/// make, plus any referring file it had to leave out of that
+/// computation because it couldn't be read or stat'd (R10) — a
+/// caller always sees both, never just a silently-narrowed `changes`
+/// list.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PreviewResult {
+    pub changes: Vec<LinkChange>,
+    pub skipped: Vec<SkippedFile>,
+}
+
 /// Orchestrates `link.preview_refactor`/`link.apply_refactor`: wires
 /// the pure functions above to the real [`GraphBackend`]/
 /// [`SourceBackend`] seams, real file reads/writes, and watcher
@@ -812,7 +852,7 @@ impl RefactorEngine {
         source: &str,
         old_path: &str,
         new_path: &str,
-    ) -> Result<Vec<LinkChange>, String> {
+    ) -> Result<PreviewResult, String> {
         let roots = self.source_roots()?;
         self.require_source(&roots, source)?;
 
@@ -820,6 +860,7 @@ impl RefactorEngine {
         let edges = self.graph.get_backlinks(&old_id);
 
         let mut mtimes = HashMap::new();
+        let mut skipped = Vec::new();
         let changes = if old_path == new_path {
             Vec::new()
         } else {
@@ -831,8 +872,15 @@ impl RefactorEngine {
                 let Some(abs) = self.resolve_abs_path(&edge.from, &roots) else {
                     continue;
                 };
-                let Ok(content) = fs::read_to_string(&abs) else {
-                    continue;
+                let content = match fs::read_to_string(&abs) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        skipped.push(SkippedFile {
+                            file: edge.from.clone(),
+                            error: e.to_string(),
+                        });
+                        continue;
+                    }
                 };
                 // R7 review finding: a file whose mtime can't be
                 // captured right now must not be included in this
@@ -841,13 +889,30 @@ impl RefactorEngine {
                 // snapshot would silently exempt it from
                 // `verify_staleness`'s later re-check at `apply` time
                 // — the exact TOCTOU gap that gate exists to close.
-                // Treat a metadata/mtime failure exactly like an
-                // unreadable file: skip it.
-                let Ok(meta) = fs::metadata(&abs) else {
-                    continue;
+                // R10 review finding: treating that (and a plain
+                // unreadable file, above) exactly like an ordinary
+                // skip left the preview silently incomplete with no
+                // indication anything was left out — report it in
+                // `skipped` instead of just dropping it.
+                let meta = match fs::metadata(&abs) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        skipped.push(SkippedFile {
+                            file: edge.from.clone(),
+                            error: e.to_string(),
+                        });
+                        continue;
+                    }
                 };
-                let Ok(mtime) = meta.modified() else {
-                    continue;
+                let mtime = match meta.modified() {
+                    Ok(t) => t,
+                    Err(e) => {
+                        skipped.push(SkippedFile {
+                            file: edge.from.clone(),
+                            error: e.to_string(),
+                        });
+                        continue;
+                    }
                 };
                 mtimes.insert(edge.from.clone(), mtime);
                 file_contents.insert(edge.from.clone(), content);
@@ -867,7 +932,7 @@ impl RefactorEngine {
                 mtimes,
             },
         );
-        Ok(changes)
+        Ok(PreviewResult { changes, skipped })
     }
 
     /// `link.apply_refactor`: re-validates and rewrites the diff
@@ -1181,8 +1246,8 @@ mod tests {
         );
         let changes = compute_changes(&edges, &files, "OldDoc.md", "NewDoc.md");
         assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].before, "(OldDoc.md)");
-        assert_eq!(changes[0].after, "(NewDoc.md)");
+        assert_eq!(changes[0].before, "OldDoc.md");
+        assert_eq!(changes[0].after, "NewDoc.md");
     }
 
     #[test]
@@ -1200,7 +1265,72 @@ mod tests {
         );
         let changes = compute_changes(&edges, &files, "OldDoc.md", "archive/NewDoc.md");
         assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].after, "(../archive/NewDoc.md)");
+        assert_eq!(changes[0].after, "../archive/NewDoc.md");
+    }
+
+    /// R9 review finding: a titled markdown link's destination is
+    /// rewritten in place, leaving the title untouched — the whole
+    /// point of recording a span that excludes the title at all.
+    #[test]
+    fn markdown_link_with_title_rewrites_only_the_destination() {
+        let edges = vec![edge(
+            "@notes:Journal.md",
+            "@notes:OldDoc.md",
+            "OldDoc.md",
+            tephra_parser::LINK_KIND_MARKDOWN,
+        )];
+        let content = "See [doc](OldDoc.md \"The title\") for more.\n";
+        let mut files = HashMap::new();
+        files.insert("@notes:Journal.md".to_string(), content.to_string());
+        let changes = compute_changes(&edges, &files, "OldDoc.md", "NewDoc.md");
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].before, "OldDoc.md");
+        assert_eq!(changes[0].after, "NewDoc.md");
+        let refs: Vec<&LinkChange> = changes.iter().collect();
+        let result = apply_changes_to_content(content, &refs).expect("span matches");
+        assert_eq!(result, "See [doc](NewDoc.md \"The title\") for more.\n");
+    }
+
+    /// R9 review finding: an angle-bracket destination is rewritten
+    /// in place, with the `<`/`>` delimiters preserved around the new
+    /// destination text.
+    #[test]
+    fn markdown_link_with_angle_bracket_destination_is_rewritten() {
+        let edges = vec![edge(
+            "@notes:Journal.md",
+            "@notes:OldDoc.md",
+            "Old Doc.md",
+            tephra_parser::LINK_KIND_MARKDOWN,
+        )];
+        let content = "See [doc](<Old Doc.md>) for more.\n";
+        let mut files = HashMap::new();
+        files.insert("@notes:Journal.md".to_string(), content.to_string());
+        let changes = compute_changes(&edges, &files, "Old Doc.md", "New Doc.md");
+        assert_eq!(changes.len(), 1);
+        let refs: Vec<&LinkChange> = changes.iter().collect();
+        let result = apply_changes_to_content(content, &refs).expect("span matches");
+        assert_eq!(result, "See [doc](<New Doc.md>) for more.\n");
+    }
+
+    /// R9 review finding: a bare destination containing its own
+    /// balanced, unescaped `(...)` is rewritten in full, not
+    /// truncated at the destination's own inner paren.
+    #[test]
+    fn markdown_link_with_paren_in_destination_is_rewritten_in_full() {
+        let edges = vec![edge(
+            "@notes:Journal.md",
+            "@notes:OldDoc.md",
+            "Old(2).md",
+            tephra_parser::LINK_KIND_MARKDOWN,
+        )];
+        let content = "See [doc](Old(2).md) for more.\n";
+        let mut files = HashMap::new();
+        files.insert("@notes:Journal.md".to_string(), content.to_string());
+        let changes = compute_changes(&edges, &files, "Old(2).md", "New(3).md");
+        assert_eq!(changes.len(), 1);
+        let refs: Vec<&LinkChange> = changes.iter().collect();
+        let result = apply_changes_to_content(content, &refs).expect("span matches");
+        assert_eq!(result, "See [doc](New(3).md) for more.\n");
     }
 
     #[test]
@@ -1713,6 +1843,80 @@ mod tests {
             "resume must be told exactly the path apply itself wrote: {log:?}"
         );
 
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // --- R10: preview reports files it could not read/stat -------------------
+
+    /// R10 review finding: `RefactorEngine::preview` must name a
+    /// referring file it could not read at all in `skipped`, not
+    /// just silently narrow `changes` with no indication anything
+    /// was left out.
+    #[test]
+    #[cfg(unix)]
+    fn preview_reports_an_unreadable_referring_file_as_skipped() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "tephra-refactor-preview-skip-test-{}",
+            rand::random::<u32>()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let journal = dir.join("Journal.md");
+        fs::write(&journal, "See [[OldDoc]] for details.\n").unwrap();
+        let secret = dir.join("Secret.md");
+        fs::write(&secret, "Also see [[OldDoc]].\n").unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let graph = FakeGraphBackend {
+            edges: vec![
+                edge(
+                    "@notes:Journal.md",
+                    "@notes:OldDoc.md",
+                    "OldDoc",
+                    tephra_parser::LINK_KIND_WIKILINK,
+                ),
+                edge(
+                    "@notes:Secret.md",
+                    "@notes:OldDoc.md",
+                    "OldDoc",
+                    tephra_parser::LINK_KIND_WIKILINK,
+                ),
+            ],
+        };
+        let sources = FakeSourceBackend {
+            name: "notes".to_string(),
+            path: dir.to_string_lossy().to_string(),
+        };
+        let watcher = std::sync::Arc::new(RecordingWatcherPauseControl {
+            log: Mutex::new(Vec::new()),
+        });
+        let engine = RefactorEngine::new(
+            std::sync::Arc::new(graph),
+            std::sync::Arc::new(sources),
+            watcher,
+        );
+
+        // Reading as root (e.g. inside some CI sandboxes) bypasses
+        // the permission bits this test depends on; skip rather than
+        // produce a false failure if so.
+        if fs::read_to_string(&secret).is_ok() {
+            fs::set_permissions(&secret, fs::Permissions::from_mode(0o644)).unwrap();
+            fs::remove_dir_all(&dir).unwrap();
+            return;
+        }
+
+        let result = engine.preview("notes", "OldDoc.md", "NewDoc.md").unwrap();
+        assert_eq!(result.changes.len(), 1, "{:?}", result.changes);
+        assert_eq!(result.changes[0].file, "@notes:Journal.md");
+        assert_eq!(result.skipped.len(), 1, "{:?}", result.skipped);
+        assert_eq!(result.skipped[0].file, "@notes:Secret.md");
+        assert!(
+            !result.skipped[0].error.is_empty(),
+            "skipped entry must explain why"
+        );
+
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o644)).unwrap();
         fs::remove_dir_all(&dir).unwrap();
     }
 
