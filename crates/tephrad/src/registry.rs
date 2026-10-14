@@ -19,7 +19,7 @@
 //!   (and by `tests/registry_lifecycle.rs` specifically for
 //!   register/rescan/unregister against a real cache and filesystem).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -687,10 +687,19 @@ impl SourceRegistry {
     /// GP8: resumes every currently-running source's watcher, after
     /// [`pause_all_watchers`](Self::pause_all_watchers), flushing
     /// anything that fired during the pause window as one merged
-    /// batch per source. Idempotent.
+    /// batch per source. Idempotent. Equivalent to
+    /// `resume_all_watchers_except(&HashSet::new())`.
     pub fn resume_all_watchers(&self) {
+        self.resume_all_watchers_except(&HashSet::new());
+    }
+
+    /// Same as [`resume_all_watchers`](Self::resume_all_watchers), but
+    /// every absolute path in `written_paths` is discarded from each
+    /// source's pending batch before it's flushed (R4 review finding
+    /// — see `crate::refactor::WatcherPauseControl`'s doc comment).
+    pub fn resume_all_watchers_except(&self, written_paths: &HashSet<PathBuf>) {
         for running in self.running.lock().unwrap().values() {
-            running.pause.resume();
+            running.pause.resume_except(written_paths);
         }
     }
 

@@ -47,7 +47,6 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -304,14 +303,26 @@ where
 ///
 /// Wraps an `on_batch` callback: while paused, a batch that fires is
 /// merged into a pending set instead of being forwarded, and
-/// [`WatcherPause::resume`] flushes that pending set as one merged
-/// batch through the same `on_batch` the moment it's called (if
-/// anything arrived while paused) — so an event that fires during the
-/// pause window is deferred, never dropped, and never processed into
-/// a reindex until after resume. Pausing does not unsubscribe the
-/// real `notify` watcher underneath (the OS keeps queueing events the
-/// whole time); it only stops this wrapper from acting on a *fired*
-/// batch until resume.
+/// [`WatcherPause::resume`]/[`WatcherPause::resume_except`] flushes
+/// that pending set as one merged batch through the same `on_batch`
+/// the moment it's called (if anything arrived while paused) — so an
+/// event that fires during the pause window is deferred, never
+/// dropped, and never processed into a reindex until after resume.
+/// Pausing does not unsubscribe the real `notify` watcher underneath
+/// (the OS keeps queueing events the whole time); it only stops this
+/// wrapper from acting on a *fired* batch until resume.
+///
+/// The paused flag and the pending set live behind one `Mutex`
+/// ([`PauseState`]), not a separate atomic bool plus a separate
+/// mutex (R4 review finding): with two independent locks, `handle`
+/// could read `paused == true`, then `resume` could run start-to-
+/// finish — clearing the flag and draining the (still-empty) pending
+/// set — entirely between that read and `handle`'s own subsequent
+/// push into the set. That batch would then sit in the pending set,
+/// unflushed, until some *later*, unrelated resume happened to come
+/// along. Guarding both under one lock makes "check paused, then
+/// enqueue" and "clear paused, then drain" mutually exclusive, so
+/// that interleaving can no longer happen.
 ///
 /// Added alongside [`crate::refactor`] rather than by PR-4 itself —
 /// despite this PR's own spec listing "the PR-4 watcher's pause/resume
@@ -322,9 +333,13 @@ pub struct WatcherPause {
     inner: Arc<PauseInner>,
 }
 
+struct PauseState {
+    paused: bool,
+    queued: HashSet<PathBuf>,
+}
+
 struct PauseInner {
-    paused: AtomicBool,
-    queued: Mutex<HashSet<PathBuf>>,
+    state: Mutex<PauseState>,
     on_batch: Box<dyn Fn(HashSet<PathBuf>) + Send + Sync>,
 }
 
@@ -336,27 +351,49 @@ impl WatcherPause {
     pub fn new(on_batch: impl Fn(HashSet<PathBuf>) + Send + Sync + 'static) -> Self {
         WatcherPause {
             inner: Arc::new(PauseInner {
-                paused: AtomicBool::new(false),
-                queued: Mutex::new(HashSet::new()),
+                state: Mutex::new(PauseState {
+                    paused: false,
+                    queued: HashSet::new(),
+                }),
                 on_batch: Box::new(on_batch),
             }),
         }
     }
 
     /// Stops forwarding fired batches to the wrapped `on_batch` until
-    /// [`resume`](Self::resume) is called. Idempotent.
+    /// [`resume`](Self::resume)/[`resume_except`](Self::resume_except)
+    /// is called. Idempotent.
     pub fn pause(&self) {
-        self.inner.paused.store(true, Ordering::SeqCst);
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .paused = true;
     }
 
     /// Resumes forwarding, and immediately flushes (as one merged
     /// batch, through the wrapped `on_batch`) anything that fired
     /// while paused. A no-op flush if nothing fired during the pause
-    /// window. Idempotent.
+    /// window. Idempotent. Equivalent to
+    /// `resume_except(&HashSet::new())`.
     pub fn resume(&self) {
-        self.inner.paused.store(false, Ordering::SeqCst);
-        let queued =
-            std::mem::take(&mut *self.inner.queued.lock().unwrap_or_else(|p| p.into_inner()));
+        self.resume_except(&HashSet::new());
+    }
+
+    /// Same as [`resume`](Self::resume), but every path in `except`
+    /// is discarded from the pending set before it's flushed (R4
+    /// review finding — see [`crate::refactor::WatcherPauseControl`]'s
+    /// doc comment for why `apply_refactor` needs this: a notify
+    /// event for a path it just wrote itself is not a real external
+    /// change to react to).
+    pub fn resume_except(&self, except: &HashSet<PathBuf>) {
+        let queued = {
+            let mut state = self.inner.state.lock().unwrap_or_else(|p| p.into_inner());
+            state.paused = false;
+            let mut queued = std::mem::take(&mut state.queued);
+            queued.retain(|p| !except.contains(p));
+            queued
+        };
         if !queued.is_empty() {
             (self.inner.on_batch)(queued);
         }
@@ -365,13 +402,11 @@ impl WatcherPause {
     /// The handler to actually pass to [`spawn_debounce`] as its
     /// `on_batch` parameter.
     pub fn handle(&self, batch: HashSet<PathBuf>) {
-        if self.inner.paused.load(Ordering::SeqCst) {
-            self.inner
-                .queued
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .extend(batch);
+        let mut state = self.inner.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.paused {
+            state.queued.extend(batch);
         } else {
+            drop(state);
             (self.inner.on_batch)(batch);
         }
     }
