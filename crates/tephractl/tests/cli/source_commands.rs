@@ -96,11 +96,21 @@ fn source_add_duplicate_name_error_is_reported_clearly() {
 }
 
 #[test]
-fn source_remove_sends_unregister_and_confirms_removal() {
-    let server = MockServer::start(vec![Behavior::Respond {
-        status: 200,
-        body: load_fixture("source_unregister_success"),
-    }]);
+fn source_remove_sends_list_then_unregister_and_confirms_removal() {
+    // T1: source_remove now checks client-side via `source.list`
+    // before calling `source.unregister`, so the mock server needs
+    // two scripted responses — "notes" exists in the list, so the
+    // unregister call follows.
+    let server = MockServer::start(vec![
+        Behavior::Respond {
+            status: 200,
+            body: load_fixture("source_list_two_sources"),
+        },
+        Behavior::Respond {
+            status: 200,
+            body: load_fixture("source_unregister_success"),
+        },
+    ]);
     let client = client_for(&server);
 
     let mut stdin: &[u8] = &[];
@@ -115,15 +125,22 @@ fn source_remove_sends_unregister_and_confirms_removal() {
 
     assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
     assert_eq!(outcome.stdout, load_expected("source_remove_rendered"));
-    assert_eq!(server.received()[0].body["method"], "source.unregister");
-    assert_eq!(server.received()[0].body["params"]["name"], "notes");
+    let received = server.received();
+    assert_eq!(received.len(), 2);
+    assert_eq!(received[0].body["method"], "source.list");
+    assert_eq!(received[1].body["method"], "source.unregister");
+    assert_eq!(received[1].body["params"]["name"], "notes");
 }
 
 #[test]
-fn source_remove_on_an_unknown_name_reports_not_found() {
+fn source_remove_on_an_unknown_name_reports_not_found_without_calling_unregister() {
+    // T1: tephrad's `source.unregister` is idempotent and can never
+    // itself report "not found", so `source remove` must check
+    // client-side against `source.list` and never even issue the
+    // `source.unregister` RPC for a name that isn't registered.
     let server = MockServer::start(vec![Behavior::Respond {
         status: 200,
-        body: load_fixture("source_unregister_not_found"),
+        body: load_fixture("source_list_two_sources"),
     }]);
     let client = client_for(&server);
 
@@ -140,6 +157,13 @@ fn source_remove_on_an_unknown_name_reports_not_found() {
     assert_eq!(outcome.exit_code, 1);
     assert_eq!(outcome.stderr, "source \"ghost\" not found\n");
     assert_eq!(outcome.stdout, "");
+    let received = server.received();
+    assert_eq!(
+        received.len(),
+        1,
+        "must not call source.unregister for an unknown name"
+    );
+    assert_eq!(received[0].body["method"], "source.list");
 }
 
 #[test]

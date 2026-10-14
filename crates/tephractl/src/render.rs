@@ -66,7 +66,11 @@ pub fn render_source_not_found(name: &str) -> String {
 /// `Display` text is `no source named "<name>"`, matched here so the
 /// CLI can tell "not found" apart from every other registry error
 /// without this crate owning (or re-implementing) the registry's own
-/// error type.
+/// error type. T1: the real daemon's `source.unregister` is
+/// idempotent and never actually sends this, so `commands::source_remove`
+/// checks client-side via `source.list` before calling unregister at
+/// all; this function (and the `RpcCallError::Rpc` arm that calls it)
+/// remains only as a defensive fallback for a server that does error.
 pub fn error_means_not_found(message: &str) -> bool {
     let lower = message.to_lowercase();
     lower.contains("no source named") || lower.contains("not found")

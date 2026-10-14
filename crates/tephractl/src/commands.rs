@@ -4,10 +4,12 @@
 //! owns no resolution/refactor/registry logic of its own — every
 //! verb here is a thin, typed wrapper over `RpcClient::call`
 //! (PR-7's fence: "no RPC methods or server-side logic"). Most
-//! commands issue exactly one RPC call; the one exception is
-//! `link refactor --apply` without `--yes`, which (R3) first calls
-//! `link.preview_refactor` to render the affected files/lines ahead
-//! of the confirmation prompt, then `link.apply_refactor` once
+//! commands issue exactly one RPC call; the exceptions are
+//! `source remove` (T1), which first calls `source.list` to check
+//! the name exists client-side before calling `source.unregister`,
+//! and `link refactor --apply` without `--yes`, which (R3) first
+//! calls `link.preview_refactor` to render the affected files/lines
+//! ahead of the confirmation prompt, then `link.apply_refactor` once
 //! confirmed — `--yes` still issues exactly one RPC.
 
 use std::io::{BufRead, Write};
@@ -131,6 +133,33 @@ fn source_add(name: &str, path: &str, json: bool, client: &RpcClient) -> Command
 }
 
 fn source_remove(name: &str, json: bool, client: &RpcClient) -> CommandOutcome {
+    // T1: tephrad's `source.unregister` is intentionally idempotent
+    // (`registry::Registry::unregister`'s doc comment: "calling this
+    // twice on an already-removed source returns Ok(()) both times
+    // rather than erroring"), so the real daemon never signals "not
+    // found" over the wire for this method — the
+    // `RpcCallError::Rpc`/`error_means_not_found` arm below is
+    // unreachable against a real `tephrad` and only guards a future
+    // or differently-behaved server. Check client-side via
+    // `source.list` first, before ever calling `source.unregister`,
+    // so a mistyped or already-removed name is reported as "not
+    // found" instead of a false "Removed source" success.
+    match client.call("source.list", json!({})) {
+        Ok(result) => {
+            let exists = as_rows(&result)
+                .iter()
+                .any(|row| row.get("name").and_then(Value::as_str) == Some(name));
+            if !exists {
+                return CommandOutcome {
+                    exit_code: 1,
+                    stdout: String::new(),
+                    stderr: render::render_source_not_found(name),
+                };
+            }
+        }
+        Err(e) => return CommandOutcome::err(describe_error(&e)),
+    }
+
     match client.call("source.unregister", json!({"name": name})) {
         Ok(result) => CommandOutcome::ok(json_or(
             &result,
