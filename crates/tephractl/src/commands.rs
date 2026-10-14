@@ -1,0 +1,307 @@
+//! Wires `cli::Command` to `transport::RpcClient` calls and
+//! `render::*` output (G8). This is the only module that decides
+//! *which* JSON-RPC method a command calls and with what params; it
+//! owns no resolution/refactor/registry logic of its own — every
+//! verb here is a thin, typed wrapper over a single `RpcClient::call`
+//! (PR-7's fence: "no RPC methods or server-side logic").
+
+use std::io::{BufRead, Write};
+
+use serde_json::{json, Value};
+
+use crate::cli::Command;
+use crate::render;
+use crate::transport::{RpcCallError, RpcClient};
+
+/// Everything `execute` produced: what to print to stdout/stderr and
+/// the process exit code `main.rs` should use. Kept as plain data
+/// (rather than printing directly) so tests can assert on exact
+/// rendered text without capturing real stdout/stderr.
+pub struct CommandOutcome {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl CommandOutcome {
+    fn ok(stdout: String) -> Self {
+        CommandOutcome {
+            exit_code: 0,
+            stdout,
+            stderr: String::new(),
+        }
+    }
+
+    fn err(message: String) -> Self {
+        CommandOutcome {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: format!("tephractl: {message}\n"),
+        }
+    }
+}
+
+fn json_or(value: &Value, rendered: impl FnOnce() -> String, json: bool) -> String {
+    if json {
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+        )
+    } else {
+        rendered()
+    }
+}
+
+/// Executes one parsed [`Command`] against `client`, reading a
+/// confirmation prompt (for `link refactor --apply` without `--yes`)
+/// from `stdin` rather than the real terminal, so tests can supply a
+/// deterministic answer.
+pub fn execute<R: BufRead>(
+    command: &Command,
+    json: bool,
+    client: &RpcClient,
+    stdin: &mut R,
+) -> CommandOutcome {
+    match command {
+        Command::SourceAdd { name, path } => source_add(name, path, json, client),
+        Command::SourceRemove { name } => source_remove(name, json, client),
+        Command::SourceList => source_list(json, client),
+        Command::Status => status(json, client),
+        Command::LinkResolve {
+            target,
+            default_source,
+        } => link_resolve(target, default_source.as_deref(), json, client),
+        Command::LinkRefactor {
+            source,
+            old_path,
+            new_path,
+            apply,
+            yes,
+        } => link_refactor(
+            RefactorRequest {
+                source,
+                old_path,
+                new_path,
+                apply: *apply,
+                yes: *yes,
+            },
+            json,
+            client,
+            stdin,
+        ),
+    }
+}
+
+fn source_add(name: &str, path: &str, json: bool, client: &RpcClient) -> CommandOutcome {
+    match client.call("source.register", json!({"name": name, "path": path})) {
+        Ok(stats) => CommandOutcome::ok(json_or(
+            &stats,
+            || render::render_source_added(name, path, &stats),
+            json,
+        )),
+        Err(e) => CommandOutcome::err(describe_error(&e)),
+    }
+}
+
+fn source_remove(name: &str, json: bool, client: &RpcClient) -> CommandOutcome {
+    match client.call("source.unregister", json!({"name": name})) {
+        Ok(result) => CommandOutcome::ok(json_or(
+            &result,
+            || render::render_source_removed(name),
+            json,
+        )),
+        Err(RpcCallError::Rpc { message, .. }) if render::error_means_not_found(&message) => {
+            CommandOutcome {
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: render::render_source_not_found(name),
+            }
+        }
+        Err(e) => CommandOutcome::err(describe_error(&e)),
+    }
+}
+
+fn source_list(json: bool, client: &RpcClient) -> CommandOutcome {
+    match client.call("source.list", json!({})) {
+        Ok(result) => {
+            let rows = as_rows(&result);
+            CommandOutcome::ok(json_or(
+                &result,
+                || render::render_source_table(&rows),
+                json,
+            ))
+        }
+        Err(e) => CommandOutcome::err(describe_error(&e)),
+    }
+}
+
+fn status(json: bool, client: &RpcClient) -> CommandOutcome {
+    match client.call("source.list", json!({})) {
+        Ok(result) => {
+            let rows = as_rows(&result);
+            if json {
+                let combined = json!({
+                    "daemon_address": client.addr(),
+                    "uptime": Value::Null,
+                    "sources": rows,
+                });
+                CommandOutcome::ok(format!(
+                    "{}\n",
+                    serde_json::to_string_pretty(&combined)
+                        .unwrap_or_else(|_| combined.to_string())
+                ))
+            } else {
+                CommandOutcome::ok(render::render_status(client.addr(), &rows))
+            }
+        }
+        Err(e) => CommandOutcome::err(describe_error(&e)),
+    }
+}
+
+fn as_rows(result: &Value) -> Vec<Value> {
+    result.as_array().cloned().unwrap_or_default()
+}
+
+fn link_resolve(
+    target: &str,
+    default_source: Option<&str>,
+    json: bool,
+    client: &RpcClient,
+) -> CommandOutcome {
+    let mut params = json!({"link": target});
+    if let Some(source) = default_source {
+        params["default_source"] = Value::String(source.to_string());
+    }
+
+    match client.call("unit.resolve_link", params) {
+        Ok(result) => CommandOutcome::ok(json_or(
+            &result,
+            || render::render_resolve_result(&result, default_source),
+            json,
+        )),
+        Err(e @ RpcCallError::Rpc { .. }) => {
+            if json {
+                if let RpcCallError::Rpc {
+                    code,
+                    message,
+                    data,
+                } = &e
+                {
+                    let body = json!({"error": {"code": code, "message": message, "data": data}});
+                    return CommandOutcome {
+                        exit_code: 1,
+                        stdout: String::new(),
+                        stderr: format!(
+                            "{}\n",
+                            serde_json::to_string_pretty(&body)
+                                .unwrap_or_else(|_| body.to_string())
+                        ),
+                    };
+                }
+                unreachable!()
+            }
+            CommandOutcome {
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: render::render_resolve_error(&e),
+            }
+        }
+        Err(e) => CommandOutcome::err(describe_error(&e)),
+    }
+}
+
+struct RefactorRequest<'a> {
+    source: &'a str,
+    old_path: &'a str,
+    new_path: &'a str,
+    apply: bool,
+    yes: bool,
+}
+
+fn link_refactor<R: BufRead>(
+    req: RefactorRequest,
+    json: bool,
+    client: &RpcClient,
+    stdin: &mut R,
+) -> CommandOutcome {
+    let params = json!({"source": req.source, "old_path": req.old_path, "new_path": req.new_path});
+
+    if !req.apply {
+        return match client.call("link.preview_refactor", params) {
+            Ok(result) => CommandOutcome::ok(json_or(
+                &result,
+                || render::render_refactor_preview(&result),
+                json,
+            )),
+            Err(e) => CommandOutcome::err(describe_error(&e)),
+        };
+    }
+
+    if !req.yes && !confirm(stdin) {
+        return CommandOutcome {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: "aborted: refactor not confirmed\n".to_string(),
+        };
+    }
+
+    match client.call("link.apply_refactor", params) {
+        Ok(result) => {
+            let aborted = result.get("status").and_then(Value::as_str) == Some("aborted");
+            let rendered = json_or(&result, || render::render_refactor_apply(&result), json);
+            if aborted {
+                CommandOutcome {
+                    exit_code: 1,
+                    stdout: String::new(),
+                    stderr: rendered,
+                }
+            } else {
+                CommandOutcome::ok(rendered)
+            }
+        }
+        Err(e) => CommandOutcome::err(describe_error(&e)),
+    }
+}
+
+/// Reads one line from `stdin` and treats `y`/`yes` (any case) as
+/// confirmation, anything else (including EOF) as a refusal — never
+/// defaults to "yes" on an unreadable/empty answer.
+fn confirm<R: BufRead>(stdin: &mut R) -> bool {
+    print_prompt();
+    let mut line = String::new();
+    match stdin.read_line(&mut line) {
+        Ok(0) | Err(_) => false,
+        Ok(_) => matches!(line.trim().to_lowercase().as_str(), "y" | "yes"),
+    }
+}
+
+fn print_prompt() {
+    print!("Apply this refactor? [y/N]: ");
+    let _ = std::io::stdout().flush();
+}
+
+fn describe_error(e: &RpcCallError) -> String {
+    e.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn confirm_accepts_y_and_yes_case_insensitively() {
+        assert!(confirm(&mut Cursor::new(b"y\n".to_vec())));
+        assert!(confirm(&mut Cursor::new(b"Y\n".to_vec())));
+        assert!(confirm(&mut Cursor::new(b"yes\n".to_vec())));
+        assert!(confirm(&mut Cursor::new(b"YES\n".to_vec())));
+    }
+
+    #[test]
+    fn confirm_rejects_anything_else_including_empty_and_eof() {
+        assert!(!confirm(&mut Cursor::new(b"n\n".to_vec())));
+        assert!(!confirm(&mut Cursor::new(b"\n".to_vec())));
+        assert!(!confirm(&mut Cursor::new(b"".to_vec())));
+        assert!(!confirm(&mut Cursor::new(b"maybe\n".to_vec())));
+    }
+}
