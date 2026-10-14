@@ -16,8 +16,14 @@
 //! USAGE:
 //!     register_sources <cache-db-path> <name>=<root> [<name>=<root> ...]
 //!
-//! Logs go to stderr at `info` level by default (set `RUST_LOG` to
-//! override, same as the `tephrad` binary).
+//! Logs go to stderr as one structured JSON object per line (R14
+//! review finding: the spec's container checkpoints "tail its
+//! structured JSON logs", not human-readable `fmt` output), at `info`
+//! level by default (set `RUST_LOG` to override, same as the
+//! `tephrad` binary). Every `source_registered`/`scan_complete` event
+//! carries the registered source's `source_id`, so a Checkpoint 2
+//! `scan_complete` line can be matched back to the `source_registered`
+//! line (Checkpoint 1) it belongs to.
 
 use std::process::ExitCode;
 
@@ -32,6 +38,7 @@ fn init_tracing() {
         .with_env_filter(filter)
         .with_target(false)
         .with_writer(std::io::stderr)
+        .json()
         .try_init();
 }
 
