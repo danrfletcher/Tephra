@@ -688,6 +688,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tephra-graph"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "tephra-cache",
+ "tephra-parser",
+]
+
+[[package]]
 name = "tephra-parser"
 version = "0.1.0"
 dependencies = [

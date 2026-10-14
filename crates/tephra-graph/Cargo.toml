@@ -1,0 +1,12 @@
+[package]
+name = "tephra-graph"
+version = "0.1.0"
+edition = "2021"
+description = "In-memory federated link graph and resolver: unit.resolve_link, graph.get_backlinks/get_forward_links/get_edges"
+
+[dependencies]
+tephra-cache = { path = "../tephra-cache" }
+tephra-parser = { path = "../tephra-parser" }
+
+[dev-dependencies]
+tempfile = "3"
