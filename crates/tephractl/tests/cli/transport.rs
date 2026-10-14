@@ -235,9 +235,12 @@ fn long_running_methods_get_a_longer_timeout_than_ordinary_methods() {
 
 /// R1 (companion to the above): the same 150ms delay against the
 /// *short* (50ms) budget used for an ordinary, non-long-running
-/// method is reported as ambiguous rather than retried.
+/// method is reported as a timeout rather than retried. Per R6,
+/// `source.list` is read-only, so this must be a plain
+/// [`RpcCallError::Timeout`] — not [`RpcCallError::Ambiguous`], which
+/// previously told the user not to re-run a harmless read.
 #[test]
-fn ordinary_methods_use_the_short_timeout_and_report_ambiguous_on_a_slow_response() {
+fn ordinary_methods_use_the_short_timeout_and_report_a_plain_timeout_on_a_slow_response() {
     let server = MockServer::start(vec![Behavior::Slow {
         delay: Duration::from_millis(150),
         status: 200,
@@ -253,6 +256,42 @@ fn ordinary_methods_use_the_short_timeout_and_report_ambiguous_on_a_slow_respons
 
     let result = client.call("source.list", serde_json::json!({}));
 
-    assert!(matches!(result, Err(RpcCallError::Ambiguous(_))));
+    assert!(matches!(result, Err(RpcCallError::Timeout(_))));
     assert_eq!(server.call_count(), 1);
+}
+
+/// R6: a timeout on a read-only method must not use the
+/// mutating-call "don't retry blindly" wording — it tells the user
+/// plainly that the daemon didn't respond, without implying it is
+/// unsafe to re-run `source.list` (or any other read-only command).
+#[test]
+fn read_only_timeout_message_is_plain_not_ambiguous() {
+    let server = MockServer::start(vec![Behavior::Slow {
+        delay: Duration::from_millis(150),
+        status: 200,
+        body: ok_envelope(serde_json::json!([])),
+    }]);
+    let client = RpcClient::with_timeouts(
+        server.addr.clone(),
+        "token".to_string(),
+        Duration::from_millis(50),
+        Duration::from_millis(400),
+        Duration::from_millis(50),
+    );
+
+    let result = client.call("source.list", serde_json::json!({}));
+
+    match result {
+        Err(RpcCallError::Timeout(msg)) => {
+            assert!(
+                msg.contains("source.list"),
+                "timeout message should name the method: {msg}"
+            );
+            assert!(
+                !msg.contains("retrying") && !msg.contains("blindly"),
+                "a read-only timeout must not carry the mutating-call \"don't retry blindly\" wording: {msg}"
+            );
+        }
+        other => panic!("expected a plain Timeout, got {other:?}"),
+    }
 }

@@ -79,16 +79,25 @@ pub enum RpcCallError {
     /// failed on the single automatic retry.
     Transport(String),
     /// A transport failure left it genuinely unknown whether the
-    /// daemon received/applied the request: either the call timed
-    /// out (R1 — a timeout is not the same thing as a dropped
-    /// connection, and must not be treated as one), or the connection
-    /// dropped on a method ([`is_mutating`]) this crate will not
-    /// blindly re-send, since a retry risks duplicating a mutation
-    /// (or, for `link.apply_refactor`, re-running an on-disk rewrite
-    /// that already succeeded). Callers must report this distinctly
-    /// from both success and a clean abort — never print "applied"/
-    /// "aborted"/"removed" for it.
+    /// daemon received/applied the request: a timeout on a
+    /// *mutating* method ([`is_mutating`]) (R1 — a timeout is not the
+    /// same thing as a dropped connection, and must not be treated as
+    /// one), or the connection dropped on a mutating method, which
+    /// this crate will not blindly re-send, since a retry risks
+    /// duplicating a mutation (or, for `link.apply_refactor`,
+    /// re-running an on-disk rewrite that already succeeded). Callers
+    /// must report this distinctly from both success and a clean
+    /// abort — never print "applied"/"aborted"/"removed" for it.
     Ambiguous(String),
+    /// A timeout on a *read-only* method (R6 — read-only RPCs never
+    /// mutate daemon/on-disk state, so a timeout here is just a slow
+    /// or hung daemon, not an ambiguous-effect situation the way a
+    /// timed-out mutating call is). Reported plainly ("tephrad did
+    /// not respond within Ns while calling ...") rather than with
+    /// [`RpcCallError::Ambiguous`]'s "don't blindly retry" wording,
+    /// which only makes sense for a call that might have mutated
+    /// state.
+    Timeout(String),
     /// The server's JSON-RPC envelope carried an `"error"` object.
     Rpc {
         code: i64,
@@ -107,6 +116,7 @@ impl fmt::Display for RpcCallError {
             RpcCallError::Unauthorized => write!(f, "authentication failed"),
             RpcCallError::Transport(msg) => write!(f, "transport error: {msg}"),
             RpcCallError::Ambiguous(msg) => write!(f, "{msg}"),
+            RpcCallError::Timeout(msg) => write!(f, "{msg}"),
             RpcCallError::Rpc { message, .. } => write!(f, "{message}"),
             RpcCallError::Decode(msg) => write!(f, "invalid response from daemon: {msg}"),
         }
@@ -120,6 +130,31 @@ fn ambiguous_timeout_message(method: &str, timeout: Duration) -> String {
         "no response from tephrad within {}s while calling \"{method}\"; it is unknown whether the request completed on the daemon — run `tephractl status`/`source list` (or check the affected files) before retrying rather than re-running this command blindly",
         timeout.as_secs()
     )
+}
+
+/// R6: the plain-timeout message for a *read-only* method — no
+/// "don't retry blindly" wording, since a read-only call that timed
+/// out never mutated anything and re-running it (or any other
+/// read-only command) is perfectly safe.
+fn plain_timeout_message(method: &str, timeout: Duration) -> String {
+    format!(
+        "tephrad did not respond within {}s while calling \"{method}\"",
+        timeout.as_secs()
+    )
+}
+
+/// R6: builds the right [`RpcCallError`] for a timeout on `method` —
+/// [`RpcCallError::Ambiguous`] (with the "don't retry blindly"
+/// wording) for a mutating method, whose effect on the daemon is
+/// genuinely unknown, or a plain [`RpcCallError::Timeout`] for a
+/// read-only one, which never mutated anything regardless of whether
+/// the daemon ever replied.
+fn timeout_error(method: &str, timeout: Duration) -> RpcCallError {
+    if is_mutating(method) {
+        RpcCallError::Ambiguous(ambiguous_timeout_message(method, timeout))
+    } else {
+        RpcCallError::Timeout(plain_timeout_message(method, timeout))
+    }
 }
 
 fn ambiguous_drop_message(method: &str, source: &reqwest::Error) -> String {
@@ -219,9 +254,16 @@ impl RpcClient {
     /// modes are reported without ever retrying:
     ///   - connection refused (the daemon isn't running at all): reported
     ///     immediately, since a second attempt cannot fix that.
-    ///   - a timeout (R1): a slow daemon, not a dropped connection — it is
-    ///     unknown whether the call completed, so this is surfaced as
-    ///     [`RpcCallError::Ambiguous`], never blindly retried.
+    ///   - a timeout (R1) on a *mutating* method: a slow daemon, not a
+    ///     dropped connection — it is unknown whether the call completed,
+    ///     so this is surfaced as [`RpcCallError::Ambiguous`], never
+    ///     blindly retried.
+    ///   - a timeout on a *read-only* method (R6): also never retried,
+    ///     but reported as a plain [`RpcCallError::Timeout`] rather than
+    ///     [`RpcCallError::Ambiguous`] — a read-only call cannot have
+    ///     mutated anything, so there is nothing ambiguous about its
+    ///     effect, and the "don't retry blindly" wording would mislead
+    ///     the user into thinking a harmless read is unsafe to re-run.
     ///   - a dropped connection on a mutating method (R1): also surfaced
     ///     as [`RpcCallError::Ambiguous`] rather than retried, since the
     ///     original request may already have taken effect on the daemon
@@ -236,18 +278,14 @@ impl RpcClient {
         match self.send_once(body, timeout) {
             Ok(response) => Ok(response),
             Err(e) if e.is_connect() => Err(RpcCallError::DaemonNotRunning),
-            Err(e) if e.is_timeout() => Err(RpcCallError::Ambiguous(ambiguous_timeout_message(
-                method, timeout,
-            ))),
+            Err(e) if e.is_timeout() => Err(timeout_error(method, timeout)),
             Err(e) if is_mutating(method) => {
                 Err(RpcCallError::Ambiguous(ambiguous_drop_message(method, &e)))
             }
             Err(_first_attempt_err) => match self.send_once(body, timeout) {
                 Ok(response) => Ok(response),
                 Err(e2) if e2.is_connect() => Err(RpcCallError::DaemonNotRunning),
-                Err(e2) if e2.is_timeout() => Err(RpcCallError::Ambiguous(
-                    ambiguous_timeout_message(method, timeout),
-                )),
+                Err(e2) if e2.is_timeout() => Err(timeout_error(method, timeout)),
                 Err(e2) => Err(RpcCallError::Transport(e2.to_string())),
             },
         }
