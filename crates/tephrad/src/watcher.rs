@@ -47,7 +47,8 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
@@ -294,6 +295,85 @@ where
     WatcherHandle {
         _watcher: watcher,
         task,
+    }
+}
+
+/// A pause/resume control for one source's already-running debounced
+/// watcher (GP8: a `link.apply_refactor` must not race the watcher's
+/// own debounced reindex of the very files it is about to rewrite).
+///
+/// Wraps an `on_batch` callback: while paused, a batch that fires is
+/// merged into a pending set instead of being forwarded, and
+/// [`WatcherPause::resume`] flushes that pending set as one merged
+/// batch through the same `on_batch` the moment it's called (if
+/// anything arrived while paused) — so an event that fires during the
+/// pause window is deferred, never dropped, and never processed into
+/// a reindex until after resume. Pausing does not unsubscribe the
+/// real `notify` watcher underneath (the OS keeps queueing events the
+/// whole time); it only stops this wrapper from acting on a *fired*
+/// batch until resume.
+///
+/// Added alongside [`crate::refactor`] rather than by PR-4 itself —
+/// despite this PR's own spec listing "the PR-4 watcher's pause/resume
+/// hooks" as a dependency, no such hook existed in this watcher before
+/// this change; see this PR's coder summary for that discrepancy.
+#[derive(Clone)]
+pub struct WatcherPause {
+    inner: Arc<PauseInner>,
+}
+
+struct PauseInner {
+    paused: AtomicBool,
+    queued: Mutex<HashSet<PathBuf>>,
+    on_batch: Box<dyn Fn(HashSet<PathBuf>) + Send + Sync>,
+}
+
+impl WatcherPause {
+    /// Wraps `on_batch` behind a pause/resume gate. Pass
+    /// [`WatcherPause::handle`] (bound via a small closure — see
+    /// `registry.rs`'s `start_watcher`) to [`spawn_debounce`] as its
+    /// own `on_batch` parameter, in place of the raw callback.
+    pub fn new(on_batch: impl Fn(HashSet<PathBuf>) + Send + Sync + 'static) -> Self {
+        WatcherPause {
+            inner: Arc::new(PauseInner {
+                paused: AtomicBool::new(false),
+                queued: Mutex::new(HashSet::new()),
+                on_batch: Box::new(on_batch),
+            }),
+        }
+    }
+
+    /// Stops forwarding fired batches to the wrapped `on_batch` until
+    /// [`resume`](Self::resume) is called. Idempotent.
+    pub fn pause(&self) {
+        self.inner.paused.store(true, Ordering::SeqCst);
+    }
+
+    /// Resumes forwarding, and immediately flushes (as one merged
+    /// batch, through the wrapped `on_batch`) anything that fired
+    /// while paused. A no-op flush if nothing fired during the pause
+    /// window. Idempotent.
+    pub fn resume(&self) {
+        self.inner.paused.store(false, Ordering::SeqCst);
+        let queued =
+            std::mem::take(&mut *self.inner.queued.lock().unwrap_or_else(|p| p.into_inner()));
+        if !queued.is_empty() {
+            (self.inner.on_batch)(queued);
+        }
+    }
+
+    /// The handler to actually pass to [`spawn_debounce`] as its
+    /// `on_batch` parameter.
+    pub fn handle(&self, batch: HashSet<PathBuf>) {
+        if self.inner.paused.load(Ordering::SeqCst) {
+            self.inner
+                .queued
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .extend(batch);
+        } else {
+            (self.inner.on_batch)(batch);
+        }
     }
 }
 
