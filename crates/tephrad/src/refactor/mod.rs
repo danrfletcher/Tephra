@@ -52,6 +52,7 @@ use tephra_graph::Edge;
 
 use crate::registry::SourceRegistry;
 use crate::rpc::backend::{GraphBackend, SourceBackend};
+use crate::watcher;
 
 // ---------------------------------------------------------------
 // Pure diff computation
@@ -70,6 +71,14 @@ pub struct LinkChange {
     pub before: String,
     /// The full matched link text after the rewrite.
     pub after: String,
+    /// Absolute byte offset of the start of the span this change
+    /// rewrites, within the referring file's own content (R1 review
+    /// finding: carried straight from `tephra_parser`'s
+    /// `WikiLink::span`/`MarkdownLink::span`, never recomputed by
+    /// re-searching for `before`'s text).
+    pub byte_start: usize,
+    /// Absolute byte offset one past the end of that span (exclusive).
+    pub byte_end: usize,
 }
 
 /// Computes every [`LinkChange`] implied by renaming `old_path` to
@@ -128,11 +137,25 @@ pub fn compute_changes(
 }
 
 /// Re-parses `content` (one referring file) with `tephra_parser` to
-/// find every occurrence of the raw link `(kind, old_raw)` and the
-/// exact line it sits on, pairing each with the already-computed
-/// `new_raw` replacement text. More than one occurrence of the same
-/// raw link in one file (linked twice) yields one [`LinkChange`] per
-/// occurrence, each at its own line.
+/// find every occurrence of the raw link `(kind, old_raw)` together
+/// with the exact byte span `tephra_parser` recorded for it, pairing
+/// each with the already-computed `new_raw` replacement text. More
+/// than one occurrence of the same raw link in one file (linked
+/// twice) yields one [`LinkChange`] per occurrence, each with its own
+/// span. R1 review finding: a plain line/text search previously
+/// stood in for this, so a textually-identical but unrelated
+/// occurrence on the same line — a copy of the raw link inside inline
+/// code, or plain prose that happened to read like a markdown link's
+/// `(target)` — could be mistaken for the real, parsed link and
+/// corrupted while the real link itself was left stale. Locating by
+/// `tephra_parser`'s own span instead means a change is only ever
+/// produced for text the parser itself recognised as this exact link
+/// occurrence — a parser that recognises a destination in an inline
+/// code span or plain prose as a link at all is a parser bug to fix
+/// in `tephra_parser`, not something this function can or should work
+/// around with its own heuristics. A markdown link with no recorded
+/// span (`MarkdownLink::span == None`, e.g. a reference-style
+/// `[text][ref]` link) is skipped entirely rather than guessed at.
 fn locate_and_diff(
     file_id: &str,
     content: &str,
@@ -150,17 +173,30 @@ fn locate_and_diff(
                     line: w.line,
                     before: format!("[[{old_raw}]]"),
                     after: format!("[[{new_raw}]]"),
+                    byte_start: w.span.0,
+                    byte_end: w.span.1,
                 });
             }
         }
     } else {
         for m in &parsed.markdown_links {
             if m.target == old_raw {
+                let Some((byte_start, byte_end)) = m.span else {
+                    // No exact byte span available for this link
+                    // occurrence (see `MarkdownLink::span`'s doc
+                    // comment) — never fall back to a textual
+                    // search-and-replace that could rewrite the
+                    // wrong thing; simply report no change here
+                    // rather than guess.
+                    continue;
+                };
                 out.push(LinkChange {
                     file: file_id.to_string(),
                     line: m.line,
                     before: format!("({old_raw})"),
                     after: format!("({new_raw})"),
+                    byte_start,
+                    byte_end,
                 });
             }
         }
@@ -380,48 +416,45 @@ fn percent_encode_path(s: &str) -> String {
 }
 
 /// Applies the subset of `changes` belonging to one file to that
-/// file's current `content`, returning the new content. Operates
-/// strictly line-by-line (splitting on `\n`, keeping every line
-/// ending exactly as found) and does exactly one `before` ->
-/// `after` substring replacement per change on its own recorded
-/// line, so every byte outside a targeted link span — including the
-/// rest of that same line — is left byte-for-byte identical.
-pub fn apply_changes_to_content(content: &str, changes: &[&LinkChange]) -> String {
-    let mut by_line: HashMap<usize, Vec<&LinkChange>> = HashMap::new();
-    for c in changes {
-        by_line.entry(c.line).or_default().push(c);
-    }
-    let mut out = String::with_capacity(content.len());
-    for (idx, line) in split_keep_line_endings(content).into_iter().enumerate() {
-        let line_no = idx + 1;
-        match by_line.get(&line_no) {
-            Some(cs) => {
-                let mut rewritten = line.to_string();
-                for c in cs {
-                    rewritten = rewritten.replacen(&c.before, &c.after, 1);
-                }
-                out.push_str(&rewritten);
-            }
-            None => out.push_str(line),
-        }
-    }
-    out
-}
+/// file's current `content`, returning the new content. Rewrites
+/// exactly the byte range [`LinkChange::byte_start`,
+/// `LinkChange::byte_end`) recorded for each change — never a
+/// textual search-and-replace — after first verifying the bytes
+/// currently at that range still equal `before` exactly (R1/R7 review
+/// findings): a span whose bytes no longer match `before` (the file
+/// changed underneath the preview in a way the mtime-based staleness
+/// gate didn't catch, or the recorded span is simply out of range for
+/// the content passed in) is reported as an error rather than
+/// silently rewriting the wrong text, or an unrelated occurrence of
+/// the same bytes elsewhere on the same line. Changes are applied
+/// from the highest `byte_start` down to the lowest, so rewriting one
+/// change's span never shifts the byte offsets of any still-pending
+/// earlier one.
+pub fn apply_changes_to_content(content: &str, changes: &[&LinkChange]) -> Result<String, String> {
+    let mut ordered: Vec<&LinkChange> = changes.to_vec();
+    ordered.sort_by_key(|c| std::cmp::Reverse(c.byte_start));
 
-fn split_keep_line_endings(s: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut start = 0;
-    let bytes = s.as_bytes();
-    for (i, &b) in bytes.iter().enumerate() {
-        if b == b'\n' {
-            out.push(&s[start..=i]);
-            start = i + 1;
+    let mut buf = content.to_string();
+    for c in ordered {
+        if c.byte_start > c.byte_end
+            || c.byte_end > buf.len()
+            || !buf.is_char_boundary(c.byte_start)
+            || !buf.is_char_boundary(c.byte_end)
+        {
+            return Err(format!(
+                "{}:{}: the recorded link span is out of range for the file's current content",
+                c.file, c.line
+            ));
         }
+        if buf[c.byte_start..c.byte_end] != c.before {
+            return Err(format!(
+                "{}:{}: content at the recorded link span no longer matches the expected text {:?}",
+                c.file, c.line, c.before
+            ));
+        }
+        buf.replace_range(c.byte_start..c.byte_end, &c.after);
     }
-    if start < s.len() {
-        out.push(&s[start..]);
-    }
-    out
+    Ok(buf)
 }
 
 // ---------------------------------------------------------------
@@ -480,6 +513,13 @@ pub trait AtomicFs: Send + Sync {
     /// callers always pass a fresh temp path) and writes `content` to
     /// it in full.
     fn write_new(&self, path: &Path, content: &[u8]) -> io::Result<()>;
+    /// Sets `path`'s permission bits to `perms` (R2 review finding:
+    /// called with the real target's own existing permissions before
+    /// every rename, so `apply_refactor` never itself widens,
+    /// narrows, or drops the executable bit on a file it rewrites —
+    /// `write_new`'s freshly-created temp file otherwise gets the
+    /// process's default mode).
+    fn set_permissions(&self, path: &Path, perms: fs::Permissions) -> io::Result<()>;
     /// Flushes `path` to stable storage.
     fn sync(&self, path: &Path) -> io::Result<()>;
     /// Atomically replaces `to` with `from` (same directory, so this
@@ -495,6 +535,9 @@ impl AtomicFs for RealFs {
         let mut f = fs::File::create(path)?;
         f.write_all(content)
     }
+    fn set_permissions(&self, path: &Path, perms: fs::Permissions) -> io::Result<()> {
+        fs::set_permissions(path, perms)
+    }
     fn sync(&self, path: &Path) -> io::Result<()> {
         fs::File::open(path)?.sync_all()
     }
@@ -504,11 +547,12 @@ impl AtomicFs for RealFs {
 }
 
 /// Rewrites `target`'s content to `new_content` via the real
-/// filesystem (temp file in `target`'s own directory, `fsync`, then
-/// `rename`) — see [`rewrite_links_atomic_with`] for the
-/// test-intercepted version and this module's doc comment for why
-/// this sequencing is what keeps a reader (or a process restart after
-/// a kill) from ever observing a half-written file.
+/// filesystem (temp file in `target`'s own directory, with `target`'s
+/// own permissions copied onto it, `fsync`, then `rename`) — see
+/// [`rewrite_links_atomic_with`] for the test-intercepted version and
+/// this module's doc comment for why this sequencing is what keeps a
+/// reader (or a process restart after a kill) from ever observing a
+/// half-written file.
 pub fn rewrite_links_atomic(target: &Path, new_content: &[u8]) -> io::Result<()> {
     rewrite_links_atomic_with(&RealFs, target, new_content)
 }
@@ -517,13 +561,46 @@ pub fn rewrite_links_atomic(target: &Path, new_content: &[u8]) -> io::Result<()>
 /// [`AtomicFs`] so a test can observe/intercept the write-fsync-rename
 /// sequence. The temp file is named `.<original-name>.tephra-tmp-<n>`
 /// in the same directory as `target` (so the final `rename` is
-/// guaranteed same-filesystem, hence atomic) and is removed on a
-/// failed rename rather than left behind.
+/// guaranteed same-filesystem, hence atomic), gets `target`'s own
+/// current permissions copied onto it before the rename (R2 review
+/// finding — a bare temp-file-then-rename otherwise silently widens
+/// or narrows the real file's permissions, or drops its executable
+/// bit, to whatever the process's default mode happens to be), and is
+/// removed again if anything after its creation fails, rather than
+/// left behind (R3: this module's temp files must never survive a
+/// failure here, only a process being killed outright between
+/// `write_new` and `rename` — see `crate::scan`'s sweep for that
+/// case).
+///
+/// Refuses outright (an `io::ErrorKind::Unsupported` error, `target`
+/// left completely untouched) if `target` is itself a symlink (R2
+/// review finding): `rename` replaces whatever directory entry sits
+/// at `target`, so renaming a temp *file* onto a symlinked (or
+/// hard-linked) note would silently turn it into a plain file —
+/// losing the link itself — rather than updating whatever it points
+/// to. Resolving through the symlink to its real target was
+/// considered and rejected: that target can resolve outside the
+/// source root entirely, and a link-rewrite RPC silently following it
+/// there is a bigger surprise than simply refusing.
 pub fn rewrite_links_atomic_with(
     fs_ops: &dyn AtomicFs,
     target: &Path,
     new_content: &[u8],
 ) -> io::Result<()> {
+    // `symlink_metadata` (unlike `metadata`) does not follow the
+    // link, so this sees `target` itself rather than whatever it
+    // points to.
+    let target_meta = fs::symlink_metadata(target)?;
+    if target_meta.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "refusing to rewrite '{}': it is a symlink, and rewriting it atomically would replace the link itself with a plain file",
+                target.display()
+            ),
+        ));
+    }
+
     let dir = target.parent().unwrap_or_else(|| Path::new("."));
     let file_name = target
         .file_name()
@@ -532,8 +609,16 @@ pub fn rewrite_links_atomic_with(
     let tmp_name = format!(".{file_name}.tephra-tmp-{}", rand::random::<u32>());
     let tmp_path = dir.join(tmp_name);
 
-    fs_ops.write_new(&tmp_path, new_content)?;
-    fs_ops.sync(&tmp_path)?;
+    let write_and_prepare = (|| -> io::Result<()> {
+        fs_ops.write_new(&tmp_path, new_content)?;
+        fs_ops.set_permissions(&tmp_path, target_meta.permissions())?;
+        fs_ops.sync(&tmp_path)
+    })();
+    if let Err(e) = write_and_prepare {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
     let result = fs_ops.rename(&tmp_path, target);
     if result.is_err() {
         let _ = fs::remove_file(&tmp_path);
@@ -551,17 +636,32 @@ pub fn rewrite_links_atomic_with(
 /// writes `apply_refactor` is in the middle of making. Behind a trait
 /// so a unit test can substitute [`NoopWatcherPause`] instead of a
 /// real [`SourceRegistry`].
+///
+/// `resume_all`'s `written_paths` are the absolute paths `apply` just
+/// finished rewriting (R4 review finding): a notify event for one of
+/// those paths reaching the watcher's debounced pipeline after resume
+/// would just be a redundant, racy reindex of content `apply` already
+/// accounted for synchronously itself (see `RefactorEngine::write_all`'s
+/// own `sources.rescan` call) — not a real external change to react
+/// to. An implementation is expected to wait out one full debounce
+/// window before actually resuming (so any such event has already
+/// landed in its paused, per-source queue) and then discard exactly
+/// `written_paths` from that queue before flushing whatever, if
+/// anything, remains — see [`crate::watcher::WatcherPause::resume_except`].
+/// Any *other* path that queued up during that window (a concurrent
+/// edit by something other than this `apply`) is still flushed
+/// normally.
 pub trait WatcherPauseControl: Send + Sync {
     fn pause_all(&self);
-    fn resume_all(&self);
+    fn resume_all(&self, written_paths: &HashSet<PathBuf>);
 }
 
 impl WatcherPauseControl for SourceRegistry {
     fn pause_all(&self) {
         SourceRegistry::pause_all_watchers(self);
     }
-    fn resume_all(&self) {
-        SourceRegistry::resume_all_watchers(self);
+    fn resume_all(&self, written_paths: &HashSet<PathBuf>) {
+        SourceRegistry::resume_all_watchers_except(self, written_paths);
     }
 }
 
@@ -572,7 +672,31 @@ pub struct NoopWatcherPause;
 
 impl WatcherPauseControl for NoopWatcherPause {
     fn pause_all(&self) {}
-    fn resume_all(&self) {}
+    fn resume_all(&self, _written_paths: &HashSet<PathBuf>) {}
+}
+
+// ---------------------------------------------------------------
+// Stale temp-file sweep (R3)
+// ---------------------------------------------------------------
+
+/// Recognizes this module's own atomic-rewrite temp-file naming
+/// convention (`.{original-file-name}.tephra-tmp-{digits}`, see
+/// [`rewrite_links_atomic_with`]). Exposed so `crate::scan`'s source
+/// walk — which already visits every file in a source on every
+/// `register`/`rescan` — can sweep away any file matching it that
+/// survived a process kill between `write_new` and `rename` (R3
+/// review finding: nothing previously cleaned these up, so a kill at
+/// exactly the wrong moment left a stray file in the user's source
+/// tree forever) rather than leaving it on disk indefinitely or
+/// indexing it as if it were real note content.
+pub fn is_stale_temp_file_name(file_name: &str) -> bool {
+    let Some(rest) = file_name.strip_prefix('.') else {
+        return false;
+    };
+    match rest.rsplit_once(".tephra-tmp-") {
+        Some((_, suffix)) => !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()),
+        None => false,
+    }
 }
 
 // ---------------------------------------------------------------
@@ -593,7 +717,11 @@ pub struct FailedFile {
 /// rewritten (`Applied`, `files_changed` may be `0` for a zero-incoming
 /// -links rename), the whole operation was aborted before any write
 /// because of a staleness conflict (`Aborted`), or some files were
-/// rewritten before a later one failed (`Partial`).
+/// rewritten before a later one failed (`Partial`). `Partial` names
+/// exactly which files are in each group (R5 review finding: the
+/// wire result previously carried only a *count* of succeeded files
+/// alongside the failed list, so a caller could never actually tell
+/// which specific files still needed attention).
 #[derive(Debug, Clone, PartialEq)]
 pub enum ApplyOutcome {
     Applied {
@@ -604,6 +732,7 @@ pub enum ApplyOutcome {
     },
     Partial {
         files_changed: usize,
+        succeeded: Vec<String>,
         failed: Vec<FailedFile>,
     },
 }
@@ -705,11 +834,22 @@ impl RefactorEngine {
                 let Ok(content) = fs::read_to_string(&abs) else {
                     continue;
                 };
-                if let Ok(meta) = fs::metadata(&abs) {
-                    if let Ok(mtime) = meta.modified() {
-                        mtimes.insert(edge.from.clone(), mtime);
-                    }
-                }
+                // R7 review finding: a file whose mtime can't be
+                // captured right now must not be included in this
+                // preview at all. Recording it in `file_contents`
+                // (hence proposing a change for it) without an mtime
+                // snapshot would silently exempt it from
+                // `verify_staleness`'s later re-check at `apply` time
+                // — the exact TOCTOU gap that gate exists to close.
+                // Treat a metadata/mtime failure exactly like an
+                // unreadable file: skip it.
+                let Ok(meta) = fs::metadata(&abs) else {
+                    continue;
+                };
+                let Ok(mtime) = meta.modified() else {
+                    continue;
+                };
+                mtimes.insert(edge.from.clone(), mtime);
                 file_contents.insert(edge.from.clone(), content);
             }
             compute_changes(&edges, &file_contents, old_path, new_path)
@@ -736,7 +876,9 @@ impl RefactorEngine {
     /// there is no such prior preview. Pauses every running source's
     /// watcher for the duration of the actual writes and always
     /// resumes it afterwards, even on a staleness abort or a
-    /// mid-write failure.
+    /// mid-write failure — see [`WatcherPauseControl`]'s doc comment
+    /// for why resume additionally waits out a debounce window and is
+    /// then told exactly which paths were written (R4).
     pub fn apply(
         &self,
         source: &str,
@@ -773,8 +915,21 @@ impl RefactorEngine {
         }
 
         self.watcher.pause_all();
-        let result = self.write_all(source, &roots, &stored.changes);
-        self.watcher.resume_all();
+        let outcome = self.write_all(source, &roots, &stored.mtimes, &stored.changes);
+        let (result, written_paths) = match outcome {
+            Ok((outcome, written_paths)) => (Ok(outcome), written_paths),
+            Err(e) => (Err(e), HashSet::new()),
+        };
+        // R4 review finding: wait out one full debounce window — plus
+        // a margin for FSEvents' own extra latency on macOS — before
+        // actually resuming, so a notify event the writes above
+        // themselves produced has reliably already landed in each
+        // paused source's queue. Without this, `resume_all` ran
+        // before that event ever arrived, so it was never paused at
+        // all: it fired straight through live, as though it were a
+        // real external change, immediately after resume.
+        std::thread::sleep(watcher::DEBOUNCE_WINDOW + std::time::Duration::from_millis(150));
+        self.watcher.resume_all(&written_paths);
         result
     }
 
@@ -782,15 +937,18 @@ impl RefactorEngine {
         &self,
         primary_source: &str,
         roots: &HashMap<String, String>,
+        expected_mtimes: &HashMap<String, SystemTime>,
         changes: &[LinkChange],
-    ) -> Result<ApplyOutcome, String> {
+    ) -> Result<(ApplyOutcome, HashSet<PathBuf>), String> {
         let mut by_file: HashMap<String, Vec<&LinkChange>> = HashMap::new();
         for c in changes {
             by_file.entry(c.file.clone()).or_default().push(c);
         }
 
         let mut files_changed = 0usize;
+        let mut succeeded = Vec::new();
         let mut failed = Vec::new();
+        let mut written_paths: HashSet<PathBuf> = HashSet::new();
         let mut touched_sources: HashSet<String> = HashSet::new();
         touched_sources.insert(primary_source.to_string());
 
@@ -805,6 +963,34 @@ impl RefactorEngine {
                 });
                 continue;
             };
+
+            // R7 review finding: `verify_staleness` only checked every
+            // affected file's mtime once, up front in `apply`. On a
+            // large fan-in that loop below can run long enough for a
+            // later file in the list to be edited from outside in the
+            // meantime without being caught. Re-check this one file's
+            // mtime again here, immediately before reading it, against
+            // the very same snapshot.
+            if let Some(expected) = expected_mtimes.get(file_id) {
+                match fs::metadata(&abs).and_then(|m| m.modified()) {
+                    Ok(actual) if actual == *expected => {}
+                    Ok(_) => {
+                        failed.push(FailedFile {
+                            file: file_id.clone(),
+                            error: "file modified since preview".to_string(),
+                        });
+                        continue;
+                    }
+                    Err(e) => {
+                        failed.push(FailedFile {
+                            file: file_id.clone(),
+                            error: format!("file unreadable since preview ({e})"),
+                        });
+                        continue;
+                    }
+                }
+            }
+
             let content = match fs::read_to_string(&abs) {
                 Ok(c) => c,
                 Err(e) => {
@@ -815,10 +1001,21 @@ impl RefactorEngine {
                     continue;
                 }
             };
-            let new_content = apply_changes_to_content(&content, file_changes);
+            let new_content = match apply_changes_to_content(&content, file_changes) {
+                Ok(c) => c,
+                Err(e) => {
+                    failed.push(FailedFile {
+                        file: file_id.clone(),
+                        error: e,
+                    });
+                    continue;
+                }
+            };
             match rewrite_links_atomic(&abs, new_content.as_bytes()) {
                 Ok(()) => {
                     files_changed += 1;
+                    succeeded.push(file_id.clone());
+                    written_paths.insert(abs.clone());
                     if let Some((src, _)) = split_federated_id(file_id) {
                         touched_sources.insert(src.to_string());
                     }
@@ -842,21 +1039,25 @@ impl RefactorEngine {
             let _ = self.sources.rescan(src);
         }
 
-        if failed.is_empty() {
-            Ok(ApplyOutcome::Applied { files_changed })
+        let outcome = if failed.is_empty() {
+            ApplyOutcome::Applied { files_changed }
         } else {
-            Ok(ApplyOutcome::Partial {
+            ApplyOutcome::Partial {
                 files_changed,
+                succeeded,
                 failed,
-            })
-        }
+            }
+        };
+        Ok((outcome, written_paths))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tephra_graph::EdgeTarget;
+    use tephra_graph::{EdgeTarget, ResolveError, ResolveResult};
+
+    use crate::rpc::backend::{ScanStatsWire, SourceRowWire};
 
     fn edge(from: &str, to: &str, to_raw: &str, kind: &str) -> Edge {
         Edge {
@@ -1026,20 +1227,100 @@ mod tests {
                 line: 2,
                 before: "[[OldDoc]]".into(),
                 after: "[[NewDoc]]".into(),
+                byte_start: 16,
+                byte_end: 26,
             },
             LinkChange {
                 file: "@notes:Journal.md".into(),
                 line: 2,
                 before: "[[OldDoc]]".into(),
                 after: "[[NewDoc]]".into(),
+                byte_start: 36,
+                byte_end: 46,
             },
         ];
         let refs: Vec<&LinkChange> = changes.iter().collect();
-        let result = apply_changes_to_content(content, &refs);
+        let result = apply_changes_to_content(content, &refs).expect("spans match");
         assert_eq!(
             result,
             "Intro line.\nSee [[NewDoc]] and also [[NewDoc]] again.\nOutro line.\n"
         );
+    }
+
+    /// R1 review finding, exact repro: a wikilink inside inline code
+    /// that reads identically to a real wikilink elsewhere in the
+    /// same file must never be mistaken for the real occurrence —
+    /// `tephra_parser` itself never recognises a `[[...]]` inside an
+    /// inline code span as a wikilink at all, so `compute_changes`
+    /// (locating purely via the parser's own spans, not a textual
+    /// search) only ever produces a change for the real one.
+    #[test]
+    fn inline_code_occurrence_of_old_name_is_never_rewritten() {
+        let edges = vec![edge(
+            "@notes:Journal.md",
+            "@notes:OldDoc.md",
+            "OldDoc",
+            tephra_parser::LINK_KIND_WIKILINK,
+        )];
+        let content = "Type `[[OldDoc]]` to get [[OldDoc]].\n";
+        let mut files = HashMap::new();
+        files.insert("@notes:Journal.md".to_string(), content.to_string());
+        let changes = compute_changes(&edges, &files, "OldDoc.md", "NewDoc.md");
+        assert_eq!(
+            changes.len(),
+            1,
+            "the inline-code occurrence must not be located as a link: {changes:?}"
+        );
+        let refs: Vec<&LinkChange> = changes.iter().collect();
+        let result = apply_changes_to_content(content, &refs).expect("span matches");
+        assert_eq!(result, "Type `[[OldDoc]]` to get [[NewDoc]].\n");
+    }
+
+    /// R1 review finding: a markdown link whose destination also
+    /// happens to appear, verbatim and parenthesized, as plain prose
+    /// earlier on the very same line must not corrupt that prose —
+    /// only the real `[text](...)` link's own recorded span is ever
+    /// rewritten.
+    #[test]
+    fn markdown_link_with_coincidental_parenthesized_text_on_the_same_line_is_untouched() {
+        let edges = vec![edge(
+            "@notes:Journal.md",
+            "@notes:OldDoc.md",
+            "OldDoc.md",
+            tephra_parser::LINK_KIND_MARKDOWN,
+        )];
+        let content = "See (OldDoc.md) in prose, but the real link is [doc](OldDoc.md).\n";
+        let mut files = HashMap::new();
+        files.insert("@notes:Journal.md".to_string(), content.to_string());
+        let changes = compute_changes(&edges, &files, "OldDoc.md", "NewDoc.md");
+        assert_eq!(changes.len(), 1);
+        let refs: Vec<&LinkChange> = changes.iter().collect();
+        let result = apply_changes_to_content(content, &refs).expect("span matches");
+        assert_eq!(
+            result,
+            "See (OldDoc.md) in prose, but the real link is [doc](NewDoc.md).\n"
+        );
+    }
+
+    /// R1/R7 review finding: if the bytes at a change's recorded span
+    /// no longer equal `before` (the file changed underneath in a way
+    /// the staleness gate didn't catch — simulated here directly,
+    /// without any real file), `apply_changes_to_content` must refuse
+    /// rather than rewrite whatever happens to be there.
+    #[test]
+    fn apply_changes_to_content_errors_if_the_recorded_span_no_longer_matches() {
+        let changes = [LinkChange {
+            file: "@notes:Journal.md".into(),
+            line: 1,
+            before: "[[OldDoc]]".into(),
+            after: "[[NewDoc]]".into(),
+            byte_start: 4,
+            byte_end: 14,
+        }];
+        let changed_content = "See [[Other!]] here.\n";
+        let refs: Vec<&LinkChange> = changes.iter().collect();
+        let result = apply_changes_to_content(changed_content, &refs);
+        assert!(result.is_err());
     }
 
     // --- verify_staleness ---------------------------------------------------
@@ -1105,6 +1386,13 @@ mod tests {
                 .push(format!("write_new:{}", path.display()));
             fs::write(path, content)
         }
+        fn set_permissions(&self, path: &Path, perms: fs::Permissions) -> io::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("set_permissions:{}", path.display()));
+            fs::set_permissions(path, perms)
+        }
         fn sync(&self, path: &Path) -> io::Result<()> {
             self.calls
                 .lock()
@@ -1140,14 +1428,16 @@ mod tests {
 
         assert_eq!(fs::read_to_string(&target).unwrap(), "new content");
         let calls = fs_ops.calls.lock().unwrap();
-        assert_eq!(calls.len(), 3);
+        assert_eq!(calls.len(), 4);
         assert!(calls[0].starts_with("write_new:"));
         assert!(
             !calls[0].contains("Doc.md\""),
             "temp write must not target the real file path directly"
         );
         assert!(calls[0] != format!("write_new:{}", target.display()));
-        assert!(calls[2].ends_with(&format!("->{}", target.display())));
+        assert!(calls[1].starts_with("set_permissions:"));
+        assert!(calls[2].starts_with("sync:"));
+        assert!(calls[3].ends_with(&format!("->{}", target.display())));
 
         // No leftover temp files after a successful rename.
         let remaining: Vec<_> = fs::read_dir(&dir).unwrap().collect();
@@ -1221,6 +1511,207 @@ mod tests {
             );
         }
         assert_eq!(fs::read_to_string(&target).unwrap(), new_content);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // --- R2: permissions / symlinks -----------------------------------------
+
+    #[test]
+    #[cfg(unix)]
+    fn atomic_rewrite_preserves_the_targets_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir =
+            std::env::temp_dir().join(format!("tephra-refactor-test-{}", rand::random::<u32>()));
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("Private.md");
+        fs::write(&target, b"old content").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+
+        rewrite_links_atomic(&target, b"new content").unwrap();
+
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new content");
+        let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "apply_refactor must not change the file's permission bits"
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn atomic_rewrite_refuses_to_replace_a_symlink() {
+        let dir =
+            std::env::temp_dir().join(format!("tephra-refactor-test-{}", rand::random::<u32>()));
+        fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("Real.md");
+        fs::write(&real, b"old content").unwrap();
+        let link = dir.join("Link.md");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let result = rewrite_links_atomic(&link, b"new content");
+        assert!(result.is_err());
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink itself must be left exactly as it was"
+        );
+        assert_eq!(
+            fs::read_to_string(&real).unwrap(),
+            "old content",
+            "the symlink's target must be untouched"
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // --- R3: stale temp-file recognition --------------------------------------
+
+    #[test]
+    fn is_stale_temp_file_name_recognizes_the_atomic_rewrite_convention() {
+        assert!(is_stale_temp_file_name(".Doc.md.tephra-tmp-123456"));
+        assert!(is_stale_temp_file_name(".a.tephra-tmp-0"));
+        assert!(!is_stale_temp_file_name("Doc.md"));
+        assert!(!is_stale_temp_file_name(".Doc.md"));
+        assert!(!is_stale_temp_file_name(".Doc.md.tephra-tmp-"));
+        assert!(!is_stale_temp_file_name(".Doc.md.tephra-tmp-12a"));
+        assert!(!is_stale_temp_file_name("Doc.md.tephra-tmp-123"));
+    }
+
+    // --- R4: apply pauses/resumes the watcher around its own writes ----------
+
+    struct FakeGraphBackend {
+        edges: Vec<Edge>,
+    }
+
+    impl GraphBackend for FakeGraphBackend {
+        fn resolve_link(
+            &self,
+            _raw: &str,
+            _default_source: Option<&str>,
+        ) -> Result<ResolveResult, ResolveError> {
+            unimplemented!("not exercised by RefactorEngine::preview/apply")
+        }
+        fn get_backlinks(&self, _id: &str) -> Vec<Edge> {
+            self.edges.clone()
+        }
+        fn get_forward_links(&self, _id: &str) -> Vec<Edge> {
+            Vec::new()
+        }
+        fn get_edges(&self) -> Vec<Edge> {
+            self.edges.clone()
+        }
+    }
+
+    struct FakeSourceBackend {
+        name: String,
+        path: String,
+    }
+
+    impl SourceBackend for FakeSourceBackend {
+        fn register(&self, _name: &str, _root: &str) -> Result<ScanStatsWire, String> {
+            unimplemented!("not exercised by RefactorEngine::preview/apply")
+        }
+        fn unregister(&self, _name: &str) -> Result<(), String> {
+            unimplemented!("not exercised by RefactorEngine::preview/apply")
+        }
+        fn list(&self) -> Result<Vec<SourceRowWire>, String> {
+            Ok(vec![SourceRowWire {
+                name: self.name.clone(),
+                path: self.path.clone(),
+                status: "active".to_string(),
+                last_scanned_at: None,
+            }])
+        }
+        fn rescan(&self, _name: &str) -> Result<ScanStatsWire, String> {
+            Ok(ScanStatsWire {
+                files_seen: 0,
+                files_ignored: 0,
+                units_written: 0,
+                links_written: 0,
+                tags_written: 0,
+                blocks_written: 0,
+            })
+        }
+    }
+
+    struct RecordingWatcherPauseControl {
+        log: Mutex<Vec<String>>,
+    }
+
+    impl WatcherPauseControl for RecordingWatcherPauseControl {
+        fn pause_all(&self) {
+            self.log.lock().unwrap().push("pause".to_string());
+        }
+        fn resume_all(&self, written_paths: &HashSet<PathBuf>) {
+            let mut paths: Vec<String> = written_paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect();
+            paths.sort();
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("resume:{}", paths.join(",")));
+        }
+    }
+
+    #[test]
+    fn apply_pauses_and_resumes_the_watcher_with_exactly_the_paths_it_wrote() {
+        let dir = std::env::temp_dir().join(format!(
+            "tephra-refactor-apply-test-{}",
+            rand::random::<u32>()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let journal = dir.join("Journal.md");
+        fs::write(&journal, "See [[OldDoc]] for details.\n").unwrap();
+
+        let graph = FakeGraphBackend {
+            edges: vec![edge(
+                "@notes:Journal.md",
+                "@notes:OldDoc.md",
+                "OldDoc",
+                tephra_parser::LINK_KIND_WIKILINK,
+            )],
+        };
+        let sources = FakeSourceBackend {
+            name: "notes".to_string(),
+            path: dir.to_string_lossy().to_string(),
+        };
+        let watcher = std::sync::Arc::new(RecordingWatcherPauseControl {
+            log: Mutex::new(Vec::new()),
+        });
+
+        let engine = RefactorEngine::new(
+            std::sync::Arc::new(graph),
+            std::sync::Arc::new(sources),
+            watcher.clone(),
+        );
+
+        engine.preview("notes", "OldDoc.md", "NewDoc.md").unwrap();
+        let outcome = engine.apply("notes", "OldDoc.md", "NewDoc.md").unwrap();
+        assert_eq!(outcome, ApplyOutcome::Applied { files_changed: 1 });
+        assert_eq!(
+            fs::read_to_string(&journal).unwrap(),
+            "See [[NewDoc]] for details.\n"
+        );
+
+        let log = watcher.log.lock().unwrap();
+        assert_eq!(
+            log.len(),
+            2,
+            "expected exactly one pause then one resume: {log:?}"
+        );
+        assert_eq!(log[0], "pause");
+        assert!(
+            log[1].starts_with("resume:") && log[1].contains(&journal.display().to_string()),
+            "resume must be told exactly the path apply itself wrote: {log:?}"
+        );
 
         fs::remove_dir_all(&dir).unwrap();
     }
