@@ -33,6 +33,20 @@
 //! IMMEDIATE` and retries on `SQLITE_BUSY` instead of reading first
 //! (risking a failed upgrade) and dropping the whole batch on the
 //! first contention it hits.
+//!
+//! Chunk hand-off (R18 review finding): every chunk's `BEGIN
+//! IMMEDIATE`/commit cycle — in a full scan, a forced rescan, and a
+//! debounced batch-apply alike — is bracketed by
+//! `crate::writer_gate::WriterGate::acquire` rather than an
+//! unconditional sleep. Before this fix, `walk_and_write` slept a
+//! fixed duration after every single chunk commit regardless of
+//! whether anything else was waiting, to give another connection a
+//! real chance at the lock between chunks (R16) — correct, but paid
+//! on every chunk of every scan, even a completely uncontended one
+//! (measured 5.3x slower on a 100k-file scan, worse on macOS due to
+//! timer coalescing). The writer gate makes the hand-off itself
+//! deterministic and free when uncontended instead: see
+//! `crate::writer_gate`'s module doc comment for the full rationale.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -44,6 +58,7 @@ use rusqlite::{Transaction, TransactionBehavior};
 use tephra_cache::Cache;
 
 use crate::ignore::IgnoreRules;
+use crate::writer_gate::{self, WriterGate, WriterGateGuard};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ScanStats {
@@ -142,32 +157,6 @@ impl From<rusqlite::Error> for ScanError {
 /// transaction boundaries.
 const SCAN_COMMIT_CHUNK_SIZE: usize = 500;
 
-/// How long [`walk_and_write`] sleeps after committing each chunk,
-/// before opening the next chunk's `BEGIN IMMEDIATE` (R16 review
-/// finding). Committing a chunk releases SQLite's write lock, but
-/// another connection that's currently waiting for it (stuck in its
-/// own `busy_timeout`'s internal sleep-and-poll loop, e.g. a
-/// concurrent `register()`'s insert, `source.rescan`'s own
-/// transition, or another source's debounced batch) does not notice
-/// a released lock the instant it's released — it only notices the
-/// next time its own backoff timer happens to wake it up. Without
-/// this sleep, this thread's next `begin_immediate` call (made with
-/// no delay at all right after the commit) almost always wins that
-/// race before the waiter's timer ever fires, so a long scan could
-/// starve every other writer for its *entire* duration even though
-/// the write lock is, technically, only held for a bounded chunk at a
-/// time (the review's probe: a concurrent `register()` issued partway
-/// through a long scan returned only once the scan fully finished,
-/// and a second, longer scan made a concurrent `register()` fail
-/// outright with "database is locked"). This sleep gives any waiting
-/// connection's poll a real chance to land in the gap, on every single
-/// chunk boundary rather than only once at the very end. Kept short
-/// (10ms, not e.g. 100ms+) so this stays a small fraction of a
-/// chunk's own work (parsing and writing up to
-/// [`SCAN_COMMIT_CHUNK_SIZE`] files) rather than a dominant cost on a
-/// very large source's scan time.
-const CHUNK_COMMIT_YIELD: Duration = Duration::from_millis(10);
-
 /// How many times a `SQLITE_BUSY` failure is retried, and the backoff
 /// slept between attempts (R11). SQLite's own `busy_timeout` (set on
 /// every connection, see `tephra_cache::cache::apply_pragmas`) already
@@ -225,6 +214,25 @@ fn retry_on_busy<T>(mut attempt: impl FnMut() -> Result<T, ScanError>) -> Result
 fn begin_immediate(cache: &Cache) -> Result<Transaction<'_>, ScanError> {
     Transaction::new_unchecked(cache.connection(), TransactionBehavior::Immediate)
         .map_err(ScanError::from)
+}
+
+/// Acquires `gate` (R18) and then opens a `BEGIN IMMEDIATE`
+/// transaction against `cache`. The returned guard must be kept alive
+/// for exactly as long as the transaction it opened is open, and
+/// dropped only once that transaction has committed (or failed) —
+/// dropping it releases the gate and wakes the next in-process writer
+/// waiting on it, so releasing it before the commit lands would let
+/// another writer in while this chunk's write lock is technically
+/// still held, and releasing it long after the commit (e.g. only at
+/// the end of a whole scan) would defeat the point of acquiring it
+/// per chunk in the first place.
+fn open_chunk<'c, 'g>(
+    cache: &'c Cache,
+    gate: &'g WriterGate,
+) -> Result<(WriterGateGuard<'g>, Transaction<'c>), ScanError> {
+    let permit = gate.acquire();
+    let tx = begin_immediate(cache)?;
+    Ok((permit, tx))
 }
 
 /// File extensions (case-insensitive, no leading dot) treated as
@@ -388,22 +396,24 @@ fn delete_existing_unit(cache: &Cache, source_id: i64, rel_path: &str) -> Result
 /// peak memory is bounded by one file's content plus its parsed
 /// structures, not by the size of the source tree.
 ///
-/// `first_tx` is the already-open transaction this walk's first chunk
-/// writes into (so a caller, e.g. [`rescan_source`], can fold a
-/// preceding delete into that same first chunk); every
-/// [`SCAN_COMMIT_CHUNK_SIZE`]th file commits it and opens a fresh one
-/// (R11 — see the module doc comment for the full rationale), and the
-/// final (possibly partial) chunk is committed once the walk is
-/// exhausted.
+/// `first_chunk` is the already-open gate permit and transaction this
+/// walk's first chunk writes into (so a caller, e.g.
+/// [`rescan_source`], can fold a preceding delete into that same
+/// first chunk); every [`SCAN_COMMIT_CHUNK_SIZE`]th file commits it,
+/// releases the gate permit, and reacquires a fresh one for the next
+/// chunk (R11/R18 — see the module doc comment for the full
+/// rationale), and the final (possibly partial) chunk is committed
+/// (and its permit released) once the walk is exhausted.
 fn walk_and_write(
     cache: &Cache,
     source_id: i64,
     root: &Path,
     ignore: &IgnoreRules,
-    first_tx: Transaction<'_>,
+    gate: &WriterGate,
+    first_chunk: (WriterGateGuard<'_>, Transaction<'_>),
 ) -> Result<ScanStats, ScanError> {
     let mut stats = ScanStats::default();
-    let mut tx = Some(first_tx);
+    let (mut permit, mut tx) = (Some(first_chunk.0), Some(first_chunk.1));
     let mut since_commit: usize = 0;
 
     let walker = walkdir::WalkDir::new(root)
@@ -454,12 +464,16 @@ fn walk_and_write(
             tx.take()
                 .expect("a transaction is always open mid-walk")
                 .commit()?;
-            // R16: give any connection currently waiting on this
-            // database's write lock a real chance to grab it before
-            // immediately reclaiming it for the next chunk — see
-            // `CHUNK_COMMIT_YIELD`'s doc comment.
-            std::thread::sleep(CHUNK_COMMIT_YIELD);
-            tx = Some(begin_immediate(cache)?);
+            // R18: drop this chunk's gate permit only after the
+            // commit lands — releasing it wakes the next in-process
+            // writer waiting on this database (if any) immediately
+            // and deterministically, with no sleep or poll needed on
+            // either side (see `crate::writer_gate`'s module doc
+            // comment).
+            drop(permit.take());
+            let (next_permit, next_tx) = open_chunk(cache, gate)?;
+            permit = Some(next_permit);
+            tx = Some(next_tx);
             since_commit = 0;
         }
     }
@@ -480,8 +494,9 @@ pub fn scan_source(
     root: &Path,
     ignore: &IgnoreRules,
 ) -> Result<ScanStats, ScanError> {
-    let first_tx = begin_immediate(cache)?;
-    walk_and_write(cache, source_id, root, ignore, first_tx)
+    let gate = writer_gate::for_path(cache.path());
+    let first_chunk = open_chunk(cache, &gate)?;
+    walk_and_write(cache, source_id, root, ignore, &gate, first_chunk)
 }
 
 /// `source.rescan`'s forced full re-walk: clears this source's
@@ -501,9 +516,10 @@ pub fn rescan_source(
     root: &Path,
     ignore: &IgnoreRules,
 ) -> Result<ScanStats, ScanError> {
-    let first_tx = begin_immediate(cache)?;
+    let gate = writer_gate::for_path(cache.path());
+    let first_chunk = open_chunk(cache, &gate)?;
     cache.delete_units_for_source(source_id)?;
-    walk_and_write(cache, source_id, root, ignore, first_tx)
+    walk_and_write(cache, source_id, root, ignore, &gate, first_chunk)
 }
 
 /// Walks an existing directory that arrived as one changed path (a
@@ -643,6 +659,15 @@ fn apply_change_batch_once(
     // it. Dropped without `commit()` (e.g. via an early `?` return
     // below) rolls the whole batch back instead of leaving a partial
     // write.
+    //
+    // Acquired through the writer gate (R18), not held across
+    // `retry_on_busy`'s retries: this function's own `?` returns drop
+    // the permit immediately on any failure, before `retry_on_busy`
+    // sleeps and tries again, so a batch stuck retrying past a
+    // genuinely busy database never also blocks another source's
+    // unrelated writes for the whole retry window.
+    let gate = writer_gate::for_path(cache.path());
+    let permit = gate.acquire();
     let tx_guard = begin_immediate(cache)?;
 
     for abs_path in changed {
@@ -707,6 +732,7 @@ fn apply_change_batch_once(
     }
 
     tx_guard.commit()?;
+    drop(permit);
     Ok(ChangeOutcome {
         stats,
         changed_paths: touched_paths,
