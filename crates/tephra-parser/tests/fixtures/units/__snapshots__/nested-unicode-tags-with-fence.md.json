@@ -1,0 +1,24 @@
+{
+  "path": "tests/fixtures/units/nested-unicode-tags-with-fence.md",
+  "content_hash": "967ae0cce45c39b308e30c465041461ffee53f428cfe3df5d9f0d82c85f9a026",
+  "frontmatter": null,
+  "headings": [],
+  "wikilinks": [],
+  "markdown_links": [],
+  "tags": [
+    {
+      "tag": "parent/child/grandchild",
+      "line": 1
+    },
+    {
+      "tag": "emoji🎉tag",
+      "line": 1
+    },
+    {
+      "tag": "日本語タグ",
+      "line": 1
+    }
+  ],
+  "blocks": [],
+  "diagnostics": []
+}

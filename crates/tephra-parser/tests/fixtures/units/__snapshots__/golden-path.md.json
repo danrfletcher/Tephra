@@ -1,0 +1,52 @@
+{
+  "path": "tests/fixtures/units/golden-path.md",
+  "content_hash": "90088d8d545f31ee56fe6a0a0e0c6082f595e32ae83162d45fae4dfbae7fe9cd",
+  "frontmatter": {
+    "raw": "title: Golden Path Note\nstatus: active\n",
+    "json": "{\"status\":\"active\",\"title\":\"Golden Path Note\"}",
+    "start_line": 1,
+    "end_line": 4
+  },
+  "headings": [
+    {
+      "level": 1,
+      "text": "Overview",
+      "line": 6
+    },
+    {
+      "level": 2,
+      "text": "Details",
+      "line": 10
+    }
+  ],
+  "wikilinks": [
+    {
+      "source_prefix": "atlas-repo",
+      "target": "README",
+      "anchor": null,
+      "alias": "Atlas Repo README",
+      "raw": "@atlas-repo:README|Atlas Repo README",
+      "line": 8
+    }
+  ],
+  "markdown_links": [
+    {
+      "text": "project site",
+      "target": "https://example.com/project",
+      "line": 8
+    }
+  ],
+  "tags": [
+    {
+      "tag": "project/golden-path",
+      "line": 12
+    }
+  ],
+  "blocks": [
+    {
+      "block_id": "golden-block",
+      "line": 12
+    }
+  ],
+  "diagnostics": []
+}

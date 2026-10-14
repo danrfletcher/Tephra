@@ -1,0 +1,22 @@
+{
+  "path": "tests/fixtures/units/unterminated-frontmatter.md",
+  "content_hash": "6c807ca9be5d45713327bc2562457e696dee03ad780a25c4df21299e9d47e602",
+  "frontmatter": null,
+  "headings": [
+    {
+      "level": 1,
+      "text": "A heading anyway",
+      "line": 4
+    }
+  ],
+  "wikilinks": [],
+  "markdown_links": [],
+  "tags": [
+    {
+      "tag": "stillparsed",
+      "line": 6
+    }
+  ],
+  "blocks": [],
+  "diagnostics": []
+}

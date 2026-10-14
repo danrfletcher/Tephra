@@ -1,0 +1,27 @@
+{
+  "path": "tests/fixtures/units/empty-links.md",
+  "content_hash": "f342cafbf9c4c02457d36046cee92a9b5d6d5860c2772121fddaa7b3637fd88b",
+  "frontmatter": null,
+  "headings": [],
+  "wikilinks": [],
+  "markdown_links": [],
+  "tags": [],
+  "blocks": [],
+  "diagnostics": [
+    {
+      "kind": "empty_markdown_link",
+      "line": 1,
+      "message": "markdown link has no destination"
+    },
+    {
+      "kind": "empty_wikilink",
+      "line": 1,
+      "message": "empty wikilink [[]]"
+    },
+    {
+      "kind": "unterminated_wikilink",
+      "line": 1,
+      "message": "unterminated wikilink: no closing ]] before end of line"
+    }
+  ]
+}

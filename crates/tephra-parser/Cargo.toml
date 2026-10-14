@@ -1,0 +1,15 @@
+[package]
+name = "tephra-parser"
+version = "0.1.0"
+edition = "2021"
+description = "Pure, synchronous Markdown AST parser: frontmatter, headings, wikilinks, markdown links, tags, and block anchors"
+
+[dependencies]
+pulldown-cmark = { version = "0.13", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+tephra-cache = { path = "../tephra-cache" }
+
+[dev-dependencies]
