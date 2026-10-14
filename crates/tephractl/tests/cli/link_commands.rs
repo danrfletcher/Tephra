@@ -13,7 +13,7 @@ use tephractl::cli::Command;
 use tephractl::commands;
 use tephractl::transport::RpcClient;
 
-use crate::support::{load_expected, load_fixture, Behavior, MockServer};
+use crate::support::{err_envelope, load_expected, load_fixture, Behavior, MockServer};
 
 fn client_for(server: &MockServer) -> RpcClient {
     RpcClient::new(server.addr.clone(), "test-token".to_string())
@@ -597,6 +597,85 @@ fn link_refactor_apply_aborted_result_renders_exactly_and_exits_nonzero() {
         load_expected("refactor_apply_aborted_rendered")
     );
     assert_eq!(outcome.stdout, "");
+}
+
+/// T5/T6: the real `tephrad` built on this branch's base (PR-6) does
+/// not implement `link.preview_refactor`/`link.apply_refactor` yet —
+/// that dispatch entry lands in PR-8 (see `dispatch.rs`'s
+/// `METHOD_NAMES`, which has no `link.*` entries; `other => Err((
+/// METHOD_NOT_FOUND, format!("unknown method \"{other}\""), None))`
+/// is what every refactor call hits today). Reproduced live against
+/// a real container daemon: `tephractl link refactor --source notes
+/// --old OldDoc.md --new NewDoc.md` prints exactly `tephractl:
+/// unknown method "link.preview_refactor"` and exits 1 — this test
+/// locks in that `tephractl`'s side of that interaction is correct
+/// (a clean, non-panicking, exit-1 error with the daemon's verbatim
+/// message, not a stack trace or a false success) so the only thing
+/// still blocking the container screenshot for C32/C33 is PR-8
+/// landing the server-side method, not any bug in this crate.
+#[test]
+fn link_refactor_preview_reports_unknown_method_cleanly_when_daemon_lacks_the_rpc() {
+    let server = MockServer::start(vec![Behavior::Respond {
+        status: 200,
+        body: err_envelope(-32601, "unknown method \"link.preview_refactor\"", None),
+    }]);
+    let client = client_for(&server);
+
+    let mut stdin: &[u8] = &[];
+    let outcome = commands::execute(
+        &Command::LinkRefactor {
+            source: "notes".to_string(),
+            old_path: "OldDoc.md".to_string(),
+            new_path: "NewDoc.md".to_string(),
+            apply: false,
+            yes: false,
+        },
+        false,
+        &client,
+        &mut stdin,
+    );
+
+    assert_eq!(outcome.exit_code, 1);
+    assert_eq!(
+        outcome.stderr,
+        "tephractl: unknown method \"link.preview_refactor\"\n"
+    );
+    assert_eq!(outcome.stdout, "");
+}
+
+/// Same as above, for `--apply --yes` hitting `link.apply_refactor`
+/// on a daemon that doesn't implement it yet (T5/T6): a clean exit-1
+/// error, never a false "applied" success and never a panic.
+#[test]
+fn link_refactor_apply_with_yes_reports_unknown_method_cleanly_when_daemon_lacks_the_rpc() {
+    let server = MockServer::start(vec![Behavior::Respond {
+        status: 200,
+        body: err_envelope(-32601, "unknown method \"link.apply_refactor\"", None),
+    }]);
+    let client = client_for(&server);
+
+    let mut stdin: &[u8] = &[];
+    let outcome = commands::execute(
+        &Command::LinkRefactor {
+            source: "notes".to_string(),
+            old_path: "OldDoc.md".to_string(),
+            new_path: "NewDoc.md".to_string(),
+            apply: true,
+            yes: true,
+        },
+        false,
+        &client,
+        &mut stdin,
+    );
+
+    assert_eq!(outcome.exit_code, 1);
+    assert_eq!(
+        outcome.stderr,
+        "tephractl: unknown method \"link.apply_refactor\"\n"
+    );
+    assert_eq!(outcome.stdout, "");
+    assert_eq!(server.received().len(), 1, "--yes issues exactly one RPC");
+    assert_eq!(server.received()[0].body["method"], "link.apply_refactor");
 }
 
 #[test]
