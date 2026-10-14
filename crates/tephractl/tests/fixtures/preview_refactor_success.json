@@ -1,0 +1,13 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "source": "notes",
+    "old_path": "OldDoc.md",
+    "new_path": "NewDoc.md",
+    "changes": [
+      { "file": "@notes:Journal.md", "line": 12, "before": "[[OldDoc]]", "after": "[[NewDoc]]" },
+      { "file": "@notes:Index.md", "line": 3, "before": "[[OldDoc|Old Doc]]", "after": "[[NewDoc|Old Doc]]" }
+    ]
+  }
+}

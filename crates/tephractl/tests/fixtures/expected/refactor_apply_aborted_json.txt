@@ -1,0 +1,4 @@
+{
+  "reason": "file modified since preview: @notes:Journal.md",
+  "status": "aborted"
+}

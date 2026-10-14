@@ -1,0 +1,2 @@
+Registered source "notes" at /home/dan/Notes
+  files seen: 42, files ignored: 3, units written: 39, links written: 12

@@ -1,0 +1,16 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "unit": {
+      "id": "@notes:Café Notes.md",
+      "source": "notes",
+      "rel_path": "Café Notes.md",
+      "frontmatter_json": null,
+      "tags": [],
+      "blocks": [],
+      "offline": false
+    },
+    "edges": []
+  }
+}

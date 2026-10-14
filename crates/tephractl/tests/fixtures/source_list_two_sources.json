@@ -1,0 +1,8 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": [
+    { "name": "notes", "path": "/home/dan/Notes", "status": "active", "last_scanned_at": 1700000000 },
+    { "name": "old-vault", "path": "/home/dan/Old", "status": "offline", "last_scanned_at": 1690000000 }
+  ]
+}

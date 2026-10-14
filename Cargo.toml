@@ -5,4 +5,5 @@ members = [
     "crates/tephra-cache",
     "crates/tephra-parser",
     "crates/tephra-graph",
+    "crates/tephractl",
 ]

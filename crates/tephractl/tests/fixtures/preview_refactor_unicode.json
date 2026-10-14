@@ -1,0 +1,12 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "source": "notes",
+    "old_path": "Café Notes.md",
+    "new_path": "Café Notes Renamed.md",
+    "changes": [
+      { "file": "@notes:Journal.md", "line": 7, "before": "[[Café Notes]]", "after": "[[Café Notes Renamed]]" }
+    ]
+  }
+}

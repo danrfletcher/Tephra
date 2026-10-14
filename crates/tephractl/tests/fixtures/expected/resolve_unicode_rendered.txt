@@ -1,0 +1,7 @@
+Resolving from source: (none — the link was already fully-qualified)
+Target source:         notes
+Resolved unit: @notes:Café Notes.md
+  path: Café Notes.md
+  tags: (none)
+  offline: no
+Outgoing edges (0):

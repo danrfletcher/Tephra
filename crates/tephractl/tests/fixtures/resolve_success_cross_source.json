@@ -1,0 +1,24 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "unit": {
+      "id": "@atlas-repo:README.md",
+      "source": "atlas-repo",
+      "rel_path": "README.md",
+      "frontmatter_json": null,
+      "tags": ["project"],
+      "blocks": [],
+      "offline": false
+    },
+    "edges": [
+      {
+        "from": "@atlas-repo:README.md",
+        "to": { "resolved": "@atlas-repo:docs/Setup.md" },
+        "to_raw": "[[Setup]]",
+        "kind": "wikilink",
+        "offline": false
+      }
+    ]
+  }
+}

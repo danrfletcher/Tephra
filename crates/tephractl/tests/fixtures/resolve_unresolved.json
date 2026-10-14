@@ -1,0 +1,12 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "error": {
+    "code": -32010,
+    "message": "no unit in source \"vault\" matches \"missing\"",
+    "data": {
+      "error": "unresolved",
+      "data": { "source": "vault", "target": "missing" }
+    }
+  }
+}

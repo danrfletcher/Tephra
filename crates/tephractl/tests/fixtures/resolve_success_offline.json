@@ -1,0 +1,24 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "unit": {
+      "id": "@old-vault:Notes.md",
+      "source": "old-vault",
+      "rel_path": "Notes.md",
+      "frontmatter_json": null,
+      "tags": [],
+      "blocks": [],
+      "offline": true
+    },
+    "edges": [
+      {
+        "from": "@old-vault:Notes.md",
+        "to": { "resolved": "@old-vault:Other.md" },
+        "to_raw": "[[Other]]",
+        "kind": "wikilink",
+        "offline": true
+      }
+    ]
+  }
+}

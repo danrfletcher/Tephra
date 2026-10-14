@@ -1,0 +1,17 @@
+{
+  "error": {
+    "code": -32010,
+    "data": {
+      "data": {
+        "candidates": [
+          "@vault:lib/guide.md",
+          "@vault:api/guide.md"
+        ],
+        "source": "vault",
+        "target": "guide"
+      },
+      "error": "ambiguous"
+    },
+    "message": "\"guide\" is ambiguous in source \"vault\": tied candidates [\"@vault:lib/guide.md\", \"@vault:api/guide.md\"]"
+  }
+}

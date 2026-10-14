@@ -1,0 +1,8 @@
+{
+  "blocks_written": 8,
+  "files_ignored": 3,
+  "files_seen": 42,
+  "links_written": 12,
+  "tags_written": 5,
+  "units_written": 39
+}
