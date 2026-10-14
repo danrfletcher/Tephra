@@ -957,6 +957,211 @@ fn a_self_edge_reached_via_two_raw_links_still_lets_one_of_them_independently_re
     );
 }
 
+/// R19 (probe case E): a single batched notification that deletes
+/// the only unit authoring an edge, while also adding the edge's
+/// *target*, must not resurrect a stale copy of the deleted unit's
+/// old edge just because the target happens to be listed first in
+/// `rel_paths`. Before the fix, `recompute_scoped` only added a
+/// touched id's own forward_index slots to `superseded` when the
+/// loop reached *that* id — so handling Y.md's match_index hit before
+/// reaching X.md re-resolved and re-queued X's old `[[Y]]` edge, with
+/// no node left to anchor it and no match key to ever let a later
+/// change remove it.
+#[test]
+fn a_batch_deleting_an_edges_author_while_adding_its_target_first_matches_a_fresh_rebuild() {
+    let cache_dir = tempdir().expect("cache tempdir");
+    let source_dir = tempdir().expect("source tempdir");
+    let cache = open_temp_cache(&cache_dir);
+    let source_id = cache
+        .register_source(
+            "notes",
+            &source_dir.path().to_string_lossy(),
+            tephra_cache::SourceStatus::Active,
+        )
+        .expect("register_source");
+
+    write_and_cache(&cache, source_id, source_dir.path(), "X.md", "See [[Y]].\n");
+
+    let mut graph = UnitGraph::build_from_cache(&cache).expect("initial build");
+    assert_eq!(
+        graph.get_forward_links("@notes:X.md")[0].to,
+        EdgeTarget::Dangling,
+        "Y.md doesn't exist yet"
+    );
+
+    // X.md is deleted; Y.md is created in the same batch. The
+    // notification lists the newly-created target, Y.md, *before*
+    // the deleted author, X.md.
+    let existing = cache
+        .get_unit_by_rel_path(source_id, "X.md")
+        .expect("get_unit_by_rel_path")
+        .expect("X.md exists before delete");
+    cache.delete_unit(existing.id).expect("delete_unit");
+    std::fs::remove_file(source_dir.path().join("X.md")).expect("remove file");
+    write_and_cache(&cache, source_id, source_dir.path(), "Y.md", "# Y\n");
+
+    graph
+        .apply_change_notification(
+            &cache,
+            &ChangeNotification {
+                source: "notes".to_string(),
+                rel_paths: vec!["Y.md".to_string(), "X.md".to_string()],
+            },
+        )
+        .expect("apply_change_notification");
+
+    assert!(
+        graph.unit("@notes:X.md").is_none(),
+        "X.md's node must be gone"
+    );
+    assert!(
+        graph.get_forward_links("@notes:X.md").is_empty(),
+        "R19: no edge from the deleted X.md must survive, even though Y.md (its old \
+         target) was listed first in the batch: {:?}",
+        graph.get_forward_links("@notes:X.md")
+    );
+
+    let fresh = UnitGraph::build_from_cache(&cache).expect("fresh rebuild");
+    assert_eq!(
+        graph.get_edges(),
+        fresh.get_edges(),
+        "R19: incremental update must agree with a full rebuild from the same cache state"
+    );
+}
+
+/// R19 (probe case F): editing a unit's own link away from an
+/// existing target, in the same batch that also touches that old
+/// target, must not leave the stale old-target edge alongside the
+/// fresh one — `get_forward_links` must reflect only the unit's
+/// *current* content.
+#[test]
+fn a_batch_editing_a_link_away_while_touching_its_old_target_first_matches_a_fresh_rebuild() {
+    let cache_dir = tempdir().expect("cache tempdir");
+    let source_dir = tempdir().expect("source tempdir");
+    let cache = open_temp_cache(&cache_dir);
+    let source_id = cache
+        .register_source(
+            "notes",
+            &source_dir.path().to_string_lossy(),
+            tephra_cache::SourceStatus::Active,
+        )
+        .expect("register_source");
+
+    write_and_cache(&cache, source_id, source_dir.path(), "A.md", "See [[B]].\n");
+    write_and_cache(&cache, source_id, source_dir.path(), "B.md", "# B\n");
+
+    let mut graph = UnitGraph::build_from_cache(&cache).expect("initial build");
+    assert_eq!(
+        graph.get_forward_links("@notes:A.md")[0].to,
+        EdgeTarget::Resolved("@notes:B.md".to_string())
+    );
+
+    // A.md is edited to link to a brand-new C.md instead of B.md;
+    // B.md (the old target, unchanged content) is also touched in
+    // the same batch, listed *before* A.md.
+    write_and_cache(&cache, source_id, source_dir.path(), "A.md", "See [[C]].\n");
+    write_and_cache(&cache, source_id, source_dir.path(), "C.md", "# C\n");
+
+    graph
+        .apply_change_notification(
+            &cache,
+            &ChangeNotification {
+                source: "notes".to_string(),
+                rel_paths: vec!["B.md".to_string(), "A.md".to_string(), "C.md".to_string()],
+            },
+        )
+        .expect("apply_change_notification");
+
+    let forward = graph.get_forward_links("@notes:A.md");
+    assert_eq!(
+        forward.len(),
+        1,
+        "R19: A.md's old [[B]] link must not survive alongside the new [[C]] link: \
+         {forward:?}"
+    );
+    assert_eq!(
+        forward[0].to,
+        EdgeTarget::Resolved("@notes:C.md".to_string())
+    );
+
+    let fresh = UnitGraph::build_from_cache(&cache).expect("fresh rebuild");
+    assert_eq!(
+        graph.get_edges(),
+        fresh.get_edges(),
+        "R19: incremental update must agree with a full rebuild from the same cache state"
+    );
+}
+
+/// R19: the same editing-away scenario as above, but exercised across
+/// every ordering of the three touched paths in one batch — the
+/// result must be independent of `rel_paths`' order, matching a
+/// fresh rebuild every time.
+#[test]
+fn a_three_path_batch_matches_a_fresh_rebuild_regardless_of_path_order() {
+    fn permutations_of_3(items: [String; 3]) -> Vec<Vec<String>> {
+        let [a, b, c] = items;
+        vec![
+            vec![a.clone(), b.clone(), c.clone()],
+            vec![a.clone(), c.clone(), b.clone()],
+            vec![b.clone(), a.clone(), c.clone()],
+            vec![b.clone(), c.clone(), a.clone()],
+            vec![c.clone(), a.clone(), b.clone()],
+            vec![c, a, b].into_iter().rev().collect(),
+        ]
+    }
+
+    for order in permutations_of_3(["A.md".to_string(), "B.md".to_string(), "C.md".to_string()]) {
+        let cache_dir = tempdir().expect("cache tempdir");
+        let source_dir = tempdir().expect("source tempdir");
+        let cache = open_temp_cache(&cache_dir);
+        let source_id = cache
+            .register_source(
+                "notes",
+                &source_dir.path().to_string_lossy(),
+                tephra_cache::SourceStatus::Active,
+            )
+            .expect("register_source");
+
+        write_and_cache(&cache, source_id, source_dir.path(), "A.md", "See [[B]].\n");
+        write_and_cache(&cache, source_id, source_dir.path(), "B.md", "# B\n");
+
+        let mut graph = UnitGraph::build_from_cache(&cache).expect("initial build");
+
+        write_and_cache(&cache, source_id, source_dir.path(), "A.md", "See [[C]].\n");
+        write_and_cache(&cache, source_id, source_dir.path(), "C.md", "# C\n");
+
+        graph
+            .apply_change_notification(
+                &cache,
+                &ChangeNotification {
+                    source: "notes".to_string(),
+                    rel_paths: order.clone(),
+                },
+            )
+            .expect("apply_change_notification");
+
+        let forward = graph.get_forward_links("@notes:A.md");
+        assert_eq!(
+            forward.len(),
+            1,
+            "order {order:?}: A.md's old [[B]] link must not survive: {forward:?}"
+        );
+        assert_eq!(
+            forward[0].to,
+            EdgeTarget::Resolved("@notes:C.md".to_string()),
+            "order {order:?}"
+        );
+
+        let fresh = UnitGraph::build_from_cache(&cache).expect("fresh rebuild");
+        assert_eq!(
+            graph.get_edges(),
+            fresh.get_edges(),
+            "order {order:?}: incremental update must agree with a full rebuild \
+             from the same cache state"
+        );
+    }
+}
+
 /// R18 (probe case C): a federated wikilink to a source that is not
 /// yet registered must still be re-resolved once that source is
 /// registered and populated through `apply_change_notification` —

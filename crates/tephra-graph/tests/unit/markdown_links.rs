@@ -192,3 +192,133 @@ fn a_markdown_link_with_a_heading_anchor_resolves_by_its_target_alone() {
         EdgeTarget::Resolved("@notes:B.md".to_string())
     );
 }
+
+/// R20: a same-file anchor-only markdown link (`[x](#heading)`) from
+/// a root-level file names no other file at all — it must resolve to
+/// the referring unit itself, exactly like a wikilink's empty-target
+/// self-reference (`[[#Heading]]`), not dangle just because `""` (the
+/// anchor stripped away) doesn't match anything in `stem_index`.
+#[test]
+fn a_markdown_anchor_only_link_from_a_root_level_file_is_a_self_reference() {
+    let mut graph = UnitGraph::new();
+    graph.upsert_unit(
+        "notes",
+        "Root.md",
+        UnitFacts {
+            links: vec![(
+                "#heading".to_string(),
+                tephra_parser::LINK_KIND_MARKDOWN.to_string(),
+            )],
+            ..Default::default()
+        },
+    );
+
+    let forward = graph.get_forward_links("@notes:Root.md");
+    assert_eq!(forward.len(), 1, "{forward:?}");
+    assert_eq!(
+        forward[0].to,
+        EdgeTarget::Resolved("@notes:Root.md".to_string()),
+        "R20: an anchor-only markdown link must be a self-edge, not dangling"
+    );
+}
+
+/// R20: the same self-reference case from a file inside a
+/// subdirectory. Before the fix, stripping `#heading` left the empty
+/// string, which `join_relative` then joined onto the linking file's
+/// own directory (`sub`) to produce the bogus key `"sub"` — resolving
+/// to an unrelated `sub.md` file rather than staying a self-edge.
+/// This test seeds exactly that unrelated file to prove the fix
+/// doesn't silently resolve to it.
+#[test]
+fn a_markdown_anchor_only_link_from_a_subdirectory_file_is_a_self_reference_not_the_parent_named_file(
+) {
+    let mut graph = UnitGraph::new();
+    graph.upsert_unit(
+        "notes",
+        "sub/A.md",
+        UnitFacts {
+            links: vec![(
+                "#heading".to_string(),
+                tephra_parser::LINK_KIND_MARKDOWN.to_string(),
+            )],
+            ..Default::default()
+        },
+    );
+    // The unrelated file the pre-fix bug would have resolved to.
+    graph.upsert_unit("notes", "sub.md", empty_facts());
+
+    let forward = graph.get_forward_links("@notes:sub/A.md");
+    assert_eq!(forward.len(), 1, "{forward:?}");
+    assert_eq!(
+        forward[0].to,
+        EdgeTarget::Resolved("@notes:sub/A.md".to_string()),
+        "R20: an anchor-only markdown link must stay a self-edge regardless of the \
+         linking file's own directory depth, never resolve to an unrelated file \
+         named after that directory"
+    );
+}
+
+/// R21: a relative markdown link from a root-level file must look up
+/// its exact target path (`stem_index`), never fall back to
+/// `basename_index` the way a bare wikilink does — so a link to a
+/// path that doesn't exist at the source root dangles, even when a
+/// same-named file exists somewhere else in the source.
+#[test]
+fn a_root_level_markdown_link_to_a_nonexistent_root_file_dangles_even_when_a_same_named_file_exists_elsewhere(
+) {
+    let mut graph = UnitGraph::new();
+    graph.upsert_unit(
+        "notes",
+        "N.md",
+        UnitFacts {
+            links: vec![(
+                "Shared.md".to_string(),
+                tephra_parser::LINK_KIND_MARKDOWN.to_string(),
+            )],
+            ..Default::default()
+        },
+    );
+    // Only a nested Shared.md exists; no file named Shared.md exists
+    // at the source root.
+    graph.upsert_unit("notes", "teamA/Shared.md", empty_facts());
+
+    let forward = graph.get_forward_links("@notes:N.md");
+    assert_eq!(forward.len(), 1, "{forward:?}");
+    assert_eq!(
+        forward[0].to,
+        EdgeTarget::Dangling,
+        "R21: a root-level markdown link to a path that doesn't exist must dangle, \
+         not silently resolve to an unrelated same-named file elsewhere in the source"
+    );
+}
+
+/// R21: the same rule for a `../`-relative link that climbs back to
+/// the source root — it must also look up the exact joined path, not
+/// fall back to a basename match, even though the joined path (with
+/// no `/` in it) looks identical to a root-level link's key.
+#[test]
+fn a_dot_dot_relative_markdown_link_to_a_nonexistent_root_file_dangles_even_when_a_same_named_file_exists_elsewhere(
+) {
+    let mut graph = UnitGraph::new();
+    graph.upsert_unit(
+        "notes",
+        "sub/K.md",
+        UnitFacts {
+            links: vec![(
+                "../Shared.md".to_string(),
+                tephra_parser::LINK_KIND_MARKDOWN.to_string(),
+            )],
+            ..Default::default()
+        },
+    );
+    graph.upsert_unit("notes", "teamA/Shared.md", empty_facts());
+
+    let forward = graph.get_forward_links("@notes:sub/K.md");
+    assert_eq!(forward.len(), 1, "{forward:?}");
+    assert_eq!(
+        forward[0].to,
+        EdgeTarget::Dangling,
+        "R21: a ../-relative markdown link to a path that doesn't exist must dangle, \
+         not silently resolve to an unrelated same-named file elsewhere in the source"
+    );
+}
