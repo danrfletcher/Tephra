@@ -95,6 +95,50 @@ const CREATE_BLOCKS: &str = "\
         line INTEGER NOT NULL \
     )";
 
+/// Indexes backing the per-unit cascading deletes in `units.rs`
+/// (`delete_unit`, `delete_units_for_source`,
+/// `delete_units_under_prefix`), each of which walks `links` by both
+/// `from_unit_id` and `to_unit_id`, `tags` by `unit_id`, and `blocks`
+/// by `unit_id` (R17 review finding). Without these, every one of
+/// those lookups was a full table scan: deleting a changed file's
+/// stale row (PR-4's debounced watcher path, run once per edited
+/// file) cost O(the *entire* cache's links/tags/blocks row count),
+/// not O(that one file's own rows) — the review's probe measured 100
+/// modified files at 0.86s and 1000 at 8.2s against a 100k-file
+/// source, long enough to hold SQLite's single writer lock past the
+/// 5-second `busy_timeout` for an ordinary `git checkout`-sized burst
+/// (E5), stalling every other source's watcher and the registry's own
+/// `list`/`register`/`rescan` calls.
+///
+/// `IF NOT EXISTS`: created both by [`create_core_tables`] (right
+/// after a schema-version rebuild's drop+recreate, since `DROP TABLE`
+/// also drops its indexes) and by [`create_core_tables_if_not_exists`]
+/// (so an already-up-to-date database gets these indexes backfilled
+/// the next time it's opened, with no schema-version bump and no
+/// separate migration script — consistent with F2's "no incremental
+/// migration logic" fence: this is the same idempotent `IF NOT
+/// EXISTS` DDL pattern already used for the core tables themselves on
+/// that same code path).
+const CREATE_IDX_LINKS_FROM_UNIT_ID: &str =
+    "CREATE INDEX IF NOT EXISTS idx_links_from_unit_id ON links(from_unit_id)";
+const CREATE_IDX_LINKS_TO_UNIT_ID: &str =
+    "CREATE INDEX IF NOT EXISTS idx_links_to_unit_id ON links(to_unit_id)";
+const CREATE_IDX_TAGS_UNIT_ID: &str =
+    "CREATE INDEX IF NOT EXISTS idx_tags_unit_id ON tags(unit_id)";
+const CREATE_IDX_BLOCKS_UNIT_ID: &str =
+    "CREATE INDEX IF NOT EXISTS idx_blocks_unit_id ON blocks(unit_id)";
+
+/// Creates (or confirms, if already present) every index in this
+/// module. Idempotent: safe to call on every open, whether or not the
+/// tables were just freshly created.
+pub(crate) fn create_core_indexes(conn: &Connection) -> Result<(), CacheError> {
+    conn.execute(CREATE_IDX_LINKS_FROM_UNIT_ID, [])?;
+    conn.execute(CREATE_IDX_LINKS_TO_UNIT_ID, [])?;
+    conn.execute(CREATE_IDX_TAGS_UNIT_ID, [])?;
+    conn.execute(CREATE_IDX_BLOCKS_UNIT_ID, [])?;
+    Ok(())
+}
+
 /// Creates `sources` and `schema_version` if absent. Idempotent and
 /// safe to call on every open: never drops or truncates either table.
 pub(crate) fn create_bootstrap_tables(conn: &Connection) -> Result<(), CacheError> {
@@ -111,6 +155,7 @@ pub(crate) fn create_core_tables_if_not_exists(conn: &Connection) -> Result<(), 
     for create in core_table_ddls_if_not_exists() {
         conn.execute(&create, [])?;
     }
+    create_core_indexes(conn)?;
     Ok(())
 }
 
@@ -142,6 +187,7 @@ pub(crate) fn create_core_tables(conn: &Connection) -> Result<(), CacheError> {
     conn.execute(CREATE_LINKS, [])?;
     conn.execute(CREATE_TAGS, [])?;
     conn.execute(CREATE_BLOCKS, [])?;
+    create_core_indexes(conn)?;
     Ok(())
 }
 
