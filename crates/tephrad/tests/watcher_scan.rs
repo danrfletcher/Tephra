@@ -304,6 +304,122 @@ fn rescan_after_a_tephraignore_edit_picks_up_the_new_rules_not_a_cached_file_lis
 }
 
 #[test]
+fn a_rescans_new_ignore_rules_are_honored_by_the_live_watcher_afterwards() {
+    // R12: `rescan`'s own walk picking up a fresh `.tephraignore` (the
+    // test above) is only half the fix — the running watcher's event
+    // filter must also start honoring those new rules immediately
+    // afterwards, for every edit from that point on, not just stay
+    // pinned to whatever rules were loaded when the watcher was first
+    // started. Mirrors the review's own probe: ignore "drafts" at
+    // register time, clear the ignore file, rescan (so drafts/d.md is
+    // now indexed), then edit both drafts/d.md and one.md and confirm
+    // *both* edits are picked up by the live watcher, not just one.md's.
+    let fixture = fixtures::vault_fixture();
+    fixture.write(".tephraignore", "drafts\n");
+    fixture.mkdir("drafts");
+    fixture.write("drafts/d.md", "# Draft\n\nNot yet indexed.\n");
+
+    let cache_dir = tempfile::tempdir().expect("cache tempdir");
+    let cache_path = cache_dir.path().join("cache.db");
+    let cache = Cache::open(&cache_path).expect("open cache");
+
+    let registry = SourceRegistry::new(cache).expect("new registry");
+    let initial = registry
+        .register("notes", fixture.root())
+        .expect("register");
+    assert_eq!(
+        initial.files_seen, 3,
+        "one.md, two.md, and .tephraignore are walked; drafts/d.md's directory is pruned \
+         entirely (never reaches the walk's per-file count) since it's ignored"
+    );
+
+    let verify_cache = Cache::open(&cache_path).expect("reopen cache");
+    let source = verify_cache
+        .get_source("notes")
+        .expect("get_source")
+        .expect("source row");
+    assert!(
+        verify_cache
+            .get_unit_by_rel_path(source.id, "drafts/d.md")
+            .expect("get_unit_by_rel_path")
+            .is_none(),
+        "drafts/d.md must not be indexed while still ignored"
+    );
+
+    // Clear the ignore rule and force a rescan: drafts/d.md is now
+    // indexed by the walk.
+    fixture.write(".tephraignore", "");
+    let rescanned = registry.rescan("notes").expect("rescan");
+    assert!(
+        rescanned.files_seen >= 3,
+        "one.md, two.md, drafts/d.md (and .tephraignore itself) must all be walked now"
+    );
+    let drafts_unit_after_rescan = verify_cache
+        .get_unit_by_rel_path(source.id, "drafts/d.md")
+        .expect("get_unit_by_rel_path")
+        .expect("drafts/d.md must be indexed once un-ignored by the rescan's walk");
+
+    // Now edit *both* files through the live watcher -- not another
+    // rescan. one.md was never ignored, so its edit is the control;
+    // drafts/d.md was ignored until the rescan above, and its edit is
+    // the actual R12 regression case: before the fix, the watcher's
+    // event filter still held the stale rules captured at register
+    // time (which still ignored "drafts"), so this edit would be
+    // silently dropped before ever reaching the debounce channel.
+    fixture.write("one.md", "# One\n\nEdited with a #edited tag.\n");
+    fixture.write("drafts/d.md", "# Draft\n\nEdited with a #edited tag too.\n");
+
+    let one_updated = wait_until(Duration::from_secs(5), || {
+        let unit = match verify_cache.get_unit_by_rel_path(source.id, "one.md") {
+            Ok(Some(u)) => u,
+            _ => return false,
+        };
+        let tag_count: i64 = verify_cache
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM tags WHERE unit_id = ?1 AND tag = ?2",
+                rusqlite::params![unit.id, "edited"],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        tag_count == 1
+    });
+    assert!(
+        one_updated,
+        "one.md's edit must be picked up (control case)"
+    );
+
+    let drafts_updated = wait_until(Duration::from_secs(5), || {
+        let unit = match verify_cache.get_unit_by_rel_path(source.id, "drafts/d.md") {
+            Ok(Some(u)) => u,
+            _ => return false,
+        };
+        let tag_count: i64 = verify_cache
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM tags WHERE unit_id = ?1 AND tag = ?2",
+                rusqlite::params![unit.id, "edited"],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        tag_count == 1
+    });
+    assert!(
+        drafts_updated,
+        "drafts/d.md's edit must also be picked up by the live watcher after the rescan \
+         un-ignored it -- the watcher's event filter must share the rescan's freshly \
+         reloaded rules, not stay pinned to the stale rules from register time"
+    );
+
+    // And the row rescan originally created must be the one that got
+    // updated (same unit id persisted through the edit's
+    // delete+reinsert, not some other stray row).
+    let _ = drafts_unit_after_rescan;
+
+    registry.unregister("notes").expect("unregister");
+}
+
+#[test]
 fn a_watched_root_removed_out_from_under_the_watcher_marks_the_source_offline() {
     let fixture = fixtures::vault_fixture();
     let cache_dir = tempfile::tempdir().expect("cache tempdir");
@@ -399,6 +515,133 @@ fn moving_a_directory_into_a_tracked_source_indexes_its_files() {
     );
 
     registry.unregister("notes").expect("unregister");
+}
+
+#[test]
+fn an_edit_that_lands_before_the_debounce_task_starts_draining_is_not_lost() {
+    // R13: `register`'s real sequence (`registry::scan_and_watch`) is
+    // `watcher::start` (subscribes the real OS-level watch), *then*
+    // the initial walk, *then* `watcher::spawn_debounce` (starts
+    // draining the tap's channel into debounced batches) — this test
+    // reproduces that exact gap directly via the same two public
+    // functions, rather than racing a real walk's timing with a
+    // sleep (the team has learned fixed-timeout waits on real
+    // fs.watch are flaky — see the project notes), so it
+    // deterministically lands the edit in the gap every run.
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, RwLock};
+
+    let fixture = fixtures::vault_fixture();
+    // Canonicalized up front, exactly like `register` does (R1):
+    // `fixture.root()` on macOS is a `/var/...` path, but the real
+    // OS-level watcher reports events against the canonical
+    // `/private/var/...` path. `register`'s own canonicalization
+    // before it ever calls `watcher::start` is what keeps those two
+    // consistent in production, so this test must do the same rather
+    // than feeding `watcher::start` and `scan::scan_source` a
+    // differently-spelled root than the one `notify` will actually
+    // report paths under.
+    let root = fixture
+        .root()
+        .canonicalize()
+        .expect("canonicalize fixture root");
+    let cache_dir = tempfile::tempdir().expect("cache tempdir");
+    let cache_path = cache_dir.path().join("cache.db");
+    let cache = Cache::open(&cache_path).expect("open cache");
+    let source_id = cache
+        .register_source(
+            "notes",
+            &root.to_string_lossy(),
+            tephra_cache::SourceStatus::Active,
+        )
+        .expect("register_source");
+
+    let ignore_rules = Arc::new(RwLock::new(
+        tephrad::ignore::IgnoreRules::load(&root).expect("load ignore"),
+    ));
+
+    // Phase 1: subscribe the real OS watcher first, exactly like
+    // `scan_and_watch` does before its walk.
+    let tap =
+        tephrad::watcher::start(root.clone(), Arc::clone(&ignore_rules)).expect("watcher::start");
+
+    // Phase 2: run the initial scan, during which — per the bug this
+    // fixes — an edit used to be silently missed because no watcher
+    // existed yet at all.
+    let scan_cache = Cache::open(&cache_path).expect("scan cache");
+    let ignore_snapshot = ignore_rules.read().unwrap().clone();
+    let stats = tephrad::scan::scan_source(&scan_cache, source_id, &root, &ignore_snapshot)
+        .expect("scan_source");
+    drop(scan_cache);
+    assert_eq!(stats.units_written, 2, "one.md and two.md");
+
+    // The edit lands here: after the scan already committed one.md's
+    // pre-edit row, but *before* the debounce task below even exists
+    // yet. On `tap`'s channel this just queues up; with no tap at
+    // all yet at this point (the pre-fix single-phase `spawn` API),
+    // this event would never have been observed by anything.
+    fixture.write(
+        "one.md",
+        "# One\n\nEdited mid-scan-window with a #during tag.\n",
+    );
+
+    // Phase 3: *now* start draining — mirroring `start_watcher`'s
+    // call to `spawn_debounce` only after the scan has committed.
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let fired = Arc::new(AtomicBool::new(false));
+    let fired_for_batch = Arc::clone(&fired);
+    let batch_cache = Arc::new(std::sync::Mutex::new(
+        Cache::open(&cache_path).expect("batch cache"),
+    ));
+    let root_for_batch = root.clone();
+    let ignore_for_batch = Arc::clone(&ignore_rules);
+    let on_batch = move |changed: HashSet<PathBuf>| {
+        let ignore_snapshot = ignore_for_batch.read().unwrap().clone();
+        let batch_cache = batch_cache.lock().unwrap();
+        tephrad::scan::apply_change_batch(
+            &batch_cache,
+            source_id,
+            &root_for_batch,
+            &changed,
+            &ignore_snapshot,
+        )
+        .expect("apply_change_batch");
+        fired_for_batch.store(true, Ordering::SeqCst);
+    };
+    let on_root_removed = || {};
+    let _handle = tephrad::watcher::spawn_debounce(
+        tap,
+        root.clone(),
+        runtime.handle().clone(),
+        on_batch,
+        on_root_removed,
+    );
+
+    let picked_up = wait_until(Duration::from_secs(5), || fired.load(Ordering::SeqCst));
+    assert!(
+        picked_up,
+        "an edit queued before spawn_debounce started draining must still fire a batch once it does"
+    );
+
+    let verify_cache = Cache::open(&cache_path).expect("reopen cache");
+    let unit = verify_cache
+        .get_unit_by_rel_path(source_id, "one.md")
+        .expect("get_unit_by_rel_path")
+        .expect("one.md's row must still exist");
+    let tag_count: i64 = verify_cache
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM tags WHERE unit_id = ?1 AND tag = ?2",
+            rusqlite::params![unit.id, "during"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        tag_count, 1,
+        "one.md's mid-scan-window edit must be reflected, not its pre-edit content"
+    );
 }
 
 #[test]

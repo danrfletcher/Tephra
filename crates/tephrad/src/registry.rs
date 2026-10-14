@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tephra_cache::{Cache, CacheError, SourceRow, SourceStatus};
@@ -246,6 +246,13 @@ impl From<ScanError> for RegistryError {
 
 struct RunningSource {
     handle: WatcherHandle,
+    /// Shared with the live watcher's event filter (R12 review
+    /// finding): `rescan` writes a freshly-reloaded `.tephraignore`
+    /// into this same lock so the running watcher's filtering (and
+    /// every subsequent debounced batch's re-parse filtering)
+    /// reflects the rescan's rules immediately, rather than only the
+    /// stale rules captured when the watcher was first started.
+    ignore_rules: Arc<RwLock<IgnoreRules>>,
 }
 
 fn now_unix() -> i64 {
@@ -393,7 +400,19 @@ impl SourceRegistry {
         source_id: i64,
         root: &Path,
     ) -> Result<ScanStats, RegistryError> {
-        let ignore_rules = IgnoreRules::load(root)?;
+        let ignore_rules = Arc::new(RwLock::new(IgnoreRules::load(root)?));
+
+        // R13: subscribe the real watcher *before* the walk, not
+        // after. `watcher::start` returns as soon as the OS-level
+        // `notify` watch is live; any edit landing from this point on
+        // — including one that lands while the walk below is still
+        // in progress — queues up on the tap's unbounded channel.
+        // Only once the scan has committed does `start_watcher`
+        // (below) actually start draining that channel into debounced
+        // batches, so nothing that happened mid-scan is silently
+        // missed the way it was when the watcher didn't exist yet
+        // until after the walk returned.
+        let tap = watcher::start(root.to_path_buf(), Arc::clone(&ignore_rules))?;
 
         // A dedicated connection for the initial scan (R8/GP4): never
         // holds `self.cache`'s shared mutex across the whole walk, so
@@ -401,11 +420,13 @@ impl SourceRegistry {
         // `register`, `rescan`, or debounced batch-apply while it
         // runs.
         let scan_cache = Cache::open(&self.cache_path)?;
-        let stats = scan::scan_source(&scan_cache, source_id, root, &ignore_rules)?;
+        let ignore_snapshot = ignore_rules.read().unwrap().clone();
+        let stats = scan::scan_source(&scan_cache, source_id, root, &ignore_snapshot)?;
         drop(scan_cache);
 
         tracing::info!(
             source = %name,
+            source_id,
             files_seen = stats.files_seen,
             files_ignored = stats.files_ignored,
             units_written = stats.units_written,
@@ -420,7 +441,13 @@ impl SourceRegistry {
             cache.set_last_scanned(name, now_unix())?;
         }
 
-        self.start_watcher(name.to_string(), source_id, root.to_path_buf())?;
+        self.start_watcher(
+            name.to_string(),
+            source_id,
+            root.to_path_buf(),
+            ignore_rules,
+            tap,
+        )?;
         Ok(stats)
     }
 
@@ -429,6 +456,8 @@ impl SourceRegistry {
         name: String,
         source_id: i64,
         root: PathBuf,
+        ignore_rules: Arc<RwLock<IgnoreRules>>,
+        tap: watcher::WatcherTap,
     ) -> Result<(), RegistryError> {
         // A dedicated connection, guarded by its own mutex, for this
         // source's debounced batch-apply path (R8): independent of
@@ -441,6 +470,7 @@ impl SourceRegistry {
         let source_name = name.clone();
         let source_root = root.clone();
         let blocking_handle = self.runtime.handle().clone();
+        let ignore_for_batch = Arc::clone(&ignore_rules);
 
         let on_batch = move |changed: std::collections::HashSet<PathBuf>| {
             tracing::info!(
@@ -453,17 +483,23 @@ impl SourceRegistry {
             let events_tx = events_tx.clone();
             let source_name = source_name.clone();
             let source_root = source_root.clone();
+            let ignore_for_batch = Arc::clone(&ignore_for_batch);
 
             // Offloaded to tokio's dedicated blocking thread pool
             // (R8): this closure is invoked synchronously from the
             // per-source debounce task, and the work inside it
-            // (loading `.tephraignore`, then genuinely blocking
-            // SQLite writes) must never occupy one of the daemon's
-            // fixed async worker threads for the whole batch — doing
-            // so would stall every other source's watcher sharing
-            // that runtime.
+            // (genuinely blocking SQLite writes) must never occupy
+            // one of the daemon's fixed async worker threads for the
+            // whole batch — doing so would stall every other
+            // source's watcher sharing that runtime.
             let join_handle = blocking_handle.spawn_blocking(move || {
-                let ignore_rules = IgnoreRules::load(&source_root).unwrap_or_default();
+                // R12: read the *current* shared rules, not a
+                // snapshot reloaded from disk independently of the
+                // watcher's own event filter — a rescan writes its
+                // freshly reloaded rules into this same lock, so the
+                // batch-apply path and the event filter always agree
+                // on what's ignored.
+                let ignore_rules = ignore_for_batch.read().unwrap().clone();
                 let cache = batch_cache.lock().unwrap();
                 match scan::apply_change_batch(&cache, source_id, &source_root, &changed, &ignore_rules) {
                     Ok(outcome) => {
@@ -513,18 +549,20 @@ impl SourceRegistry {
             }
         };
 
-        let ignore_rules_for_watch = IgnoreRules::load(&root).unwrap_or_default();
-        let handle = watcher::spawn(
+        let handle = watcher::spawn_debounce(
+            tap,
             root,
-            ignore_rules_for_watch,
             self.runtime.handle().clone(),
             on_batch,
             on_root_removed,
-        )?;
-        self.running
-            .lock()
-            .unwrap()
-            .insert(name, RunningSource { handle });
+        );
+        self.running.lock().unwrap().insert(
+            name,
+            RunningSource {
+                handle,
+                ignore_rules,
+            },
+        );
         Ok(())
     }
 
@@ -594,12 +632,24 @@ impl SourceRegistry {
 
         let ignore_rules = IgnoreRules::load(&root)?;
 
+        // R12: push the freshly-reloaded rules into the live
+        // watcher's shared lock (if one is currently running for this
+        // source) *before* the re-walk below, so a path the walk
+        // un-ignores is also immediately un-ignored for every
+        // watcher event and debounced batch from this point on, not
+        // just for this one walk — and conversely for a path newly
+        // ignored.
+        if let Some(running) = self.running.lock().unwrap().get(name) {
+            *running.ignore_rules.write().unwrap() = ignore_rules.clone();
+        }
+
         let scan_cache = Cache::open(&self.cache_path)?;
         let stats = scan::rescan_source(&scan_cache, source_id, &root, &ignore_rules)?;
         drop(scan_cache);
 
         tracing::info!(
             source = %name,
+            source_id,
             files_seen = stats.files_seen,
             files_ignored = stats.files_ignored,
             units_written = stats.units_written,

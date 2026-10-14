@@ -15,16 +15,39 @@
 //!   real-time sleeps (the project has learned the hard way — see
 //!   the fs.watch flake note — that fixed-timeout waits on real
 //!   timers are not reliable in tests).
-//! - [`spawn`]: wires a real `notify::RecommendedWatcher` on a
-//!   source's root into [`debounce_loop`], filtering ignored paths
-//!   (and the root path itself) out before they ever reach the
-//!   debounce channel (R5), and is exercised only by the integration
-//!   tests under `tests/`, which use a real filesystem and the real
-//!   250ms window.
+//! - [`start`]/[`spawn_debounce`]: wires a real
+//!   `notify::RecommendedWatcher` on a source's root into
+//!   [`debounce_loop`], filtering ignored paths (and the root path
+//!   itself) out before they ever reach the debounce channel (R5),
+//!   and is exercised only by the integration tests under `tests/`,
+//!   which use a real filesystem and the real 250ms window.
+//!
+//! Split into two steps — [`start`] (subscribes the real OS-level
+//! `notify` watcher and returns a [`WatcherTap`] holding its events
+//! channel) and [`spawn_debounce`] (starts actually draining that
+//! channel into debounced batches) — rather than one combined call,
+//! so a caller can start observing filesystem events *before* running
+//! a slow initial scan (R13 review finding): the channel between them
+//! is unbounded, so any event that arrives in the gap between
+//! [`start`] and [`spawn_debounce`] simply queues up rather than being
+//! lost or requiring the watcher to already be fully wired up.
+//! Without this split, an edit landing after the walk had already
+//! passed a file, but before the watcher was started, was never
+//! re-indexed until the next manual rescan.
+//!
+//! The ignore rules a running watcher filters against are shared via
+//! `Arc<RwLock<IgnoreRules>>` (R12 review finding), not a plain
+//! snapshot captured once at `start()` time: `source.rescan` writes a
+//! freshly-reloaded `.tephraignore` into that same `RwLock` (see
+//! `registry.rs`), so a path newly un-ignored (or newly ignored) by a
+//! `.tephraignore` edit is filtered consistently by every subsequent
+//! watcher event from that point on, not just by the rescan's own
+//! one-off walk.
 
 use std::collections::HashSet;
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
@@ -143,6 +166,71 @@ impl From<notify::Error> for WatchError {
     }
 }
 
+/// The already-live half of a source's watcher (R13): the real
+/// OS-level `notify::RecommendedWatcher` (subscribed to events from
+/// the moment [`start`] returns) plus the still-undrained channel its
+/// filtered events are queued into. Kept separate from
+/// [`WatcherHandle`] so a caller can hold one of these across a slow
+/// initial scan — nothing is lost while a `WatcherTap` sits idle,
+/// since the channel is unbounded — and only build the actual
+/// debounce task (via [`spawn_debounce`]) once the scan has committed.
+pub struct WatcherTap {
+    watcher: RecommendedWatcher,
+    rx: mpsc::UnboundedReceiver<PathBuf>,
+}
+
+/// Subscribes a real recursive `notify` watch on `root`, filtering a
+/// path that is the root itself, or that the current contents of
+/// `ignore` report as ignored, out before it ever reaches the
+/// returned tap's channel (R5): neither should ever appear in a
+/// reported `source_changed` batch, and neither should be able to
+/// reset the debounce timer indefinitely (e.g. continuous `.git`
+/// activity in a repo source). This still leaves root-removal
+/// detection intact in the realistic case: deleting or moving out a
+/// populated root produces events for its non-ignored files too,
+/// which keep arriving on the channel and so still trigger
+/// [`spawn_debounce`]'s existence re-check.
+///
+/// `ignore` is read fresh on every single incoming event (R12 review
+/// finding), not captured once as an owned snapshot: `source.rescan`
+/// writes a freshly-reloaded `.tephraignore` into this very
+/// `RwLock` (see `registry.rs`), so a path's ignored status always
+/// reflects the most recently loaded rules, not whatever was true
+/// when this watcher was first started.
+pub fn start(root: PathBuf, ignore: Arc<RwLock<IgnoreRules>>) -> Result<WatcherTap, WatchError> {
+    let (tx, rx) = mpsc::unbounded_channel::<PathBuf>();
+    let root_for_watch = root.clone();
+
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
+        let Ok(event) = res else { return };
+        for path in event.paths {
+            let rel = match path.strip_prefix(&root_for_watch) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            // See the doc comment above on the root-path exemption:
+            // deliberately not filtered out here even though it never
+            // ends up in a reported `source_changed` batch.
+            let ignored = match ignore.read() {
+                Ok(rules) => rules.is_ignored(rel),
+                // A poisoned lock (a panic elsewhere while holding the
+                // write half) must not silently swallow every future
+                // event as "ignored" -- fail open so events keep
+                // flowing rather than the watcher going silently inert.
+                Err(poisoned) => poisoned.into_inner().is_ignored(rel),
+            };
+            if ignored {
+                continue;
+            }
+            let _ = tx.send(path);
+        }
+    })?;
+
+    watcher.watch(&root, RecursiveMode::Recursive)?;
+
+    Ok(WatcherTap { watcher, rx })
+}
+
 /// A running source's watcher: the real OS-level `notify` watcher
 /// (kept alive for as long as this handle exists) plus the tokio task
 /// running its debounce loop. Dropping or calling [`WatcherHandle::stop`]
@@ -164,78 +252,35 @@ impl WatcherHandle {
     }
 }
 
-/// Spawns a dedicated watcher for `root`: a real recursive `notify`
-/// watch, forwarding observed paths through [`debounce_loop`] on
-/// `runtime`, invoking `on_batch` once per coalesced batch and
-/// `on_root_removed` if `root` itself is ever found missing (the
-/// watched root was deleted or moved out from under the watcher —
-/// handled here rather than crashing, consistent with Linux inotify
-/// emitting no distinct "folder deleted" error of its own: every
-/// incoming event opportunistically re-checks whether `root` still
-/// resolves, and routes to `on_root_removed` instead of the normal
-/// batch path the first time it doesn't).
+/// Starts draining `tap`'s already-queued (and still-arriving) events
+/// into [`debounce_loop`] on `runtime`, invoking `on_batch` once per
+/// coalesced batch and `on_root_removed` if `root` itself is ever
+/// found missing (the watched root was deleted or moved out from
+/// under the watcher — handled here rather than crashing, consistent
+/// with Linux inotify emitting no distinct "folder deleted" error of
+/// its own: every incoming event opportunistically re-checks whether
+/// `root` still resolves, and routes to `on_root_removed` instead of
+/// the normal batch path the first time it doesn't).
 ///
-/// A path that is the root itself, or that `ignore` reports as
-/// ignored, is filtered out before it ever reaches the debounce
-/// channel (R5): neither should ever appear in a reported
-/// `source_changed` batch, and neither should be able to reset the
-/// debounce timer indefinitely (e.g. continuous `.git` activity in a
-/// repo source). This still leaves root-removal detection intact in
-/// the realistic case: deleting or moving out a populated root
-/// produces events for its non-ignored files too, which keep arriving
-/// on this channel and so still trigger `on_batch_checked`'s
-/// existence re-check below.
-pub fn spawn<B, R>(
+/// Called separately from, and generally well after, [`start`] (R13):
+/// an event that arrived on `tap`'s channel before this was called —
+/// while a slow initial scan was still running, say — is still here,
+/// queued, and is drained into this call's very first debounced batch
+/// rather than having been silently missed.
+pub fn spawn_debounce<B, R>(
+    tap: WatcherTap,
     root: PathBuf,
-    ignore: IgnoreRules,
     runtime: tokio::runtime::Handle,
     on_batch: B,
     on_root_removed: R,
-) -> Result<WatcherHandle, WatchError>
+) -> WatcherHandle
 where
     B: Fn(HashSet<PathBuf>) + Send + Sync + 'static,
     R: Fn() + Send + Sync + 'static,
 {
-    let (tx, rx) = mpsc::unbounded_channel::<PathBuf>();
-    let root_for_watch = root.clone();
-    let ignore_for_watch = ignore;
-    let tx_for_events = tx.clone();
-
-    let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
-        let Ok(event) = res else { return };
-        for path in event.paths {
-            let rel = match path.strip_prefix(&root_for_watch) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-            // An ignored path must never reset the debounce timer or
-            // end up reported (R5). The root path itself is
-            // deliberately *not* filtered out here, even though it
-            // never ends up in a reported `source_changed` batch
-            // (`apply_change_batch`'s path-to-rel conversion skips an
-            // empty relative path outright, so it's never counted or
-            // touched): a root removed quickly (e.g. one
-            // `remove_dir_all` call, rather than a Finder-style
-            // one-file-at-a-time delete) can coalesce, at the OS
-            // notification layer, into a single event naming only the
-            // root directory itself with no distinct per-file events
-            // at all — filtering that one event out here would mean
-            // the debounce loop never fires and
-            // `spawn`'s own root-removal re-check (see below) never
-            // runs, leaving the source stuck `Active` over a root
-            // that no longer exists.
-            if ignore_for_watch.is_ignored(rel) {
-                continue;
-            }
-            let _ = tx_for_events.send(path);
-        }
-    })?;
-
-    watcher.watch(&root, RecursiveMode::Recursive)?;
-
-    let root_for_task = root.clone();
+    let WatcherTap { watcher, rx } = tap;
     let task = runtime.spawn(async move {
-        let root_check = root_for_task.clone();
+        let root_check = root;
         let on_batch_checked = move |batch: HashSet<PathBuf>| {
             if !root_check.exists() {
                 on_root_removed();
@@ -246,10 +291,10 @@ where
         debounce_loop(rx, DEBOUNCE_WINDOW, DEBOUNCE_MAX_WAIT, on_batch_checked).await;
     });
 
-    Ok(WatcherHandle {
+    WatcherHandle {
         _watcher: watcher,
         task,
-    })
+    }
 }
 
 #[cfg(test)]
