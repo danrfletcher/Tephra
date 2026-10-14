@@ -129,12 +129,98 @@ fn editing_a_tracked_file_debounces_and_updates_only_that_files_row() {
         "the old #project tag must be gone after the edit"
     );
 
+    // R7(a): assert the stored link's actual target, not just a
+    // count — a naive implementation could pass `link_count == 1`
+    // while still storing stale data if deletion and reinsertion
+    // were miswired.
+    let link_to_raw: String = conn
+        .query_row(
+            "SELECT to_raw FROM links WHERE from_unit_id = ?1",
+            [unit.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        link_to_raw, "Three",
+        "the stored link must point at the new [[Three]] wikilink"
+    );
+
+    // R7(a): the old `^block1` anchor must be gone too, not just
+    // uncounted in a stale aggregate.
+    let block_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM blocks WHERE unit_id = ?1",
+            [unit.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        block_count, 0,
+        "the old ^block1 anchor must be gone after the edit"
+    );
+
     // two.md's own row must be completely untouched by one.md's edit.
     let other_unit = verify_cache
         .get_unit_by_rel_path(source.id, "two.md")
         .expect("get_unit_by_rel_path")
         .expect("two.md's unit row must be untouched");
     assert_eq!(other_unit.rel_path, "two.md");
+
+    registry.unregister("notes").expect("unregister");
+}
+
+#[test]
+fn creating_a_new_file_in_a_tracked_source_adds_its_row() {
+    // R7(a): the spec requires "create, modify, and delete" coverage;
+    // only modify and delete existed before this test.
+    let fixture = fixtures::vault_fixture();
+    let cache_dir = tempfile::tempdir().expect("cache tempdir");
+    let cache_path = cache_dir.path().join("cache.db");
+    let cache = Cache::open(&cache_path).expect("open cache");
+
+    let registry = SourceRegistry::new(cache).expect("new registry");
+    registry
+        .register("notes", fixture.root())
+        .expect("register");
+
+    fixture.write("three.md", "# Three\n\nBrand new file with a #fresh tag.\n");
+
+    let verify_cache = Cache::open(&cache_path).expect("reopen cache");
+    let source = verify_cache
+        .get_source("notes")
+        .expect("get_source")
+        .expect("source row");
+
+    let created = wait_until(Duration::from_secs(5), || {
+        verify_cache
+            .get_unit_by_rel_path(source.id, "three.md")
+            .expect("get_unit_by_rel_path")
+            .is_some()
+    });
+    assert!(
+        created,
+        "three.md's row must be created after the file is added"
+    );
+
+    let unit = verify_cache
+        .get_unit_by_rel_path(source.id, "three.md")
+        .expect("get_unit_by_rel_path")
+        .expect("three.md's unit row");
+    let tag_count: i64 = verify_cache
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM tags WHERE unit_id = ?1 AND tag = ?2",
+            rusqlite::params![unit.id, "fresh"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(tag_count, 1, "the new file's #fresh tag must be recorded");
+
+    // one.md and two.md are untouched by the new file's arrival.
+    let one = verify_cache
+        .get_unit_by_rel_path(source.id, "one.md")
+        .expect("get_unit_by_rel_path");
+    assert!(one.is_some(), "one.md's row must still exist");
 
     registry.unregister("notes").expect("unregister");
 }
@@ -246,6 +332,131 @@ fn a_watched_root_removed_out_from_under_the_watcher_marks_the_source_offline() 
         went_offline,
         "the source must transition to offline, not crash the daemon or other sources' watchers"
     );
+
+    registry.unregister("notes").expect("unregister");
+}
+
+#[test]
+fn moving_a_directory_into_a_tracked_source_indexes_its_files() {
+    // R4: a directory moved into a source (a shell `mv`, or an
+    // atomic `rename(2)`) arrives as one changed path naming the
+    // directory itself — nothing is indexed unless that path is
+    // walked and its files upserted.
+    let fixture = fixtures::vault_fixture();
+    let cache_dir = tempfile::tempdir().expect("cache tempdir");
+    let cache_path = cache_dir.path().join("cache.db");
+    let cache = Cache::open(&cache_path).expect("open cache");
+
+    let registry = SourceRegistry::new(cache).expect("new registry");
+    registry
+        .register("notes", fixture.root())
+        .expect("register");
+
+    // Build the directory to be moved in *outside* the watched root,
+    // then move it in with one atomic rename.
+    let staging = tempfile::tempdir().expect("staging tempdir");
+    std::fs::create_dir_all(staging.path().join("docs")).expect("mkdir docs");
+    std::fs::write(
+        staging.path().join("docs/new.md"),
+        "# New\n\nHas a #moved-in tag.\n",
+    )
+    .expect("write docs/new.md");
+    std::fs::rename(staging.path().join("docs"), fixture.root().join("docs"))
+        .expect("rename docs into the source");
+
+    let verify_cache = Cache::open(&cache_path).expect("reopen cache");
+    let source = verify_cache
+        .get_source("notes")
+        .expect("get_source")
+        .expect("source row");
+
+    let created = wait_until(Duration::from_secs(5), || {
+        verify_cache
+            .get_unit_by_rel_path(source.id, "docs/new.md")
+            .expect("get_unit_by_rel_path")
+            .is_some()
+    });
+    assert!(
+        created,
+        "a directory moved into the source must have its files indexed"
+    );
+
+    let unit = verify_cache
+        .get_unit_by_rel_path(source.id, "docs/new.md")
+        .unwrap()
+        .unwrap();
+    let tag_count: i64 = verify_cache
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM tags WHERE unit_id = ?1 AND tag = ?2",
+            rusqlite::params![unit.id, "moved-in"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        tag_count, 1,
+        "the moved-in file's #moved-in tag must be recorded"
+    );
+
+    registry.unregister("notes").expect("unregister");
+}
+
+#[test]
+fn moving_a_directory_out_of_a_tracked_source_removes_its_files_rows() {
+    // R4: a directory moved out of a source must have every one of
+    // its tracked files' rows reclaimed — not left behind forever,
+    // since the changed-path event names only the directory, never
+    // each file that used to live under it.
+    let fixture = fixtures::vault_fixture();
+    fixture.mkdir("d2");
+    fixture.write("d2/x.md", "# X\n\nSome content.\n");
+
+    let cache_dir = tempfile::tempdir().expect("cache tempdir");
+    let cache_path = cache_dir.path().join("cache.db");
+    let cache = Cache::open(&cache_path).expect("open cache");
+
+    let registry = SourceRegistry::new(cache).expect("new registry");
+    registry
+        .register("notes", fixture.root())
+        .expect("register");
+
+    let verify_cache = Cache::open(&cache_path).expect("reopen cache");
+    let source = verify_cache
+        .get_source("notes")
+        .expect("get_source")
+        .expect("source row");
+    assert!(
+        verify_cache
+            .get_unit_by_rel_path(source.id, "d2/x.md")
+            .expect("get_unit_by_rel_path")
+            .is_some(),
+        "d2/x.md must be indexed by the initial scan"
+    );
+
+    let staging = tempfile::tempdir().expect("staging tempdir");
+    std::fs::rename(fixture.root().join("d2"), staging.path().join("d2"))
+        .expect("rename d2 out of the source");
+
+    let removed = wait_until(Duration::from_secs(5), || {
+        verify_cache
+            .get_unit_by_rel_path(source.id, "d2/x.md")
+            .expect("get_unit_by_rel_path")
+            .is_none()
+    });
+    assert!(
+        removed,
+        "a directory moved out of the source must have its files' rows removed"
+    );
+
+    // one.md/two.md are untouched by d2's removal.
+    assert!(verify_cache
+        .get_unit_by_rel_path(source.id, "one.md")
+        .unwrap()
+        .is_some());
+    assert!(verify_cache
+        .get_unit_by_rel_path(source.id, "two.md")
+        .unwrap()
+        .is_some());
 
     registry.unregister("notes").expect("unregister");
 }

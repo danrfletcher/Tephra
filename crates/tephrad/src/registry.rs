@@ -15,7 +15,9 @@
 //!   fixture tree, no parsing, no SQLite.
 //! - [`SourceRegistry`]: the real orchestrator wiring validation,
 //!   `tephra_cache::Cache`, [`crate::scan`], and [`crate::watcher`]
-//!   together. Exercised by the integration tests under `tests/`.
+//!   together. Exercised by the integration tests under `tests/`
+//!   (and by `tests/registry_lifecycle.rs` specifically for
+//!   register/rescan/unregister against a real cache and filesystem).
 
 use std::collections::HashMap;
 use std::fmt;
@@ -123,6 +125,16 @@ impl std::error::Error for RegisterError {}
 /// of the candidate root. Pure: no filesystem access, no SQLite — see
 /// the module doc comment.
 ///
+/// `root` must already be the *canonical* form of the candidate path
+/// (see [`SourceRegistry::register`]) when `existing`'s roots are
+/// themselves canonical, as they are in production: comparing a
+/// non-canonical candidate (a symlink, a trailing slash, macOS's
+/// `/var` vs `/private/var`) against canonical stored roots would
+/// silently miss an exact-duplicate or nested/ancestor conflict (R1
+/// review finding) — this function itself doesn't canonicalize
+/// anything, since it must stay callable with purely synthetic,
+/// nonexistent `Source` fixtures in the unit tests below.
+///
 /// Checked in this order: path validity first (an invalid path is
 /// rejected regardless of what else is registered), then name
 /// duplication, then the three path-conflict shapes (exact duplicate,
@@ -173,7 +185,9 @@ pub fn validate_register<'a>(
 
 /// One internal `source_changed` event (GP6) — the seam a later
 /// broadcaster (PR-6's JSON-RPC/WebSocket layer) subscribes to rather
-/// than reimplementing change detection itself.
+/// than reimplementing change detection itself. `paths` only ever
+/// contains absolute paths that were actually upserted or deleted in
+/// the cache (R5) — never a raw, unfiltered watcher event batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DaemonEvent {
     SourceChanged { source: String, paths: Vec<PathBuf> },
@@ -241,19 +255,27 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-/// The live orchestrator: owns the shared `Cache`, a dedicated tokio
-/// runtime for watcher tasks (independent of whatever runtime a
-/// caller/test happens to be in), and the map of currently-running
-/// per-source watchers.
+/// The live orchestrator: owns the shared `Cache` (used only for
+/// quick, infrequent operations — registering/listing/transitioning a
+/// source row), the path that `Cache` was opened against (so a scan
+/// or a source's debounced batch-apply path can open its own,
+/// independent connection to the same WAL-mode database rather than
+/// contending for the shared one — R8), a dedicated tokio runtime for
+/// watcher tasks (independent of whatever runtime a caller/test
+/// happens to be in), and the map of currently-running per-source
+/// watchers.
 ///
-/// Every source's watcher task, `notify` watcher instance, and ignore
-/// evaluation are independent of every other source's (GP4): the only
-/// thing ever shared across sources is the single `Cache` connection
-/// (guarded by a mutex) and the broadcast event channel, and every
-/// cache operation is scoped by `source_id` — one source's register,
-/// rescan, or crash never touches another's rows or watcher.
+/// Every source's watcher task, `notify` watcher instance, ignore
+/// evaluation, and scan/batch-apply SQLite connection are independent
+/// of every other source's (GP4): the only state ever shared across
+/// sources is the one `Cache` connection behind `cache` (used
+/// sparingly and briefly — see above) and the broadcast event
+/// channel. A large initial scan or a slow batch for one source does
+/// not hold that shared lock, and so cannot stall another source's
+/// `list`/`register`/`rescan` call or its own debounced watcher.
 pub struct SourceRegistry {
     cache: Arc<Mutex<Cache>>,
+    cache_path: PathBuf,
     runtime: tokio::runtime::Runtime,
     running: Mutex<HashMap<String, RunningSource>>,
     events_tx: tokio::sync::broadcast::Sender<DaemonEvent>,
@@ -266,8 +288,10 @@ impl SourceRegistry {
             .enable_all()
             .build()?;
         let (events_tx, _rx) = tokio::sync::broadcast::channel(1024);
+        let cache_path = cache.path().to_path_buf();
         Ok(SourceRegistry {
             cache: Arc::new(Mutex::new(cache)),
+            cache_path,
             runtime,
             running: Mutex::new(HashMap::new()),
             events_tx,
@@ -280,39 +304,55 @@ impl SourceRegistry {
         self.events_tx.subscribe()
     }
 
-    fn existing_sources(&self) -> Result<Vec<Source>, RegistryError> {
-        let cache = self.cache.lock().unwrap();
-        Ok(cache
-            .list_sources()?
-            .into_iter()
-            .map(|r| Source {
-                name: r.name,
-                root: PathBuf::from(r.path),
-            })
-            .collect())
-    }
-
     /// `source.register` (G1/GP2/GP3): validates the candidate root,
     /// registers it in the cache, runs its initial full scan
     /// synchronously (so the returned [`ScanStats`] reflect a
     /// genuinely complete scan, not an in-flight one), then starts its
     /// dedicated watcher task.
+    ///
+    /// If the scan or the watcher fails to start after the source row
+    /// has already been inserted, that row is rolled back (deleted)
+    /// rather than left behind `Active`, partially (or not at all)
+    /// indexed, and with no running watcher (R2 review finding) — a
+    /// state a retry of the same name could never otherwise recover
+    /// from, since it would be rejected as a duplicate.
     pub fn register(&self, name: &str, root: impl AsRef<Path>) -> Result<ScanStats, RegistryError> {
         let root = root.as_ref();
         let probe = probe_path(root);
-        let existing = self.existing_sources()?;
-        validate_register(&existing, name, root, probe)?;
 
-        // Canonicalize once validation has confirmed the path exists
-        // and is a readable directory, so the stored root and every
-        // subsequent nested/ancestor check for later registrations
-        // compare resolved paths (no trailing-slash or `..`
-        // false-negatives).
-        let canonical_root = root.canonicalize()?;
-        let ignore_rules = IgnoreRules::load(&canonical_root)?;
+        // Canonicalize *before* validating (R1): every existing
+        // source's stored root is already canonical (this same
+        // method canonicalizes before inserting, below), so comparing
+        // a non-canonical candidate against those would miss an exact
+        // duplicate or a nested/ancestor conflict spelled differently
+        // — a symlink, a trailing slash, or (on macOS) `/var` versus
+        // its canonical `/private/var`. Only attempted once `probe`
+        // has confirmed the path exists and is readable;
+        // `canonicalize()` would just fail the same way otherwise, so
+        // the original (invalid) path is kept for `validate_register`
+        // to report the real reason against.
+        let canonical_root = if probe == PathProbe::Ok {
+            root.canonicalize()?
+        } else {
+            root.to_path_buf()
+        };
 
+        // Validate-then-insert happens under one, uninterrupted hold
+        // of the cache lock (R1 related fix): otherwise two
+        // concurrent `register` calls for overlapping roots could
+        // each read "no conflict exists yet" before either one's
+        // insert becomes visible to the other.
         let source_id = {
             let cache = self.cache.lock().unwrap();
+            let existing: Vec<Source> = cache
+                .list_sources()?
+                .into_iter()
+                .map(|r| Source {
+                    name: r.name,
+                    root: PathBuf::from(r.path),
+                })
+                .collect();
+            validate_register(&existing, name, &canonical_root, probe)?;
             cache.register_source(
                 name,
                 &canonical_root.to_string_lossy(),
@@ -320,18 +360,67 @@ impl SourceRegistry {
             )?
         };
 
-        let stats = {
-            let cache = self.cache.lock().unwrap();
-            scan::scan_source(&cache, source_id, &canonical_root, &ignore_rules)?
-        };
+        match self.scan_and_watch(name, source_id, &canonical_root) {
+            Ok(stats) => {
+                tracing::info!(
+                    source = %name,
+                    source_id,
+                    root = %canonical_root.display(),
+                    "source_registered"
+                );
+                Ok(stats)
+            }
+            Err(e) => {
+                let cache = self.cache.lock().unwrap();
+                if let Err(cleanup_err) = cache.delete_source(name) {
+                    tracing::warn!(
+                        source = %name,
+                        error = %cleanup_err,
+                        "failed to roll back a partially registered source after a scan/watch failure"
+                    );
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// The rest of `register`'s work once the source row exists:
+    /// initial scan, then start the watcher. Split out so `register`
+    /// can roll the row back on any failure from this point on (R2).
+    fn scan_and_watch(
+        &self,
+        name: &str,
+        source_id: i64,
+        root: &Path,
+    ) -> Result<ScanStats, RegistryError> {
+        let ignore_rules = IgnoreRules::load(root)?;
+
+        // A dedicated connection for the initial scan (R8/GP4): never
+        // holds `self.cache`'s shared mutex across the whole walk, so
+        // a large source's scan can't stall another source's `list`,
+        // `register`, `rescan`, or debounced batch-apply while it
+        // runs.
+        let scan_cache = Cache::open(&self.cache_path)?;
+        let stats = scan::scan_source(&scan_cache, source_id, root, &ignore_rules)?;
+        drop(scan_cache);
+
+        tracing::info!(
+            source = %name,
+            files_seen = stats.files_seen,
+            files_ignored = stats.files_ignored,
+            units_written = stats.units_written,
+            links_written = stats.links_written,
+            tags_written = stats.tags_written,
+            blocks_written = stats.blocks_written,
+            "scan_complete"
+        );
 
         {
             let cache = self.cache.lock().unwrap();
             cache.set_last_scanned(name, now_unix())?;
         }
 
-        self.start_watcher(name.to_string(), source_id, canonical_root)?;
-
+        self.start_watcher(name.to_string(), source_id, root.to_path_buf())?;
         Ok(stats)
     }
 
@@ -341,31 +430,75 @@ impl SourceRegistry {
         source_id: i64,
         root: PathBuf,
     ) -> Result<(), RegistryError> {
-        let cache_for_batch = Arc::clone(&self.cache);
+        // A dedicated connection, guarded by its own mutex, for this
+        // source's debounced batch-apply path (R8): independent of
+        // `self.cache` and of every other source's own dedicated
+        // connection, so one source's batch work can never block
+        // another's, nor a `list`/`register`/`rescan` call against
+        // the shared registry cache.
+        let batch_cache = Arc::new(Mutex::new(Cache::open(&self.cache_path)?));
         let events_tx = self.events_tx.clone();
-        let name_for_batch = name.clone();
-        let root_for_batch = root.clone();
+        let source_name = name.clone();
+        let source_root = root.clone();
+        let blocking_handle = self.runtime.handle().clone();
 
         let on_batch = move |changed: std::collections::HashSet<PathBuf>| {
-            let ignore_rules = IgnoreRules::load(&root_for_batch).unwrap_or_default();
-            let cache = cache_for_batch.lock().unwrap();
-            match scan::apply_change_batch(
-                &cache,
-                source_id,
-                &root_for_batch,
-                &changed,
-                &ignore_rules,
-            ) {
-                Ok(_) => {
-                    let _ = events_tx.send(DaemonEvent::SourceChanged {
-                        source: name_for_batch.clone(),
-                        paths: changed.into_iter().collect(),
-                    });
+            tracing::info!(
+                source = %source_name,
+                batch_size = changed.len(),
+                "debounce_fired"
+            );
+
+            let batch_cache = Arc::clone(&batch_cache);
+            let events_tx = events_tx.clone();
+            let source_name = source_name.clone();
+            let source_root = source_root.clone();
+
+            // Offloaded to tokio's dedicated blocking thread pool
+            // (R8): this closure is invoked synchronously from the
+            // per-source debounce task, and the work inside it
+            // (loading `.tephraignore`, then genuinely blocking
+            // SQLite writes) must never occupy one of the daemon's
+            // fixed async worker threads for the whole batch — doing
+            // so would stall every other source's watcher sharing
+            // that runtime.
+            let join_handle = blocking_handle.spawn_blocking(move || {
+                let ignore_rules = IgnoreRules::load(&source_root).unwrap_or_default();
+                let cache = batch_cache.lock().unwrap();
+                match scan::apply_change_batch(&cache, source_id, &source_root, &changed, &ignore_rules) {
+                    Ok(outcome) => {
+                        // R5: report only the paths that were
+                        // actually upserted or deleted, and skip the
+                        // event entirely when nothing really changed
+                        // (e.g. a batch made entirely of
+                        // ignored/directory-only paths that the
+                        // watcher-level filter let through anyway).
+                        if !outcome.changed_paths.is_empty() {
+                            tracing::info!(
+                                source = %source_name,
+                                paths = ?outcome.changed_paths,
+                                "source_changed"
+                            );
+                            let _ = events_tx.send(DaemonEvent::SourceChanged {
+                                source: source_name,
+                                paths: outcome.changed_paths,
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(source = %source_name, error = %e, "failed to apply change batch");
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(source = %name_for_batch, error = %e, "failed to apply change batch");
-                }
-            }
+            });
+            // Fire-and-forget: `on_batch` itself is a synchronous
+            // `Fn`, invoked from the debounce loop's async task, so
+            // there's nothing further to await here — the spawned
+            // blocking task reports its own success/failure via the
+            // `tracing`/broadcast calls above. Dropped explicitly
+            // (rather than via `let _ =`) so this fire-and-forget is
+            // a documented choice, not a `clippy::let_underscore_future`
+            // warning silenced away.
+            drop(join_handle);
         };
 
         let cache_for_offline = Arc::clone(&self.cache);
@@ -380,8 +513,10 @@ impl SourceRegistry {
             }
         };
 
+        let ignore_rules_for_watch = IgnoreRules::load(&root).unwrap_or_default();
         let handle = watcher::spawn(
             root,
+            ignore_rules_for_watch,
             self.runtime.handle().clone(),
             on_batch,
             on_root_removed,
@@ -421,6 +556,12 @@ impl SourceRegistry {
     /// [`tephra_cache::Cache::rebuild`]'s job, gated by schema
     /// version).
     ///
+    /// The clear-then-rewalk runs as **one** transaction against a
+    /// dedicated connection (R2/R8: see [`scan::rescan_source`]),
+    /// never holding `self.cache`'s shared mutex across the whole
+    /// walk, and never leaving the source's rows cleared with nothing
+    /// re-inserted if a walk entry errors out partway through.
+    ///
     /// If the source's root is currently missing, this is a safe
     /// no-op that (re)confirms the `offline` status rather than
     /// erroring the whole call out or crashing — consistent with "a
@@ -452,11 +593,21 @@ impl SourceRegistry {
         }
 
         let ignore_rules = IgnoreRules::load(&root)?;
-        let stats = {
-            let cache = self.cache.lock().unwrap();
-            cache.delete_units_for_source(source_id)?;
-            scan::scan_source(&cache, source_id, &root, &ignore_rules)?
-        };
+
+        let scan_cache = Cache::open(&self.cache_path)?;
+        let stats = scan::rescan_source(&scan_cache, source_id, &root, &ignore_rules)?;
+        drop(scan_cache);
+
+        tracing::info!(
+            source = %name,
+            files_seen = stats.files_seen,
+            files_ignored = stats.files_ignored,
+            units_written = stats.units_written,
+            links_written = stats.links_written,
+            tags_written = stats.tags_written,
+            blocks_written = stats.blocks_written,
+            "scan_complete"
+        );
 
         {
             let cache = self.cache.lock().unwrap();
@@ -659,19 +810,6 @@ mod tests {
         );
     }
 
-    // ---- list/unregister semantics on the pure `Source` fixture -------
-
-    #[test]
-    fn list_returns_every_registered_source_unmodified() {
-        let sources = [
-            source("notes", "/vault/notes"),
-            source("repo", "/code/repo"),
-        ];
-        assert_eq!(sources.len(), 2);
-        assert!(sources.iter().any(|s| s.name == "notes"));
-        assert!(sources.iter().any(|s| s.name == "repo"));
-    }
-
     #[test]
     fn unregister_then_register_the_same_name_again_is_allowed() {
         // Once a name is removed from the in-memory existing-sources
@@ -681,5 +819,68 @@ mod tests {
         let result =
             validate_register(&existing, "notes", Path::new("/vault/notes"), PathProbe::Ok);
         assert_eq!(result, Ok(()));
+    }
+
+    // ---- R1: duplicate/nested-root rejection survives non-canonical
+    // spellings of an already-registered root -------------------------
+
+    #[test]
+    fn register_rejects_a_symlink_to_an_already_registered_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_root = dir.path().join("real");
+        std::fs::create_dir(&real_root).unwrap();
+        let canonical_real_root = real_root.canonicalize().unwrap();
+
+        let existing = vec![source("notes", canonical_real_root.to_str().unwrap())];
+
+        let symlink_path = dir.path().join("alias");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_root, &symlink_path).unwrap();
+        #[cfg(not(unix))]
+        std::os::windows::fs::symlink_dir(&real_root, &symlink_path).unwrap();
+
+        // The caller canonicalizes the candidate the same way
+        // `SourceRegistry::register` does before calling
+        // `validate_register` (R1): a symlink to an already-registered
+        // root canonicalizes to the identical path and so must be
+        // rejected as a duplicate, not accepted as a distinct root.
+        let canonical_candidate = symlink_path.canonicalize().unwrap();
+        let result = validate_register(&existing, "alias", &canonical_candidate, PathProbe::Ok);
+        assert_eq!(
+            result,
+            Err(RegisterError::Conflict {
+                with: "notes".to_string(),
+                reason: ConflictReason::SameRoot,
+            })
+        );
+    }
+
+    #[test]
+    fn canonicalizing_before_validation_collapses_differently_spelled_duplicate_roots() {
+        // Simulates macOS's `/var` -> `/private/var` symlink: a
+        // non-canonical candidate spelling of an already-registered
+        // canonical root must be caught once canonicalized, the way
+        // `SourceRegistry::register` canonicalizes before validating.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("vault");
+        std::fs::create_dir(&root).unwrap();
+        let canonical_root = root.canonicalize().unwrap();
+
+        let existing = vec![source("notes", canonical_root.to_str().unwrap())];
+
+        // A non-canonical spelling that still resolves to the exact
+        // same directory (e.g. a trailing "." component).
+        let non_canonical_candidate = root.join(".");
+        let canonicalized_candidate = non_canonical_candidate.canonicalize().unwrap();
+        assert_eq!(canonicalized_candidate, canonical_root);
+
+        let result = validate_register(&existing, "dup", &canonicalized_candidate, PathProbe::Ok);
+        assert_eq!(
+            result,
+            Err(RegisterError::Conflict {
+                with: "notes".to_string(),
+                reason: ConflictReason::SameRoot,
+            })
+        );
     }
 }

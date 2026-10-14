@@ -12,6 +12,10 @@ path = "src/lib.rs"
 name = "tephrad"
 path = "src/main.rs"
 
+[[bin]]
+name = "register_sources"
+path = "src/bin/register_sources.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
