@@ -288,6 +288,46 @@ pub fn render_refactor_apply(result: &Value) -> String {
             let reason = str_field(result, "reason");
             format!("Refactor aborted: {reason}\n")
         }
+        // R5 review finding: this PR introduced "partial" (some files
+        // rewritten, a later one failed) and owns the end-to-end CLI
+        // wiring for it, so it must be rendered explicitly — falling
+        // through to the raw-JSON-dump fallback arm below would print
+        // an unreadable blob instead of naming exactly which files
+        // succeeded and which failed.
+        Some("partial") => {
+            let files_changed = result
+                .get("files_changed")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let mut out = format!(
+                "Refactor partially applied: {files_changed} file(s) changed before a failure\n"
+            );
+            let succeeded = result
+                .get("succeeded")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if !succeeded.is_empty() {
+                out.push_str("  succeeded:\n");
+                for file in &succeeded {
+                    out.push_str(&format!("    {}\n", file.as_str().unwrap_or("")));
+                }
+            }
+            let failed = result
+                .get("failed")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if !failed.is_empty() {
+                out.push_str("  failed:\n");
+                for failure in &failed {
+                    let file = str_field(failure, "file");
+                    let error = str_field(failure, "error");
+                    out.push_str(&format!("    {file}: {error}\n"));
+                }
+            }
+            out
+        }
         _ => format!("{}\n", pretty(result)),
     }
 }

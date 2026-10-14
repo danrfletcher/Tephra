@@ -1,0 +1,5 @@
+Refactor partially applied: 1 file(s) changed before a failure
+  succeeded:
+    @notes:Journal.md
+  failed:
+    @notes:Index.md: permission denied

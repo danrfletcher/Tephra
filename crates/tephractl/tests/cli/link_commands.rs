@@ -599,6 +599,40 @@ fn link_refactor_apply_aborted_result_renders_exactly_and_exits_nonzero() {
     assert_eq!(outcome.stdout, "");
 }
 
+/// R5 review finding: "partial" (some files rewritten, a later one
+/// failed) must render every succeeded and failed file by name, not
+/// just a raw count, and must exit non-zero — a script driving
+/// `tephractl` cannot otherwise tell a partial failure from success.
+#[test]
+fn link_refactor_apply_partial_result_renders_exactly_and_exits_nonzero() {
+    let server = MockServer::start(vec![Behavior::Respond {
+        status: 200,
+        body: load_fixture("apply_refactor_partial"),
+    }]);
+    let client = client_for(&server);
+
+    let mut stdin: &[u8] = &[];
+    let outcome = commands::execute(
+        &Command::LinkRefactor {
+            source: "notes".to_string(),
+            old_path: "OldDoc.md".to_string(),
+            new_path: "NewDoc.md".to_string(),
+            apply: true,
+            yes: true,
+        },
+        false,
+        &client,
+        &mut stdin,
+    );
+
+    assert_eq!(outcome.exit_code, 1, "stderr: {}", outcome.stderr);
+    assert_eq!(
+        outcome.stderr,
+        load_expected("refactor_apply_partial_rendered")
+    );
+    assert_eq!(outcome.stdout, "");
+}
+
 /// T5/T6: the real `tephrad` built on this branch's base (PR-6) does
 /// not implement `link.preview_refactor`/`link.apply_refactor` yet —
 /// that dispatch entry lands in PR-8 (see `dispatch.rs`'s
