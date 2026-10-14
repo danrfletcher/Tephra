@@ -656,6 +656,33 @@ async fn preview_refactor_never_writes_even_against_a_read_only_source_root() {
         )
         .await;
 
+    // R6(b) review finding: chmod only the directory to 0500 (as this
+    // test originally did) stops *new* files being created inside it
+    // but does nothing to stop an in-place write to an *existing*
+    // file that's still individually writable — so it could never
+    // have caught a preview that (incorrectly) wrote in place rather
+    // than only reading. Chmod the existing files themselves to 0400
+    // too, and compare their exact bytes and mtimes from before and
+    // after preview, rather than relying solely on would-be writes
+    // failing.
+    let old_doc_path = notes.root().join("OldDoc.md");
+    let journal_path = notes.root().join("Journal.md");
+    let old_doc_before = std::fs::read(&old_doc_path).unwrap();
+    let journal_before = std::fs::read(&journal_path).unwrap();
+    let old_doc_mtime_before = std::fs::metadata(&old_doc_path)
+        .unwrap()
+        .modified()
+        .unwrap();
+    let journal_mtime_before = std::fs::metadata(&journal_path)
+        .unwrap()
+        .modified()
+        .unwrap();
+
+    let mut file_perms = std::fs::metadata(&journal_path).unwrap().permissions();
+    file_perms.set_mode(0o400);
+    std::fs::set_permissions(&old_doc_path, file_perms.clone()).expect("chmod OldDoc.md 0400");
+    std::fs::set_permissions(&journal_path, file_perms).expect("chmod Journal.md 0400");
+
     // Make the directory itself read-only + non-executable-for-write
     // (0500): any attempt to create a file (e.g. a temp file for an
     // atomic rewrite) inside it would fail immediately.
@@ -681,6 +708,12 @@ async fn preview_refactor_never_writes_even_against_a_read_only_source_root() {
     let mut restore = std::fs::metadata(notes.root()).unwrap().permissions();
     restore.set_mode(0o700);
     std::fs::set_permissions(notes.root(), restore).expect("restore root permissions");
+    let mut file_restore = std::fs::metadata(&journal_path)
+        .map(|m| m.permissions())
+        .unwrap_or_else(|_| std::fs::Permissions::from_mode(0o644));
+    file_restore.set_mode(0o644);
+    let _ = std::fs::set_permissions(&old_doc_path, file_restore.clone());
+    let _ = std::fs::set_permissions(&journal_path, file_restore);
 
     if unsafe { libc::geteuid() } == 0 {
         daemon.stop();
@@ -691,6 +724,36 @@ async fn preview_refactor_never_writes_even_against_a_read_only_source_root() {
     assert_eq!(preview["result"]["changes"].as_array().unwrap().len(), 1);
     assert!(bogus_preview.get("error").is_none(), "{bogus_preview:?}");
     assert_eq!(bogus_preview["result"]["changes"], json!([]));
+
+    // The actual proof R6(b) asked for: every byte and the mtime of
+    // both files are exactly as they were before `preview_refactor`
+    // ran, not merely "the directory refused a new file".
+    assert_eq!(
+        std::fs::read(&old_doc_path).unwrap(),
+        old_doc_before,
+        "preview must never write to OldDoc.md"
+    );
+    assert_eq!(
+        std::fs::read(&journal_path).unwrap(),
+        journal_before,
+        "preview must never write to Journal.md"
+    );
+    assert_eq!(
+        std::fs::metadata(&old_doc_path)
+            .unwrap()
+            .modified()
+            .unwrap(),
+        old_doc_mtime_before,
+        "preview must never touch OldDoc.md's mtime"
+    );
+    assert_eq!(
+        std::fs::metadata(&journal_path)
+            .unwrap()
+            .modified()
+            .unwrap(),
+        journal_mtime_before,
+        "preview must never touch Journal.md's mtime"
+    );
 
     daemon.stop();
 }
@@ -949,4 +1012,161 @@ async fn no_leftover_temp_files_and_nothing_to_reapply_after_restart() {
     );
 
     daemon2.stop();
+}
+
+/// R3 review finding, direct reproduction: a process killed between
+/// `write_new` and `rename` (see `tephrad::refactor::rewrite_links_atomic_with`)
+/// leaves a `.<name>.tephra-tmp-<n>` file sitting in the user's own
+/// source tree. Nothing in the normal apply path ever revisits it, so
+/// simulate exactly that — plant the stray file directly, without
+/// ever calling `apply_refactor` — then "restart" (register on a
+/// fresh daemon, the same source root) and confirm `source.register`'s
+/// own full walk sweeps it away rather than leaving it forever or
+/// indexing it as if it were a real note.
+#[tokio::test]
+async fn a_temp_file_left_by_a_simulated_kill_is_swept_on_the_next_register() {
+    let notes = fixtures::empty_source();
+    notes.write("OldDoc.md", "# Old Doc\n");
+    notes.write("Journal.md", "See [[OldDoc]] here.\n");
+
+    // Plant the stray temp file exactly as a kill between `write_new`
+    // and `rename` would leave it: same naming convention, sitting
+    // right next to the real file it was about to replace.
+    let stray = notes.root().join(".Journal.md.tephra-tmp-424242");
+    std::fs::write(&stray, "partially written garbage").unwrap();
+    assert!(
+        stray.exists(),
+        "the stray temp file must exist before register"
+    );
+
+    let daemon = TestDaemon::start().await;
+    let register = daemon
+        .call(
+            "source.register",
+            json!({"name": "notes", "root": notes.root().to_string_lossy()}),
+        )
+        .await;
+    assert!(register.get("error").is_none(), "{register:?}");
+
+    assert!(
+        !stray.exists(),
+        "a stale refactor temp file must be swept away by the next register/rescan walk"
+    );
+    // The real files are completely unaffected by the sweep.
+    assert_eq!(
+        std::fs::read_to_string(notes.root().join("Journal.md")).unwrap(),
+        "See [[OldDoc]] here.\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(notes.root().join("OldDoc.md")).unwrap(),
+        "# Old Doc\n"
+    );
+
+    daemon.stop();
+}
+
+/// R6(c): two `apply_refactor` calls targeting overlapping files
+/// (both renames are referenced from the same `Journal.md`) started
+/// genuinely concurrently (`tokio::join!`, not one awaited before the
+/// other starts) must be serialized by `apply_lock`, not interleaved.
+///
+/// Because both touch the same `Journal.md`, serialization here
+/// doesn't mean both necessarily succeed: `apply_lock` lets exactly
+/// one of the two run to completion (its own read, write, and
+/// rescan) before the other even starts its own staleness check —
+/// and that second call's own `preview_refactor` snapshot of
+/// `Journal.md`'s mtime, taken before either apply ran, no longer
+/// matches the file the first apply just rewrote, so it correctly
+/// aborts rather than either corrupting the file or silently
+/// clobbering the first rename. Without `apply_lock` serializing the
+/// two calls at all, both could instead read `Journal.md`'s original
+/// content concurrently, compute their own single-line rewrite from
+/// it, and whichever wrote last would silently clobber the other's
+/// rename entirely — the exact race this test rules out.
+#[tokio::test]
+async fn two_concurrent_applies_targeting_overlapping_files_are_serialized() {
+    let daemon = Arc::new(TestDaemon::start().await);
+    let notes = fixtures::empty_source();
+    notes.write("OldA.md", "# Old A\n");
+    notes.write("OldB.md", "# Old B\n");
+    notes.write("Journal.md", "See [[OldA]] and [[OldB]] here.\n");
+
+    daemon
+        .call(
+            "source.register",
+            json!({"name": "notes", "root": notes.root().to_string_lossy()}),
+        )
+        .await;
+
+    let preview_a = daemon
+        .call(
+            "link.preview_refactor",
+            json!({"source": "notes", "old_path": "OldA.md", "new_path": "NewA.md"}),
+        )
+        .await;
+    let preview_b = daemon
+        .call(
+            "link.preview_refactor",
+            json!({"source": "notes", "old_path": "OldB.md", "new_path": "NewB.md"}),
+        )
+        .await;
+    assert_eq!(preview_a["result"]["changes"].as_array().unwrap().len(), 1);
+    assert_eq!(preview_b["result"]["changes"].as_array().unwrap().len(), 1);
+
+    let d1 = daemon.clone();
+    let d2 = daemon.clone();
+    let (apply_a, apply_b) = tokio::join!(
+        d1.call(
+            "link.apply_refactor",
+            json!({"source": "notes", "old_path": "OldA.md", "new_path": "NewA.md"}),
+        ),
+        d2.call(
+            "link.apply_refactor",
+            json!({"source": "notes", "old_path": "OldB.md", "new_path": "NewB.md"}),
+        )
+    );
+
+    drop(d1);
+    drop(d2);
+
+    let status_a = apply_a["result"]["status"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    let status_b = apply_b["result"]["status"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    let applied_count = [&status_a, &status_b]
+        .iter()
+        .filter(|s| s.as_str() == "applied")
+        .count();
+    let aborted_count = [&status_a, &status_b]
+        .iter()
+        .filter(|s| s.as_str() == "aborted")
+        .count();
+    assert_eq!(
+        (applied_count, aborted_count),
+        (1, 1),
+        "apply_lock must let exactly one of the two overlapping applies through to completion \
+         and correctly abort the other on staleness — never both succeed (which would require \
+         an unserialized, interleaved write) and never both abort (the first one through always \
+         has a fresh, matching snapshot): a={apply_a:?} b={apply_b:?}"
+    );
+
+    let journal = std::fs::read_to_string(notes.root().join("Journal.md")).unwrap();
+    let plausible_after_exactly_one_rename_lands = [
+        "See [[NewA]] and [[OldB]] here.\n",
+        "See [[OldA]] and [[NewB]] here.\n",
+    ];
+    assert!(
+        plausible_after_exactly_one_rename_lands.contains(&journal.as_str()),
+        "Journal.md must reflect exactly the one rename that actually succeeded, with no \
+         corruption from the two applies interleaving: {journal:?}"
+    );
+
+    match Arc::try_unwrap(daemon) {
+        Ok(daemon) => daemon.stop(),
+        Err(_) => panic!("daemon Arc still has other owners after both applies completed"),
+    }
 }
