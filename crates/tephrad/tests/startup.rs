@@ -419,7 +419,12 @@ fn first_run_creates_cache_db_with_six_tables() {
     }
 
     let code = process.terminate_and_wait(Duration::from_secs(5));
-    assert_eq!(code, Some(0), "expected clean exit after SIGTERM");
+    assert_eq!(
+        code,
+        Some(0),
+        "expected clean exit after SIGTERM, got stderr: {:?}",
+        process.captured_stderr_lines()
+    );
 }
 
 #[test]

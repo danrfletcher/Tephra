@@ -1,10 +1,13 @@
 //! `tephrad`: federated graph and link engine daemon.
 //!
-//! This PR implements the startup skeleton: CLI flag parsing, XDG
-//! path resolution, config load/default-write, token ensure, the
-//! SQLite cache open and schema-version check (`tephra-cache`'s
-//! `Cache::open`, G5), and a bare TCP listener bind. JSON-RPC dispatch
-//! and HTTP/WebSocket framing land in PR-6.
+//! Startup runs: CLI flag parsing, XDG path resolution, config
+//! load/default-write, token ensure, the SQLite cache open and
+//! schema-version check (`tephra-cache`'s `Cache::open`, G5), a bare
+//! TCP listener bind, and then (PR-6) builds the live
+//! [`tephrad::registry::SourceRegistry`] and an initial
+//! [`tephra_graph::UnitGraph`] snapshot and serves JSON-RPC/WebSocket
+//! requests against them (`tephrad::rpc`) over that listener until a
+//! shutdown signal arrives.
 
 mod cli;
 mod config;
@@ -13,8 +16,14 @@ mod server;
 mod token;
 
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use cli::Action;
+use serde_json::json;
+use tephrad::registry::{DaemonEvent, SourceRegistry};
+use tephrad::rpc::backend::{GraphBackend, SourceBackend};
+use tephrad::rpc::server::{build_router, AppState};
+use tokio::sync::broadcast::error::RecvError;
 
 /// Startup stage names used in `tephrad: <stage> failed: <reason>`
 /// messages, so failures are unambiguous about where they occurred.
@@ -31,7 +40,51 @@ fn fail(stage: &str, reason: impl std::fmt::Display) -> ExitCode {
     ExitCode::FAILURE
 }
 
+#[cfg(unix)]
+fn block_shutdown_signals() {
+    // Block SIGTERM/SIGINT before doing any other work in `main`, so a
+    // signal arriving during the plain, synchronous startup prelude
+    // (config/directory/token/cache stages, all of which run before
+    // any tokio runtime or signal handler exists) is held *pending* by
+    // the kernel rather than invoking the OS's default
+    // "terminate immediately, no cleanup" disposition for it.
+    //
+    // Every worker thread the tokio runtime later spawns inherits
+    // this blocked mask at thread-creation time (POSIX), so it's in
+    // effect everywhere in the process, not just on the thread that
+    // calls this — this one call is enough. See
+    // `wait_for_shutdown_signal`'s matching `unblock_shutdown_signals`
+    // call for where/why it's lifted again, once our own
+    // graceful-shutdown handler is actually armed.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+    }
+}
+
+#[cfg(not(unix))]
+fn block_shutdown_signals() {}
+
+#[cfg(unix)]
+fn unblock_shutdown_signals() {
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+    }
+}
+
+#[cfg(not(unix))]
+fn unblock_shutdown_signals() {}
+
 fn main() -> ExitCode {
+    block_shutdown_signals();
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     let default_config_path = paths::default_config_path();
 
@@ -106,14 +159,57 @@ fn main() -> ExitCode {
         Err(e) => return fail(stage::CACHE, e),
     }
 
-    run_server(&cfg.listen_addr)
+    run_server(&cfg.listen_addr, &cache_path, &cfg.data_dir.join("token"))
 }
 
-/// Stage 5 (listener bind) and stage 6 (ready log) run on a tokio runtime
-/// built here, rather than via `#[tokio::main]`, so that stages 1-4 above
-/// (which are synchronous and must run before any async runtime exists)
-/// stay plain, directly-testable functions.
-fn run_server(listen_addr: &str) -> ExitCode {
+/// Stage 5 (listener bind), stage 5b (registry + initial graph build,
+/// PR-6) and stage 6 (ready log, then serving JSON-RPC/WebSocket
+/// requests until shutdown) run on a tokio runtime built here, rather
+/// than via `#[tokio::main]`, so that stages 1-4 above (which are
+/// synchronous and must run before any async runtime exists) stay
+/// plain, directly-testable functions.
+///
+/// Three ordering/thread details inside the async block below are
+/// load-bearing, not incidental — each one was found by directly
+/// reproducing an intermittent clean-shutdown test failure, not by
+/// inspection, so they're recorded here in full:
+///
+/// 1. `main` blocks SIGTERM/SIGINT (see `block_shutdown_signals`)
+///    before doing any other work, so a signal arriving during the
+///    synchronous startup prelude (stages 1-4, before any tokio
+///    runtime or signal handler exists) is held *pending* by the
+///    kernel rather than invoking the OS's default
+///    "terminate immediately, no cleanup" disposition for it.
+/// 2. The `tokio::signal::unix::signal(...)` registration calls and
+///    the matching `unblock_shutdown_signals()` call below run
+///    *inline*, synchronously, as the literal first lines of the
+///    top-level future passed to `block_on` — not inside a separately
+///    `tokio::spawn`-ed task. This is deliberate and was confirmed by
+///    direct reproduction (not just reasoning about it): on this
+///    platform, a signal that is pending while blocked on one thread
+///    is *not* delivered when a *different* thread later unblocks it
+///    — only the thread that actually performed the block (here, the
+///    one `main` block_on's caller, which is the same thread that ran
+///    `block_shutdown_signals()`) reliably receives it once it
+///    unblocks. `Runtime::block_on`'s top-level future is polled on
+///    the calling thread for this first, non-yielding poll, which is
+///    exactly why the block/register/unblock sequence must stay
+///    inline here rather than move into a spawned task (which tokio's
+///    multi-thread scheduler can and does run on a different worker
+///    thread). Once unblocked here, later signals are delivered fine
+///    regardless of which thread happens to be running at the time —
+///    only this initial block/unblock handoff is thread-sensitive.
+/// 3. `SourceRegistry::new` builds and owns its own dedicated internal
+///    `tokio::runtime::Runtime` (for its watcher tasks), and dropping
+///    a `Runtime` while the current thread is inside another
+///    runtime's `block_on` panics ("Cannot drop a runtime in a
+///    context where blocking is not allowed"). The async block below
+///    therefore hands its `Arc<SourceRegistry>` back out as part of
+///    its return value, so the final, refcount-zero drop of it always
+///    happens in this function's plain synchronous frame, strictly
+///    after `runtime.block_on` has already returned — never while
+///    still inside it.
+fn run_server(listen_addr: &str, cache_path: &std::path::Path, token_path: &std::path::Path) -> ExitCode {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -122,50 +218,153 @@ fn run_server(listen_addr: &str) -> ExitCode {
         Err(e) => return fail(stage::LISTENER, e),
     };
 
-    runtime.block_on(async move {
+    let (exit, registry_to_drop_after_runtime_shutdown) = runtime.block_on(async move {
+        // Inline, no `.await` yet: see point 2 in this function's doc
+        // comment for why this exact sequence must run synchronously,
+        // right here, on the thread that called `block_on`.
+        #[cfg(unix)]
+        let shutdown_rx = {
+            use tokio::signal::unix::{signal, SignalKind};
+            let sigterm = signal(SignalKind::terminate());
+            let sigint = signal(SignalKind::interrupt());
+            unblock_shutdown_signals();
+
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+            match (sigterm, sigint) {
+                (Ok(mut sigterm), Ok(mut sigint)) => {
+                    tokio::spawn(async move {
+                        tokio::select! {
+                            _ = sigterm.recv() => {}
+                            _ = sigint.recv() => {}
+                        }
+                        tracing::info!("received shutdown signal, stopping");
+                        let _ = shutdown_tx.send(());
+                    });
+                }
+                _ => {
+                    // Could not install either handler: fall back to
+                    // Ctrl-C so the daemon still exits cleanly on some
+                    // shutdown signal rather than hanging forever.
+                    tokio::spawn(async move {
+                        let _ = tokio::signal::ctrl_c().await;
+                        tracing::info!("received shutdown signal, stopping");
+                        let _ = shutdown_tx.send(());
+                    });
+                }
+            }
+            shutdown_rx
+        };
+
+        #[cfg(not(unix))]
+        let shutdown_rx = {
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+            tokio::spawn(async move {
+                let _ = tokio::signal::ctrl_c().await;
+                tracing::info!("received shutdown signal, stopping");
+                let _ = shutdown_tx.send(());
+            });
+            shutdown_rx
+        };
+
         let listener = match server::bind(listen_addr).await {
             Ok(l) => l,
-            Err(e) => return fail(stage::LISTENER, e),
+            Err(e) => return (fail(stage::LISTENER, e), None),
         };
 
         let bound_addr = match listener.local_addr() {
             Ok(a) => a,
-            Err(e) => return fail(stage::LISTENER, e),
+            Err(e) => return (fail(stage::LISTENER, e), None),
         };
+
+        // Stage 5b: build the live source registry (its own cache
+        // handle) and a one-time initial graph snapshot (a second,
+        // short-lived cache handle, dropped once the build completes)
+        // that the RPC dispatch table (PR-6) reads/writes through.
+        //
+        // The graph snapshot is built once, at startup, and never
+        // rebuilt in place: a `source.rescan`/watcher-driven
+        // `DaemonEvent` still gets forwarded live to WebSocket clients
+        // as a `graph:changed` notification (GP6) so they know to
+        // re-query, but `unit.resolve_link`/`graph.get_*` keep
+        // answering from this startup-time snapshot until the daemon
+        // is restarted. Rebuilding the in-memory graph incrementally
+        // from `DaemonEvent`s via `UnitGraph::apply_change_notification`
+        // is explicitly left as follow-up work, not part of this PR's
+        // acceptance criteria.
+        let registry_cache = match tephra_cache::Cache::open(cache_path) {
+            Ok(c) => c,
+            Err(e) => return (fail(stage::CACHE, e), None),
+        };
+        let registry = match SourceRegistry::new(registry_cache) {
+            Ok(r) => Arc::new(r),
+            Err(e) => return (fail(stage::CACHE, e), None),
+        };
+        let graph = {
+            let graph_cache = match tephra_cache::Cache::open(cache_path) {
+                Ok(c) => c,
+                Err(e) => return (fail(stage::CACHE, e), None),
+            };
+            match tephra_graph::UnitGraph::build_from_cache(&graph_cache) {
+                Ok(g) => Arc::new(g),
+                Err(e) => return (fail(stage::CACHE, e), None),
+            }
+        };
+
+        let state = Arc::new(AppState::new(
+            token_path.to_path_buf(),
+            graph as Arc<dyn GraphBackend>,
+            registry.clone() as Arc<dyn SourceBackend>,
+        ));
+
+        // Forwards every `DaemonEvent` the registry's watchers/rescans
+        // produce (GP6) to connected WebSocket clients as a
+        // `graph:changed` notification. Ends only when the registry
+        // itself is dropped (daemon shutdown), at which point there is
+        // nothing left to forward.
+        let forward_state = state.clone();
+        let mut events = registry.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match events.recv().await {
+                    Ok(DaemonEvent::SourceChanged { source, paths }) => {
+                        let payload = json!({
+                            "source": source,
+                            "paths": paths
+                                .iter()
+                                .map(|p| p.display().to_string())
+                                .collect::<Vec<_>>(),
+                        });
+                        forward_state.broadcast_graph_changed(payload);
+                    }
+                    Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Closed) => break,
+                }
+            }
+        });
+
+        let app = build_router(state);
 
         // Stage 5: ready log. This is the single unambiguous "listening"
         // line other tools wait on.
         tracing::info!("listening on {bound_addr}");
 
-        wait_for_shutdown_signal().await;
-        tracing::info!("received shutdown signal, stopping");
-        ExitCode::SUCCESS
-    })
-}
+        let shutdown = async {
+            let _ = shutdown_rx.await;
+        };
 
-#[cfg(unix)]
-async fn wait_for_shutdown_signal() {
-    use tokio::signal::unix::{signal, SignalKind};
-
-    let mut sigterm = match signal(SignalKind::terminate()) {
-        Ok(s) => s,
-        Err(_) => {
-            // Fall back to Ctrl-C only if SIGTERM handling can't be
-            // installed; still exits cleanly on any shutdown signal.
-            let _ = tokio::signal::ctrl_c().await;
-            return;
+        if let Err(e) = axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown)
+            .await
+        {
+            tracing::error!("server error: {e}");
         }
-    };
 
-    tokio::select! {
-        _ = sigterm.recv() => {}
-        _ = tokio::signal::ctrl_c() => {}
-    }
-}
+        (ExitCode::SUCCESS, Some(registry))
+    });
 
-#[cfg(not(unix))]
-async fn wait_for_shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    drop(registry_to_drop_after_runtime_shutdown);
+    drop(runtime);
+    exit
 }
 
 /// Initializes `tracing` exactly once, human-readable to stderr, at the
