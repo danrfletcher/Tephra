@@ -207,6 +207,51 @@ pub(crate) fn delete_units_for_source(conn: &Connection, source_id: i64) -> Resu
     Ok(())
 }
 
+/// Deletes every `units` row (and cascading `links`/`tags`/`blocks`
+/// rows) whose `rel_path` is nested under `rel_prefix` — i.e. starts
+/// with `"<rel_prefix>/"` — scoped to `source_id`. Leaves a row at
+/// `rel_prefix` itself (an exact match, not a nested one) untouched;
+/// callers that also need that exact row gone call
+/// [`delete_unit`]/[`get_unit_by_rel_path`] separately.
+///
+/// Used by the watcher's batch-apply path (PR-4) when a changed path
+/// no longer exists on disk and was a directory rather than a file: a
+/// shell `mv` of a directory out of a source arrives as exactly one
+/// such event, naming only the directory itself, so every unit row
+/// that used to live under it must be cleaned up explicitly or it
+/// would be left behind as a stale row forever. Returns the number of
+/// `units` rows removed, so a caller can tell whether anything was
+/// actually there to delete.
+pub(crate) fn delete_units_under_prefix(
+    conn: &Connection,
+    source_id: i64,
+    rel_prefix: &str,
+) -> Result<usize, CacheError> {
+    let like_pattern = format!("{rel_prefix}/%");
+    conn.execute(
+        "UPDATE links SET to_unit_id = NULL WHERE to_unit_id IN \
+         (SELECT id FROM units WHERE source_id = ?1 AND rel_path LIKE ?2)",
+        rusqlite::params![source_id, like_pattern],
+    )?;
+    conn.execute(
+        "DELETE FROM links WHERE from_unit_id IN (SELECT id FROM units WHERE source_id = ?1 AND rel_path LIKE ?2)",
+        rusqlite::params![source_id, like_pattern],
+    )?;
+    conn.execute(
+        "DELETE FROM tags WHERE unit_id IN (SELECT id FROM units WHERE source_id = ?1 AND rel_path LIKE ?2)",
+        rusqlite::params![source_id, like_pattern],
+    )?;
+    conn.execute(
+        "DELETE FROM blocks WHERE unit_id IN (SELECT id FROM units WHERE source_id = ?1 AND rel_path LIKE ?2)",
+        rusqlite::params![source_id, like_pattern],
+    )?;
+    let deleted = conn.execute(
+        "DELETE FROM units WHERE source_id = ?1 AND rel_path LIKE ?2",
+        rusqlite::params![source_id, like_pattern],
+    )?;
+    Ok(deleted)
+}
+
 /// Every `units` row belonging to the source named `source_name`,
 /// each paired with that source's current status. Returns cached rows
 /// for an offline source too (E2) rather than an empty result — the

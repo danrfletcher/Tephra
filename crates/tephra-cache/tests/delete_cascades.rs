@@ -125,6 +125,84 @@ fn delete_source_removes_the_source_row_and_cascades() {
 }
 
 #[test]
+fn delete_units_under_prefix_clears_only_the_nested_rel_paths() {
+    use tephra_cache::{NewLink, NewUnit};
+
+    let dir = tempfile::tempdir().unwrap();
+    let cache = open_temp_cache(&dir);
+    let source_id = cache
+        .register_source("notes", "/vault/notes", SourceStatus::Active)
+        .expect("register_source");
+
+    // `dir/a.md` and `dir/sub/b.md` are both nested under `dir`;
+    // `dir2/c.md` only shares a string prefix (not a real path
+    // component boundary) and must survive; `top.md` is unrelated.
+    let dir_a = cache
+        .insert_unit(&NewUnit {
+            source_id,
+            rel_path: "dir/a.md",
+            mtime: None,
+            frontmatter_json: None,
+        })
+        .expect("insert dir/a.md");
+    cache
+        .insert_link(&NewLink {
+            from_unit_id: dir_a,
+            to_raw: "[[Other]]",
+            to_unit_id: None,
+            kind: "wikilink",
+        })
+        .expect("insert link for dir/a.md");
+    let dir_sub_b = cache
+        .insert_unit(&NewUnit {
+            source_id,
+            rel_path: "dir/sub/b.md",
+            mtime: None,
+            frontmatter_json: None,
+        })
+        .expect("insert dir/sub/b.md");
+    let dir2_c = cache
+        .insert_unit(&NewUnit {
+            source_id,
+            rel_path: "dir2/c.md",
+            mtime: None,
+            frontmatter_json: None,
+        })
+        .expect("insert dir2/c.md");
+    let top = cache
+        .insert_unit(&NewUnit {
+            source_id,
+            rel_path: "top.md",
+            mtime: None,
+            frontmatter_json: None,
+        })
+        .expect("insert top.md");
+
+    let deleted = cache
+        .delete_units_under_prefix(source_id, "dir")
+        .expect("delete_units_under_prefix");
+    assert_eq!(
+        deleted, 2,
+        "only dir/a.md and dir/sub/b.md are nested under dir"
+    );
+
+    assert!(cache.get_unit(dir_a).expect("get_unit").is_none());
+    assert!(cache.get_unit(dir_sub_b).expect("get_unit").is_none());
+    assert!(
+        cache.get_unit(dir2_c).expect("get_unit").is_some(),
+        "dir2/c.md only shares a string prefix with \"dir\", not a path component boundary"
+    );
+    assert!(cache.get_unit(top).expect("get_unit").is_some());
+
+    // dir/a.md's link row was cascaded away too.
+    let conn = cache.connection();
+    let links: i64 = conn
+        .query_row("SELECT COUNT(*) FROM links", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(links, 0);
+}
+
+#[test]
 fn delete_source_is_idempotent_on_an_already_removed_source() {
     let dir = tempfile::tempdir().unwrap();
     let cache = open_temp_cache(&dir);

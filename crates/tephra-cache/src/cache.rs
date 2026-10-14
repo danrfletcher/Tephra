@@ -265,6 +265,21 @@ impl Cache {
         units::delete_units_for_source(&self.conn, source_id)
     }
 
+    /// Deletes every `units` row (and cascading `links`/`tags`/
+    /// `blocks` rows) whose `rel_path` is nested under `rel_prefix`,
+    /// scoped to `source_id`. See
+    /// [`units::delete_units_under_prefix`] for the exact semantics
+    /// (used by PR-4's watcher batch-apply path when a directory is
+    /// moved/removed out from under a source). Returns the number of
+    /// `units` rows removed.
+    pub fn delete_units_under_prefix(
+        &self,
+        source_id: i64,
+        rel_prefix: &str,
+    ) -> Result<usize, CacheError> {
+        units::delete_units_under_prefix(&self.conn, source_id, rel_prefix)
+    }
+
     /// Deletes the named source's row and every `units`/`links`/
     /// `tags`/`blocks` row that belonged to it. Idempotent: a no-op
     /// (not an error) if no source with this name exists, so
