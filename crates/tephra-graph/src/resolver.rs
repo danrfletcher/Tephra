@@ -212,7 +212,14 @@ fn join_relative(from_dir: &str, target: &str) -> String {
 /// `from_rel_path`'s own directory (a leading `./` included — joining
 /// against a directory already absorbs it), then NFC-normalized with
 /// its markdown extension stripped — the exact form compared against
-/// [`crate::UnitGraph::stem_index`] (R1/R6).
+/// [`crate::UnitGraph::stem_index`] (R1/R6). Only ever looked up
+/// against `stem_index` (R21), never `basename_index`, regardless of
+/// whether the result contains a `/` — see
+/// [`markdown_target_is_self_reference`] for the case where this
+/// would otherwise be empty, and [`resolve_in_scope`]'s
+/// `allow_basename` parameter for why a markdown link never falls
+/// back to a basename-anywhere-in-source match the way a bare
+/// wikilink does.
 pub(crate) fn normalize_markdown_target(from_rel_path: &str, raw_target: &str) -> String {
     let without_anchor = raw_target.split('#').next().unwrap_or(raw_target);
     let decoded = percent_decode(without_anchor);
@@ -222,6 +229,21 @@ pub(crate) fn normalize_markdown_target(from_rel_path: &str, raw_target: &str) -
         .unwrap_or("");
     let joined = join_relative(from_dir, &decoded);
     normalize_key(strip_markdown_extension(&joined))
+}
+
+/// Whether a markdown link's raw target names no file at all once any
+/// `#anchor` suffix is removed and it is percent-decoded — a
+/// same-file anchor link like `[x](#heading)` (R20), the markdown
+/// equivalent of a wikilink's empty-target self-reference
+/// (`[[#Heading]]`). Checked on the raw target directly, *before*
+/// [`join_relative`] ever runs: joining an empty remainder onto the
+/// linking file's own directory previously produced a bogus
+/// non-empty key (`""` at the source root, or the directory's own
+/// name — e.g. `"sub"` — for a file inside a subdirectory), so the
+/// bug's exact shape depended on how deep the linking file was.
+pub(crate) fn markdown_target_is_self_reference(raw_target: &str) -> bool {
+    let without_anchor = raw_target.split('#').next().unwrap_or(raw_target);
+    percent_decode(without_anchor).is_empty()
 }
 
 /// The final path component of a normalized stem/target key — the
@@ -260,17 +282,31 @@ pub(crate) struct GraphIndex<'a> {
 /// edge in the graph used to pay an O(units-in-source) cost on every
 /// rebuild. Matching rule (E4, a judgement call where the spec is
 /// silent on the exact shape): a candidate matches if its normalized
-/// stem equals `target` exactly, or — when `target` itself contains
-/// no `/` — its basename equals `target`. Among every match, the
-/// one(s) with the shortest matched path (by `char` count) win; a tie
-/// among the shortest is reported as [`ResolveOutcome::Ambiguous`]
-/// with every tied id, sorted, rather than guessing one.
+/// stem equals `target` exactly, or — when `allow_basename` is `true`
+/// *and* `target` itself contains no `/` — its basename equals
+/// `target`. Among every match, the one(s) with the shortest matched
+/// path (by `char` count) win; a tie among the shortest is reported
+/// as [`ResolveOutcome::Ambiguous`] with every tied id, sorted,
+/// rather than guessing one.
+///
+/// `allow_basename` is `false` for every markdown-link lookup (R21):
+/// a markdown link's key is always an exact relative path from the
+/// source root (root-level targets simply have no `/` in that path),
+/// so falling back to `basename_index` for one would silently match
+/// some unrelated same-named file anywhere else in the source,
+/// exactly when the linking file happens to sit at the source root
+/// or climbs back to it with `../` — a "link to a path that doesn't
+/// exist must dangle" violation, not an exact-path lookup giving the
+/// wrong depth-dependent answer. It is `true` only for a wikilink's
+/// bare (no `@source:`-prefix-stripped) target, where a basename
+/// match anywhere in the source is the documented, tested rule.
 pub(crate) fn resolve_in_scope(
     index: &GraphIndex<'_>,
     scope_source: &str,
     target: &str,
+    allow_basename: bool,
 ) -> ResolveOutcome {
-    let candidate_ids: &[String] = if target.contains('/') {
+    let candidate_ids: &[String] = if !allow_basename || target.contains('/') {
         index
             .stem_index
             .get(scope_source)
@@ -366,8 +402,13 @@ pub(crate) fn edge_target_scope_key(
         // Markdown-style `[text](target)` link: no `@source` prefix
         // grammar, resolved only within the referring unit's own
         // source. An absolute URL (contains "://") never names a
-        // vault/repo unit, so it is never worth indexing.
-        if to_raw.contains("://") {
+        // vault/repo unit, so it is never worth indexing. A target
+        // that is empty once its `#anchor` is stripped (R20) is a
+        // same-file anchor link, resolved below in
+        // `resolve_edge_target` without a match key at all — just
+        // like a wikilink's empty-target self-reference — so it must
+        // not get indexed under a bogus key here either.
+        if to_raw.contains("://") || markdown_target_is_self_reference(to_raw) {
             return None;
         }
         let from_rel_path = index
@@ -406,13 +447,25 @@ pub(crate) fn resolve_edge_target(
             // self-reference edge case) — no search needed.
             return EdgeTarget::Resolved(from_id.to_string());
         }
+    } else if markdown_target_is_self_reference(to_raw) {
+        // The markdown equivalent of the wikilink case just above
+        // (R20): `[x](#heading)` names no file, only an anchor within
+        // the linking file itself, so it always resolves to the
+        // referring unit regardless of that unit's own directory
+        // depth — checked here, before `edge_target_scope_key` would
+        // otherwise join the empty remainder onto `from_dir` and
+        // produce a bogus non-empty key.
+        return EdgeTarget::Resolved(from_id.to_string());
     }
     match edge_target_scope_key(index, from_id, from_source, to_raw, kind) {
         None => EdgeTarget::Dangling,
-        Some((scope, key)) => match resolve_in_scope(index, &scope, &key) {
-            ResolveOutcome::Unique(id) => EdgeTarget::Resolved(id),
-            ResolveOutcome::Ambiguous(_) | ResolveOutcome::NotFound => EdgeTarget::Dangling,
-        },
+        Some((scope, key)) => {
+            let allow_basename = kind == tephra_parser::LINK_KIND_WIKILINK;
+            match resolve_in_scope(index, &scope, &key, allow_basename) {
+                ResolveOutcome::Unique(id) => EdgeTarget::Resolved(id),
+                ResolveOutcome::Ambiguous(_) | ResolveOutcome::NotFound => EdgeTarget::Dangling,
+            }
+        }
     }
 }
 
@@ -461,7 +514,7 @@ pub(crate) fn resolve_link_impl(
 
     let key = normalize_wikilink_target(&wikilink.target);
     let index = graph.index();
-    match resolve_in_scope(&index, &scope, &key) {
+    match resolve_in_scope(&index, &scope, &key, true) {
         ResolveOutcome::Unique(id) => {
             let unit = graph
                 .unit(&id)

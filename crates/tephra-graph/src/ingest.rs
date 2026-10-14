@@ -367,18 +367,45 @@ impl UnitGraph {
     /// large source — is left completely untouched: not cloned, not
     /// re-indexed, not even read. See
     /// `tests/integration/watcher_update.rs`'s scaling test.
+    ///
+    /// Gathers every touched id's own forward_index slots into
+    /// `superseded` in one pass over all of `touched_ids` before the
+    /// match_index re-resolution pass runs at all (R19), so a
+    /// multi-path batch (several entries in `touched_ids` at once —
+    /// a folder delete, a git checkout, a multi-file save) gives the
+    /// same result regardless of which order `touched_ids` lists
+    /// them in, matching a fresh [`UnitGraph::build_from_cache`] on
+    /// the same cache state.
     pub(crate) fn recompute_scoped(&mut self, touched_ids: &[String]) {
         let mut superseded: HashSet<usize> = HashSet::new();
         let mut fresh: Vec<Edge> = Vec::new();
 
+        // Every touched id's own forward_index slots are collected
+        // into `superseded` *first*, for every touched id, before the
+        // match_index re-resolution pass below ever runs (R19). A
+        // batched notification can list several paths together (a
+        // folder delete, a git checkout, a multi-file save), and the
+        // match_index pass for one touched id must never re-queue a
+        // *stale* copy of an edge some other touched id in the same
+        // batch already authored and is about to replace — e.g.
+        // ["Y.md", "X.md"] where X.md (listed second) used to contain
+        // `[[Y]]`: processing Y.md's match_index hit before reaching
+        // X.md used to re-resolve and re-insert X's *old* edge from
+        // its pre-change `to_raw`, with no match key of its own to
+        // ever let a later change remove it, because X's own
+        // forward_index slots weren't superseded yet at that point in
+        // the single combined loop this replaces. Doing this gathering
+        // pass up front, covering every touched id regardless of
+        // order, makes the result independent of `touched_ids`'
+        // ordering, matching a fresh `build_from_cache` on the same
+        // cache state.
         for tid in touched_ids {
-            // Every edge this id used to author is replaced wholesale
-            // below (dropped here, regenerated fresh if the id still
-            // exists) — never left stale alongside a new version.
             if let Some(idxs) = self.forward_index.get(tid) {
                 superseded.extend(idxs.iter().copied());
             }
+        }
 
+        for tid in touched_ids {
             if let Some(facts) = self.nodes.get(tid).cloned() {
                 // Insert or update: (re)resolve this id's own links
                 // fresh.
