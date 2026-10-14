@@ -69,12 +69,24 @@ pub fn vault_fixture() -> TempSource {
 /// A repo-shaped fixture: `README.md` carries one wikilink
 /// (`[[one]]`); a `.git` directory and a `target/` build directory
 /// are also populated, each with a `.md` file that must never reach
-/// the parser (G2).
+/// the parser (G2). `Cargo.toml` and `src/main.rs` are real,
+/// non-ignored source files a code repository would contain — they
+/// are walked and counted in `files_seen` like any other non-ignored
+/// file, but (R3) must never be fed through the parser: only
+/// `README.md`'s `.md` extension qualifies it to become a unit, so a
+/// code-repo source never ends up with a false wikilink parsed out of
+/// `Cargo.toml`'s `[[bin]]` table or a false tag out of a `main.rs`
+/// comment.
 pub fn repo_fixture() -> TempSource {
     let dir = tempfile::tempdir().expect("tempdir");
     let src = TempSource { dir };
 
     src.write("README.md", "# atlas-repo\n\nSee [[one]] for details.\n");
+    src.write(
+        "Cargo.toml",
+        "[package]\nname = \"atlas-repo\"\n\n[[bin]]\nname = \"atlas-repo\"\n",
+    );
+    src.write("src/main.rs", "// #not_a_real_tag\nfn main() {}\n");
     src.mkdir(".git");
     src.write(".git/HEAD", "ref: refs/heads/main\n");
     src.mkdir("target/debug");
