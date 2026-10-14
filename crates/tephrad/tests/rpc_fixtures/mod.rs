@@ -241,6 +241,13 @@ pub async fn spawn_with_token(graph: MockGraph, sources: MockSources, token: &st
         token_path,
         Arc::new(graph) as Arc<dyn GraphBackend>,
         Arc::new(sources) as Arc<dyn SourceBackend>,
+        // These fixtures always back `AppState` with a canned
+        // `MockGraph`, never a real `tephrad::rpc::backend::SharedGraph`
+        // — there is nothing for a successful `source.*` mutation to
+        // refresh here (R1 is instead covered end-to-end, against the
+        // real `SourceRegistry`/`UnitGraph`, by
+        // `tests/rpc_live_graph.rs`).
+        None,
     ));
     let router = build_router(state.clone());
 

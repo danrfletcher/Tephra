@@ -14,9 +14,12 @@
 //! derive `Serialize` themselves (and this PR does not touch those
 //! other crates' structs to add it).
 
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
+
 use serde::Serialize;
 
-use tephra_cache::{SourceRow, SourceStatus};
+use tephra_cache::{Cache, SourceRow, SourceStatus};
 use tephra_graph::{Edge, ResolveError, ResolveResult, UnitGraph};
 
 use crate::registry::{RegistryError, SourceRegistry};
@@ -52,6 +55,98 @@ impl GraphBackend for UnitGraph {
     }
     fn get_edges(&self) -> Vec<Edge> {
         UnitGraph::get_edges(self)
+    }
+}
+
+/// R1 fix: a [`GraphBackend`] whose underlying [`UnitGraph`] snapshot
+/// can be swapped out in place, behind a plain `RwLock` — every query
+/// takes the read lock for the duration of one call, exactly like a
+/// bare `UnitGraph` would; [`SharedGraph::replace`] is the only way to
+/// install a fresher snapshot, under the write lock, atomically from
+/// every concurrent reader's point of view.
+///
+/// Without this, the production daemon's in-memory graph was built
+/// once at startup and never updated: a `source.register`/`rescan`
+/// over RPC (or a watcher-driven change) updated `tephra-cache` on
+/// disk but left every running `unit.resolve_link`/`graph.get_*` call
+/// answering from the stale startup snapshot until the daemon was
+/// restarted (R1 review finding). [`crate::rpc::server::AppState`]
+/// holds this behind `Arc<dyn GraphBackend>` for queries, and
+/// additionally keeps the concrete `Arc<SharedGraph>` alongside a
+/// [`GraphRefresh`] so a successful mutating `source.*` call (and the
+/// watcher's own `DaemonEvent`s) can call [`GraphRefresh::refresh`]
+/// to rebuild it from the cache and swap it in.
+pub struct SharedGraph {
+    inner: RwLock<UnitGraph>,
+}
+
+impl SharedGraph {
+    pub fn new(initial: UnitGraph) -> Self {
+        SharedGraph {
+            inner: RwLock::new(initial),
+        }
+    }
+
+    /// Atomically swaps in a freshly built `graph` as this backend's
+    /// current snapshot. Every in-flight or subsequent query call
+    /// sees either the old snapshot in full or the new one in full —
+    /// never a partially-updated graph.
+    pub fn replace(&self, graph: UnitGraph) {
+        *self.inner.write().unwrap() = graph;
+    }
+}
+
+impl GraphBackend for SharedGraph {
+    fn resolve_link(
+        &self,
+        raw: &str,
+        default_source: Option<&str>,
+    ) -> Result<ResolveResult, ResolveError> {
+        self.inner.read().unwrap().resolve_link(raw, default_source)
+    }
+    fn get_backlinks(&self, id: &str) -> Vec<Edge> {
+        self.inner.read().unwrap().get_backlinks(id)
+    }
+    fn get_forward_links(&self, id: &str) -> Vec<Edge> {
+        self.inner.read().unwrap().get_forward_links(id)
+    }
+    fn get_edges(&self) -> Vec<Edge> {
+        self.inner.read().unwrap().get_edges()
+    }
+}
+
+/// Bundles everything needed to rebuild a [`SharedGraph`] from the
+/// on-disk cache: the cache's path (a fresh, short-lived [`Cache`]
+/// handle is opened from it for each rebuild, exactly like
+/// `main.rs`'s own startup-time build does) and the live snapshot to
+/// swap the result into. Cheap to clone (two `Arc`-backed fields) so
+/// every request handler can own one without borrowing from
+/// [`crate::rpc::server::AppState`] across an `.await`/`spawn_blocking`
+/// boundary.
+#[derive(Clone)]
+pub struct GraphRefresh {
+    shared: Arc<SharedGraph>,
+    cache_path: PathBuf,
+}
+
+impl GraphRefresh {
+    pub fn new(shared: Arc<SharedGraph>, cache_path: PathBuf) -> Self {
+        GraphRefresh { shared, cache_path }
+    }
+
+    /// Rebuilds a fresh [`UnitGraph`] from the current contents of the
+    /// on-disk cache (G4's already-implemented
+    /// `UnitGraph::build_from_cache`, not new graph logic — R1 review
+    /// finding) and swaps it into the shared backend. Synchronous and
+    /// blocking (a real file open plus a full cache read): callers in
+    /// `server.rs`/`main.rs` always run this inside
+    /// `tokio::task::spawn_blocking`, never directly on an async
+    /// worker thread (R6).
+    pub fn refresh(&self) -> Result<(), String> {
+        let cache = Cache::open(&self.cache_path).map_err(|e| e.to_string())?;
+        let graph = UnitGraph::build_from_cache(&cache).map_err(|e| e.to_string())?;
+        self.shared.replace(graph);
+        Ok(())
     }
 }
 

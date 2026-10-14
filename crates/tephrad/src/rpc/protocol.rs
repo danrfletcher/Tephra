@@ -30,6 +30,12 @@ pub const INVALID_PARAMS: i64 = -32602;
 pub const UNAUTHORIZED: i64 = -32001;
 pub const RESOLVE_ERROR: i64 = -32010;
 pub const SOURCE_ERROR: i64 = -32011;
+/// Standard JSON-RPC 2.0 "Internal error" (§5.1): used only when a
+/// dispatch call panicked inside its `tokio::task::spawn_blocking`
+/// task (R6) — a bug, not a client-facing validation/auth/domain
+/// failure, so it gets the generic reserved code rather than
+/// [`SOURCE_ERROR`]/[`RESOLVE_ERROR`].
+pub const INTERNAL_ERROR: i64 = -32603;
 
 /// One JSON-RPC error object.
 #[derive(Debug, Clone, Serialize)]

@@ -47,8 +47,12 @@ const CMP_WIDTH: usize = 128;
 ///
 /// `Debug` is derived purely so `Result<Authenticated, _>::unwrap_err()`
 /// is usable in tests; it reveals nothing (the type carries no
-/// fields) and is never used to leak any credential.
-#[derive(Debug)]
+/// fields) and is never used to leak any credential. `Clone`/`Copy`
+/// are likewise free (the type is zero-sized) and let a proof move
+/// into a `tokio::task::spawn_blocking` closure by value (R6) without
+/// weakening the "only `authenticate`/`verify_bearer` can construct
+/// one" guarantee — both constructors stay private to this module.
+#[derive(Debug, Clone, Copy)]
 pub struct Authenticated(());
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,17 +115,35 @@ pub fn constant_time_token_eq(a: &str, b: &str) -> bool {
     fa.ct_eq(&fb).into()
 }
 
-/// Reads the token file at `token_path` fresh on every call (no
-/// cache — E11) and checks `headers` against it. Any I/O error
-/// reading the token file (missing, permissions, mid-rotation
+/// Extracts the bearer credential from `headers`, as an owned
+/// `String`, without checking it against the token file at all.
+///
+/// Exposed (R2 fix) so a WebSocket handshake can retain the raw
+/// credential presented at upgrade time and re-run [`verify_bearer`]
+/// against it before dispatching every later message on that same
+/// connection — there is no per-frame `Authorization` header in the
+/// WebSocket protocol to re-extract from, so the connection's own
+/// handshake-time value must be the thing re-checked.
+pub fn bearer_from_headers(headers: &HeaderMap) -> Option<String> {
+    extract_bearer(headers).map(str::to_string)
+}
+
+/// Checks `provided` against the token file at `token_path`'s current
+/// contents, fresh from disk on every call (no cache — E11). Any I/O
+/// error reading the token file (missing, permissions, mid-rotation
 /// race, ...) is treated the same as a token mismatch, never as "no
 /// auth required": there is no fail-open path here. Likewise, an
 /// empty or all-whitespace token file (which should never happen in
 /// practice — `token::ensure_token` always writes a valid 64-hex-char
 /// value — but is not this module's job to assume) can never be
 /// matched by an empty bearer credential.
-pub fn authenticate(headers: &HeaderMap, token_path: &Path) -> Result<Authenticated, AuthError> {
-    let provided = extract_bearer(headers).ok_or(AuthError::Missing)?;
+///
+/// The lower-level half of [`authenticate`], factored out so a
+/// WebSocket connection can re-run exactly this check per message
+/// (R2) against the bearer value it retained at handshake time,
+/// without needing a fresh `HeaderMap` (which doesn't exist per-frame
+/// on an already-open socket).
+pub fn verify_bearer(provided: &str, token_path: &Path) -> Result<Authenticated, AuthError> {
     let expected_raw = std::fs::read_to_string(token_path).unwrap_or_default();
     let expected = expected_raw.trim();
 
@@ -133,6 +155,15 @@ pub fn authenticate(headers: &HeaderMap, token_path: &Path) -> Result<Authentica
     } else {
         Err(AuthError::Mismatch)
     }
+}
+
+/// Reads the token file at `token_path` fresh on every call (no
+/// cache — E11) and checks `headers` against it. See [`verify_bearer`]
+/// for the comparison's own semantics; this adds only the
+/// header-extraction step on top of it.
+pub fn authenticate(headers: &HeaderMap, token_path: &Path) -> Result<Authenticated, AuthError> {
+    let provided = extract_bearer(headers).ok_or(AuthError::Missing)?;
+    verify_bearer(provided, token_path)
 }
 
 #[cfg(test)]

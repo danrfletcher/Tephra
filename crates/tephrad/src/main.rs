@@ -277,20 +277,14 @@ fn run_server(listen_addr: &str, cache_path: &std::path::Path, token_path: &std:
         };
 
         // Stage 5b: build the live source registry (its own cache
-        // handle) and a one-time initial graph snapshot (a second,
-        // short-lived cache handle, dropped once the build completes)
-        // that the RPC dispatch table (PR-6) reads/writes through.
-        //
-        // The graph snapshot is built once, at startup, and never
-        // rebuilt in place: a `source.rescan`/watcher-driven
-        // `DaemonEvent` still gets forwarded live to WebSocket clients
-        // as a `graph:changed` notification (GP6) so they know to
-        // re-query, but `unit.resolve_link`/`graph.get_*` keep
-        // answering from this startup-time snapshot until the daemon
-        // is restarted. Rebuilding the in-memory graph incrementally
-        // from `DaemonEvent`s via `UnitGraph::apply_change_notification`
-        // is explicitly left as follow-up work, not part of this PR's
-        // acceptance criteria.
+        // handle) and an initial `UnitGraph` snapshot behind a
+        // [`tephrad::rpc::backend::SharedGraph`] (R1): a successful
+        // mutating `source.*` RPC call, and every watcher-driven
+        // `DaemonEvent` below, rebuilds this snapshot from the cache
+        // and swaps it in via `GraphRefresh::refresh`, so
+        // `unit.resolve_link`/`graph.get_*` reflect a source
+        // registered/rescanned over RPC on this same running daemon —
+        // no restart required.
         let registry_cache = match tephra_cache::Cache::open(cache_path) {
             Ok(c) => c,
             Err(e) => return (fail(stage::CACHE, e), None),
@@ -299,34 +293,54 @@ fn run_server(listen_addr: &str, cache_path: &std::path::Path, token_path: &std:
             Ok(r) => Arc::new(r),
             Err(e) => return (fail(stage::CACHE, e), None),
         };
-        let graph = {
+        let shared_graph = {
             let graph_cache = match tephra_cache::Cache::open(cache_path) {
                 Ok(c) => c,
                 Err(e) => return (fail(stage::CACHE, e), None),
             };
             match tephra_graph::UnitGraph::build_from_cache(&graph_cache) {
-                Ok(g) => Arc::new(g),
+                Ok(g) => Arc::new(tephrad::rpc::backend::SharedGraph::new(g)),
                 Err(e) => return (fail(stage::CACHE, e), None),
             }
         };
+        let graph_refresh = tephrad::rpc::backend::GraphRefresh::new(
+            shared_graph.clone(),
+            cache_path.to_path_buf(),
+        );
 
         let state = Arc::new(AppState::new(
             token_path.to_path_buf(),
-            graph as Arc<dyn GraphBackend>,
+            shared_graph as Arc<dyn GraphBackend>,
             registry.clone() as Arc<dyn SourceBackend>,
+            Some(graph_refresh),
         ));
 
         // Forwards every `DaemonEvent` the registry's watchers/rescans
         // produce (GP6) to connected WebSocket clients as a
-        // `graph:changed` notification. Ends only when the registry
-        // itself is dropped (daemon shutdown), at which point there is
-        // nothing left to forward.
+        // `graph:changed` notification, after first refreshing the
+        // in-memory graph (R1) so the push actually corresponds to a
+        // graph that has already changed by the time a client
+        // re-queries it. Ends only when the registry itself is
+        // dropped (daemon shutdown), at which point there is nothing
+        // left to forward.
         let forward_state = state.clone();
         let mut events = registry.subscribe();
         tokio::spawn(async move {
             loop {
                 match events.recv().await {
                     Ok(DaemonEvent::SourceChanged { source, paths }) => {
+                        if let Some(refresh) = forward_state.graph_refresh.clone() {
+                            let refreshed = tokio::task::spawn_blocking(move || refresh.refresh()).await;
+                            match refreshed {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => {
+                                    tracing::warn!(error = %e, "failed to refresh the in-memory graph after a watcher event");
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "graph refresh task panicked");
+                                }
+                            }
+                        }
                         let payload = json!({
                             "source": source,
                             "paths": paths
