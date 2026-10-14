@@ -40,8 +40,8 @@ pub struct UnitMetadata {
 /// What a wikilink/markdown-link edge's `to_raw` resolved to.
 ///
 /// Serialized externally-tagged with `rename_all = "snake_case"`
-/// (`{"resolved":"@source:path"}` or the plain string `"dangling"`) —
-/// the frozen GP5 wire shape; see `tests/unit/gp5_contract.rs`.
+/// (`{"resolved":"@source:path"}` or the plain string "dangling") —
+/// the frozen GP5 wire shape; see `tests/integration/gp5_contract.rs`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EdgeTarget {
@@ -108,7 +108,7 @@ pub(crate) fn federated_id(source: &str, rel_path: &str) -> String {
 /// a *stale* id (one with no current node, e.g. the pre-rename path
 /// in GP7's scenario) still names, so a dangling-edge lookup can be
 /// scoped to the right source without requiring the node to exist.
-fn parse_federated_id(id: &str) -> Option<(&str, &str)> {
+pub(crate) fn parse_federated_id(id: &str) -> Option<(&str, &str)> {
     id.strip_prefix('@')?.split_once(':')
 }
 
@@ -148,7 +148,18 @@ pub struct UnitGraph {
     /// (E4's ambiguous-tie case). The O(1)-average candidate lookup
     /// for a bare (no `/`) target.
     pub(crate) basename_index: HashMap<String, HashMap<String, Vec<String>>>,
-    pub(crate) edges: Vec<Edge>,
+    /// The edge store. A slot is `None` once its edge has been
+    /// superseded (R13): every incremental update
+    /// ([`crate::ingest::UnitGraph::recompute_scoped`]) frees and
+    /// reuses slots in place — via [`UnitGraph::free_slots`] — rather
+    /// than cloning and re-collecting the whole `Vec` on every edit,
+    /// so one edit's cost scales with how many edges it actually
+    /// touches, not with the total number of edges in the graph.
+    pub(crate) edges: Vec<Option<Edge>>,
+    /// Slots in `edges` that are currently `None` and available for
+    /// reuse by the next inserted edge, so the `Vec` doesn't grow
+    /// without bound as edges are superseded and replaced over time.
+    pub(crate) free_slots: Vec<usize>,
     /// Federated id -> indices into `edges` whose `from` is that id.
     pub(crate) forward_index: HashMap<String, Vec<usize>>,
     /// Federated id -> indices into `edges` whose `to` resolved to
@@ -156,21 +167,36 @@ pub struct UnitGraph {
     /// so [`UnitGraph::get_backlinks`] stays bounded-time even for a
     /// single unit with well over 1,000 incoming edges.
     pub(crate) backward_index: HashMap<String, Vec<usize>>,
-    /// `(scope_source, normalized_target_key)` -> indices into `edges`
-    /// of currently-[`EdgeTarget::Dangling`] edges whose own computed
-    /// match key equals that pair (see
+    /// `(scope_source, normalized_target_key)` -> indices into
+    /// `edges` of *every* edge (resolved or dangling) whose own
+    /// computed match key equals that pair (see
     /// [`crate::resolver::edge_target_scope_key`]) — the key *every*
     /// edge, resolved or not, would be looked up under if a unit
-    /// existed at that path/name. Lets two things stay bounded-time
-    /// rather than rescanning every edge in the graph:
-    /// - a unit inserted or renamed into place can find which
-    ///   previously-dangling edges might now resolve to it (R3's
-    ///   scoped incremental update);
+    /// existed at that path/name. Covering resolved edges too (not
+    /// only dangling ones, R10) is what lets an insert or removal
+    /// re-check an edge that was already resolved to a *different*
+    /// candidate, not just one that was already dangling — e.g. a
+    /// shorter same-named file landing at the root must pull an edge
+    /// away from a longer already-resolved candidate, and removing
+    /// one half of a tie must let the edge resolve to the remaining
+    /// candidate rather than only ever flipping to dangling. Lets
+    /// three things stay bounded-time rather than rescanning every
+    /// edge in the graph:
+    /// - a unit inserted or renamed into place can find every edge
+    ///   (dangling *or* already resolved elsewhere) that might now
+    ///   resolve differently (R3/R10's scoped incremental update);
+    /// - a unit's removal can find every edge that might now need to
+    ///   re-resolve to a different candidate, or fall back to
+    ///   dangling, rather than being hard-set to dangling regardless
+    ///   of whether another candidate exists (R10);
     /// - [`UnitGraph::get_backlinks`], queried with a *stale* id (one
     ///   with no current node — GP7's renamed-note scenario), can
-    ///   still surface every edge that still intends to target that
-    ///   path/name even though it no longer resolves (R4).
-    pub(crate) dangling_index: HashMap<(String, String), Vec<usize>>,
+    ///   still surface every still-dangling edge that intends to
+    ///   target that path/name even though it no longer resolves
+    ///   (R4) — filtered to just the dangling ones at query time,
+    ///   since a *live* id's own backlinks must never include an
+    ///   edge that didn't actually resolve to it (R11).
+    pub(crate) match_index: HashMap<(String, String), Vec<usize>>,
 }
 
 impl Default for UnitGraph {
@@ -192,9 +218,10 @@ impl UnitGraph {
             stem_index: HashMap::new(),
             basename_index: HashMap::new(),
             edges: Vec::new(),
+            free_slots: Vec::new(),
             forward_index: HashMap::new(),
             backward_index: HashMap::new(),
-            dangling_index: HashMap::new(),
+            match_index: HashMap::new(),
         }
     }
 
@@ -229,7 +256,8 @@ impl UnitGraph {
     pub(crate) fn recompute_offline_flags(&mut self) {
         let nodes = &self.nodes;
         let offline_sources = &self.offline_sources;
-        for edge in &mut self.edges {
+        for slot in &mut self.edges {
+            let Some(edge) = slot else { continue };
             let from_offline = nodes
                 .get(&edge.from)
                 .is_some_and(|n| offline_sources.contains(&n.source));
@@ -291,7 +319,7 @@ impl UnitGraph {
         let mut out: Vec<Edge> = self
             .forward_index
             .get(id)
-            .map(|idxs| idxs.iter().map(|&i| self.edges[i].clone()).collect())
+            .map(|idxs| idxs.iter().filter_map(|&i| self.edges[i].clone()).collect())
             .unwrap_or_default();
         out.sort_by(edge_sort_key);
         out
@@ -304,39 +332,51 @@ impl UnitGraph {
     /// bounded-time regardless of how many thousands of edges target
     /// `id` (no linear scan over every edge in the graph).
     ///
-    /// Also includes every currently-[`EdgeTarget::Dangling`] edge
-    /// whose own match key equals `id`'s path or basename (R4/GP7):
-    /// when `id` names a unit no longer in the graph — most
+    /// When `id` names no unit currently in the graph — most
     /// pointedly, the pre-rename path of a note PR-4's watcher just
-    /// moved — the edges that used to resolve to it flip to dangling
-    /// on removal rather than vanishing from `get_backlinks`
-    /// altogether, so a refactor-preview caller (PR-8) can still find
-    /// every impacted incoming link across every source by querying
-    /// the *old* id, exactly as GP7 requires. This lookup is a no-op
-    /// when `id` currently does exist as a real node: any link that
-    /// would match its path/basename already resolved (so is not
-    /// dangling) rather than being left dangling alongside a live
-    /// match. Empty (never `null`, never an error) if nothing targets
+    /// moved (GP7) — also includes every currently-[`EdgeTarget::Dangling`]
+    /// edge whose own match key equals `id`'s path or basename
+    /// (R4/GP7's dangling-edge lookup via [`UnitGraph::match_index`]):
+    /// the edges that used to resolve to it flip to dangling on
+    /// removal rather than vanishing from `get_backlinks` altogether,
+    /// so a refactor-preview caller (PR-8) can still find every
+    /// impacted incoming link across every source by querying the
+    /// *old* id, exactly as GP7 requires.
+    ///
+    /// This lookup is skipped entirely when `id` *does* currently
+    /// exist as a real node (R11): a dangling edge that happens to
+    /// share `id`'s basename with some other, different unit (e.g.
+    /// an ambiguous same-basename tie elsewhere in the source) must
+    /// never be reported as one of `id`'s own backlinks, since it
+    /// did not actually resolve to `id` — callers are told backlinks
+    /// are edges "whose target resolved to id", and this lookup keeps
+    /// that true for a live id rather than only documenting it as
+    /// true. Empty (never `null`, never an error) if nothing targets
     /// `id` at all.
     pub fn get_backlinks(&self, id: &str) -> Vec<Edge> {
         let mut idxs: Vec<usize> = self.backward_index.get(id).cloned().unwrap_or_default();
 
-        if let Some((source, rel_path)) = parse_federated_id(id) {
-            let stem = normalize_key(strip_markdown_extension(rel_path));
-            let basename = basename_of(&stem).to_string();
-            if let Some(v) = self.dangling_index.get(&(source.to_string(), stem.clone())) {
-                idxs.extend(v.iter().copied());
-            }
-            if basename != stem {
-                if let Some(v) = self.dangling_index.get(&(source.to_string(), basename)) {
-                    idxs.extend(v.iter().copied());
+        if !self.nodes.contains_key(id) {
+            if let Some((source, rel_path)) = parse_federated_id(id) {
+                let stem = normalize_key(strip_markdown_extension(rel_path));
+                let basename = basename_of(&stem).to_string();
+                let mut keys = vec![(source.to_string(), stem.clone())];
+                if basename != stem {
+                    keys.push((source.to_string(), basename));
+                }
+                for key in keys {
+                    if let Some(v) = self.match_index.get(&key) {
+                        idxs.extend(v.iter().copied().filter(|&i| {
+                            matches!(self.edges[i], Some(ref e) if e.to == EdgeTarget::Dangling)
+                        }));
+                    }
                 }
             }
         }
 
         idxs.sort_unstable();
         idxs.dedup();
-        let mut out: Vec<Edge> = idxs.iter().map(|&i| self.edges[i].clone()).collect();
+        let mut out: Vec<Edge> = idxs.iter().filter_map(|&i| self.edges[i].clone()).collect();
         out.sort_by(edge_sort_key);
         out
     }
@@ -345,7 +385,7 @@ impl UnitGraph {
     /// deterministic output and de-duplicated (R2). Empty (never
     /// `null`) for an empty graph.
     pub fn get_edges(&self) -> Vec<Edge> {
-        let mut out = self.edges.clone();
+        let mut out: Vec<Edge> = self.edges.iter().filter_map(|e| e.clone()).collect();
         out.sort_by(edge_sort_key);
         out
     }

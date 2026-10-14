@@ -11,7 +11,7 @@ use std::fmt;
 
 use tephra_cache::{Cache, CacheError, SourceStatus};
 
-use crate::model::{federated_id, NodeFacts};
+use crate::model::{federated_id, parse_federated_id, NodeFacts};
 use crate::resolver::{
     basename_of, edge_target_scope_key, normalize_key, resolve_edge_target,
     strip_markdown_extension,
@@ -129,17 +129,27 @@ fn dedup_key(edge: &Edge) -> DedupKey {
     }
 }
 
+/// Picks, between two edges that share a [`DedupKey`], the one that
+/// survives: the lexicographically smaller `(kind, to_raw)` pair,
+/// for a deterministic, input-order-independent winner.
+fn keeps_priority(a: &Edge, b: &Edge) -> bool {
+    (a.kind.as_str(), a.to_raw.as_str()) <= (b.kind.as_str(), b.to_raw.as_str())
+}
+
 /// Collapses `edges` by [`dedup_key`] (R2), keeping, for each key, the
 /// edge with the lexicographically smallest `(kind, to_raw)` so the
-/// survivor is deterministic regardless of input order.
+/// survivor is deterministic regardless of input order. Used only by
+/// the one-time full build/rebuild path
+/// ([`UnitGraph::rebuild_edges`]), where every edge in the graph is
+/// being considered at once anyway; [`UnitGraph::recompute_scoped`]'s
+/// incremental path uses the scoped [`dedup_against_graph`] instead
+/// (R13).
 fn dedup_edges(edges: Vec<Edge>) -> Vec<Edge> {
     let mut by_key: HashMap<DedupKey, Edge> = HashMap::new();
     for edge in edges {
         let key = dedup_key(&edge);
         match by_key.get(&key) {
-            Some(existing)
-                if (existing.kind.as_str(), existing.to_raw.as_str())
-                    <= (edge.kind.as_str(), edge.to_raw.as_str()) => {}
+            Some(existing) if keeps_priority(existing, &edge) => {}
             _ => {
                 by_key.insert(key, edge);
             }
@@ -148,42 +158,129 @@ fn dedup_edges(edges: Vec<Edge>) -> Vec<Edge> {
     by_key.into_values().collect()
 }
 
-/// Rebuilds `forward_index`/`backward_index`/`dangling_index` from
-/// `edges` in one O(edges) pass — pure bookkeeping (hash-map
-/// insertion), never a resolution call, so this is always cheap
-/// regardless of how the edge list itself was produced (a full
-/// rebuild or [`UnitGraph::recompute_scoped`]'s targeted recompute).
-fn rebuild_indices(graph: &mut UnitGraph) {
-    let mut forward_index: HashMap<String, Vec<usize>> = HashMap::new();
-    let mut backward_index: HashMap<String, Vec<usize>> = HashMap::new();
-    let mut dangling_index: HashMap<(String, String), Vec<usize>> = HashMap::new();
+/// The `(scope_source, normalized_target_key)` [`UnitGraph::match_index`]
+/// key `edge` would be indexed under, or `None` when `edge` has no
+/// sensible key (its `from` id no longer has a node, or its target
+/// is an absolute URL / anchor-only self-link) — looked up afresh
+/// rather than cached on the edge itself, since it depends only on
+/// `edge.from`/`edge.to_raw`/`edge.kind` and the referring unit's
+/// source, none of which [`insert_edge`]/[`remove_edge`] ever change
+/// for an edge already in the graph.
+fn edge_match_key(graph: &UnitGraph, edge: &Edge) -> Option<(String, String)> {
+    let from_source = graph.nodes.get(&edge.from)?.source.clone();
+    let index = graph.index();
+    edge_target_scope_key(&index, &edge.from, &from_source, &edge.to_raw, &edge.kind)
+}
 
-    for (i, edge) in graph.edges.iter().enumerate() {
-        forward_index.entry(edge.from.clone()).or_default().push(i);
-        match &edge.to {
-            EdgeTarget::Resolved(to_id) => {
-                backward_index.entry(to_id.clone()).or_default().push(i);
-            }
-            EdgeTarget::Dangling => {
-                if let Some(from_source) = graph.nodes.get(&edge.from).map(|n| n.source.clone()) {
-                    let index = graph.index();
-                    if let Some(key) = edge_target_scope_key(
-                        &index,
-                        &edge.from,
-                        &from_source,
-                        &edge.to_raw,
-                        &edge.kind,
-                    ) {
-                        dangling_index.entry(key).or_default().push(i);
-                    }
-                }
+/// Inserts `edge` into a free (or newly appended) slot in
+/// `graph.edges`, updating `forward_index`/`backward_index`/
+/// `match_index` for just this one edge (R13: O(1)-amortized, never a
+/// whole-graph rebuild) — the counterpart to [`remove_edge`].
+fn insert_edge(graph: &mut UnitGraph, edge: Edge) -> usize {
+    let key = edge_match_key(graph, &edge);
+    let to = edge.to.clone();
+    let from = edge.from.clone();
+
+    let slot = match graph.free_slots.pop() {
+        Some(s) => {
+            graph.edges[s] = Some(edge);
+            s
+        }
+        None => {
+            graph.edges.push(Some(edge));
+            graph.edges.len() - 1
+        }
+    };
+
+    graph.forward_index.entry(from).or_default().push(slot);
+    if let EdgeTarget::Resolved(to_id) = to {
+        graph.backward_index.entry(to_id).or_default().push(slot);
+    }
+    if let Some(key) = key {
+        graph.match_index.entry(key).or_default().push(slot);
+    }
+    slot
+}
+
+/// Removes the edge currently at `slot` (a no-op if the slot is
+/// already empty), pruning its `forward_index`/`backward_index`/
+/// `match_index` entries and freeing the slot for reuse — the
+/// counterpart to [`insert_edge`], same O(1)-amortized cost (R13).
+fn remove_edge(graph: &mut UnitGraph, slot: usize) {
+    let Some(edge) = graph.edges[slot].take() else {
+        return;
+    };
+    if let Some(v) = graph.forward_index.get_mut(&edge.from) {
+        v.retain(|&i| i != slot);
+    }
+    if let EdgeTarget::Resolved(to_id) = &edge.to {
+        if let Some(v) = graph.backward_index.get_mut(to_id) {
+            v.retain(|&i| i != slot);
+        }
+    }
+    if let Some(key) = edge_match_key(graph, &edge) {
+        if let Some(v) = graph.match_index.get_mut(&key) {
+            v.retain(|&i| i != slot);
+        }
+    }
+    graph.free_slots.push(slot);
+}
+
+/// Scoped de-duplication (R2/R13) for [`UnitGraph::recompute_scoped`]:
+/// collapses `fresh` by [`dedup_key`] exactly like [`dedup_edges`],
+/// then checks each surviving edge's `from` id against whatever *that
+/// same id* still authors elsewhere in the graph (via
+/// `forward_index`, not a scan of every edge in the graph) for a
+/// collision — e.g. two different now-freshly-re-resolved edges from
+/// the same unit landing on the same target. The cost stays
+/// proportional to the number of edges this update actually touches
+/// (the `fresh` batch plus the touched `from` ids' own untouched
+/// edges), never the graph's total size.
+fn dedup_against_graph(
+    graph: &UnitGraph,
+    fresh: Vec<Edge>,
+    superseded: &mut HashSet<usize>,
+) -> Vec<Edge> {
+    let mut by_key: HashMap<DedupKey, Edge> = HashMap::new();
+    for edge in fresh {
+        let key = dedup_key(&edge);
+        match by_key.get(&key) {
+            Some(existing) if keeps_priority(existing, &edge) => {}
+            _ => {
+                by_key.insert(key, edge);
             }
         }
     }
 
-    graph.forward_index = forward_index;
-    graph.backward_index = backward_index;
-    graph.dangling_index = dangling_index;
+    let froms: HashSet<String> = by_key.values().map(|e| e.from.clone()).collect();
+    for from in froms {
+        let Some(idxs) = graph.forward_index.get(&from).cloned() else {
+            continue;
+        };
+        for i in idxs {
+            if superseded.contains(&i) {
+                continue;
+            }
+            let Some(existing) = graph.edges[i].clone() else {
+                continue;
+            };
+            let key = dedup_key(&existing);
+            let Some(survivor) = by_key.get(&key) else {
+                continue;
+            };
+            if keeps_priority(&existing, survivor) {
+                // The untouched existing edge wins the tie-break;
+                // drop the fresh survivor rather than duplicating it.
+                by_key.remove(&key);
+            } else {
+                // The fresh survivor wins; the untouched existing
+                // edge must go so only one of the pair remains.
+                superseded.insert(i);
+            }
+        }
+    }
+
+    by_key.into_values().collect()
 }
 
 impl UnitGraph {
@@ -195,11 +292,6 @@ impl UnitGraph {
         self.register_source(source);
         let id = federated_id(source, rel_path);
 
-        // If this id already existed at a different stem (shouldn't
-        // happen — `rel_path` is part of the id — but kept defensive)
-        // its old index entries are removed first via `remove_node`'s
-        // own bookkeeping path, called by every caller that reuses an
-        // id for a different path.
         self.by_source
             .entry(source.to_string())
             .or_default()
@@ -207,18 +299,30 @@ impl UnitGraph {
 
         let stem = normalize_key(strip_markdown_extension(rel_path));
         let basename = basename_of(&stem).to_string();
-        self.stem_index
+
+        // Re-upserting the same path (an edit) must not duplicate
+        // this id's own entry in either index (R9): a bare re-insert
+        // of an already-indexed id would otherwise leave `[id, id]`
+        // behind, making every future lookup under this exact
+        // stem/basename see a spurious two-way tie with itself.
+        let stem_bucket = self
+            .stem_index
             .entry(source.to_string())
             .or_default()
             .entry(stem)
-            .or_default()
-            .push(id.clone());
-        self.basename_index
+            .or_default();
+        if !stem_bucket.contains(&id) {
+            stem_bucket.push(id.clone());
+        }
+        let basename_bucket = self
+            .basename_index
             .entry(source.to_string())
             .or_default()
             .entry(basename)
-            .or_default()
-            .push(id.clone());
+            .or_default();
+        if !basename_bucket.contains(&id) {
+            basename_bucket.push(id.clone());
+        }
 
         self.nodes.insert(
             id,
@@ -278,14 +382,14 @@ impl UnitGraph {
     }
 
     /// Recomputes every edge from the current `nodes` map from
-    /// scratch and rebuilds the forward/backward/dangling indices.
-    /// Used for the initial [`UnitGraph::build_from_cache`] (there is
-    /// no smaller scope to recompute — every node is new) and as the
-    /// one-time cost [`UnitGraph::recompute_scoped`]'s own candidate
-    /// gathering never needs to pay again on a later edit. Resolution
-    /// itself goes through `stem_index`/`basename_index` (O(1)
-    /// average per link, R3) rather than scanning every unit in a
-    /// link's scope source, so this full rebuild is O(total links),
+    /// scratch and rebuilds the forward/backward/match indices from
+    /// nothing. Used for the initial [`UnitGraph::build_from_cache`]
+    /// (there is no smaller scope to recompute — every node is new)
+    /// and as the one-time cost [`UnitGraph::recompute_scoped`]'s own
+    /// candidate gathering never needs to pay again on a later edit.
+    /// Resolution itself goes through `stem_index`/`basename_index`
+    /// (O(1) average per link, R3) rather than scanning every unit in
+    /// a link's scope source, so this full rebuild is O(total links),
     /// not O(total links × units-in-source).
     pub(crate) fn rebuild_edges(&mut self) {
         let mut ids: Vec<&String> = self.nodes.keys().collect();
@@ -310,36 +414,46 @@ impl UnitGraph {
             }
         }
 
-        self.edges = dedup_edges(edges);
-        rebuild_indices(self);
+        let edges = dedup_edges(edges);
+
+        self.edges = Vec::new();
+        self.free_slots = Vec::new();
+        self.forward_index = HashMap::new();
+        self.backward_index = HashMap::new();
+        self.match_index = HashMap::new();
+        for edge in edges {
+            insert_edge(self, edge);
+        }
     }
 
     /// Recomputes edges scoped to exactly what `touched_ids` (ids
     /// just inserted, updated, or removed — [`UnitGraph::nodes`] has
     /// already been updated by the time this runs) could possibly
     /// affect (R3's fix for the quadratic incremental-update cost),
-    /// rather than re-resolving every link in the graph:
+    /// rather than re-resolving every link in the graph, and updates
+    /// `forward_index`/`backward_index`/`match_index`/the edge store
+    /// in place for only the superseded and fresh edges (R13's fix
+    /// for the still-linear-per-edit cost: no cloning or re-indexing
+    /// of every edge in the graph on every call):
     ///
     /// - every edge each touched id itself authors is dropped and, if
     ///   the id still exists (an insert or update, not a removal),
     ///   recomputed fresh from its current `links`;
-    /// - if a touched id no longer exists (a removal), every edge
-    ///   that used to resolve *to* it (found via `backward_index`, not
-    ///   a scan) flips to [`EdgeTarget::Dangling`] instead of vanishing
-    ///   — the removed node's path/name might still matter to a GP7
-    ///   caller via [`UnitGraph::get_backlinks`]'s dangling-edge
-    ///   lookup;
-    /// - if a touched id now exists (an insert, or a rename landing on
-    ///   a path nothing resolved to before), every currently-dangling
-    ///   edge whose own match key equals its stem or basename (found
-    ///   via `dangling_index`, not a scan) is re-resolved — it may now
-    ///   newly resolve to the touched id.
+    /// - every edge anywhere in the graph — resolved *or* dangling —
+    ///   whose own match key equals a touched id's stem or basename
+    ///   (found via [`UnitGraph::match_index`], not a scan) is
+    ///   re-resolved against the now-current node set (R10): this
+    ///   covers an insert that should pull an edge away from a
+    ///   longer already-resolved candidate, an insert that turns a
+    ///   unique resolution into a tie, and a removal that lets a tie
+    ///   collapse back to its one remaining candidate — not only the
+    ///   "already dangling, might now resolve" and "resolved to the
+    ///   removed id, flip to dangling" cases the pre-fix version
+    ///   handled.
     ///
     /// Every other edge in the graph — the overwhelming majority in a
-    /// large source — is left untouched, copied across as-is rather
-    /// than re-resolved, so one edit's cost scales with how many
-    /// edges that specific change could plausibly affect, not with
-    /// the size of the source it lives in. See
+    /// large source — is left completely untouched: not cloned, not
+    /// re-indexed, not even read. See
     /// `tests/integration/watcher_update.rs`'s scaling test.
     pub(crate) fn recompute_scoped(&mut self, touched_ids: &[String]) {
         let mut superseded: HashSet<usize> = HashSet::new();
@@ -353,107 +467,91 @@ impl UnitGraph {
                 superseded.extend(idxs.iter().copied());
             }
 
-            match self.nodes.get(tid).cloned() {
-                Some(facts) => {
-                    // Insert or update: (re)resolve this id's own
-                    // links fresh.
-                    let index = self.index();
-                    for (to_raw, kind) in &facts.links {
-                        let to = resolve_edge_target(&index, tid, &facts.source, to_raw, kind);
+            if let Some(facts) = self.nodes.get(tid).cloned() {
+                // Insert or update: (re)resolve this id's own links
+                // fresh.
+                let index = self.index();
+                for (to_raw, kind) in &facts.links {
+                    let to = resolve_edge_target(&index, tid, &facts.source, to_raw, kind);
+                    let target_offline = matches!(&to, EdgeTarget::Resolved(to_id)
+                        if self.nodes.get(to_id).is_some_and(|n| self.offline_sources.contains(&n.source)));
+                    let offline = self.offline_sources.contains(&facts.source) || target_offline;
+                    fresh.push(Edge {
+                        from: tid.clone(),
+                        to,
+                        to_raw: to_raw.clone(),
+                        kind: kind.clone(),
+                        offline,
+                    });
+                }
+            }
+
+            // Whether `tid` now exists (an insert, or a rename
+            // landing on a path nothing resolved to before) or no
+            // longer exists (a removal), every edge in the graph —
+            // resolved *or* dangling — whose own match key equals
+            // this id's stem or basename might now resolve
+            // differently (R10). The key is derived from `tid`'s own
+            // path, parsed back out of the id string itself, so this
+            // works identically whether `tid` currently has a node or
+            // not.
+            if let Some((source, rel_path)) = parse_federated_id(tid) {
+                let stem = normalize_key(strip_markdown_extension(rel_path));
+                let basename = basename_of(&stem).to_string();
+                let mut keys = vec![(source.to_string(), stem.clone())];
+                if basename != stem {
+                    keys.push((source.to_string(), basename));
+                }
+                for key in keys {
+                    let Some(idxs) = self.match_index.get(&key).cloned() else {
+                        continue;
+                    };
+                    for i in idxs {
+                        if superseded.contains(&i) {
+                            continue;
+                        }
+                        let Some(old) = self.edges[i].clone() else {
+                            continue;
+                        };
+                        let from_source = self
+                            .nodes
+                            .get(&old.from)
+                            .map(|n| n.source.clone())
+                            .unwrap_or_default();
+                        let to = {
+                            let index = self.index();
+                            resolve_edge_target(
+                                &index,
+                                &old.from,
+                                &from_source,
+                                &old.to_raw,
+                                &old.kind,
+                            )
+                        };
                         let target_offline = matches!(&to, EdgeTarget::Resolved(to_id)
                             if self.nodes.get(to_id).is_some_and(|n| self.offline_sources.contains(&n.source)));
-                        let offline =
-                            self.offline_sources.contains(&facts.source) || target_offline;
+                        let offline = self.offline_sources.contains(&from_source) || target_offline;
+                        superseded.insert(i);
                         fresh.push(Edge {
-                            from: tid.clone(),
+                            from: old.from,
                             to,
-                            to_raw: to_raw.clone(),
-                            kind: kind.clone(),
+                            to_raw: old.to_raw,
+                            kind: old.kind,
                             offline,
                         });
-                    }
-
-                    // Insert, or a rename landing on a path nothing
-                    // resolved to before: any currently-dangling edge
-                    // whose match key equals this id's stem/basename
-                    // might now resolve.
-                    let stem = normalize_key(strip_markdown_extension(&facts.rel_path));
-                    let basename = basename_of(&stem).to_string();
-                    let mut keys = vec![(facts.source.clone(), stem.clone())];
-                    if basename != stem {
-                        keys.push((facts.source.clone(), basename));
-                    }
-                    for key in keys {
-                        if let Some(idxs) = self.dangling_index.get(&key).cloned() {
-                            for i in idxs {
-                                if superseded.contains(&i) {
-                                    continue;
-                                }
-                                let old = self.edges[i].clone();
-                                let from_source = self
-                                    .nodes
-                                    .get(&old.from)
-                                    .map(|n| n.source.clone())
-                                    .unwrap_or_default();
-                                let to = resolve_edge_target(
-                                    &index,
-                                    &old.from,
-                                    &from_source,
-                                    &old.to_raw,
-                                    &old.kind,
-                                );
-                                let target_offline = matches!(&to, EdgeTarget::Resolved(to_id)
-                                    if self.nodes.get(to_id).is_some_and(|n| self.offline_sources.contains(&n.source)));
-                                let offline =
-                                    self.offline_sources.contains(&from_source) || target_offline;
-                                superseded.insert(i);
-                                fresh.push(Edge {
-                                    from: old.from,
-                                    to,
-                                    to_raw: old.to_raw,
-                                    kind: old.kind,
-                                    offline,
-                                });
-                            }
-                        }
-                    }
-                }
-                None => {
-                    // Removal: every edge that used to resolve to
-                    // this id flips to dangling instead of vanishing
-                    // (R4/GP7 — `get_backlinks` can still find it by
-                    // the old path via `dangling_index`).
-                    if let Some(idxs) = self.backward_index.get(tid).cloned() {
-                        for i in idxs {
-                            if superseded.contains(&i) {
-                                continue;
-                            }
-                            let mut edge = self.edges[i].clone();
-                            let from_offline = self
-                                .nodes
-                                .get(&edge.from)
-                                .is_some_and(|n| self.offline_sources.contains(&n.source));
-                            edge.to = EdgeTarget::Dangling;
-                            edge.offline = from_offline;
-                            superseded.insert(i);
-                            fresh.push(edge);
-                        }
                     }
                 }
             }
         }
 
-        let mut edges: Vec<Edge> = self
-            .edges
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| !superseded.contains(i))
-            .map(|(_, e)| e.clone())
-            .collect();
-        edges.extend(fresh);
+        let fresh = dedup_against_graph(self, fresh, &mut superseded);
 
-        self.edges = dedup_edges(edges);
-        rebuild_indices(self);
+        for i in superseded {
+            remove_edge(self, i);
+        }
+        for edge in fresh {
+            insert_edge(self, edge);
+        }
     }
 
     /// Builds a fresh [`UnitGraph`] from every source and unit
@@ -498,10 +596,22 @@ impl UnitGraph {
             .ok_or_else(|| GraphError::UnknownSource(note.source.clone()))?;
 
         self.register_source(&note.source);
-        if source_row.status == SourceStatus::Offline {
+        let was_offline = self.offline_sources.contains(&note.source);
+        let now_offline = source_row.status == SourceStatus::Offline;
+        if now_offline {
             self.offline_sources.insert(note.source.clone());
         } else {
             self.offline_sources.remove(&note.source);
+        }
+        if was_offline != now_offline {
+            // R12: a status flip must re-annotate every edge in the
+            // graph, not only the ones this batch's `recompute_scoped`
+            // happens to touch below — otherwise a unit whose source
+            // just went offline/online keeps a stale `Edge::offline`
+            // on an edge this notification doesn't otherwise mention
+            // (E2: one query giving two different answers about
+            // whether the source is offline).
+            self.recompute_offline_flags();
         }
 
         let mut touched_ids = Vec::with_capacity(note.rel_paths.len());

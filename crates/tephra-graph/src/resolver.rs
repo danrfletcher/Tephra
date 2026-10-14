@@ -37,7 +37,8 @@ pub struct ResolveResult {
 /// struct, and unit variants without reshaping any of them — so GP5's
 /// frozen wire contract is explicit rather than left to serde's
 /// default externally-tagged guess. See
-/// `tests/unit/gp5_contract.rs` for the exact JSON this produces.
+/// `tests/integration/gp5_contract.rs` for the exact JSON this
+/// produces.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "error", content = "data", rename_all = "snake_case")]
 pub enum ResolveError {
@@ -164,13 +165,19 @@ pub(crate) fn normalize_wikilink_target(target: &str) -> String {
 
 /// Percent-decodes `s` (`%XX` escapes), falling back to the original
 /// text unchanged if the decoded bytes aren't valid UTF-8 (never
-/// panics, never silently drops characters) — a markdown link to a
-/// non-ASCII or space-containing path is commonly percent-encoded by
-/// the editor that wrote it (R1: `caf%C3%A9%20notes.md`), unlike a
-/// wikilink target, which this parser's grammar already stores
-/// decoded.
+/// panics, never silently drops or replaces characters) — a markdown
+/// link to a non-ASCII or space-containing path is commonly
+/// percent-encoded by the editor that wrote it (R1:
+/// `caf%C3%A9%20notes.md`), unlike a wikilink target, which this
+/// parser's grammar already stores decoded. Deliberately uses
+/// `decode_utf8` (strict), not `decode_utf8_lossy` (R15): lossy
+/// decoding would replace invalid bytes with U+FFFD, silently
+/// changing the text rather than leaving it unchanged as documented.
 fn percent_decode(s: &str) -> Cow<'_, str> {
-    percent_encoding::percent_decode_str(s).decode_utf8_lossy()
+    match percent_encoding::percent_decode_str(s).decode_utf8() {
+        Ok(decoded) => decoded,
+        Err(_) => Cow::Borrowed(s),
+    }
 }
 
 /// Joins `target` onto `from_dir` (the directory containing the
