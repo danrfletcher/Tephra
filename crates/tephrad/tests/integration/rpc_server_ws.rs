@@ -134,3 +134,59 @@ async fn an_authenticated_connection_receives_a_graph_changed_push_with_no_reque
     assert_eq!(body["method"], json!("graph:changed"));
     assert_eq!(body["params"]["source"], json!("vault"));
 }
+
+/// R3/E9: the WebSocket transport must enforce the same body-size cap
+/// as `POST /rpc` (`MAX_BODY_BYTES`), not axum/tungstenite's own much
+/// larger defaults (64 MiB message / 16 MiB frame) — otherwise a WS
+/// client could make the server buffer and fully `serde_json`-parse a
+/// body far larger than the HTTP cap ever allows.
+#[tokio::test]
+async fn an_oversized_websocket_message_is_rejected_and_the_server_stays_responsive() {
+    let server = spawn(MockGraph::new(), MockSources::new()).await;
+    let mut ws = connect_ws(&server.ws_url(), &server.token).await.unwrap();
+
+    // A single text frame bigger than this server's configured
+    // `max_message_size` (set to `MAX_BODY_BYTES`, same as the HTTP
+    // cap) — tungstenite's own *client*-side default (64 MiB) is well
+    // above this, so the client itself has no trouble constructing
+    // it; it is this server's own configured limit that must reject
+    // it. The server can reject a message this large either after a
+    // full message is received, or mid-frame while still streaming
+    // it in (closing the TCP connection outright) — either way the
+    // client-side `send` itself may surface the rejection as a
+    // transport error rather than this call succeeding, so both
+    // outcomes count as "rejected" here.
+    let oversized = "a".repeat(tephrad::rpc::server::MAX_BODY_BYTES + 1);
+    let send_result = ws.send(Message::Text(oversized.into())).await;
+
+    if send_result.is_ok() {
+        // The server tears down a connection that violates its own
+        // message-size limit rather than silently buffering/parsing
+        // it; this socket must end (close frame or the stream simply
+        // closing), never hang and never reply as if nothing happened.
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next()).await;
+        match outcome {
+            Err(_) => panic!("the server must not hang on an oversized WS message"),
+            Ok(None) => {} // stream ended
+            Ok(Some(Err(_))) => {} // transport-level error/close
+            Ok(Some(Ok(Message::Close(_)))) => {}
+            Ok(Some(Ok(other))) => {
+                panic!("expected the oversized-message connection to close, got: {other:?}")
+            }
+        }
+    }
+
+    // A fresh connection must still be served normally right
+    // afterward — the whole server, not just this one connection,
+    // stays responsive.
+    let mut next_ws = connect_ws(&server.ws_url(), &server.token)
+        .await
+        .expect("a later client must still be able to connect");
+    next_ws
+        .send(Message::Text(json!({ "jsonrpc": "2.0", "id": 1, "method": "graph.get_edges", "params": {} }).to_string().into()))
+        .await
+        .unwrap();
+    let reply = next_ws.next().await.unwrap().unwrap();
+    let body: serde_json::Value = serde_json::from_str(&reply.into_text().unwrap()).unwrap();
+    assert_eq!(body["id"], json!(1));
+}

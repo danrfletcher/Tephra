@@ -106,11 +106,8 @@ async fn a_rotated_token_is_honored_on_the_very_next_request() {
     assert_eq!(after_new.status(), reqwest::StatusCode::OK);
 }
 
-/// E11, WebSocket angle: a connection that authenticated at handshake
-/// time under the old token keeps serving requests on that already-open
-/// socket after rotation (there is no per-frame re-check — see
-/// `handle_socket`'s doc comment in `src/rpc/server.rs` for why), but a
-/// *new* connection attempt under the old token is rejected immediately.
+/// E11, WebSocket angle: a *new* connection attempt under the old
+/// token is rejected immediately after rotation.
 #[tokio::test]
 async fn rotation_blocks_new_websocket_handshakes_immediately() {
     let server = spawn(MockGraph::new(), MockSources::new()).await;
@@ -123,6 +120,56 @@ async fn rotation_blocks_new_websocket_handshakes_immediately() {
 
     let result_new = connect_ws(&server.ws_url(), &"e".repeat(64)).await;
     assert!(result_new.is_ok(), "the freshly rotated token must authenticate a new handshake");
+}
+
+/// R2/E11/G6: a connection that authenticated at handshake time under
+/// the old token must NOT keep serving requests on that already-open
+/// socket after the token file is rotated out from under it — every
+/// message is re-checked against the token file's current contents
+/// (`handle_socket` in `src/rpc/server.rs`), not just the one
+/// presented at the handshake.
+#[tokio::test]
+async fn a_rotated_token_is_rejected_on_an_already_open_websocket_on_its_very_next_message() {
+    let server = spawn(MockGraph::new(), MockSources::new()).await;
+    let old_token = server.token.clone();
+
+    let mut ws = connect_ws(&server.ws_url(), &old_token)
+        .await
+        .expect("handshake under the still-current token succeeds");
+
+    // The connection works before rotation.
+    ws.send(Message::Text(
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "graph.get_edges", "params": {} }).to_string().into(),
+    ))
+    .await
+    .unwrap();
+    let reply = ws.next().await.unwrap().unwrap();
+    let body: serde_json::Value = serde_json::from_str(&reply.into_text().unwrap()).unwrap();
+    assert_eq!(body["result"], json!([]));
+
+    server.rotate_token("d".repeat(64).as_str());
+
+    // The same already-open socket, with no reconnect, must now be
+    // rejected on its very next message — including a mutating
+    // source.* call, which must not be allowed to slip through under
+    // a revoked token just because the socket predates the rotation.
+    ws.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0", "id": 2, "method": "source.register",
+            "params": { "name": "evil", "root": "/tmp" }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    let reply = ws.next().await.unwrap().unwrap();
+    let body: serde_json::Value = serde_json::from_str(&reply.into_text().unwrap()).unwrap();
+    assert_eq!(
+        body["error"]["code"],
+        json!(tephrad::rpc::protocol::UNAUTHORIZED),
+        "a message on a socket whose handshake token was since revoked must be rejected: {body:?}"
+    );
 }
 
 /// E12: an abrupt client disconnect (dropping the WebSocket stream
