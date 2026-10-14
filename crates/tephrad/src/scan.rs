@@ -18,12 +18,29 @@
 //! path both apply this filter identically, so a code-repo source
 //! never ends up with false wikilinks/tags derived from its source
 //! files.
+//!
+//! Transaction strategy (R11 review finding): a full scan or forced
+//! rescan commits its writes in bounded chunks ([`SCAN_COMMIT_CHUNK_SIZE`])
+//! rather than holding one open transaction (and so SQLite's single
+//! writer lock) for the entire walk — a large source's scan must not
+//! make every other source's watcher batch, or the shared registry's
+//! own `list`/`register`/`rescan` connection, sit out the busy timeout
+//! and fail for the whole scan's duration (breaking GP4/GP6 in
+//! practice even though every source's in-process state is already
+//! independent). The debounced batch-apply path ([`apply_change_batch`])
+//! stays single-transaction (E5: "a single rescan transaction ...
+//! never one write per event"), but now opens it with `BEGIN
+//! IMMEDIATE` and retries on `SQLITE_BUSY` instead of reading first
+//! (risking a failed upgrade) and dropping the whole batch on the
+//! first contention it hits.
 
 use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use rusqlite::{Transaction, TransactionBehavior};
 use tephra_cache::Cache;
 
 use crate::ignore::IgnoreRules;
@@ -106,6 +123,82 @@ impl From<rusqlite::Error> for ScanError {
     fn from(e: rusqlite::Error) -> Self {
         ScanError::Sqlite(e)
     }
+}
+
+/// Number of files written per committed chunk during a full scan or
+/// forced rescan (R11): bounded so a long walk over a very large
+/// source periodically commits and releases SQLite's single writer
+/// lock, instead of holding one open transaction for the walk's
+/// entire duration. This trades strict all-or-nothing atomicity for
+/// the whole walk (a genuine cache-level write failure partway
+/// through now leaves whatever chunks already committed in place,
+/// rather than rolling the entire walk back) for that interleaving —
+/// the realistic per-entry failure modes (an unreadable file, a
+/// non-UTF8 file, an unreadable directory) are already handled by
+/// logging and skipping rather than propagating (see [`write_unit`]
+/// and the walk loop below), so the only way a chunk's commit is
+/// never reached at all is a genuine SQLite-level failure (disk full,
+/// corruption) — already a serious failure mode regardless of
+/// transaction boundaries.
+const SCAN_COMMIT_CHUNK_SIZE: usize = 500;
+
+/// How many times a `SQLITE_BUSY` failure is retried, and the backoff
+/// slept between attempts (R11). SQLite's own `busy_timeout` (set on
+/// every connection, see `tephra_cache::cache::apply_pragmas`) already
+/// waits out a lock that's currently held before returning
+/// `SQLITE_BUSY` to the caller — these retries are a second, coarser
+/// layer on top of that: a whole failed attempt (not just the
+/// `BEGIN`) is retried wholesale, so a batch that loses the race
+/// entirely (rather than merely waiting out a brief lock hold) is
+/// retried rather than silently discarded on its very first
+/// `SQLITE_BUSY`, which is what this module's previous "log and drop"
+/// behavior did.
+const MAX_BUSY_RETRIES: u32 = 8;
+const BUSY_RETRY_BACKOFF: Duration = Duration::from_millis(150);
+
+/// Whether `err` is SQLite's `SQLITE_BUSY` (the database is locked by
+/// another connection), as opposed to any other failure that retrying
+/// would just reproduce identically.
+fn is_database_busy(err: &ScanError) -> bool {
+    matches!(
+        err,
+        ScanError::Sqlite(rusqlite::Error::SqliteFailure(inner, _))
+            if inner.code == rusqlite::ErrorCode::DatabaseBusy
+    )
+}
+
+/// Retries `attempt` up to [`MAX_BUSY_RETRIES`] times, sleeping
+/// [`BUSY_RETRY_BACKOFF`] between attempts, whenever it fails with a
+/// `SQLITE_BUSY`-classified error (R11) — any other error (including
+/// a non-busy SQLite error) is returned immediately on its first
+/// occurrence, since retrying those would just repeat the same
+/// failure.
+fn retry_on_busy<T>(mut attempt: impl FnMut() -> Result<T, ScanError>) -> Result<T, ScanError> {
+    let mut tries = 0;
+    loop {
+        match attempt() {
+            Ok(v) => return Ok(v),
+            Err(e) if is_database_busy(&e) && tries < MAX_BUSY_RETRIES => {
+                tries += 1;
+                std::thread::sleep(BUSY_RETRY_BACKOFF);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Opens a `BEGIN IMMEDIATE` transaction against `cache`'s connection
+/// (R11): acquires SQLite's write lock up front, rather than the
+/// `BEGIN DEFERRED` a plain `unchecked_transaction()` uses, which only
+/// takes a lock lazily on a connection's first write — leaving a
+/// transaction that reads before it writes (as
+/// [`apply_change_batch`] does, via `get_unit_by_rel_path`) exposed to
+/// an immediate, non-retryable failure if another connection committed
+/// a change in between, rather than a retryable "the lock is currently
+/// held" wait.
+fn begin_immediate(cache: &Cache) -> Result<Transaction<'_>, ScanError> {
+    Transaction::new_unchecked(cache.connection(), TransactionBehavior::Immediate)
+        .map_err(ScanError::from)
 }
 
 /// File extensions (case-insensitive, no leading dot) treated as
@@ -246,13 +339,24 @@ fn delete_existing_unit(cache: &Cache, source_id: i64, rel_path: &str) -> Result
 /// file's rows are written to the cache before moving to the next —
 /// peak memory is bounded by one file's content plus its parsed
 /// structures, not by the size of the source tree.
+///
+/// `first_tx` is the already-open transaction this walk's first chunk
+/// writes into (so a caller, e.g. [`rescan_source`], can fold a
+/// preceding delete into that same first chunk); every
+/// [`SCAN_COMMIT_CHUNK_SIZE`]th file commits it and opens a fresh one
+/// (R11 — see the module doc comment for the full rationale), and the
+/// final (possibly partial) chunk is committed once the walk is
+/// exhausted.
 fn walk_and_write(
     cache: &Cache,
     source_id: i64,
     root: &Path,
     ignore: &IgnoreRules,
+    first_tx: Transaction<'_>,
 ) -> Result<ScanStats, ScanError> {
     let mut stats = ScanStats::default();
+    let mut tx = Some(first_tx);
+    let mut since_commit: usize = 0;
 
     let walker = walkdir::WalkDir::new(root)
         .follow_links(false)
@@ -296,44 +400,57 @@ fn walk_and_write(
         if let Some(file_stats) = write_unit(cache, source_id, root, entry.path())? {
             stats.accumulate(file_stats);
         }
+
+        since_commit += 1;
+        if since_commit >= SCAN_COMMIT_CHUNK_SIZE {
+            tx.take()
+                .expect("a transaction is always open mid-walk")
+                .commit()?;
+            tx = Some(begin_immediate(cache)?);
+            since_commit = 0;
+        }
     }
 
+    if let Some(tx) = tx {
+        tx.commit()?;
+    }
     Ok(stats)
 }
 
-/// `source.register`'s initial full scan (GP2/GP3): one transaction
-/// for the whole walk (R2/GP4: "its own scan transaction"), against a
-/// source with no pre-existing rows.
+/// `source.register`'s initial full scan (GP2/GP3), against a source
+/// with no pre-existing rows. Commits in bounded chunks rather than
+/// one transaction for the whole walk (R11 — see the module doc
+/// comment).
 pub fn scan_source(
     cache: &Cache,
     source_id: i64,
     root: &Path,
     ignore: &IgnoreRules,
 ) -> Result<ScanStats, ScanError> {
-    let tx_guard = cache.connection().unchecked_transaction()?;
-    let stats = walk_and_write(cache, source_id, root, ignore)?;
-    tx_guard.commit()?;
-    Ok(stats)
+    let first_tx = begin_immediate(cache)?;
+    walk_and_write(cache, source_id, root, ignore, first_tx)
 }
 
 /// `source.rescan`'s forced full re-walk: clears this source's
-/// existing rows and re-walks it inside **one** transaction (R2) —
-/// unlike a naive "delete, then scan" pair run as two separate
-/// operations, a walk error partway through (now rare, since
-/// unreadable entries are skipped rather than propagated; see
-/// [`walk_and_write`]) rolls back the delete too, instead of leaving
-/// the source's rows wiped with nothing re-inserted.
+/// existing rows and re-walks it, with the clear folded into the
+/// walk's first committed chunk (R2/R11) — unlike a naive "delete,
+/// then scan" pair run as fully separate transactions, a failure
+/// before the first chunk commits rolls the delete back too, instead
+/// of leaving the source's rows wiped with nothing re-inserted at
+/// all. Past that first chunk, later chunks commit independently (R11
+/// — see the module doc comment): a failure deep into a very large
+/// rescan can still leave the source with only part of its rows
+/// restored until the next rescan, a deliberate trade against holding
+/// the sole SQLite writer lock for the whole walk.
 pub fn rescan_source(
     cache: &Cache,
     source_id: i64,
     root: &Path,
     ignore: &IgnoreRules,
 ) -> Result<ScanStats, ScanError> {
-    let tx_guard = cache.connection().unchecked_transaction()?;
+    let first_tx = begin_immediate(cache)?;
     cache.delete_units_for_source(source_id)?;
-    let stats = walk_and_write(cache, source_id, root, ignore)?;
-    tx_guard.commit()?;
-    Ok(stats)
+    walk_and_write(cache, source_id, root, ignore, first_tx)
 }
 
 /// Walks an existing directory that arrived as one changed path (a
@@ -429,7 +546,33 @@ fn upsert_directory(
 ///   nested under it is deleted too — covering a directory that was
 ///   removed or moved out, whose own files would otherwise be left
 ///   behind as stale rows forever.
+///
+/// Retries the whole attempt on `SQLITE_BUSY` (R11 — see the module
+/// doc comment) rather than logging and discarding the batch on its
+/// first contention with another connection (this source's own
+/// in-progress rescan, or another source's scan sharing the same
+/// WAL-mode database file): each retried attempt opens its own fresh
+/// transaction and starts from this batch's original `changed` set
+/// again, so a batch is only ever fully applied once or not at all,
+/// never partially re-applied across attempts.
 pub fn apply_change_batch(
+    cache: &Cache,
+    source_id: i64,
+    root: &Path,
+    changed: &HashSet<PathBuf>,
+    ignore: &IgnoreRules,
+) -> Result<ChangeOutcome, ScanError> {
+    retry_on_busy(|| apply_change_batch_once(cache, source_id, root, changed, ignore))
+}
+
+/// One attempt at [`apply_change_batch`]'s work, run inside its own
+/// `BEGIN IMMEDIATE` transaction (R11): the write lock is acquired up
+/// front, before any of this batch's reads (e.g.
+/// `delete_existing_unit`'s `get_unit_by_rel_path` lookup), so this
+/// never hits the specific "read first, then fail to upgrade to a
+/// writer because another connection committed in between" failure
+/// mode a `BEGIN DEFERRED` transaction is exposed to.
+fn apply_change_batch_once(
     cache: &Cache,
     source_id: i64,
     root: &Path,
@@ -439,14 +582,15 @@ pub fn apply_change_batch(
     let mut stats = ScanStats::default();
     let mut touched_paths: Vec<PathBuf> = Vec::new();
 
-    // Brackets the whole batch in one BEGIN/COMMIT (E5): `cache`'s
-    // typed insert/delete helpers below still operate through
-    // `cache`'s own `&self` methods, but since those execute against
-    // the very same underlying SQLite connection this transaction
-    // guard was opened on, every one of them runs inside it. Dropped
-    // without `commit()` (e.g. via an early `?` return below) rolls
-    // the whole batch back instead of leaving a partial write.
-    let tx_guard = cache.connection().unchecked_transaction()?;
+    // Brackets the whole batch in one BEGIN IMMEDIATE/COMMIT (E5):
+    // `cache`'s typed insert/delete helpers below still operate
+    // through `cache`'s own `&self` methods, but since those execute
+    // against the very same underlying SQLite connection this
+    // transaction guard was opened on, every one of them runs inside
+    // it. Dropped without `commit()` (e.g. via an early `?` return
+    // below) rolls the whole batch back instead of leaving a partial
+    // write.
+    let tx_guard = begin_immediate(cache)?;
 
     for abs_path in changed {
         let rel_path = match to_rel_string(root, abs_path) {
