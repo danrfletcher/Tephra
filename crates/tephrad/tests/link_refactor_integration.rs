@@ -37,6 +37,36 @@ fn wait_until(timeout: Duration, mut check: impl FnMut() -> bool) -> bool {
     }
 }
 
+/// Minimal test-only percent-decode (mirrors
+/// `tephrad::refactor`'s own private helper of the same shape):
+/// used by the R12/R13 markdown-destination tests below to assert a
+/// rewritten link's target decodes to the expected new path,
+/// regardless of whether the rewrite happened to leave it bare or
+/// percent-encoded it for safety.
+fn test_percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = |b: u8| match b {
+                b'0'..=b'9' => Some(b - b'0'),
+                b'a'..=b'f' => Some(b - b'a' + 10),
+                b'A'..=b'F' => Some(b - b'A' + 10),
+                _ => None,
+            };
+            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 struct TestDaemon {
     addr: std::net::SocketAddr,
     token: String,
@@ -457,7 +487,122 @@ async fn unicode_and_space_filenames_round_trip_through_preview_and_apply() {
     daemon.stop();
 }
 
-/// E3: if an affected file's mtime changed between preview and
+/// R12 review finding, end-to-end: a markdown link renamed to a
+/// unicode- and space-containing path round-trips through the real
+/// daemon's preview and apply, across a bare, a titled, and a
+/// relative (cross-directory) destination, without turning any of
+/// them into plain text — asserted by reparsing the rewritten files
+/// and checking each one's link target decodes to the new path.
+#[tokio::test]
+async fn markdown_links_unicode_and_space_filenames_round_trip_through_preview_and_apply() {
+    let daemon = TestDaemon::start().await;
+    let notes = fixtures::empty_source();
+    notes.write("OldDoc.md", "# Old Doc\n");
+    notes.write(
+        "Journal.md",
+        "Bare: [doc](OldDoc.md) end.\nTitled: [doc](OldDoc.md \"The title\")\n",
+    );
+    notes.write("sub/Deep.md", "[doc](../OldDoc.md)\n");
+
+    daemon
+        .call(
+            "source.register",
+            json!({"name": "notes", "root": notes.root().to_string_lossy()}),
+        )
+        .await;
+
+    let preview = daemon
+        .call(
+            "link.preview_refactor",
+            json!({"source": "notes", "old_path": "OldDoc.md", "new_path": "Café Notes (2).md"}),
+        )
+        .await;
+    assert_eq!(preview["result"]["changes"].as_array().unwrap().len(), 3);
+
+    let apply = daemon
+        .call(
+            "link.apply_refactor",
+            json!({"source": "notes", "old_path": "OldDoc.md", "new_path": "Café Notes (2).md"}),
+        )
+        .await;
+    assert_eq!(apply["result"]["status"], json!("applied"));
+    assert_eq!(apply["result"]["files_changed"], json!(2));
+
+    let journal = std::fs::read_to_string(notes.root().join("Journal.md")).unwrap();
+    assert!(
+        journal.contains("\"The title\""),
+        "the title must survive untouched: {journal:?}"
+    );
+    let reparsed_journal =
+        tephra_parser::parse_unit(std::path::Path::new("@notes:Journal.md"), &journal);
+    assert_eq!(reparsed_journal.markdown_links.len(), 2);
+    for link in &reparsed_journal.markdown_links {
+        assert_eq!(
+            test_percent_decode(&link.target),
+            "Café Notes (2).md",
+            "a renamed markdown link must still resolve to the new path: {link:?}"
+        );
+    }
+
+    let deep = std::fs::read_to_string(notes.root().join("sub/Deep.md")).unwrap();
+    let reparsed_deep =
+        tephra_parser::parse_unit(std::path::Path::new("@notes:sub/Deep.md"), &deep);
+    assert_eq!(reparsed_deep.markdown_links.len(), 1);
+    assert_eq!(
+        test_percent_decode(&reparsed_deep.markdown_links[0].target),
+        "../Café Notes (2).md"
+    );
+
+    daemon.stop();
+}
+
+/// R13 review finding, end-to-end: a markdown destination written
+/// with a backslash escape (`Old\(2\).md`) shows up in the preview
+/// (because the parser's decoded target still matches the old path)
+/// and must actually apply cleanly, rather than coming back
+/// "partial" because the recorded span's raw bytes never equalled
+/// the decoded `before` text.
+#[tokio::test]
+async fn markdown_link_with_backslash_escaped_destination_applies_end_to_end() {
+    let daemon = TestDaemon::start().await;
+    let notes = fixtures::empty_source();
+    notes.write("Old(2).md", "# Old doc\n");
+    notes.write("Journal.md", "[doc](Old\\(2\\).md)\n");
+
+    daemon
+        .call(
+            "source.register",
+            json!({"name": "notes", "root": notes.root().to_string_lossy()}),
+        )
+        .await;
+
+    let preview = daemon
+        .call(
+            "link.preview_refactor",
+            json!({"source": "notes", "old_path": "Old(2).md", "new_path": "New(3).md"}),
+        )
+        .await;
+    assert_eq!(preview["result"]["changes"].as_array().unwrap().len(), 1);
+
+    let apply = daemon
+        .call(
+            "link.apply_refactor",
+            json!({"source": "notes", "old_path": "Old(2).md", "new_path": "New(3).md"}),
+        )
+        .await;
+    assert_eq!(apply["result"]["status"], json!("applied"), "{apply:?}");
+
+    let journal = std::fs::read_to_string(notes.root().join("Journal.md")).unwrap();
+    let reparsed = tephra_parser::parse_unit(std::path::Path::new("@notes:Journal.md"), &journal);
+    assert_eq!(reparsed.markdown_links.len(), 1);
+    assert_eq!(
+        test_percent_decode(&reparsed.markdown_links[0].target),
+        "New(3).md"
+    );
+
+    daemon.stop();
+}
+
 /// apply, `apply_refactor` aborts with a descriptive error before
 /// writing to any file — including files that were not stale.
 #[tokio::test]

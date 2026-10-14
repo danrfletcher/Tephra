@@ -66,10 +66,23 @@ pub struct LinkChange {
     pub file: String,
     /// 1-indexed line number within that file.
     pub line: usize,
-    /// The full matched link text before the rewrite (including its
-    /// `[[`/`]]` or `(`/`)` delimiters).
+    /// The exact source bytes at `[byte_start, byte_end)` before the
+    /// rewrite — for a wikilink, includes its `[[`/`]]` delimiters;
+    /// for a markdown link, covers only the destination text itself,
+    /// never the enclosing `(`/`)`, a title, or a `<`/`>` destination's
+    /// own brackets (R9). Taken verbatim from the referring file's
+    /// own content at that span (R13 review finding), never from the
+    /// parser's already-unescaped/entity-decoded value: a markdown
+    /// destination written with a backslash escape (`Old\(2\).md`) or
+    /// an HTML entity reference (`&amp;`) has raw source bytes that
+    /// differ from `tephra_parser`'s decoded `MarkdownLink::target`,
+    /// and `apply_changes_to_content`'s byte-exact check against this
+    /// field would otherwise always fail for such a link.
     pub before: String,
-    /// The full matched link text after the rewrite.
+    /// The full replacement text after the rewrite, in the same raw
+    /// source form as `before` (e.g. percent-encoded where writing
+    /// the new destination literally would otherwise be unsafe or
+    /// ambiguous — see [`locate_and_diff`]'s markdown branch).
     pub after: String,
     /// Absolute byte offset of the start of the span this change
     /// rewrites, within the referring file's own content (R1 review
@@ -190,6 +203,12 @@ fn locate_and_diff(
                     // rather than guess.
                     continue;
                 };
+                if byte_end > content.len()
+                    || !content.is_char_boundary(byte_start)
+                    || !content.is_char_boundary(byte_end)
+                {
+                    continue;
+                }
                 // R9 review finding: `m.span` (and hence `before`)
                 // covers only the destination text itself — never a
                 // surrounding `(`/`)`, a title, or a `<`/`>`
@@ -203,11 +222,25 @@ fn locate_and_diff(
                 // byte-exact check against the recorded span would
                 // always fail, because the span never covered the
                 // title/brackets wrapped into `before`.
+                //
+                // R13 review finding: `old_raw`/`m.target` is
+                // `pulldown-cmark`'s already backslash-unescaped,
+                // entity-decoded destination — but the recorded span
+                // covers the *raw source bytes*, which differ from
+                // that decoded value whenever the destination used a
+                // backslash escape (`Old\(2\).md`) or an HTML entity
+                // reference (`&amp;`). `before` must always be taken
+                // from the raw bytes at the span, never from the
+                // decoded `old_raw`, so `apply_changes_to_content`'s
+                // byte-exact check can ever succeed for such a link.
+                let raw_before = &content[byte_start..byte_end];
                 out.push(LinkChange {
                     file: file_id.to_string(),
                     line: m.line,
-                    before: old_raw.to_string(),
-                    after: new_raw.to_string(),
+                    before: raw_before.to_string(),
+                    after: finalize_markdown_after(
+                        raw_before, old_raw, new_raw, content, byte_start,
+                    ),
                     byte_start,
                     byte_end,
                 });
@@ -215,6 +248,118 @@ fn locate_and_diff(
         }
     }
     out
+}
+
+/// Builds the exact raw replacement text for one markdown-link
+/// destination occurrence, given:
+/// - `raw_before`: the literal source bytes currently at the span
+///   (may differ from `old_raw` if the source used a backslash
+///   escape or HTML entity reference — R13).
+/// - `old_raw`/`new_raw`: the parser-decoded old and new destination
+///   text (plus any `#anchor`), as computed by [`rewrite_markdown_raw`]
+///   (never itself percent-encoded — that decision is made here).
+/// - `content`/`byte_start`: used only to look at the single byte
+///   immediately before the span, which tells us whether this
+///   destination is written in `<...>` (angle-bracket) form, in
+///   which case spaces and parentheses never need escaping, or in
+///   bare form, which has real CommonMark syntax constraints.
+///
+/// Percent-encodes the new destination's path portion (preserving
+/// any `#anchor` unencoded, exactly as the destination's style
+/// already did) whenever any of the following holds, each a
+/// guarantee that writing `new_raw` back literally would either
+/// break re-parsing (R12) or require reproducing an escaping
+/// convention this function does not attempt to replicate
+/// byte-for-byte (R13):
+/// - the original destination was itself percent-encoded (style
+///   preservation, pre-existing behaviour);
+/// - the original destination's raw source bytes differ from its
+///   decoded value (a backslash escape or HTML entity was used);
+/// - the new destination text is not safe to write literally as-is
+///   for this occurrence's bracket style (a bare destination
+///   containing whitespace, an unbalanced paren, a literal
+///   backslash, or a leading `<`; or an angle-bracket destination
+///   containing a literal `<`, `>`, backslash, or newline).
+///
+/// A percent-encoded destination contains none of CommonMark's
+/// syntactically significant characters, so it is always safe to
+/// write literally in either form, and `tephra_graph`'s own resolver
+/// already treats percent-encoding as a normal, fully round-trippable
+/// destination convention (see `tephra_graph::resolver::percent_decode`).
+fn finalize_markdown_after(
+    raw_before: &str,
+    old_raw: &str,
+    new_raw: &str,
+    content: &str,
+    byte_start: usize,
+) -> String {
+    let (new_path, anchor) = match new_raw.split_once('#') {
+        Some((p, a)) => (p, Some(a)),
+        None => (new_raw, None),
+    };
+    let old_path_before_anchor = old_raw.split_once('#').map(|(p, _)| p).unwrap_or(old_raw);
+    let originally_percent_encoded = old_path_before_anchor.contains('%');
+    let original_used_escaping = raw_before != old_raw;
+    let is_angle_bracket = byte_start > 0 && content.as_bytes().get(byte_start - 1) == Some(&b'<');
+
+    let needs_percent_encoding = originally_percent_encoded
+        || original_used_escaping
+        || !destination_is_safe_literal(new_path, is_angle_bracket);
+
+    let final_path = if needs_percent_encoding {
+        percent_encode_path(new_path)
+    } else {
+        new_path.to_string()
+    };
+    match anchor {
+        Some(a) => format!("{final_path}#{a}"),
+        None => final_path,
+    }
+}
+
+/// Whether `path` (the new destination's path portion, decoded, with
+/// no `#anchor`) can be written literally at this span without any
+/// escaping, given whether the span is written in `<...>`
+/// (angle-bracket) or bare form — see [`finalize_markdown_after`].
+fn destination_is_safe_literal(path: &str, is_angle_bracket: bool) -> bool {
+    if is_angle_bracket {
+        !path.is_empty()
+            && !path
+                .bytes()
+                .any(|b| matches!(b, b'<' | b'>' | b'\\' | b'\n' | b'\r'))
+    } else {
+        is_safe_bare_destination(path)
+    }
+}
+
+/// Mirrors `tephra_parser::markdown_pass`'s own bare-destination scan
+/// (whitespace or an unmatched `)` ends the destination early; a
+/// balanced, unescaped `(...)` is part of it) to decide whether
+/// writing `path` literally, followed by the link's own real closing
+/// `)`, would re-parse back to exactly `path` with no truncation, no
+/// early termination, and no unterminated open paren. A leading `<`
+/// is also unsafe: a bare destination that starts with one would be
+/// misread as the start of an angle-bracket destination on reparse.
+fn is_safe_bare_destination(path: &str) -> bool {
+    if path.is_empty() || path.as_bytes()[0] == b'<' {
+        return false;
+    }
+    let mut depth: i32 = 0;
+    for &b in path.as_bytes() {
+        match b {
+            b'\\' => return false,
+            b'(' => depth += 1,
+            b')' => {
+                if depth == 0 {
+                    return false;
+                }
+                depth -= 1;
+            }
+            b' ' | b'\t' | b'\n' | b'\r' => return false,
+            _ => {}
+        }
+    }
+    depth == 0
 }
 
 /// Rewrites one wikilink's full raw inner text (`WikiLink::raw` /
@@ -276,9 +421,23 @@ fn rewrite_target_component(target: &str, new_path: &str) -> String {
 /// names `new_path` instead, relative to `from_id`'s own directory
 /// (markdown link destinations, unlike wikilinks, are always
 /// directory-relative — or root-relative if they start with `/`).
-/// Preserves a trailing `#anchor` and round-trips percent-encoding
-/// (re-encodes the replacement only if the original destination was
-/// itself percent-encoded).
+/// Preserves a trailing `#anchor`, decoding any pre-existing
+/// percent-encoding on the old destination's path portion only to
+/// compute `new_stem`'s relative placement correctly (a percent-
+/// encoded old path must still be treated as naming the same file
+/// its decoded form would).
+///
+/// Returns the new destination's *decoded* text — never itself
+/// percent-encoded, nor escaped for any particular bracket style.
+/// Those decisions depend on where in the source text this
+/// destination actually sits (bare vs `<...>`, and whether its raw
+/// bytes already differed from this decoded form), which only
+/// [`locate_and_diff`]'s `finalize_markdown_after` can see (R12/R13
+/// review findings: a single global percent-encoding choice here,
+/// keyed only on the *old* destination's own style, could neither
+/// react to a new destination that needs escaping the old one never
+/// did, nor to an old destination that used backslash/entity
+/// escaping rather than percent-encoding).
 fn rewrite_markdown_raw(from_id: &str, to_raw: &str, new_path: &str) -> Option<String> {
     let (before_anchor, anchor) = match to_raw.split_once('#') {
         Some((a, b)) => (a, Some(b)),
@@ -291,7 +450,6 @@ fn rewrite_markdown_raw(from_id: &str, to_raw: &str, new_path: &str) -> Option<S
         // assumed.
         return None;
     }
-    let was_percent_encoded = before_anchor.contains('%');
     let decoded = percent_decode(before_anchor);
     let is_absolute = decoded.starts_with('/');
     let decoded_trimmed = decoded.trim_start_matches('/');
@@ -306,14 +464,10 @@ fn rewrite_markdown_raw(from_id: &str, to_raw: &str, new_path: &str) -> Option<S
     } else {
         relative_path(from_dir, new_stem)
     };
-    let mut new_target = match ext {
+    let mut out = match ext {
         Some(e) => format!("{core}{e}"),
         None => core,
     };
-    if was_percent_encoded {
-        new_target = percent_encode_path(&new_target);
-    }
-    let mut out = new_target;
     if let Some(a) = anchor {
         out.push('#');
         out.push_str(a);
@@ -1331,6 +1485,156 @@ mod tests {
         let refs: Vec<&LinkChange> = changes.iter().collect();
         let result = apply_changes_to_content(content, &refs).expect("span matches");
         assert_eq!(result, "See [doc](New(3).md) for more.\n");
+    }
+
+    /// R12 review finding: renaming to a destination that contains a
+    /// space is not a safe bare CommonMark destination — writing it
+    /// literally would make the title-less `)` at the space's
+    /// position terminate the destination early, silently turning
+    /// the rest of the link into plain text. The rewrite must
+    /// percent-encode it instead, and the result must still parse
+    /// back to a markdown link whose target resolves to the new
+    /// path.
+    #[test]
+    fn markdown_link_renamed_to_a_path_with_a_space_is_percent_encoded() {
+        let edges = vec![edge(
+            "@notes:Journal.md",
+            "@notes:OldDoc.md",
+            "OldDoc.md",
+            tephra_parser::LINK_KIND_MARKDOWN,
+        )];
+        let content = "Bare: [d](OldDoc.md) end.\n";
+        let mut files = HashMap::new();
+        files.insert("@notes:Journal.md".to_string(), content.to_string());
+        let changes = compute_changes(&edges, &files, "OldDoc.md", "New Doc (2).md");
+        assert_eq!(changes.len(), 1);
+        let refs: Vec<&LinkChange> = changes.iter().collect();
+        let result = apply_changes_to_content(content, &refs).expect("span matches");
+        assert_eq!(result, "Bare: [d](New%20Doc%20%282%29.md) end.\n");
+
+        // The rewritten file still parses to a link whose target
+        // resolves to the new path (R12's acceptance bar).
+        let reparsed = tephra_parser::parse_unit(Path::new("@notes:Journal.md"), &result);
+        assert_eq!(reparsed.markdown_links.len(), 1);
+        assert_eq!(
+            percent_decode(&reparsed.markdown_links[0].target),
+            "New Doc (2).md"
+        );
+    }
+
+    /// R12: the same rename, but through a titled markdown link —
+    /// only the destination is percent-encoded; the title is left
+    /// exactly as written.
+    #[test]
+    fn markdown_link_with_title_renamed_to_a_path_with_a_space_percent_encodes_only_the_destination(
+    ) {
+        let edges = vec![edge(
+            "@notes:Journal.md",
+            "@notes:OldDoc.md",
+            "OldDoc.md",
+            tephra_parser::LINK_KIND_MARKDOWN,
+        )];
+        let content = "[d](OldDoc.md \"The title\")\n";
+        let mut files = HashMap::new();
+        files.insert("@notes:Journal.md".to_string(), content.to_string());
+        let changes = compute_changes(&edges, &files, "OldDoc.md", "New Doc (2).md");
+        assert_eq!(changes.len(), 1);
+        let refs: Vec<&LinkChange> = changes.iter().collect();
+        let result = apply_changes_to_content(content, &refs).expect("span matches");
+        assert_eq!(result, "[d](New%20Doc%20%282%29.md \"The title\")\n");
+
+        let reparsed = tephra_parser::parse_unit(Path::new("@notes:Journal.md"), &result);
+        assert_eq!(reparsed.markdown_links.len(), 1);
+        assert_eq!(
+            percent_decode(&reparsed.markdown_links[0].target),
+            "New Doc (2).md"
+        );
+    }
+
+    /// R12: a relative markdown link renamed across a directory to a
+    /// path with a space — the `../` segments stay unencoded (they
+    /// are in `percent_encode_path`'s unreserved set), only the
+    /// filename's unsafe characters are encoded.
+    #[test]
+    fn relative_markdown_link_renamed_to_a_path_with_a_space_is_percent_encoded() {
+        let edges = vec![edge(
+            "@notes:sub/Deep.md",
+            "@notes:OldDoc.md",
+            "../OldDoc.md",
+            tephra_parser::LINK_KIND_MARKDOWN,
+        )];
+        let content = "[d](../OldDoc.md)\n";
+        let mut files = HashMap::new();
+        files.insert("@notes:sub/Deep.md".to_string(), content.to_string());
+        let changes = compute_changes(&edges, &files, "OldDoc.md", "Café Notes (2).md");
+        assert_eq!(changes.len(), 1);
+        let refs: Vec<&LinkChange> = changes.iter().collect();
+        let result = apply_changes_to_content(content, &refs).expect("span matches");
+
+        let reparsed = tephra_parser::parse_unit(Path::new("@notes:sub/Deep.md"), &result);
+        assert_eq!(reparsed.markdown_links.len(), 1);
+        assert_eq!(
+            percent_decode(&reparsed.markdown_links[0].target),
+            "../Café Notes (2).md"
+        );
+    }
+
+    /// R13 review finding, exact repro: a bare markdown destination
+    /// written with backslash escapes (`Old\(2\).md`, decoding to
+    /// `Old(2).md`) has raw source bytes that differ from the
+    /// parser's decoded target — `before` must come from those raw
+    /// bytes, not the decoded value, or the byte-exact check in
+    /// `apply_changes_to_content` always fails.
+    #[test]
+    fn markdown_link_with_backslash_escaped_destination_is_applied() {
+        let edges = vec![edge(
+            "@notes:Journal.md",
+            "@notes:OldDoc.md",
+            "Old(2).md",
+            tephra_parser::LINK_KIND_MARKDOWN,
+        )];
+        let content = "[d](Old\\(2\\).md)\n";
+        let mut files = HashMap::new();
+        files.insert("@notes:Journal.md".to_string(), content.to_string());
+        let changes = compute_changes(&edges, &files, "Old(2).md", "New(3).md");
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].before, "Old\\(2\\).md");
+        let refs: Vec<&LinkChange> = changes.iter().collect();
+        let result = apply_changes_to_content(content, &refs).expect("span matches");
+
+        let reparsed = tephra_parser::parse_unit(Path::new("@notes:Journal.md"), &result);
+        assert_eq!(reparsed.markdown_links.len(), 1);
+        assert_eq!(
+            percent_decode(&reparsed.markdown_links[0].target),
+            "New(3).md"
+        );
+    }
+
+    /// R13: an HTML entity reference (`&amp;`) in the destination has
+    /// the same raw-vs-decoded mismatch as a backslash escape.
+    #[test]
+    fn markdown_link_with_html_entity_in_destination_is_applied() {
+        let edges = vec![edge(
+            "@notes:Journal.md",
+            "@notes:OldDoc.md",
+            "Old&Doc.md",
+            tephra_parser::LINK_KIND_MARKDOWN,
+        )];
+        let content = "[d](Old&amp;Doc.md)\n";
+        let mut files = HashMap::new();
+        files.insert("@notes:Journal.md".to_string(), content.to_string());
+        let changes = compute_changes(&edges, &files, "Old&Doc.md", "New&Doc.md");
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].before, "Old&amp;Doc.md");
+        let refs: Vec<&LinkChange> = changes.iter().collect();
+        let result = apply_changes_to_content(content, &refs).expect("span matches");
+
+        let reparsed = tephra_parser::parse_unit(Path::new("@notes:Journal.md"), &result);
+        assert_eq!(reparsed.markdown_links.len(), 1);
+        assert_eq!(
+            percent_decode(&reparsed.markdown_links[0].target),
+            "New&Doc.md"
+        );
     }
 
     #[test]
