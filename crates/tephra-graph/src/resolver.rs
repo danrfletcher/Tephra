@@ -189,22 +189,44 @@ fn percent_decode(s: &str) -> Cow<'_, str> {
 /// arithmetic, independent of the host OS's path separator, since
 /// every `rel_path` in this crate already uses `/` (see
 /// `tests/fixtures/mod.rs`).
-fn join_relative(from_dir: &str, target: &str) -> String {
-    let mut stack: Vec<&str> = if from_dir.is_empty() {
-        Vec::new()
-    } else {
-        from_dir.split('/').filter(|s| !s.is_empty()).collect()
+///
+/// Two cases anchor the result at the source root rather than
+/// `from_dir`, and both must give the same answer regardless of how
+/// deep the linking file sits (R22, the same class of depth-dependent
+/// bug R21 fixed for bare basenames):
+///
+/// - A target starting with `/` (a root-absolute path, standard in
+///   GitHub-style READMEs such as the `atlas-repo` code source) is
+///   resolved from the source root, never from `from_dir` — so
+///   `/docs/X.md` means `docs/X.md` from *every* linking file, not
+///   `sub/docs/X.md` when the link happens to live in `sub/`.
+/// - A `..` that would pop past the source root returns `None` (so
+///   the caller dangles the edge) instead of silently stopping at the
+///   root: the target names a path outside the source entirely, and
+///   it must never be treated as if it named some unrelated file that
+///   happens to share the remaining components.
+fn join_relative(from_dir: &str, target: &str) -> Option<String> {
+    let (mut stack, remainder): (Vec<&str>, &str) = match target.strip_prefix('/') {
+        Some(rest) => (Vec::new(), rest),
+        None => {
+            let base: Vec<&str> = if from_dir.is_empty() {
+                Vec::new()
+            } else {
+                from_dir.split('/').filter(|s| !s.is_empty()).collect()
+            };
+            (base, target)
+        }
     };
-    for component in target.split('/') {
+    for component in remainder.split('/') {
         match component {
             "" | "." => {}
             ".." => {
-                stack.pop();
+                stack.pop()?;
             }
             other => stack.push(other),
         }
     }
-    stack.join("/")
+    Some(stack.join("/"))
 }
 
 /// A markdown link's (`[text](target)`) normalized match key: the
@@ -220,15 +242,20 @@ fn join_relative(from_dir: &str, target: &str) -> String {
 /// `allow_basename` parameter for why a markdown link never falls
 /// back to a basename-anywhere-in-source match the way a bare
 /// wikilink does.
-pub(crate) fn normalize_markdown_target(from_rel_path: &str, raw_target: &str) -> String {
+///
+/// Returns `None` when the target names a path outside the source
+/// (a `..` that climbs past the source root, R22) — the caller must
+/// then dangle the edge rather than index it under a bogus,
+/// depth-dependent key.
+pub(crate) fn normalize_markdown_target(from_rel_path: &str, raw_target: &str) -> Option<String> {
     let without_anchor = raw_target.split('#').next().unwrap_or(raw_target);
     let decoded = percent_decode(without_anchor);
     let from_dir = from_rel_path
         .rsplit_once('/')
         .map(|(dir, _)| dir)
         .unwrap_or("");
-    let joined = join_relative(from_dir, &decoded);
-    normalize_key(strip_markdown_extension(&joined))
+    let joined = join_relative(from_dir, &decoded)?;
+    Some(normalize_key(strip_markdown_extension(&joined)))
 }
 
 /// Whether a markdown link's raw target names no file at all once any
@@ -416,10 +443,8 @@ pub(crate) fn edge_target_scope_key(
             .get(from_id)
             .map(|f| f.rel_path.as_str())
             .unwrap_or("");
-        Some((
-            from_source.to_string(),
-            normalize_markdown_target(from_rel_path, to_raw),
-        ))
+        let key = normalize_markdown_target(from_rel_path, to_raw)?;
+        Some((from_source.to_string(), key))
     }
 }
 
