@@ -10,3 +10,5 @@ mod rpc_server_http;
 mod rpc_server_ws;
 #[path = "integration/rpc_concurrency.rs"]
 mod rpc_concurrency;
+#[path = "integration/rpc_transport_parity.rs"]
+mod rpc_transport_parity;
