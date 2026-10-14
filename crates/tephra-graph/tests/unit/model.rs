@@ -383,3 +383,46 @@ fn get_backlinks_for_a_live_unit_never_includes_an_edge_that_only_shares_its_bas
         graph.get_backlinks("@notes:teamB/Shared.md")
     );
 }
+
+/// R17: once a unit that authored edges is removed and its edges'
+/// slots are reused by brand-new edges, a stale-id `get_backlinks`
+/// lookup (GP7's own query shape) must never surface the *new*,
+/// unrelated edge that merely happens to now live in the slot the
+/// removed unit's edge used to occupy. Before the fix, `remove_edge`
+/// recomputed the edge's `match_index` key by looking up `edge.from`
+/// in `nodes` — but by the time it ran, `remove_node` had already
+/// deleted that very node, so the key lookup silently returned
+/// `None`, the prune was skipped, and the stale slot number lingered
+/// in `match_index` for the next `insert_edge` to hand to a
+/// completely different edge.
+#[test]
+fn a_stale_id_lookup_after_remove_and_slot_reuse_never_returns_an_unrelated_edge() {
+    let mut graph = UnitGraph::new();
+
+    // X.md links to a target ("Ghost") that never exists — a
+    // dangling edge, indexed under match_index[("notes", "ghost"...)].
+    graph.upsert_unit("notes", "X.md", facts(&[("Ghost", "wikilink")], &[], &[]));
+    assert_eq!(graph.get_backlinks("@notes:Ghost.md").len(), 1);
+
+    // X.md (and its one authored edge) is removed entirely.
+    graph.remove_unit("notes", "X.md");
+    assert!(graph.unit("@notes:X.md").is_none());
+
+    // A brand-new, unrelated unit is upserted afterwards. If the
+    // free'd slot from X.md's removed edge got reused for Y.md's own
+    // edge, and the stale match_index entry wasn't pruned, a lookup
+    // on the long-gone "Ghost" id would incorrectly find Y's edge.
+    graph.upsert_unit("notes", "Y.md", facts(&[("Other", "wikilink")], &[], &[]));
+
+    let stale_lookup = graph.get_backlinks("@notes:Ghost.md");
+    assert!(
+        stale_lookup.is_empty(),
+        "R17: a stale id's backlinks must not resurrect an unrelated edge through a \
+         reused match_index slot: {stale_lookup:?}"
+    );
+
+    // Y's own edge is still reachable through its own correct key.
+    let y_backlinks = graph.get_backlinks("@notes:Other.md");
+    assert_eq!(y_backlinks.len(), 1);
+    assert_eq!(y_backlinks[0].from, "@notes:Y.md");
+}

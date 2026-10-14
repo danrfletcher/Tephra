@@ -793,3 +793,242 @@ fn apply_change_notification_offline_transition_reannotates_every_edge() {
          only named C.md"
     );
 }
+
+/// R16 (probe case B): two raw links from the same unit that
+/// currently resolve to the *same* target must not permanently lose
+/// one of them from storage — once a later insert makes the two
+/// targets diverge, both must independently re-resolve, matching a
+/// fresh `build_from_cache` on the same cache state.
+#[test]
+fn two_raw_links_resolving_to_the_same_target_both_survive_and_independently_re_resolve() {
+    let cache_dir = tempdir().expect("cache tempdir");
+    let source_dir = tempdir().expect("source tempdir");
+    let cache = open_temp_cache(&cache_dir);
+    let source_id = cache
+        .register_source(
+            "notes",
+            &source_dir.path().to_string_lossy(),
+            tephra_cache::SourceStatus::Active,
+        )
+        .expect("register_source");
+
+    write_and_cache(
+        &cache,
+        source_id,
+        source_dir.path(),
+        "N.md",
+        "See [[Shared]] and [[teamA/Shared]].\n",
+    );
+    write_and_cache(
+        &cache,
+        source_id,
+        source_dir.path(),
+        "teamA/Shared.md",
+        "# Shared A\n",
+    );
+
+    let mut graph = UnitGraph::build_from_cache(&cache).expect("initial build");
+    // Both raw links currently resolve to the same unit, so the
+    // query-output collapses them to one row (R2/R16's query-time
+    // dedup) — but the probe's bug was that one of the two raw links
+    // was discarded from *storage*, not merely folded at query time.
+    let forward = graph.get_forward_links("@notes:N.md");
+    assert_eq!(forward.len(), 1, "{forward:?}");
+    assert_eq!(
+        forward[0].to,
+        EdgeTarget::Resolved("@notes:teamA/Shared.md".to_string())
+    );
+
+    // Insert a shorter root-level Shared.md: E4 says the bare
+    // `[[Shared]]` link must now prefer it (shortest match), while
+    // the `[[teamA/Shared]]` link (a full relative path) is
+    // unaffected and must keep pointing at teamA/Shared.md — two
+    // genuinely different targets now, not one.
+    write_and_cache(
+        &cache,
+        source_id,
+        source_dir.path(),
+        "Shared.md",
+        "# Shared root\n",
+    );
+    graph
+        .apply_change_notification(
+            &cache,
+            &ChangeNotification {
+                source: "notes".to_string(),
+                rel_paths: vec!["Shared.md".to_string()],
+            },
+        )
+        .expect("apply_change_notification");
+
+    let forward_after = graph.get_forward_links("@notes:N.md");
+    assert_eq!(
+        forward_after.len(),
+        2,
+        "both raw links must now be independently resolved, not just one: {forward_after:?}"
+    );
+    assert!(forward_after
+        .iter()
+        .any(|e| e.to_raw == "Shared" && e.to == EdgeTarget::Resolved("@notes:Shared.md".into())));
+    assert!(forward_after.iter().any(|e| e.to_raw == "teamA/Shared"
+        && e.to == EdgeTarget::Resolved("@notes:teamA/Shared.md".into())));
+
+    let fresh = UnitGraph::build_from_cache(&cache).expect("fresh rebuild");
+    assert_eq!(
+        graph.get_edges(),
+        fresh.get_edges(),
+        "R16: incremental update must agree with a full rebuild from the same cache state"
+    );
+}
+
+/// R16 (probe case D): a note's self-reference edge, reached via two
+/// differently-spelled raw links (`[[A]]` and `[[#H]]`), must not
+/// permanently discard either raw link's own record — once a shorter
+/// same-named candidate is inserted elsewhere and pulls the bare-name
+/// link away from the self-edge, the anchor-only link must still
+/// correctly stay a self-edge, and the bare-name link must correctly
+/// repoint, matching a fresh `build_from_cache`.
+#[test]
+fn a_self_edge_reached_via_two_raw_links_still_lets_one_of_them_independently_repoint() {
+    let cache_dir = tempdir().expect("cache tempdir");
+    let source_dir = tempdir().expect("source tempdir");
+    let cache = open_temp_cache(&cache_dir);
+    let source_id = cache
+        .register_source(
+            "notes",
+            &source_dir.path().to_string_lossy(),
+            tephra_cache::SourceStatus::Active,
+        )
+        .expect("register_source");
+
+    write_and_cache(
+        &cache,
+        source_id,
+        source_dir.path(),
+        "sub/A.md",
+        "See [[A]] and [[#H]].\n",
+    );
+
+    let mut graph = UnitGraph::build_from_cache(&cache).expect("initial build");
+    // Before a root A.md exists, both raw links resolve to the
+    // referring unit itself, so query output collapses them to one
+    // self-edge row.
+    let forward = graph.get_forward_links("@notes:sub/A.md");
+    assert_eq!(forward.len(), 1, "{forward:?}");
+    assert_eq!(
+        forward[0].to,
+        EdgeTarget::Resolved("@notes:sub/A.md".to_string())
+    );
+
+    // A shorter root A.md now exists: E4 says the bare `[[A]]` link
+    // must repoint to it (shortest match wins), while the
+    // anchor-only `[[#H]]` link always resolves to the referring
+    // unit itself regardless.
+    write_and_cache(&cache, source_id, source_dir.path(), "A.md", "# A root\n");
+    graph
+        .apply_change_notification(
+            &cache,
+            &ChangeNotification {
+                source: "notes".to_string(),
+                rel_paths: vec!["A.md".to_string()],
+            },
+        )
+        .expect("apply_change_notification");
+
+    let forward_after = graph.get_forward_links("@notes:sub/A.md");
+    assert_eq!(
+        forward_after.len(),
+        2,
+        "the bare-name link and the anchor-only link must now resolve to different \
+         targets, not stay collapsed into one stale self-edge: {forward_after:?}"
+    );
+    assert!(forward_after
+        .iter()
+        .any(|e| e.to_raw == "A" && e.to == EdgeTarget::Resolved("@notes:A.md".into())));
+    assert!(forward_after
+        .iter()
+        .any(|e| e.to_raw == "#H" && e.to == EdgeTarget::Resolved("@notes:sub/A.md".into())));
+
+    let fresh = UnitGraph::build_from_cache(&cache).expect("fresh rebuild");
+    assert_eq!(
+        graph.get_edges(),
+        fresh.get_edges(),
+        "R16: incremental update must agree with a full rebuild from the same cache state"
+    );
+}
+
+/// R18 (probe case C): a federated wikilink to a source that is not
+/// yet registered must still be re-resolved once that source is
+/// registered and populated through `apply_change_notification` —
+/// not stay dangling forever just because it was never indexed at
+/// all while the target source was unknown.
+#[test]
+fn a_link_to_a_not_yet_registered_source_resolves_once_that_source_is_populated() {
+    let notes_cache_dir = tempdir().expect("cache tempdir");
+    let notes_dir = tempdir().expect("notes source tempdir");
+    let repo_dir = tempdir().expect("repo source tempdir");
+    let cache = open_temp_cache(&notes_cache_dir);
+
+    let notes_id = cache
+        .register_source(
+            "notes",
+            &notes_dir.path().to_string_lossy(),
+            tephra_cache::SourceStatus::Active,
+        )
+        .expect("register_source notes");
+
+    write_and_cache(
+        &cache,
+        notes_id,
+        notes_dir.path(),
+        "N.md",
+        "See [[@atlas-repo:README]].\n",
+    );
+
+    // atlas-repo does not exist in the graph yet at all.
+    let mut graph = UnitGraph::build_from_cache(&cache).expect("initial build");
+    assert_eq!(
+        graph.get_forward_links("@notes:N.md")[0].to,
+        EdgeTarget::Dangling,
+        "atlas-repo isn't registered yet, so the link must be dangling, not a panic \
+         or a silent empty result"
+    );
+
+    // atlas-repo is registered and gets its first unit, applied
+    // incrementally exactly as PR-4's registry would do it at
+    // runtime after the daemon has already started.
+    let repo_id = cache
+        .register_source(
+            "atlas-repo",
+            &repo_dir.path().to_string_lossy(),
+            tephra_cache::SourceStatus::Active,
+        )
+        .expect("register_source atlas-repo");
+    write_and_cache(&cache, repo_id, repo_dir.path(), "README.md", "# Readme\n");
+
+    graph.register_source("atlas-repo");
+    graph
+        .apply_change_notification(
+            &cache,
+            &ChangeNotification {
+                source: "atlas-repo".to_string(),
+                rel_paths: vec!["README.md".to_string()],
+            },
+        )
+        .expect("apply_change_notification");
+
+    assert_eq!(
+        graph.get_forward_links("@notes:N.md")[0].to,
+        EdgeTarget::Resolved("@atlas-repo:README.md".to_string()),
+        "R18: a federated link to a source registered after the graph was built must \
+         still be re-resolved once that source gets its matching unit"
+    );
+
+    let fresh = UnitGraph::build_from_cache(&cache).expect("fresh rebuild");
+    assert_eq!(
+        graph.get_edges(),
+        fresh.get_edges(),
+        "the incrementally-updated graph must agree with a full rebuild from the \
+         same cache state"
+    );
+}
