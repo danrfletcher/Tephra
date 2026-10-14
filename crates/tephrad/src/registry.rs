@@ -30,6 +30,7 @@ use tephra_cache::{Cache, CacheError, SourceRow, SourceStatus};
 use crate::ignore::IgnoreRules;
 use crate::scan::{self, ScanError, ScanStats};
 use crate::watcher::{self, WatchError, WatcherHandle};
+use crate::writer_gate::{self, WriterGate};
 
 // ---- pure validation -------------------------------------------------
 
@@ -296,12 +297,32 @@ fn is_cache_busy(err: &CacheError) -> bool {
 /// 5-second `busy_timeout` pragma (R11) made every one of these
 /// quick registry writes fail outright with "database is locked"
 /// rather than simply waiting its turn.
+///
+/// `gate` is acquired fresh for each individual attempt, not held
+/// across the whole retry loop (R18): this is the same writer gate
+/// `crate::scan`'s chunked scan commits and debounced batch-apply
+/// acquire around their own `BEGIN IMMEDIATE`/commit cycles against
+/// this very same database file, so a quick registry write queued up
+/// on it is handed the gate deterministically the moment a scan's
+/// current chunk releases it, instead of relying on winning a race
+/// against that scan's own immediate reacquire. Releasing it between
+/// retries (rather than holding it for the whole backoff loop) means
+/// a write that's genuinely stuck waiting on a database held busy by
+/// something outside this gate (e.g. a real external connection, as
+/// in `tests/register_busy_retry.rs`) never also blocks some other,
+/// unrelated source's writes against the same gate for the whole
+/// retry window.
 fn retry_cache_on_busy<T>(
+    gate: &WriterGate,
     mut attempt: impl FnMut() -> Result<T, CacheError>,
 ) -> Result<T, CacheError> {
     let mut tries = 0;
     loop {
-        match attempt() {
+        let result = {
+            let _permit = gate.acquire();
+            attempt()
+        };
+        match result {
             Ok(v) => return Ok(v),
             Err(e) if is_cache_busy(&e) && tries < MAX_CACHE_BUSY_RETRIES => {
                 tries += 1;
@@ -333,6 +354,16 @@ fn retry_cache_on_busy<T>(
 pub struct SourceRegistry {
     cache: Arc<Mutex<Cache>>,
     cache_path: PathBuf,
+    /// The same fair writer gate (R18, see `crate::writer_gate`)
+    /// every write against `cache_path`'s database file goes through
+    /// — this registry's own quick writes below, and (via
+    /// `writer_gate::for_path`, keyed by the identical path) every
+    /// scan/rescan/batch-apply connection `crate::scan` opens
+    /// independently. Stored here (rather than looked up fresh each
+    /// time) purely so every call site shares one `Arc` without
+    /// re-hashing the path on every write; `writer_gate::for_path`
+    /// would return the exact same instance either way.
+    gate: Arc<WriterGate>,
     runtime: tokio::runtime::Runtime,
     running: Mutex<HashMap<String, RunningSource>>,
     events_tx: tokio::sync::broadcast::Sender<DaemonEvent>,
@@ -346,9 +377,11 @@ impl SourceRegistry {
             .build()?;
         let (events_tx, _rx) = tokio::sync::broadcast::channel(1024);
         let cache_path = cache.path().to_path_buf();
+        let gate = writer_gate::for_path(&cache_path);
         Ok(SourceRegistry {
             cache: Arc::new(Mutex::new(cache)),
             cache_path,
+            gate,
             runtime,
             running: Mutex::new(HashMap::new()),
             events_tx,
@@ -410,7 +443,7 @@ impl SourceRegistry {
                 })
                 .collect();
             validate_register(&existing, name, &canonical_root, probe)?;
-            retry_cache_on_busy(|| {
+            retry_cache_on_busy(&self.gate, || {
                 cache.register_source(
                     name,
                     &canonical_root.to_string_lossy(),
@@ -431,7 +464,9 @@ impl SourceRegistry {
             }
             Err(e) => {
                 let cache = self.cache.lock().unwrap();
-                if let Err(cleanup_err) = retry_cache_on_busy(|| cache.delete_source(name)) {
+                if let Err(cleanup_err) =
+                    retry_cache_on_busy(&self.gate, || cache.delete_source(name))
+                {
                     tracing::warn!(
                         source = %name,
                         error = %cleanup_err,
@@ -490,7 +525,7 @@ impl SourceRegistry {
 
         {
             let cache = self.cache.lock().unwrap();
-            retry_cache_on_busy(|| cache.set_last_scanned(name, now_unix()))?;
+            retry_cache_on_busy(&self.gate, || cache.set_last_scanned(name, now_unix()))?;
         }
 
         self.start_watcher(
@@ -591,9 +626,10 @@ impl SourceRegistry {
 
         let cache_for_offline = Arc::clone(&self.cache);
         let name_for_offline = name.clone();
+        let gate_for_offline = Arc::clone(&self.gate);
         let on_root_removed = move || {
             let cache = cache_for_offline.lock().unwrap();
-            if let Err(e) = retry_cache_on_busy(|| {
+            if let Err(e) = retry_cache_on_busy(&gate_for_offline, || {
                 cache.transition_source_status(&name_for_offline, SourceStatus::Offline)
             }) {
                 tracing::warn!(source = %name_for_offline, error = %e, "failed to mark source offline");
@@ -629,7 +665,7 @@ impl SourceRegistry {
             running.handle.stop();
         }
         let cache = self.cache.lock().unwrap();
-        retry_cache_on_busy(|| cache.delete_source(name))?;
+        retry_cache_on_busy(&self.gate, || cache.delete_source(name))?;
         Ok(())
     }
 
@@ -671,7 +707,7 @@ impl SourceRegistry {
         if probe_path(&root) != PathProbe::Ok {
             let cache = self.cache.lock().unwrap();
             if status != SourceStatus::Offline {
-                retry_cache_on_busy(|| {
+                retry_cache_on_busy(&self.gate, || {
                     cache.transition_source_status(name, SourceStatus::Offline)
                 })?;
             }
@@ -681,7 +717,9 @@ impl SourceRegistry {
         {
             let cache = self.cache.lock().unwrap();
             if status != SourceStatus::Stale {
-                retry_cache_on_busy(|| cache.transition_source_status(name, SourceStatus::Stale))?;
+                retry_cache_on_busy(&self.gate, || {
+                    cache.transition_source_status(name, SourceStatus::Stale)
+                })?;
             }
         }
 
@@ -716,8 +754,10 @@ impl SourceRegistry {
 
         {
             let cache = self.cache.lock().unwrap();
-            retry_cache_on_busy(|| cache.transition_source_status(name, SourceStatus::Active))?;
-            retry_cache_on_busy(|| cache.set_last_scanned(name, now_unix()))?;
+            retry_cache_on_busy(&self.gate, || {
+                cache.transition_source_status(name, SourceStatus::Active)
+            })?;
+            retry_cache_on_busy(&self.gate, || cache.set_last_scanned(name, now_unix()))?;
         }
 
         Ok(stats)
@@ -1007,8 +1047,9 @@ mod tests {
 
     #[test]
     fn retry_cache_on_busy_succeeds_once_the_operation_stops_failing() {
+        let gate = WriterGate::new();
         let mut calls = 0u32;
-        let result: Result<&str, CacheError> = retry_cache_on_busy(|| {
+        let result: Result<&str, CacheError> = retry_cache_on_busy(&gate, || {
             calls += 1;
             if calls < 4 {
                 Err(busy_error())
@@ -1025,8 +1066,9 @@ mod tests {
 
     #[test]
     fn retry_cache_on_busy_gives_up_after_the_retry_budget_is_exhausted() {
+        let gate = WriterGate::new();
         let mut calls = 0u32;
-        let result: Result<(), CacheError> = retry_cache_on_busy(|| {
+        let result: Result<(), CacheError> = retry_cache_on_busy(&gate, || {
             calls += 1;
             Err(busy_error())
         });
@@ -1043,8 +1085,9 @@ mod tests {
 
     #[test]
     fn retry_cache_on_busy_does_not_retry_a_non_busy_error() {
+        let gate = WriterGate::new();
         let mut calls = 0u32;
-        let result: Result<(), CacheError> = retry_cache_on_busy(|| {
+        let result: Result<(), CacheError> = retry_cache_on_busy(&gate, || {
             calls += 1;
             Err(CacheError::DuplicateSource("notes".to_string()))
         });
