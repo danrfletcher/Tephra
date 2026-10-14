@@ -1,0 +1,952 @@
+//! G7/GP7/GP8/E3 end-to-end: `link.preview_refactor` then
+//! `link.apply_refactor` over the real RPC transport, against a real
+//! [`tephrad::registry::SourceRegistry`]/[`tephra_graph::UnitGraph`]
+//! pair and real on-disk files — spanning two registered sources
+//! (`notes`, `atlas-repo`), exactly as the spec's golden path and E3
+//! staleness scenario describe. Mirrors `rpc_live_graph.rs`'s own
+//! "real components, not `rpc_fixtures`'s mocks" rationale: a mocked
+//! `RefactorBackend` can't prove the real engine's file reads/writes,
+//! staleness gate, or watcher pause/resume actually happen.
+
+mod fixtures;
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use serde_json::json;
+use tephra_cache::Cache;
+use tephra_graph::UnitGraph;
+use tephrad::refactor::{RefactorEngine, WatcherPauseControl};
+use tephrad::registry::SourceRegistry;
+use tephrad::rpc::backend::{
+    GraphBackend, GraphRefresh, RefactorBackend, SharedGraph, SourceBackend,
+};
+use tephrad::rpc::server::{build_router, AppState};
+use tokio::net::TcpListener;
+
+fn wait_until(timeout: Duration, mut check: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if check() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+struct TestDaemon {
+    addr: std::net::SocketAddr,
+    token: String,
+    _cache_dir: tempfile::TempDir,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl TestDaemon {
+    async fn start() -> Self {
+        let cache_dir = tempfile::tempdir().expect("cache dir");
+        let cache_path = cache_dir.path().join("cache.db");
+        let token_path = cache_dir.path().join("token");
+        let token = "c".repeat(64);
+        std::fs::write(&token_path, &token).expect("write token");
+
+        let registry_cache = Cache::open(&cache_path).expect("open cache for registry");
+        let registry = Arc::new(SourceRegistry::new(registry_cache).expect("new registry"));
+
+        let graph_cache = Cache::open(&cache_path).expect("open cache for graph");
+        let initial_graph = UnitGraph::build_from_cache(&graph_cache).expect("build initial graph");
+        let shared_graph = Arc::new(SharedGraph::new(initial_graph));
+        let graph_refresh = GraphRefresh::new(shared_graph.clone(), cache_path.clone());
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local_addr");
+
+        let refactor_engine = RefactorEngine::new(
+            shared_graph.clone() as Arc<dyn GraphBackend>,
+            registry.clone() as Arc<dyn SourceBackend>,
+            registry.clone() as Arc<dyn WatcherPauseControl>,
+        );
+
+        let state = Arc::new(AppState::new(
+            token_path,
+            shared_graph as Arc<dyn GraphBackend>,
+            registry as Arc<dyn SourceBackend>,
+            Arc::new(refactor_engine) as Arc<dyn RefactorBackend>,
+            Some(graph_refresh),
+        ));
+        let router = build_router(state);
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        TestDaemon {
+            addr,
+            token,
+            _cache_dir: cache_dir,
+            server,
+        }
+    }
+
+    async fn call(&self, method: &str, params: serde_json::Value) -> serde_json::Value {
+        let client = reqwest::Client::new();
+        let url = format!("http://{}/rpc", self.addr);
+        client
+            .post(&url)
+            .bearer_auth(&self.token)
+            .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params }))
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()
+    }
+
+    async fn call_no_auth(&self, method: &str, params: serde_json::Value) -> reqwest::Response {
+        let client = reqwest::Client::new();
+        let url = format!("http://{}/rpc", self.addr);
+        client
+            .post(&url)
+            .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params }))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    fn stop(self) {
+        self.server.abort();
+    }
+}
+
+/// GP7/GP8: a two-source fixture tree (`notes` and `atlas-repo`),
+/// seeded with both a same-source wikilink and a cross-source
+/// wikilink pointing at `@notes:OldDoc`, is registered, previewed,
+/// and applied — the preview lists both occurrences with zero disk
+/// writes, and the apply rewrites only the targeted spans, byte for
+/// byte, in both files.
+#[tokio::test]
+async fn preview_then_apply_rewrites_links_across_two_sources_with_exact_byte_diffs() {
+    let daemon = TestDaemon::start().await;
+
+    let notes = fixtures::empty_source();
+    notes.write("OldDoc.md", "# Old Doc\n\nContent here.\n");
+    notes.write(
+        "Journal.md",
+        "Morning note.\n\nSee [[OldDoc]] for details.\n",
+    );
+
+    let atlas_repo = fixtures::empty_source();
+    atlas_repo.write(
+        "README.md",
+        "# atlas-repo\n\nLinked from another source: [[@notes:OldDoc]]\n",
+    );
+
+    let reg_notes = daemon
+        .call(
+            "source.register",
+            json!({"name": "notes", "root": notes.root().to_string_lossy()}),
+        )
+        .await;
+    assert!(reg_notes.get("error").is_none(), "{reg_notes:?}");
+    let reg_repo = daemon
+        .call(
+            "source.register",
+            json!({"name": "atlas-repo", "root": atlas_repo.root().to_string_lossy()}),
+        )
+        .await;
+    assert!(reg_repo.get("error").is_none(), "{reg_repo:?}");
+
+    let preview = daemon
+        .call(
+            "link.preview_refactor",
+            json!({"source": "notes", "old_path": "OldDoc.md", "new_path": "NewDoc.md"}),
+        )
+        .await;
+    assert!(preview.get("error").is_none(), "{preview:?}");
+    let changes = preview["result"]["changes"]
+        .as_array()
+        .expect("changes array");
+    assert_eq!(
+        changes.len(),
+        2,
+        "Journal.md and README.md both reference OldDoc: {changes:?}"
+    );
+
+    // GP7 fence: a preview must perform zero disk writes.
+    let journal_before = std::fs::read_to_string(notes.root().join("Journal.md")).unwrap();
+    let readme_before = std::fs::read_to_string(atlas_repo.root().join("README.md")).unwrap();
+    assert!(journal_before.contains("[[OldDoc]]"));
+    assert!(readme_before.contains("[[@notes:OldDoc]]"));
+
+    let apply = daemon
+        .call(
+            "link.apply_refactor",
+            json!({"source": "notes", "old_path": "OldDoc.md", "new_path": "NewDoc.md"}),
+        )
+        .await;
+    assert!(apply.get("error").is_none(), "{apply:?}");
+    assert_eq!(apply["result"]["status"], json!("applied"));
+    assert_eq!(apply["result"]["files_changed"], json!(2));
+
+    // Exact before/after content: only the targeted link span
+    // changed, everything else byte-identical.
+    let journal_after = std::fs::read_to_string(notes.root().join("Journal.md")).unwrap();
+    assert_eq!(
+        journal_after,
+        "Morning note.\n\nSee [[NewDoc]] for details.\n"
+    );
+    let readme_after = std::fs::read_to_string(atlas_repo.root().join("README.md")).unwrap();
+    assert_eq!(
+        readme_after,
+        "# atlas-repo\n\nLinked from another source: [[@notes:NewDoc]]\n"
+    );
+
+    daemon.stop();
+}
+
+/// Edge case: moving a file with zero incoming links returns an
+/// empty preview, and the matching apply performs no writes and
+/// still reports success.
+#[tokio::test]
+async fn zero_incoming_links_previews_empty_and_applies_as_a_successful_no_op() {
+    let daemon = TestDaemon::start().await;
+    let notes = fixtures::empty_source();
+    notes.write("Lonely.md", "# Lonely\n\nNo one links here.\n");
+
+    daemon
+        .call(
+            "source.register",
+            json!({"name": "notes", "root": notes.root().to_string_lossy()}),
+        )
+        .await;
+
+    let preview = daemon
+        .call(
+            "link.preview_refactor",
+            json!({"source": "notes", "old_path": "Lonely.md", "new_path": "StillLonely.md"}),
+        )
+        .await;
+    assert_eq!(preview["result"]["changes"], json!([]));
+
+    let apply = daemon
+        .call(
+            "link.apply_refactor",
+            json!({"source": "notes", "old_path": "Lonely.md", "new_path": "StillLonely.md"}),
+        )
+        .await;
+    assert_eq!(apply["result"]["status"], json!("applied"));
+    assert_eq!(apply["result"]["files_changed"], json!(0));
+
+    daemon.stop();
+}
+
+/// Edge case: `old_path == new_path` — `preview_refactor` returns an
+/// empty diff, `apply_refactor` is a no-op, neither errors.
+#[tokio::test]
+async fn identical_old_and_new_path_is_a_no_op_on_both_preview_and_apply() {
+    let daemon = TestDaemon::start().await;
+    let notes = fixtures::empty_source();
+    notes.write("Doc.md", "# Doc\n");
+    notes.write("Journal.md", "See [[Doc]].\n");
+
+    daemon
+        .call(
+            "source.register",
+            json!({"name": "notes", "root": notes.root().to_string_lossy()}),
+        )
+        .await;
+
+    let preview = daemon
+        .call(
+            "link.preview_refactor",
+            json!({"source": "notes", "old_path": "Doc.md", "new_path": "Doc.md"}),
+        )
+        .await;
+    assert_eq!(preview["result"]["changes"], json!([]));
+
+    let apply = daemon
+        .call(
+            "link.apply_refactor",
+            json!({"source": "notes", "old_path": "Doc.md", "new_path": "Doc.md"}),
+        )
+        .await;
+    assert_eq!(apply["result"]["status"], json!("applied"));
+    assert_eq!(apply["result"]["files_changed"], json!(0));
+    let journal = std::fs::read_to_string(notes.root().join("Journal.md")).unwrap();
+    assert_eq!(journal, "See [[Doc]].\n", "content must be untouched");
+
+    daemon.stop();
+}
+
+/// Edge case: a case-only rename (`OldDoc.md` -> `olddoc.md`) is
+/// detected and rewritten without a duplicate or orphaned entry.
+#[tokio::test]
+async fn case_only_rename_rewrites_exactly_once() {
+    let daemon = TestDaemon::start().await;
+    let notes = fixtures::empty_source();
+    notes.write("OldDoc.md", "# Old Doc\n");
+    notes.write("Journal.md", "See [[OldDoc]] here.\n");
+
+    daemon
+        .call(
+            "source.register",
+            json!({"name": "notes", "root": notes.root().to_string_lossy()}),
+        )
+        .await;
+
+    let apply = daemon
+        .call(
+            "link.apply_refactor",
+            json!({"source": "notes", "old_path": "OldDoc.md", "new_path": "olddoc.md"}),
+        )
+        .await;
+    // link.apply_refactor requires a prior preview; this call alone
+    // must be rejected (RPC error), then the real golden path below
+    // re-does it correctly.
+    assert!(apply.get("error").is_some());
+
+    let preview = daemon
+        .call(
+            "link.preview_refactor",
+            json!({"source": "notes", "old_path": "OldDoc.md", "new_path": "olddoc.md"}),
+        )
+        .await;
+    assert_eq!(preview["result"]["changes"].as_array().unwrap().len(), 1);
+
+    let apply = daemon
+        .call(
+            "link.apply_refactor",
+            json!({"source": "notes", "old_path": "OldDoc.md", "new_path": "olddoc.md"}),
+        )
+        .await;
+    assert_eq!(apply["result"]["status"], json!("applied"));
+    assert_eq!(apply["result"]["files_changed"], json!(1));
+    let journal = std::fs::read_to_string(notes.root().join("Journal.md")).unwrap();
+    assert_eq!(
+        journal, "See [[olddoc]] here.\n",
+        "exactly one rewrite, no duplicate/orphan"
+    );
+
+    daemon.stop();
+}
+
+/// Edge case: `new_path` already exists as a distinct file in the
+/// target source — `preview_refactor` still returns the link diff,
+/// and `apply_refactor` proceeds (it rewrites references only; it
+/// never moves/renames the file on disk).
+#[tokio::test]
+async fn new_path_already_existing_does_not_block_the_refactor_or_move_any_file() {
+    let daemon = TestDaemon::start().await;
+    let notes = fixtures::empty_source();
+    notes.write("OldDoc.md", "# Old Doc\n");
+    notes.write("NewDoc.md", "# A distinct, pre-existing file\n");
+    notes.write("Journal.md", "See [[OldDoc]] here.\n");
+
+    daemon
+        .call(
+            "source.register",
+            json!({"name": "notes", "root": notes.root().to_string_lossy()}),
+        )
+        .await;
+
+    let preview = daemon
+        .call(
+            "link.preview_refactor",
+            json!({"source": "notes", "old_path": "OldDoc.md", "new_path": "NewDoc.md"}),
+        )
+        .await;
+    assert_eq!(preview["result"]["changes"].as_array().unwrap().len(), 1);
+
+    let apply = daemon
+        .call(
+            "link.apply_refactor",
+            json!({"source": "notes", "old_path": "OldDoc.md", "new_path": "NewDoc.md"}),
+        )
+        .await;
+    assert_eq!(apply["result"]["status"], json!("applied"));
+
+    // Neither OldDoc.md nor the pre-existing NewDoc.md was moved,
+    // renamed, or overwritten — only the referring link text changed.
+    assert_eq!(
+        std::fs::read_to_string(notes.root().join("OldDoc.md")).unwrap(),
+        "# Old Doc\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(notes.root().join("NewDoc.md")).unwrap(),
+        "# A distinct, pre-existing file\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(notes.root().join("Journal.md")).unwrap(),
+        "See [[NewDoc]] here.\n"
+    );
+
+    daemon.stop();
+}
+
+/// Edge case: unicode and space-containing filenames round-trip
+/// through preview and apply without corrupting the link text.
+#[tokio::test]
+async fn unicode_and_space_filenames_round_trip_through_preview_and_apply() {
+    let daemon = TestDaemon::start().await;
+    let notes = fixtures::empty_source();
+    notes.write("Café Notes.md", "# Caf\u{e9} Notes\n");
+    notes.write("Journal.md", "See [[Café Notes]] for details.\n");
+
+    daemon
+        .call(
+            "source.register",
+            json!({"name": "notes", "root": notes.root().to_string_lossy()}),
+        )
+        .await;
+
+    let preview = daemon
+        .call(
+            "link.preview_refactor",
+            json!({"source": "notes", "old_path": "Café Notes.md", "new_path": "Café Notes (2).md"}),
+        )
+        .await;
+    assert_eq!(preview["result"]["changes"].as_array().unwrap().len(), 1);
+
+    let apply = daemon
+        .call(
+            "link.apply_refactor",
+            json!({"source": "notes", "old_path": "Café Notes.md", "new_path": "Café Notes (2).md"}),
+        )
+        .await;
+    assert_eq!(apply["result"]["status"], json!("applied"));
+    let journal = std::fs::read_to_string(notes.root().join("Journal.md")).unwrap();
+    assert_eq!(journal, "See [[Café Notes (2)]] for details.\n");
+
+    daemon.stop();
+}
+
+/// E3: if an affected file's mtime changed between preview and
+/// apply, `apply_refactor` aborts with a descriptive error before
+/// writing to any file — including files that were not stale.
+#[tokio::test]
+async fn staleness_between_preview_and_apply_aborts_before_any_write() {
+    let daemon = TestDaemon::start().await;
+    let notes = fixtures::empty_source();
+    notes.write("OldDoc.md", "# Old Doc\n");
+    notes.write("Journal.md", "See [[OldDoc]] here.\n");
+    notes.write("Index.md", "Also [[OldDoc]] here.\n");
+
+    daemon
+        .call(
+            "source.register",
+            json!({"name": "notes", "root": notes.root().to_string_lossy()}),
+        )
+        .await;
+
+    let preview = daemon
+        .call(
+            "link.preview_refactor",
+            json!({"source": "notes", "old_path": "OldDoc.md", "new_path": "NewDoc.md"}),
+        )
+        .await;
+    assert_eq!(preview["result"]["changes"].as_array().unwrap().len(), 2);
+
+    // Touch Journal.md's mtime without changing its content — this
+    // alone must be enough to trip the staleness gate (E3 is an
+    // mtime check, not a content-hash check).
+    let journal_path = notes.root().join("Journal.md");
+    let original_content = std::fs::read_to_string(&journal_path).unwrap();
+    let future =
+        filetime::FileTime::from_unix_time(filetime::FileTime::now().unix_seconds() + 3600, 0);
+    filetime::set_file_mtime(&journal_path, future).expect("set_file_mtime");
+
+    let apply = daemon
+        .call(
+            "link.apply_refactor",
+            json!({"source": "notes", "old_path": "OldDoc.md", "new_path": "NewDoc.md"}),
+        )
+        .await;
+    assert_eq!(apply["result"]["status"], json!("aborted"));
+    let reason = apply["result"]["reason"].as_str().unwrap_or("");
+    assert!(reason.contains("modified since preview"), "{reason}");
+    assert!(reason.contains("Journal.md"), "{reason}");
+
+    // Zero bytes changed on disk anywhere — including Index.md, which
+    // was not itself stale (E3: "aborts ... including files that
+    // were not stale").
+    assert_eq!(
+        std::fs::read_to_string(&journal_path).unwrap(),
+        original_content
+    );
+    assert_eq!(
+        std::fs::read_to_string(notes.root().join("Index.md")).unwrap(),
+        "Also [[OldDoc]] here.\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(notes.root().join("OldDoc.md")).unwrap(),
+        "# Old Doc\n"
+    );
+
+    daemon.stop();
+}
+
+/// Edge case: calling `apply_refactor` without a prior matching
+/// `preview_refactor` call is rejected, preventing apply against a
+/// stale, unseen diff.
+#[tokio::test]
+async fn apply_without_a_prior_preview_is_rejected() {
+    let daemon = TestDaemon::start().await;
+    let notes = fixtures::empty_source();
+    notes.write("OldDoc.md", "# Old Doc\n");
+    notes.write("Journal.md", "See [[OldDoc]].\n");
+
+    daemon
+        .call(
+            "source.register",
+            json!({"name": "notes", "root": notes.root().to_string_lossy()}),
+        )
+        .await;
+
+    let apply = daemon
+        .call(
+            "link.apply_refactor",
+            json!({"source": "notes", "old_path": "OldDoc.md", "new_path": "NewDoc.md"}),
+        )
+        .await;
+    assert!(apply.get("error").is_some(), "{apply:?}");
+    let message = apply["error"]["message"].as_str().unwrap_or("");
+    assert!(message.contains("preview"), "{message}");
+    assert_eq!(
+        std::fs::read_to_string(notes.root().join("Journal.md")).unwrap(),
+        "See [[OldDoc]].\n",
+        "a rejected apply must not write anything"
+    );
+
+    daemon.stop();
+}
+
+/// Edge case: a target file becomes unreadable (permission denied)
+/// between preview and apply — that file is reported as failed,
+/// already-written files are not rolled back, and the response
+/// enumerates exactly which files succeeded vs failed.
+#[tokio::test]
+#[cfg(unix)]
+async fn a_file_that_becomes_unreadable_between_preview_and_apply_is_reported_not_rolled_back() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let daemon = TestDaemon::start().await;
+    let notes = fixtures::empty_source();
+    notes.write("OldDoc.md", "# Old Doc\n");
+    notes.write("Journal.md", "See [[OldDoc]] here.\n");
+    notes.write("Index.md", "Also [[OldDoc]] here.\n");
+
+    daemon
+        .call(
+            "source.register",
+            json!({"name": "notes", "root": notes.root().to_string_lossy()}),
+        )
+        .await;
+
+    let preview = daemon
+        .call(
+            "link.preview_refactor",
+            json!({"source": "notes", "old_path": "OldDoc.md", "new_path": "NewDoc.md"}),
+        )
+        .await;
+    assert_eq!(preview["result"]["changes"].as_array().unwrap().len(), 2);
+
+    // Index.md becomes unreadable (0000) between preview and apply.
+    // Its mtime is untouched, so this exercises the write-time I/O
+    // failure path, not the staleness gate.
+    let index_path = notes.root().join("Index.md");
+    let mut perms = std::fs::metadata(&index_path).unwrap().permissions();
+    perms.set_mode(0o000);
+    std::fs::set_permissions(&index_path, perms).expect("chmod 000");
+
+    let apply = daemon
+        .call(
+            "link.apply_refactor",
+            json!({"source": "notes", "old_path": "OldDoc.md", "new_path": "NewDoc.md"}),
+        )
+        .await;
+
+    // Restore permissions immediately so the fixture tempdir can be
+    // cleaned up regardless of the assertion outcome below.
+    let mut restore = std::fs::metadata(&index_path).unwrap().permissions();
+    restore.set_mode(0o644);
+    std::fs::set_permissions(&index_path, restore).expect("restore permissions");
+
+    // Root running as uid 0 (some CI containers) bypasses the 0000
+    // permission bits entirely; skip the assertion in that
+    // environment rather than fail on an untestable precondition.
+    if unsafe { libc::geteuid() } == 0 {
+        daemon.stop();
+        return;
+    }
+
+    assert_eq!(apply["result"]["status"], json!("partial"), "{apply:?}");
+    assert_eq!(apply["result"]["files_changed"], json!(1));
+    let failed = apply["result"]["failed"].as_array().expect("failed array");
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0]["file"], json!("@notes:Index.md"));
+
+    // Journal.md (succeeded before the failure) is not rolled back.
+    assert_eq!(
+        std::fs::read_to_string(notes.root().join("Journal.md")).unwrap(),
+        "See [[NewDoc]] here.\n"
+    );
+
+    daemon.stop();
+}
+
+/// F5: both RPC methods reject a request with no/invalid bearer
+/// token with the same 401-equivalent error PR-6 uses for every
+/// other method — no new unauthenticated code path for disk
+/// mutation.
+#[tokio::test]
+async fn both_refactor_methods_require_authentication_over_http() {
+    let daemon = TestDaemon::start().await;
+    let notes = fixtures::empty_source();
+    notes.write("OldDoc.md", "# Old Doc\n");
+
+    daemon
+        .call(
+            "source.register",
+            json!({"name": "notes", "root": notes.root().to_string_lossy()}),
+        )
+        .await;
+
+    let preview_resp = daemon
+        .call_no_auth(
+            "link.preview_refactor",
+            json!({"source": "notes", "old_path": "OldDoc.md", "new_path": "NewDoc.md"}),
+        )
+        .await;
+    assert_eq!(preview_resp.status(), 401);
+
+    let apply_resp = daemon
+        .call_no_auth(
+            "link.apply_refactor",
+            json!({"source": "notes", "old_path": "OldDoc.md", "new_path": "NewDoc.md"}),
+        )
+        .await;
+    assert_eq!(apply_resp.status(), 401);
+
+    daemon.stop();
+}
+
+/// Fence: no file is ever mutated by `link.preview_refactor` under
+/// any input, including a malformed/nonexistent `old_path` — proven
+/// here by making the entire source root read-only (no file can be
+/// created or written inside it) and asserting `preview_refactor`
+/// still succeeds, over both a real existing target and a bogus one.
+#[tokio::test]
+#[cfg(unix)]
+async fn preview_refactor_never_writes_even_against_a_read_only_source_root() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let daemon = TestDaemon::start().await;
+    let notes = fixtures::empty_source();
+    notes.write("OldDoc.md", "# Old Doc\n");
+    notes.write("Journal.md", "See [[OldDoc]] here.\n");
+
+    daemon
+        .call(
+            "source.register",
+            json!({"name": "notes", "root": notes.root().to_string_lossy()}),
+        )
+        .await;
+
+    // Make the directory itself read-only + non-executable-for-write
+    // (0500): any attempt to create a file (e.g. a temp file for an
+    // atomic rewrite) inside it would fail immediately.
+    let mut perms = std::fs::metadata(notes.root()).unwrap().permissions();
+    perms.set_mode(0o500);
+    std::fs::set_permissions(notes.root(), perms).expect("chmod 0500 the source root");
+
+    let preview = daemon
+        .call(
+            "link.preview_refactor",
+            json!({"source": "notes", "old_path": "OldDoc.md", "new_path": "NewDoc.md"}),
+        )
+        .await;
+
+    let bogus_preview = daemon
+        .call(
+            "link.preview_refactor",
+            json!({"source": "notes", "old_path": "does/not/exist.md", "new_path": "also/missing.md"}),
+        )
+        .await;
+
+    // Restore so the tempdir can be cleaned up.
+    let mut restore = std::fs::metadata(notes.root()).unwrap().permissions();
+    restore.set_mode(0o700);
+    std::fs::set_permissions(notes.root(), restore).expect("restore root permissions");
+
+    if unsafe { libc::geteuid() } == 0 {
+        daemon.stop();
+        return;
+    }
+
+    assert!(preview.get("error").is_none(), "{preview:?}");
+    assert_eq!(preview["result"]["changes"].as_array().unwrap().len(), 1);
+    assert!(bogus_preview.get("error").is_none(), "{bogus_preview:?}");
+    assert_eq!(bogus_preview["result"]["changes"], json!([]));
+
+    daemon.stop();
+}
+
+/// Programmatic test for the watcher pause/resume requirement (GP8):
+/// while `SourceRegistry::pause_all_watchers` is in effect, a real
+/// filesystem edit on a tracked file is not processed into a reindex
+/// — the cache row stays at its pre-edit content — until
+/// `resume_all_watchers` is called, after which the deferred edit is
+/// picked up. Exercises `tephrad::registry::SourceRegistry` directly
+/// (PR-4's own watcher/registry test surface), the same mechanism
+/// `RefactorEngine::apply` drives around its own writes.
+#[test]
+fn watcher_pause_defers_a_reindex_until_resume() {
+    use tephrad::registry::SourceRegistry;
+
+    let fixture = fixtures::vault_fixture();
+    let cache_dir = tempfile::tempdir().expect("cache tempdir");
+    let cache_path = cache_dir.path().join("cache.db");
+    let cache = Cache::open(&cache_path).expect("open cache");
+
+    let registry = SourceRegistry::new(cache).expect("new registry");
+    registry
+        .register("notes", fixture.root())
+        .expect("register");
+
+    registry.pause_all_watchers();
+
+    fixture.write(
+        "one.md",
+        "# One\n\nEdited while paused, now links to [[Three]] only.\n",
+    );
+
+    // While paused, the edit must not be reflected for a reasonable
+    // window — `wait_until` here is expected to time out (we assert
+    // it did *not* fire), proving the watcher's batch was deferred
+    // rather than raced.
+    let verify_cache = Cache::open(&cache_path).expect("reopen cache");
+    let source = verify_cache
+        .get_source("notes")
+        .expect("get_source")
+        .expect("source row");
+    let reindexed_while_paused = wait_until(Duration::from_millis(600), || {
+        let unit = match verify_cache.get_unit_by_rel_path(source.id, "one.md") {
+            Ok(Some(u)) => u,
+            _ => return false,
+        };
+        let link_count: i64 = verify_cache
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM links WHERE from_unit_id = ?1 AND to_raw = ?2",
+                rusqlite::params![unit.id, "Three"],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        link_count == 1
+    });
+    assert!(
+        !reindexed_while_paused,
+        "a filesystem event fired during the pause window must not be processed into a \
+         reindex until after resume"
+    );
+
+    registry.resume_all_watchers();
+
+    let reindexed_after_resume = wait_until(Duration::from_secs(5), || {
+        let unit = match verify_cache.get_unit_by_rel_path(source.id, "one.md") {
+            Ok(Some(u)) => u,
+            _ => return false,
+        };
+        let link_count: i64 = verify_cache
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM links WHERE from_unit_id = ?1 AND to_raw = ?2",
+                rusqlite::params![unit.id, "Three"],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        link_count == 1
+    });
+    assert!(
+        reindexed_after_resume,
+        "the deferred edit must be processed once the watcher is resumed"
+    );
+
+    registry.unregister("notes").expect("unregister");
+}
+
+/// Edge case: a very large fan-in (1,000+ files linking to the same
+/// target) completes as a single bounded `apply_refactor` call
+/// without the daemon blocking RPC handling for other sources during
+/// the run — asserted by firing a `graph.get_edges` call against a
+/// second, unrelated source concurrently with the large apply and
+/// observing it complete promptly rather than waiting for the apply
+/// to finish.
+#[tokio::test]
+async fn large_fan_in_completes_as_one_bounded_apply_without_blocking_other_rpc_calls() {
+    let daemon = TestDaemon::start().await;
+
+    let notes = fixtures::empty_source();
+    notes.write("OldDoc.md", "# Old Doc\n");
+    const FAN_IN: usize = 1_200;
+    for i in 0..FAN_IN {
+        notes.write(&format!("Linker{i:04}.md"), "See [[OldDoc]] here.\n");
+    }
+
+    let other = fixtures::empty_source();
+    other.write("Solo.md", "# Solo\n\nNothing to do with notes.\n");
+
+    daemon
+        .call(
+            "source.register",
+            json!({"name": "notes", "root": notes.root().to_string_lossy()}),
+        )
+        .await;
+    daemon
+        .call(
+            "source.register",
+            json!({"name": "other", "root": other.root().to_string_lossy()}),
+        )
+        .await;
+
+    let preview = daemon
+        .call(
+            "link.preview_refactor",
+            json!({"source": "notes", "old_path": "OldDoc.md", "new_path": "NewDoc.md"}),
+        )
+        .await;
+    assert_eq!(
+        preview["result"]["changes"].as_array().unwrap().len(),
+        FAN_IN
+    );
+
+    // Fire the large apply and a small, unrelated `graph.get_edges`
+    // call on `other` concurrently. If the apply blocked the whole
+    // daemon, the concurrent call would also stall until the apply
+    // finished; measuring that it returns well before the apply does
+    // (not merely "eventually") is the actual non-blocking proof.
+    let apply_fut = daemon.call(
+        "link.apply_refactor",
+        json!({"source": "notes", "old_path": "OldDoc.md", "new_path": "NewDoc.md"}),
+    );
+    let other_fut = async {
+        // Give the apply a moment to actually start before racing it.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let start = Instant::now();
+        let result = daemon.call("graph.get_edges", json!({})).await;
+        (result, start.elapsed())
+    };
+
+    let (apply, (other_result, other_elapsed)) = tokio::join!(apply_fut, other_fut);
+
+    assert!(other_result.get("error").is_none(), "{other_result:?}");
+    assert!(
+        other_elapsed < Duration::from_secs(2),
+        "an unrelated RPC call took {other_elapsed:?} to return — the daemon appears to have \
+         blocked all RPC handling on the large apply rather than running it as a bounded, \
+         non-blocking operation"
+    );
+
+    assert_eq!(apply["result"]["status"], json!("applied"));
+    assert_eq!(apply["result"]["files_changed"], json!(FAN_IN));
+
+    daemon.stop();
+}
+
+/// Edge case ("process is killed mid-apply_refactor: on restart
+/// tephrad does not re-apply a partial refactor automatically; files
+/// already rewritten remain rewritten and no temp files are left
+/// behind"): `tephrad` keeps no on-disk journal of an in-progress
+/// apply to resume (confirmed by inspection — `RefactorEngine::apply`
+/// persists nothing beyond each file's own atomic write), so a
+/// restart can never "automatically re-apply" anything by
+/// construction; this test instead pins the two properties that
+/// *are* mechanically checkable without an actual `kill -9`: after a
+/// real multi-file apply completes, (a) no `.tephra-tmp-*` temp file
+/// is left in any affected directory, and (b) restarting the daemon
+/// against the same on-disk files and cache does not alter them
+/// again (nothing to "re-apply" — the files already reflect the
+/// applied state, and a fresh preview against them now reports zero
+/// further changes).
+#[tokio::test]
+async fn no_leftover_temp_files_and_nothing_to_reapply_after_restart() {
+    let daemon = TestDaemon::start().await;
+    let notes = fixtures::empty_source();
+    notes.write("OldDoc.md", "# Old Doc\n");
+    notes.write("Journal.md", "See [[OldDoc]] here.\n");
+    notes.write("Index.md", "Also [[OldDoc]] here.\n");
+
+    daemon
+        .call(
+            "source.register",
+            json!({"name": "notes", "root": notes.root().to_string_lossy()}),
+        )
+        .await;
+    daemon
+        .call(
+            "link.preview_refactor",
+            json!({"source": "notes", "old_path": "OldDoc.md", "new_path": "NewDoc.md"}),
+        )
+        .await;
+    let apply = daemon
+        .call(
+            "link.apply_refactor",
+            json!({"source": "notes", "old_path": "OldDoc.md", "new_path": "NewDoc.md"}),
+        )
+        .await;
+    assert_eq!(apply["result"]["status"], json!("applied"));
+    daemon.stop();
+
+    // (a) no leftover temp files anywhere in the source root.
+    for entry in walkdir::WalkDir::new(notes.root()) {
+        let entry = entry.expect("walk fixture tree");
+        let name = entry.file_name().to_string_lossy();
+        assert!(
+            !name.contains(".tephra-tmp-"),
+            "leftover temp file after a completed apply: {}",
+            entry.path().display()
+        );
+    }
+
+    // (b) a fresh daemon ("restart"), pointed at the same already-
+    // rewritten files, has nothing further to reapply: a new preview
+    // for the exact same rename reports zero occurrences of the old
+    // name (it was already rewritten to the new name everywhere),
+    // and the files are untouched by simply starting the daemon.
+    let journal_after_restart = std::fs::read_to_string(notes.root().join("Journal.md")).unwrap();
+    let index_after_restart = std::fs::read_to_string(notes.root().join("Index.md")).unwrap();
+
+    let daemon2 = TestDaemon::start().await;
+    daemon2
+        .call(
+            "source.register",
+            json!({"name": "notes", "root": notes.root().to_string_lossy()}),
+        )
+        .await;
+    let preview_after_restart = daemon2
+        .call(
+            "link.preview_refactor",
+            json!({"source": "notes", "old_path": "OldDoc.md", "new_path": "NewDoc.md"}),
+        )
+        .await;
+    assert_eq!(
+        preview_after_restart["result"]["changes"],
+        json!([]),
+        "nothing left to reapply: OldDoc.md has no remaining references after the restart"
+    );
+    assert_eq!(
+        std::fs::read_to_string(notes.root().join("Journal.md")).unwrap(),
+        journal_after_restart,
+        "starting a fresh daemon must not itself rewrite anything"
+    );
+    assert_eq!(
+        std::fs::read_to_string(notes.root().join("Index.md")).unwrap(),
+        index_after_restart
+    );
+
+    daemon2.stop();
+}
