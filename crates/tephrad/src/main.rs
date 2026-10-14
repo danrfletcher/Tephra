@@ -1,9 +1,10 @@
 //! `tephrad`: federated graph and link engine daemon.
 //!
-//! This PR implements the startup skeleton only: CLI flag parsing, XDG
-//! path resolution, config load/default-write, token ensure, and a bare
-//! TCP listener bind. JSON-RPC dispatch and HTTP/WebSocket framing land
-//! in PR-6.
+//! This PR implements the startup skeleton: CLI flag parsing, XDG
+//! path resolution, config load/default-write, token ensure, the
+//! SQLite cache open and schema-version check (`tephra-cache`'s
+//! `Cache::open`, G5), and a bare TCP listener bind. JSON-RPC dispatch
+//! and HTTP/WebSocket framing land in PR-6.
 
 mod cli;
 mod config;
@@ -21,6 +22,7 @@ mod stage {
     pub const CONFIG: &str = "config";
     pub const DIRECTORY: &str = "directory";
     pub const TOKEN: &str = "token";
+    pub const CACHE: &str = "cache";
     pub const LISTENER: &str = "listener";
 }
 
@@ -91,11 +93,24 @@ fn main() -> ExitCode {
     }
     // The token value itself is never logged, at any level, above.
 
+    // Stage 4: cache open. Creates `<data_dir>/cache.db` if absent
+    // (parent directory included), applies the WAL pragmas, and runs
+    // the schema-version check/rebuild (G5) — see `tephra_cache::Cache::open`.
+    // A failure here is a hard startup failure, same as every other
+    // stage; the daemon has nothing useful to do without its cache.
+    let cache_path = cfg.data_dir.join("cache.db");
+    match tephra_cache::Cache::open(&cache_path) {
+        Ok(cache) => {
+            tracing::info!(path = %cache.path().display(), "cache ready");
+        }
+        Err(e) => return fail(stage::CACHE, e),
+    }
+
     run_server(&cfg.listen_addr)
 }
 
-/// Stage 4 (listener bind) and stage 5 (ready log) run on a tokio runtime
-/// built here, rather than via `#[tokio::main]`, so that stages 1-3 above
+/// Stage 5 (listener bind) and stage 6 (ready log) run on a tokio runtime
+/// built here, rather than via `#[tokio::main]`, so that stages 1-4 above
 /// (which are synchronous and must run before any async runtime exists)
 /// stay plain, directly-testable functions.
 fn run_server(listen_addr: &str) -> ExitCode {

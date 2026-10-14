@@ -1,0 +1,11 @@
+[package]
+name = "tephra-cache"
+version = "0.1.0"
+edition = "2021"
+description = "SQLite persistent cache: schema, versioning, and source-status bookkeeping for tephrad"
+
+[dependencies]
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+[dev-dependencies]
+tempfile = "3"
