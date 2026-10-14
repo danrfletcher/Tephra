@@ -209,12 +209,14 @@ pub fn parse_unit_bytes(path: &Path, bytes: &[u8]) -> Result<ParsedUnit, Invalid
 pub fn parse_unit(path: &Path, content: &str) -> ParsedUnit {
     let mut diagnostics = Vec::new();
 
-    let (frontmatter, body, body_start_line) = frontmatter::extract(content, &mut diagnostics);
+    let (frontmatter, body, body_start_line, body_start_byte) =
+        frontmatter::extract(content, &mut diagnostics);
 
-    let pass = markdown_pass::run(body, body_start_line, &mut diagnostics);
+    let pass = markdown_pass::run(body, body_start_line, body_start_byte, &mut diagnostics);
     let (wikilinks, wikilink_spans) = wikilinks::scan(
         body,
         body_start_line,
+        body_start_byte,
         &pass.excluded_ranges,
         &mut diagnostics,
     );

@@ -42,6 +42,17 @@ pub struct MarkdownLink {
     pub target: String,
     /// 1-indexed line number, absolute within the original file.
     pub line: usize,
+    /// Absolute byte range `[start, end)` within the original file's
+    /// content covering exactly the destination text's enclosing
+    /// `(`/`)` — `None` for a link whose destination never appears
+    /// literally at a `(...)` position (e.g. a reference-style
+    /// `[text][ref]` link; see [`inline_destination_range`]). R1
+    /// review finding: `tephrad::refactor` rewrites a link by this
+    /// exact span rather than a textual search-and-replace, so a
+    /// textually-identical occurrence elsewhere on the same line
+    /// (plain prose that happens to contain the same parenthesized
+    /// text) is never mistaken for this one.
+    pub span: Option<(usize, usize)>,
 }
 
 pub(crate) struct MarkdownPass {
@@ -58,9 +69,16 @@ pub(crate) struct MarkdownPass {
     pub link_destination_ranges: Vec<(usize, usize)>,
 }
 
+/// (link text so far, destination, starting line, destination's
+/// exact byte-range in the body if it had one). Tracked while
+/// walking `pulldown_cmark`'s event stream to accumulate one link's
+/// pieces across the `Start(Tag::Link)`...`End(TagEnd::Link)` span.
+type CurrentLink = (String, String, usize, Option<(usize, usize)>);
+
 pub(crate) fn run(
     body: &str,
     body_start_line: usize,
+    body_start_byte: usize,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> MarkdownPass {
     let mut headings = Vec::new();
@@ -69,7 +87,7 @@ pub(crate) fn run(
     let mut link_destination_ranges = Vec::new();
 
     let mut current_heading: Option<(u8, String, usize)> = None;
-    let mut current_link: Option<(String, String, usize)> = None;
+    let mut current_link: Option<CurrentLink> = None;
     let mut in_code_block_start: Option<usize> = None;
 
     let line_index = LineIndex::new(body);
@@ -92,8 +110,9 @@ pub(crate) fn run(
                 }
             }
             Event::Start(Tag::Link { dest_url, .. }) => {
-                current_link = Some((dest_url.to_string(), String::new(), range.start));
-                if let Some(dest) = inline_destination_range(body, &range) {
+                let dest_range = inline_destination_range(body, &range);
+                current_link = Some((dest_url.to_string(), String::new(), range.start, dest_range));
+                if let Some(dest) = dest_range {
                     link_destination_ranges.push(dest);
                 }
             }
@@ -107,7 +126,7 @@ pub(crate) fn run(
                 }
             }
             Event::End(TagEnd::Link) => {
-                if let Some((target, text, start)) = current_link.take() {
+                if let Some((target, text, start, dest_range)) = current_link.take() {
                     let line = absolute_line(start);
                     if target.is_empty() {
                         diagnostics.push(Diagnostic::new(
@@ -116,7 +135,18 @@ pub(crate) fn run(
                             "markdown link has no destination",
                         ));
                     } else {
-                        links.push(MarkdownLink { text, target, line });
+                        let span = dest_range.map(|(open_abs, close_abs)| {
+                            (
+                                body_start_byte + open_abs - 1,
+                                body_start_byte + close_abs + 1,
+                            )
+                        });
+                        links.push(MarkdownLink {
+                            text,
+                            target,
+                            line,
+                            span,
+                        });
                     }
                 }
             }
@@ -132,7 +162,7 @@ pub(crate) fn run(
                 if let Some((_, buf, _)) = current_heading.as_mut() {
                     buf.push_str(&text);
                 }
-                if let Some((_, buf, _)) = current_link.as_mut() {
+                if let Some((_, buf, _, _)) = current_link.as_mut() {
                     buf.push_str(&text);
                 }
                 excluded_ranges.push((range.start, range.end));
@@ -144,7 +174,7 @@ pub(crate) fn run(
                 if let Some((_, buf, _)) = current_heading.as_mut() {
                     buf.push_str(&text);
                 }
-                if let Some((_, buf, _)) = current_link.as_mut() {
+                if let Some((_, buf, _, _)) = current_link.as_mut() {
                     buf.push_str(&text);
                 }
             }
@@ -152,7 +182,7 @@ pub(crate) fn run(
                 if let Some((_, buf, _)) = current_heading.as_mut() {
                     buf.push(' ');
                 }
-                if let Some((_, buf, _)) = current_link.as_mut() {
+                if let Some((_, buf, _, _)) = current_link.as_mut() {
                     buf.push(' ');
                 }
             }

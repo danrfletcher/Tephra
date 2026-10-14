@@ -21,7 +21,11 @@
       "anchor": null,
       "alias": null,
       "raw": "WikiLink",
-      "line": 8
+      "line": 8,
+      "span": [
+        122,
+        134
+      ]
     }
   ],
   "markdown_links": [],
