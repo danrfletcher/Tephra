@@ -1,8 +1,10 @@
-//! Listener-bind stub.
+//! Listener bind.
 //!
-//! This PR implements only the TCP bind proving deterministic startup
-//! order. JSON-RPC method dispatch and HTTP/WebSocket framing are PR-6's
-//! responsibility and are explicitly out of scope here.
+//! Earlier PRs implemented only the TCP bind proving deterministic
+//! startup order. JSON-RPC method dispatch and HTTP/WebSocket framing
+//! now live in the library crate's `rpc` module (`tephrad::rpc`),
+//! served over the listener this module binds — see `main.rs`'s
+//! `run_server` for how the two are wired together.
 
 use std::io;
 
