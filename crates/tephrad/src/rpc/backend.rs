@@ -330,10 +330,14 @@ impl From<crate::refactor::FailedFile> for FailedFileWire {
 /// `link.apply_refactor`'s result shape. Serializes to exactly
 /// `{"status":"applied","files_changed":N}`,
 /// `{"status":"aborted","reason":"..."}`, or (the permission-denied-
-/// mid-apply edge case) `{"status":"partial","files_changed":N,"failed":[...]}` —
-/// `tephractl`'s own PR-7 render/CLI code only ever reads `"status"`
+/// mid-apply edge case) `{"status":"partial","files_changed":N,"succeeded":[...],"failed":[...]}`
+/// — `tephractl`'s own PR-7 render/CLI code only ever reads `"status"`
 /// and (for `"applied"`) `"files_changed"`, so `"partial"`'s extra
-/// `"failed"` field is additive and does not change that contract.
+/// `"succeeded"`/`"failed"` fields are additive and do not change
+/// that contract. `"succeeded"` names exactly which files were
+/// rewritten before the first failure (R5 review finding: the spec
+/// requires the response to "enumerate exactly which files succeeded
+/// vs failed", which a bare count could never do).
 #[derive(Debug, Clone, Serialize)]
 pub struct RefactorApplyWire {
     pub status: String,
@@ -341,6 +345,8 @@ pub struct RefactorApplyWire {
     pub files_changed: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub succeeded: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failed: Option<Vec<FailedFileWire>>,
 }
@@ -353,21 +359,25 @@ impl From<crate::refactor::ApplyOutcome> for RefactorApplyWire {
                 status: "applied".to_string(),
                 files_changed: Some(files_changed),
                 reason: None,
+                succeeded: None,
                 failed: None,
             },
             ApplyOutcome::Aborted { reason } => RefactorApplyWire {
                 status: "aborted".to_string(),
                 files_changed: None,
                 reason: Some(reason),
+                succeeded: None,
                 failed: None,
             },
             ApplyOutcome::Partial {
                 files_changed,
+                succeeded,
                 failed,
             } => RefactorApplyWire {
                 status: "partial".to_string(),
                 files_changed: Some(files_changed),
                 reason: None,
+                succeeded: Some(succeeded),
                 failed: Some(failed.into_iter().map(FailedFileWire::from).collect()),
             },
         }
