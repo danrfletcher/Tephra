@@ -20,7 +20,10 @@ async fn ws_upgrade_without_authorization_header_is_rejected() {
     // rather than this server panicking or silently accepting it.
     let request = server.ws_url().into_client_request().unwrap();
     let result = tokio_tungstenite::connect_async(request).await;
-    assert!(result.is_err(), "an unauthenticated WebSocket handshake must be rejected");
+    assert!(
+        result.is_err(),
+        "an unauthenticated WebSocket handshake must be rejected"
+    );
 }
 
 #[tokio::test]
@@ -46,7 +49,9 @@ async fn an_authenticated_websocket_serves_requests_with_the_same_results_as_htt
     );
     let server = spawn(graph, MockSources::new()).await;
 
-    let mut ws = connect_ws(&server.ws_url(), &server.token).await.expect("authenticated handshake must succeed");
+    let mut ws = connect_ws(&server.ws_url(), &server.token)
+        .await
+        .expect("authenticated handshake must succeed");
 
     let request = json!({
         "jsonrpc": "2.0",
@@ -54,9 +59,15 @@ async fn an_authenticated_websocket_serves_requests_with_the_same_results_as_htt
         "method": "graph.get_backlinks",
         "params": { "id": "@vault:notes/one.md" }
     });
-    ws.send(Message::Text(request.to_string().into())).await.unwrap();
+    ws.send(Message::Text(request.to_string().into()))
+        .await
+        .unwrap();
 
-    let reply = ws.next().await.expect("a reply").expect("not a transport error");
+    let reply = ws
+        .next()
+        .await
+        .expect("a reply")
+        .expect("not a transport error");
     let text = reply.into_text().expect("text frame");
     let body: serde_json::Value = serde_json::from_str(&text).unwrap();
 
@@ -65,7 +76,10 @@ async fn an_authenticated_websocket_serves_requests_with_the_same_results_as_htt
     // asserts for an identical method/params pair over plain HTTP.
     assert_eq!(body["id"], json!(1));
     assert_eq!(body["result"][0]["from"], json!("@vault:notes/two.md"));
-    assert_eq!(body["result"][0]["to"], json!({"resolved": "@vault:notes/one.md"}));
+    assert_eq!(
+        body["result"][0]["to"],
+        json!({"resolved": "@vault:notes/one.md"})
+    );
 }
 
 #[tokio::test]
@@ -73,9 +87,13 @@ async fn malformed_envelope_over_websocket_gets_the_same_error_code_as_over_http
     let server = spawn(MockGraph::new(), MockSources::new()).await;
     let mut ws = connect_ws(&server.ws_url(), &server.token).await.unwrap();
 
-    ws.send(Message::Text(json!({ "jsonrpc": "2.0", "id": 1, "method": "nope" }).to_string().into()))
-        .await
-        .unwrap();
+    ws.send(Message::Text(
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "nope" })
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
 
     let reply = ws.next().await.unwrap().unwrap();
     let body: serde_json::Value = serde_json::from_str(&reply.into_text().unwrap()).unwrap();
@@ -90,17 +108,24 @@ async fn invalid_json_frame_returns_a_parse_error_without_closing_the_socket() {
     let server = spawn(MockGraph::new(), MockSources::new()).await;
     let mut ws = connect_ws(&server.ws_url(), &server.token).await.unwrap();
 
-    ws.send(Message::Text("not json at all".into())).await.unwrap();
+    ws.send(Message::Text("not json at all".into()))
+        .await
+        .unwrap();
     let reply = ws.next().await.unwrap().unwrap();
     let body: serde_json::Value = serde_json::from_str(&reply.into_text().unwrap()).unwrap();
     assert_eq!(body["error"]["code"], json!(-32700));
 
     // The socket must still be usable afterward.
-    ws.send(Message::Text(json!({ "jsonrpc": "2.0", "id": 9, "method": "graph.get_edges", "params": {} }).to_string().into()))
-        .await
-        .unwrap();
+    ws.send(Message::Text(
+        json!({ "jsonrpc": "2.0", "id": 9, "method": "graph.get_edges", "params": {} })
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
     let second = ws.next().await.unwrap().unwrap();
-    let second_body: serde_json::Value = serde_json::from_str(&second.into_text().unwrap()).unwrap();
+    let second_body: serde_json::Value =
+        serde_json::from_str(&second.into_text().unwrap()).unwrap();
     assert_eq!(second_body["id"], json!(9));
 }
 
@@ -167,7 +192,7 @@ async fn an_oversized_websocket_message_is_rejected_and_the_server_stays_respons
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next()).await;
         match outcome {
             Err(_) => panic!("the server must not hang on an oversized WS message"),
-            Ok(None) => {} // stream ended
+            Ok(None) => {}         // stream ended
             Ok(Some(Err(_))) => {} // transport-level error/close
             Ok(Some(Ok(Message::Close(_)))) => {}
             Ok(Some(Ok(other))) => {
@@ -183,7 +208,11 @@ async fn an_oversized_websocket_message_is_rejected_and_the_server_stays_respons
         .await
         .expect("a later client must still be able to connect");
     next_ws
-        .send(Message::Text(json!({ "jsonrpc": "2.0", "id": 1, "method": "graph.get_edges", "params": {} }).to_string().into()))
+        .send(Message::Text(
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "graph.get_edges", "params": {} })
+                .to_string()
+                .into(),
+        ))
         .await
         .unwrap();
     let reply = next_ws.next().await.unwrap().unwrap();

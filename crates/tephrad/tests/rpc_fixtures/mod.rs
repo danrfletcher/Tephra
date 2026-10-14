@@ -46,7 +46,10 @@ impl MockGraph {
     }
 
     pub fn with_resolve(self, link: &str, result: Result<ResolveResult, ResolveError>) -> Self {
-        self.resolve.lock().unwrap().insert(link.to_string(), result);
+        self.resolve
+            .lock()
+            .unwrap()
+            .insert(link.to_string(), result);
         self
     }
 
@@ -56,7 +59,10 @@ impl MockGraph {
     }
 
     pub fn with_forward_links(self, id: &str, edges: Vec<Edge>) -> Self {
-        self.forward_links.lock().unwrap().insert(id.to_string(), edges);
+        self.forward_links
+            .lock()
+            .unwrap()
+            .insert(id.to_string(), edges);
         self
     }
 
@@ -72,20 +78,35 @@ impl GraphBackend for MockGraph {
         raw: &str,
         _default_source: Option<&str>,
     ) -> Result<ResolveResult, ResolveError> {
-        self.resolve.lock().unwrap().get(raw).cloned().unwrap_or_else(|| {
-            Err(ResolveError::Unresolved {
-                source: "mock".to_string(),
-                target: raw.to_string(),
+        self.resolve
+            .lock()
+            .unwrap()
+            .get(raw)
+            .cloned()
+            .unwrap_or_else(|| {
+                Err(ResolveError::Unresolved {
+                    source: "mock".to_string(),
+                    target: raw.to_string(),
+                })
             })
-        })
     }
 
     fn get_backlinks(&self, id: &str) -> Vec<Edge> {
-        self.backlinks.lock().unwrap().get(id).cloned().unwrap_or_default()
+        self.backlinks
+            .lock()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn get_forward_links(&self, id: &str) -> Vec<Edge> {
-        self.forward_links.lock().unwrap().get(id).cloned().unwrap_or_default()
+        self.forward_links
+            .lock()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn get_edges(&self) -> Vec<Edge> {
@@ -109,12 +130,18 @@ impl MockSources {
     }
 
     pub fn with_register(self, name: &str, result: Result<ScanStatsWire, String>) -> Self {
-        self.register.lock().unwrap().insert(name.to_string(), result);
+        self.register
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), result);
         self
     }
 
     pub fn with_unregister(self, name: &str, result: Result<(), String>) -> Self {
-        self.unregister.lock().unwrap().insert(name.to_string(), result);
+        self.unregister
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), result);
         self
     }
 
@@ -145,7 +172,11 @@ impl SourceBackend for MockSources {
             .unwrap()
             .get(name)
             .cloned()
-            .unwrap_or_else(|| Err(format!("no mock response configured for unregister({name})")))
+            .unwrap_or_else(|| {
+                Err(format!(
+                    "no mock response configured for unregister({name})"
+                ))
+            })
     }
 
     fn list(&self) -> Result<Vec<SourceRowWire>, String> {
@@ -294,7 +325,9 @@ pub async fn spawn_with_token_and_any_sources(
     let token_path = tempdir.path().join("token");
     write_token_file(&token_path, token);
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind ephemeral port");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local_addr");
 
     let state = Arc::new(AppState::new(
@@ -364,9 +397,10 @@ pub async fn connect_ws(
     use tokio_tungstenite::tungstenite::http::HeaderValue;
 
     let mut request = url.into_client_request()?;
-    request
-        .headers_mut()
-        .insert("Authorization", HeaderValue::from_str(&format!("Bearer {token}")).unwrap());
+    request.headers_mut().insert(
+        "Authorization",
+        HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+    );
 
     let (stream, _response) = tokio_tungstenite::connect_async(request).await?;
     Ok(stream)

@@ -67,7 +67,9 @@ fn dependency_tree_contains_no_gui_webview_or_browser_launching_crates() {
         .lines()
         .filter(|line| {
             let lower = line.to_ascii_lowercase();
-            BANNED_DEPENDENCY_SUBSTRINGS.iter().any(|needle| lower.contains(needle))
+            BANNED_DEPENDENCY_SUBSTRINGS
+                .iter()
+                .any(|needle| lower.contains(needle))
         })
         .collect();
 
@@ -90,7 +92,10 @@ fn cargo_toml_declares_no_gui_webview_or_browser_launching_dependency() {
         .filter(|needle| lower.contains(*needle))
         .copied()
         .collect();
-    assert!(offenders.is_empty(), "Cargo.toml names a banned dependency: {offenders:?}");
+    assert!(
+        offenders.is_empty(),
+        "Cargo.toml names a banned dependency: {offenders:?}"
+    );
 }
 
 const BANNED_SOURCE_PATTERNS: &[&str] = &[
@@ -119,7 +124,10 @@ fn source_tree_contains_no_vscode_or_chrome_extension_code() {
             }
         }
     });
-    assert!(offenders.is_empty(), "source tree contains banned VSCode/Chrome client references: {offenders:?}");
+    assert!(
+        offenders.is_empty(),
+        "source tree contains banned VSCode/Chrome client references: {offenders:?}"
+    );
 }
 
 /// F4: no VSCode/Chrome extension manifest file (`manifest.json` with
@@ -135,7 +143,10 @@ fn no_extension_manifest_files_exist_in_this_crate() {
             offenders.push(path.to_path_buf());
         }
     });
-    assert!(offenders.is_empty(), "found an extension-manifest-shaped file: {offenders:?}");
+    assert!(
+        offenders.is_empty(),
+        "found an extension-manifest-shaped file: {offenders:?}"
+    );
 }
 
 fn walk_rs_files(dir: &std::path::Path, visit: &mut impl FnMut(&std::path::Path, &str)) {
@@ -149,7 +160,9 @@ fn walk_rs_files(dir: &std::path::Path, visit: &mut impl FnMut(&std::path::Path,
 }
 
 fn walk_all_files(dir: &std::path::Path, visit: &mut impl FnMut(&std::path::Path)) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {

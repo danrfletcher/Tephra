@@ -51,7 +51,9 @@ async fn registering_a_source_over_rpc_makes_it_resolvable_on_the_same_running_d
     let shared_graph = Arc::new(SharedGraph::new(initial_graph));
     let graph_refresh = GraphRefresh::new(shared_graph.clone(), cache_path.clone());
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind ephemeral port");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local_addr");
 
     let state = Arc::new(AppState::new(

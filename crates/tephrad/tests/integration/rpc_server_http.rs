@@ -50,7 +50,10 @@ async fn request_with_no_authorization_header_is_rejected_with_401_and_jsonrpc_e
 
     assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
     let body: serde_json::Value = response.json().await.expect("valid JSON body");
-    assert!(body.get("error").is_some(), "must be an unambiguous JSON-RPC error, not a bare 200");
+    assert!(
+        body.get("error").is_some(),
+        "must be an unambiguous JSON-RPC error, not a bare 200"
+    );
     assert!(body.get("result").is_none());
 }
 
@@ -74,7 +77,10 @@ async fn request_with_wrong_token_is_rejected() {
 async fn unit_resolve_link_returns_the_mocked_resolution_over_http() {
     let graph = MockGraph::new().with_resolve(
         "[[one]]",
-        Ok(ResolveResult { unit: sample_unit(), edges: vec![sample_edge()] }),
+        Ok(ResolveResult {
+            unit: sample_unit(),
+            edges: vec![sample_edge()],
+        }),
     );
     let server = spawn(graph, MockSources::new()).await;
 
@@ -96,14 +102,20 @@ async fn unit_resolve_link_returns_the_mocked_resolution_over_http() {
     let body: serde_json::Value = response.json().await.unwrap();
     assert_eq!(body["id"], json!("req-1"));
     assert_eq!(body["result"]["unit"]["id"], json!("@vault:notes/one.md"));
-    assert_eq!(body["result"]["edges"][0]["to"], json!({"resolved": "@vault:notes/one.md"}));
+    assert_eq!(
+        body["result"]["edges"][0]["to"],
+        json!({"resolved": "@vault:notes/one.md"})
+    );
 }
 
 #[tokio::test]
 async fn unit_resolve_link_surfaces_a_resolve_error_as_a_jsonrpc_error() {
     let graph = MockGraph::new().with_resolve(
         "[[missing]]",
-        Err(ResolveError::Unresolved { source: "vault".to_string(), target: "missing".to_string() }),
+        Err(ResolveError::Unresolved {
+            source: "vault".to_string(),
+            target: "missing".to_string(),
+        }),
     );
     let server = spawn(graph, MockSources::new()).await;
 
@@ -244,19 +256,17 @@ async fn oversized_body_is_rejected_and_the_server_stays_responsive() {
 
 #[tokio::test]
 async fn source_list_and_source_register_route_through_the_mock_registry_over_http() {
-    let sources = MockSources::new()
-        .with_list(Ok(vec![]))
-        .with_register(
-            "vault",
-            Ok(tephrad::rpc::backend::ScanStatsWire {
-                files_seen: 3,
-                files_ignored: 0,
-                units_written: 3,
-                links_written: 1,
-                tags_written: 1,
-                blocks_written: 0,
-            }),
-        );
+    let sources = MockSources::new().with_list(Ok(vec![])).with_register(
+        "vault",
+        Ok(tephrad::rpc::backend::ScanStatsWire {
+            files_seen: 3,
+            files_ignored: 0,
+            units_written: 3,
+            links_written: 1,
+            tags_written: 1,
+            blocks_written: 0,
+        }),
+    );
     let server = spawn(MockGraph::new(), sources).await;
     let client = reqwest::Client::new();
 

@@ -136,7 +136,12 @@ pub fn success_response(id: Value, result: Value) -> Value {
 }
 
 /// `{"jsonrpc":"2.0","id":<id>,"error":{"code":...,"message":...}}`.
-pub fn error_response(id: Value, code: i64, message: impl Into<String>, data: Option<Value>) -> Value {
+pub fn error_response(
+    id: Value,
+    code: i64,
+    message: impl Into<String>,
+    data: Option<Value>,
+) -> Value {
     let mut error = json!({ "code": code, "message": message.into() });
     if let Some(data) = data {
         error["data"] = data;

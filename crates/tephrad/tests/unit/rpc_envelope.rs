@@ -9,8 +9,8 @@
 use serde_json::json;
 use tephrad::rpc::dispatch::{dispatch, Backends, METHOD_NAMES};
 use tephrad::rpc::protocol::{
-    batch_rejected_response, error_response, success_response, validate_envelope,
-    INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND,
+    batch_rejected_response, error_response, success_response, validate_envelope, INVALID_PARAMS,
+    INVALID_REQUEST, METHOD_NOT_FOUND,
 };
 
 // -- validate_envelope -------------------------------------------------
@@ -108,7 +108,12 @@ fn error_response_includes_optional_data_only_when_provided() {
     let without_data = error_response(json!(1), INVALID_PARAMS, "bad params", None);
     assert!(without_data["error"].get("data").is_none());
 
-    let with_data = error_response(json!(1), INVALID_PARAMS, "bad params", Some(json!({"field": "link"})));
+    let with_data = error_response(
+        json!(1),
+        INVALID_PARAMS,
+        "bad params",
+        Some(json!({"field": "link"})),
+    );
     assert_eq!(with_data["error"]["data"]["field"], json!("link"));
 }
 
@@ -140,7 +145,11 @@ impl tephrad::rpc::backend::GraphBackend for NullGraph {
 }
 struct NullSources;
 impl tephrad::rpc::backend::SourceBackend for NullSources {
-    fn register(&self, _name: &str, _root: &str) -> Result<tephrad::rpc::backend::ScanStatsWire, String> {
+    fn register(
+        &self,
+        _name: &str,
+        _root: &str,
+    ) -> Result<tephrad::rpc::backend::ScanStatsWire, String> {
         unreachable!("params validation must fail before a handler is ever called")
     }
     fn unregister(&self, _name: &str) -> Result<(), String> {
@@ -182,15 +191,29 @@ fn unknown_method_returns_method_not_found() {
     let sources = NullSources;
     let p = proof();
 
-    let err = dispatch(&p, "unit.delete_everything", &json!({}), &backends(&graph, &sources))
-        .unwrap_err();
+    let err = dispatch(
+        &p,
+        "unit.delete_everything",
+        &json!({}),
+        &backends(&graph, &sources),
+    )
+    .unwrap_err();
     assert_eq!(err.0, METHOD_NOT_FOUND);
 }
 
 #[test]
 fn method_table_is_exactly_the_eight_named_verbs() {
     assert_eq!(METHOD_NAMES.len(), 8);
-    for name in ["unit.resolve_link", "graph.get_backlinks", "graph.get_forward_links", "graph.get_edges", "source.register", "source.unregister", "source.list", "source.rescan"] {
+    for name in [
+        "unit.resolve_link",
+        "graph.get_backlinks",
+        "graph.get_forward_links",
+        "graph.get_edges",
+        "source.register",
+        "source.unregister",
+        "source.list",
+        "source.rescan",
+    ] {
         assert!(METHOD_NAMES.contains(&name), "missing method {name}");
     }
 }
@@ -201,7 +224,13 @@ fn unit_resolve_link_without_link_param_is_invalid_params() {
     let sources = NullSources;
     let p = proof();
 
-    let err = dispatch(&p, "unit.resolve_link", &json!({}), &backends(&graph, &sources)).unwrap_err();
+    let err = dispatch(
+        &p,
+        "unit.resolve_link",
+        &json!({}),
+        &backends(&graph, &sources),
+    )
+    .unwrap_err();
     assert_eq!(err.0, INVALID_PARAMS);
 }
 
@@ -211,7 +240,13 @@ fn unit_resolve_link_with_empty_link_param_is_invalid_params() {
     let sources = NullSources;
     let p = proof();
 
-    let err = dispatch(&p, "unit.resolve_link", &json!({"link": ""}), &backends(&graph, &sources)).unwrap_err();
+    let err = dispatch(
+        &p,
+        "unit.resolve_link",
+        &json!({"link": ""}),
+        &backends(&graph, &sources),
+    )
+    .unwrap_err();
     assert_eq!(err.0, INVALID_PARAMS);
 }
 
@@ -221,7 +256,13 @@ fn unit_resolve_link_with_non_string_link_param_is_invalid_params() {
     let sources = NullSources;
     let p = proof();
 
-    let err = dispatch(&p, "unit.resolve_link", &json!({"link": 123}), &backends(&graph, &sources)).unwrap_err();
+    let err = dispatch(
+        &p,
+        "unit.resolve_link",
+        &json!({"link": 123}),
+        &backends(&graph, &sources),
+    )
+    .unwrap_err();
     assert_eq!(err.0, INVALID_PARAMS);
 }
 
@@ -231,7 +272,13 @@ fn graph_get_backlinks_without_id_param_is_invalid_params() {
     let sources = NullSources;
     let p = proof();
 
-    let err = dispatch(&p, "graph.get_backlinks", &json!({}), &backends(&graph, &sources)).unwrap_err();
+    let err = dispatch(
+        &p,
+        "graph.get_backlinks",
+        &json!({}),
+        &backends(&graph, &sources),
+    )
+    .unwrap_err();
     assert_eq!(err.0, INVALID_PARAMS);
 }
 
@@ -241,7 +288,13 @@ fn graph_get_forward_links_without_id_param_is_invalid_params() {
     let sources = NullSources;
     let p = proof();
 
-    let err = dispatch(&p, "graph.get_forward_links", &json!({}), &backends(&graph, &sources)).unwrap_err();
+    let err = dispatch(
+        &p,
+        "graph.get_forward_links",
+        &json!({}),
+        &backends(&graph, &sources),
+    )
+    .unwrap_err();
     assert_eq!(err.0, INVALID_PARAMS);
 }
 
@@ -251,7 +304,12 @@ fn graph_get_edges_takes_no_params_and_never_fails_on_params_shape() {
     let sources = NullSources;
     let p = proof();
 
-    let result = dispatch(&p, "graph.get_edges", &json!({"ignored": "extra"}), &backends(&graph, &sources));
+    let result = dispatch(
+        &p,
+        "graph.get_edges",
+        &json!({"ignored": "extra"}),
+        &backends(&graph, &sources),
+    );
     assert!(result.is_ok());
 }
 
@@ -261,10 +319,22 @@ fn source_register_without_name_or_root_is_invalid_params() {
     let sources = NullSources;
     let p = proof();
 
-    let missing_both = dispatch(&p, "source.register", &json!({}), &backends(&graph, &sources)).unwrap_err();
+    let missing_both = dispatch(
+        &p,
+        "source.register",
+        &json!({}),
+        &backends(&graph, &sources),
+    )
+    .unwrap_err();
     assert_eq!(missing_both.0, INVALID_PARAMS);
 
-    let missing_root = dispatch(&p, "source.register", &json!({"name": "vault"}), &backends(&graph, &sources)).unwrap_err();
+    let missing_root = dispatch(
+        &p,
+        "source.register",
+        &json!({"name": "vault"}),
+        &backends(&graph, &sources),
+    )
+    .unwrap_err();
     assert_eq!(missing_root.0, INVALID_PARAMS);
 }
 
@@ -274,7 +344,13 @@ fn source_unregister_without_name_is_invalid_params() {
     let sources = NullSources;
     let p = proof();
 
-    let err = dispatch(&p, "source.unregister", &json!({}), &backends(&graph, &sources)).unwrap_err();
+    let err = dispatch(
+        &p,
+        "source.unregister",
+        &json!({}),
+        &backends(&graph, &sources),
+    )
+    .unwrap_err();
     assert_eq!(err.0, INVALID_PARAMS);
 }
 

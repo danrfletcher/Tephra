@@ -193,8 +193,17 @@ fn constant_time_eq_distinguishes_every_single_byte_difference() {
 #[test]
 fn mismatch_position_does_not_change_the_boolean_outcome() {
     let base = "f".repeat(64);
-    let mismatch_first = { let mut b = base.clone().into_bytes(); b[0] = b'g'; String::from_utf8(b).unwrap() };
-    let mismatch_last = { let mut b = base.clone().into_bytes(); let n = b.len(); b[n - 1] = b'g'; String::from_utf8(b).unwrap() };
+    let mismatch_first = {
+        let mut b = base.clone().into_bytes();
+        b[0] = b'g';
+        String::from_utf8(b).unwrap()
+    };
+    let mismatch_last = {
+        let mut b = base.clone().into_bytes();
+        let n = b.len();
+        b[n - 1] = b'g';
+        String::from_utf8(b).unwrap()
+    };
 
     assert!(!constant_time_token_eq(&base, &mismatch_first));
     assert!(!constant_time_token_eq(&base, &mismatch_last));

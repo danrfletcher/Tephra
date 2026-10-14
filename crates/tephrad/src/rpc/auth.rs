@@ -182,7 +182,10 @@ mod tests {
 
     #[test]
     fn constant_time_token_eq_matches_identical_strings() {
-        assert!(constant_time_token_eq("a".repeat(64).as_str(), "a".repeat(64).as_str()));
+        assert!(constant_time_token_eq(
+            "a".repeat(64).as_str(),
+            "a".repeat(64).as_str()
+        ));
     }
 
     #[test]

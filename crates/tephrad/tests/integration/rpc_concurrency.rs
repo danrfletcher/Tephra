@@ -11,7 +11,9 @@ use serde_json::json;
 use tephra_graph::{Edge, EdgeTarget};
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::rpc_fixtures::{connect_ws, spawn, spawn_with_token_and_any_sources, MockGraph, MockSources, SlowSources};
+use crate::rpc_fixtures::{
+    connect_ws, spawn, spawn_with_token_and_any_sources, MockGraph, MockSources, SlowSources,
+};
 
 /// E10: table-driven over N = 1, 2, 10 concurrent WebSocket clients,
 /// each authenticating independently and issuing its own request, so
@@ -40,16 +42,21 @@ async fn n_concurrent_websocket_clients_each_get_their_own_correct_response() {
             let url = server.ws_url();
             let token = server.token.clone();
             tasks.push(tokio::spawn(async move {
-                let mut ws = connect_ws(&url, &token).await.expect("each client authenticates independently");
+                let mut ws = connect_ws(&url, &token)
+                    .await
+                    .expect("each client authenticates independently");
                 let request = json!({
                     "jsonrpc": "2.0",
                     "id": i,
                     "method": "graph.get_backlinks",
                     "params": { "id": format!("@vault:note-{i}.md") }
                 });
-                ws.send(Message::Text(request.to_string().into())).await.unwrap();
+                ws.send(Message::Text(request.to_string().into()))
+                    .await
+                    .unwrap();
                 let reply = ws.next().await.unwrap().unwrap();
-                let body: serde_json::Value = serde_json::from_str(&reply.into_text().unwrap()).unwrap();
+                let body: serde_json::Value =
+                    serde_json::from_str(&reply.into_text().unwrap()).unwrap();
                 (i, body)
             }));
         }
@@ -59,7 +66,10 @@ async fn n_concurrent_websocket_clients_each_get_their_own_correct_response() {
             // This client's own id and only its own expected edge —
             // never another client's response.
             assert_eq!(body["id"], json!(i));
-            assert_eq!(body["result"][0]["from"], json!(format!("@vault:referrer-{i}.md")));
+            assert_eq!(
+                body["result"][0]["from"],
+                json!(format!("@vault:referrer-{i}.md"))
+            );
         }
     }
 }
@@ -116,10 +126,16 @@ async fn rotation_blocks_new_websocket_handshakes_immediately() {
     server.rotate_token("e".repeat(64).as_str());
 
     let result = connect_ws(&server.ws_url(), &old_token).await;
-    assert!(result.is_err(), "a new handshake under the revoked token must be rejected");
+    assert!(
+        result.is_err(),
+        "a new handshake under the revoked token must be rejected"
+    );
 
     let result_new = connect_ws(&server.ws_url(), &"e".repeat(64)).await;
-    assert!(result_new.is_ok(), "the freshly rotated token must authenticate a new handshake");
+    assert!(
+        result_new.is_ok(),
+        "the freshly rotated token must authenticate a new handshake"
+    );
 }
 
 /// R2/E11/G6: a connection that authenticated at handshake time under
@@ -139,7 +155,9 @@ async fn a_rotated_token_is_rejected_on_an_already_open_websocket_on_its_very_ne
 
     // The connection works before rotation.
     ws.send(Message::Text(
-        json!({ "jsonrpc": "2.0", "id": 1, "method": "graph.get_edges", "params": {} }).to_string().into(),
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "graph.get_edges", "params": {} })
+            .to_string()
+            .into(),
     ))
     .await
     .unwrap();
@@ -191,7 +209,11 @@ async fn an_abrupt_client_disconnect_does_not_affect_later_clients() {
         .await
         .expect("a later client must still be able to connect");
     next_client
-        .send(Message::Text(json!({ "jsonrpc": "2.0", "id": 1, "method": "graph.get_edges", "params": {} }).to_string().into()))
+        .send(Message::Text(
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "graph.get_edges", "params": {} })
+                .to_string()
+                .into(),
+        ))
         .await
         .unwrap();
     let reply = next_client.next().await.unwrap().unwrap();
@@ -241,7 +263,8 @@ async fn an_abrupt_tcp_reset_mid_http_request_does_not_affect_later_requests() {
         use tokio::io::AsyncWriteExt;
 
         let mut stream = tokio::net::TcpStream::connect(server.addr).await.unwrap();
-        let declared_body = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"graph.get_edges\",\"params\":{}}";
+        let declared_body =
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"graph.get_edges\",\"params\":{}}";
         let partial_body = &declared_body[..declared_body.len() / 2];
         let request = format!(
             "POST /rpc HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
@@ -257,7 +280,9 @@ async fn an_abrupt_tcp_reset_mid_http_request_does_not_affect_later_requests() {
         // handshake a plain `drop` would perform — this is what E12
         // actually specifies ("abrupt client TCP reset mid-request"),
         // not just an early disconnect.
-        stream.set_zero_linger().expect("SO_LINGER 0 must be settable on a loopback TCP stream");
+        stream
+            .set_zero_linger()
+            .expect("SO_LINGER 0 must be settable on a loopback TCP stream");
         drop(stream);
     }
 
@@ -284,7 +309,9 @@ async fn an_abrupt_tcp_reset_mid_websocket_frame_does_not_affect_later_clients()
     {
         use tokio::io::AsyncWriteExt;
 
-        let ws = connect_ws(&server.ws_url(), &server.token).await.expect("handshake succeeds");
+        let ws = connect_ws(&server.ws_url(), &server.token)
+            .await
+            .expect("handshake succeeds");
         let inner = ws.into_inner();
         let mut tcp = match inner {
             tokio_tungstenite::MaybeTlsStream::Plain(tcp) => tcp,
@@ -297,11 +324,12 @@ async fn an_abrupt_tcp_reset_mid_websocket_frame_does_not_affect_later_clients()
         // of that declared 1000-byte payload — a genuine mid-frame
         // truncation, not an idle or pre-handshake disconnect.
         let mut frame_start = vec![0x81u8, 0xFE, 0x03, 0xE8, 0x01, 0x02, 0x03, 0x04];
-        frame_start.extend(std::iter::repeat(0x41u8).take(10));
+        frame_start.extend(std::iter::repeat_n(0x41u8, 10));
         tcp.write_all(&frame_start).await.unwrap();
         tcp.flush().await.unwrap();
 
-        tcp.set_zero_linger().expect("SO_LINGER 0 must be settable on a loopback TCP stream");
+        tcp.set_zero_linger()
+            .expect("SO_LINGER 0 must be settable on a loopback TCP stream");
         drop(tcp);
     }
 
@@ -309,7 +337,11 @@ async fn an_abrupt_tcp_reset_mid_websocket_frame_does_not_affect_later_clients()
         .await
         .expect("a later client must still be able to connect");
     next_client
-        .send(Message::Text(json!({ "jsonrpc": "2.0", "id": 1, "method": "graph.get_edges", "params": {} }).to_string().into()))
+        .send(Message::Text(
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "graph.get_edges", "params": {} })
+                .to_string()
+                .into(),
+        ))
         .await
         .unwrap();
     let reply = next_client.next().await.unwrap().unwrap();

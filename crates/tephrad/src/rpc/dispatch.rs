@@ -98,8 +98,7 @@ fn unit_resolve_link(params: &Value, graph: &dyn GraphBackend) -> DispatchResult
     match graph.resolve_link(link, default_source) {
         Ok(result) => Ok(serde_json::to_value(result).expect("ResolveResult always serializes")),
         Err(e) => {
-            let data =
-                serde_json::to_value(&e).expect("ResolveError always serializes");
+            let data = serde_json::to_value(&e).expect("ResolveError always serializes");
             Err((RESOLVE_ERROR, e.to_string(), Some(data)))
         }
     }

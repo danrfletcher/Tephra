@@ -209,7 +209,11 @@ fn main() -> ExitCode {
 ///    happens in this function's plain synchronous frame, strictly
 ///    after `runtime.block_on` has already returned — never while
 ///    still inside it.
-fn run_server(listen_addr: &str, cache_path: &std::path::Path, token_path: &std::path::Path) -> ExitCode {
+fn run_server(
+    listen_addr: &str,
+    cache_path: &std::path::Path,
+    token_path: &std::path::Path,
+) -> ExitCode {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

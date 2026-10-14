@@ -34,8 +34,14 @@ async fn ws_response_bytes(server: &crate::rpc_fixtures::TestServer, request: &V
     let mut ws = connect_ws(&server.ws_url(), &server.token)
         .await
         .expect("WebSocket handshake must succeed");
-    ws.send(Message::Text(request.to_string().into())).await.expect("send over WS");
-    let reply = ws.next().await.expect("a reply").expect("not a transport error");
+    ws.send(Message::Text(request.to_string().into()))
+        .await
+        .expect("send over WS");
+    let reply = ws
+        .next()
+        .await
+        .expect("a reply")
+        .expect("not a transport error");
     reply.into_text().expect("text frame").as_bytes().to_vec()
 }
 
@@ -48,7 +54,8 @@ async fn assert_transport_parity(server: &crate::rpc_fixtures::TestServer, reque
     let http_bytes = http_response_bytes(server, &request).await;
     let ws_bytes = ws_response_bytes(server, &request).await;
     assert_eq!(
-        http_bytes, ws_bytes,
+        http_bytes,
+        ws_bytes,
         "HTTP and WS must return byte-identical responses for {request}:\n  http: {}\n  ws:   {}",
         String::from_utf8_lossy(&http_bytes),
         String::from_utf8_lossy(&ws_bytes),
@@ -85,7 +92,10 @@ async fn http_and_ws_produce_byte_identical_responses_across_every_standard_outc
         )
         .with_resolve(
             "[[missing]]",
-            Err(ResolveError::Unresolved { source: "vault".to_string(), target: "missing".to_string() }),
+            Err(ResolveError::Unresolved {
+                source: "vault".to_string(),
+                target: "missing".to_string(),
+            }),
         );
     let server = spawn(graph, MockSources::new()).await;
 
@@ -140,8 +150,12 @@ async fn http_and_ws_produce_byte_identical_responses_across_every_standard_outc
         .expect("HTTP response body")
         .to_vec();
 
-    let mut ws = connect_ws(&server.ws_url(), &server.token).await.expect("WS handshake");
-    ws.send(Message::Text("not json at all".into())).await.expect("send over WS");
+    let mut ws = connect_ws(&server.ws_url(), &server.token)
+        .await
+        .expect("WS handshake");
+    ws.send(Message::Text("not json at all".into()))
+        .await
+        .expect("send over WS");
     let ws_parse_error = ws
         .next()
         .await
@@ -153,7 +167,8 @@ async fn http_and_ws_produce_byte_identical_responses_across_every_standard_outc
         .to_vec();
 
     assert_eq!(
-        http_parse_error, ws_parse_error,
+        http_parse_error,
+        ws_parse_error,
         "HTTP and WS parse-error responses must be byte-identical:\n  http: {}\n  ws:   {}",
         String::from_utf8_lossy(&http_parse_error),
         String::from_utf8_lossy(&ws_parse_error),
