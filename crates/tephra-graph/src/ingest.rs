@@ -101,71 +101,17 @@ fn load_unit_facts(
     })
 }
 
-/// De-duplication key for one resolved edge target: every raw link
-/// that resolves to the *same* real unit collapses to one edge (R2 —
-/// e.g. a note containing `[[B]]` twice, or `[[A]]`/`[[#H]]` both
-/// resolving to the note's own self-edge), discarding every `to_raw`
-/// but the one kept (the lexicographically smallest `(kind, to_raw)`
-/// pair, for a deterministic, input-order-independent survivor).
-///
-/// A dangling edge is *not* collapsed just because another edge from
-/// the same unit is also dangling — two different unresolved targets
-/// (`[[Foo]]` and `[[Bar]]`, neither existing) are still two distinct,
-/// meaningful dangling edges, not duplicates of each other — so a
-/// dangling edge's key additionally includes its own `(kind, to_raw)`,
-/// collapsing only an exact repeat of the identical raw link.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum DedupKey {
-    Resolved(String, String),
-    Dangling(String, String, String),
-}
-
-fn dedup_key(edge: &Edge) -> DedupKey {
-    match &edge.to {
-        EdgeTarget::Resolved(id) => DedupKey::Resolved(edge.from.clone(), id.clone()),
-        EdgeTarget::Dangling => {
-            DedupKey::Dangling(edge.from.clone(), edge.kind.clone(), edge.to_raw.clone())
-        }
-    }
-}
-
-/// Picks, between two edges that share a [`DedupKey`], the one that
-/// survives: the lexicographically smaller `(kind, to_raw)` pair,
-/// for a deterministic, input-order-independent winner.
-fn keeps_priority(a: &Edge, b: &Edge) -> bool {
-    (a.kind.as_str(), a.to_raw.as_str()) <= (b.kind.as_str(), b.to_raw.as_str())
-}
-
-/// Collapses `edges` by [`dedup_key`] (R2), keeping, for each key, the
-/// edge with the lexicographically smallest `(kind, to_raw)` so the
-/// survivor is deterministic regardless of input order. Used only by
-/// the one-time full build/rebuild path
-/// ([`UnitGraph::rebuild_edges`]), where every edge in the graph is
-/// being considered at once anyway; [`UnitGraph::recompute_scoped`]'s
-/// incremental path uses the scoped [`dedup_against_graph`] instead
-/// (R13).
-fn dedup_edges(edges: Vec<Edge>) -> Vec<Edge> {
-    let mut by_key: HashMap<DedupKey, Edge> = HashMap::new();
-    for edge in edges {
-        let key = dedup_key(&edge);
-        match by_key.get(&key) {
-            Some(existing) if keeps_priority(existing, &edge) => {}
-            _ => {
-                by_key.insert(key, edge);
-            }
-        }
-    }
-    by_key.into_values().collect()
-}
-
 /// The `(scope_source, normalized_target_key)` [`UnitGraph::match_index`]
 /// key `edge` would be indexed under, or `None` when `edge` has no
-/// sensible key (its `from` id no longer has a node, or its target
-/// is an absolute URL / anchor-only self-link) — looked up afresh
-/// rather than cached on the edge itself, since it depends only on
-/// `edge.from`/`edge.to_raw`/`edge.kind` and the referring unit's
-/// source, none of which [`insert_edge`]/[`remove_edge`] ever change
-/// for an edge already in the graph.
+/// sensible key (its target is an absolute URL / anchor-only
+/// self-link) — used only by [`insert_edge`], at a point where
+/// `edge.from` always still has a node (R17: see
+/// [`crate::UnitGraph::edge_keys`] for why [`remove_edge`] must *not*
+/// call this — by the time a removed unit's own authored edges are
+/// superseded, `edge.from`'s node is already gone, so recomputing the
+/// key here would silently return `None` and skip the `match_index`
+/// prune, leaving a stale slot number behind for [`insert_edge`] to
+/// later hand to an unrelated edge via `free_slots`).
 fn edge_match_key(graph: &UnitGraph, edge: &Edge) -> Option<(String, String)> {
     let from_source = graph.nodes.get(&edge.from)?.source.clone();
     let index = graph.index();
@@ -174,8 +120,12 @@ fn edge_match_key(graph: &UnitGraph, edge: &Edge) -> Option<(String, String)> {
 
 /// Inserts `edge` into a free (or newly appended) slot in
 /// `graph.edges`, updating `forward_index`/`backward_index`/
-/// `match_index` for just this one edge (R13: O(1)-amortized, never a
-/// whole-graph rebuild) — the counterpart to [`remove_edge`].
+/// `match_index`/`edge_keys` for just this one edge (R13:
+/// O(1)-amortized, never a whole-graph rebuild) — the counterpart to
+/// [`remove_edge`]. The match key is computed once, here, and stored
+/// in `graph.edge_keys` alongside the edge (R17) so `remove_edge` can
+/// prune `match_index` correctly even after `edge.from`'s node has
+/// since been removed.
 fn insert_edge(graph: &mut UnitGraph, edge: Edge) -> usize {
     let key = edge_match_key(graph, &edge);
     let to = edge.to.clone();
@@ -184,10 +134,12 @@ fn insert_edge(graph: &mut UnitGraph, edge: Edge) -> usize {
     let slot = match graph.free_slots.pop() {
         Some(s) => {
             graph.edges[s] = Some(edge);
+            graph.edge_keys[s] = key.clone();
             s
         }
         None => {
             graph.edges.push(Some(edge));
+            graph.edge_keys.push(key.clone());
             graph.edges.len() - 1
         }
     };
@@ -206,10 +158,19 @@ fn insert_edge(graph: &mut UnitGraph, edge: Edge) -> usize {
 /// already empty), pruning its `forward_index`/`backward_index`/
 /// `match_index` entries and freeing the slot for reuse — the
 /// counterpart to [`insert_edge`], same O(1)-amortized cost (R13).
+/// Prunes `match_index` using the key stored in `graph.edge_keys` at
+/// insert time (R17), *not* by recomputing it from `edge.from`'s
+/// node: that node may already be gone by the time this runs (a
+/// removed unit's own authored edges are superseded before
+/// `recompute_scoped` finishes), and recomputing from a missing node
+/// would silently skip the prune, leaving the slot number behind in
+/// `match_index` for [`insert_edge`] to later hand to a completely
+/// unrelated edge.
 fn remove_edge(graph: &mut UnitGraph, slot: usize) {
     let Some(edge) = graph.edges[slot].take() else {
         return;
     };
+    let key = graph.edge_keys[slot].take();
     if let Some(v) = graph.forward_index.get_mut(&edge.from) {
         v.retain(|&i| i != slot);
     }
@@ -218,69 +179,12 @@ fn remove_edge(graph: &mut UnitGraph, slot: usize) {
             v.retain(|&i| i != slot);
         }
     }
-    if let Some(key) = edge_match_key(graph, &edge) {
+    if let Some(key) = key {
         if let Some(v) = graph.match_index.get_mut(&key) {
             v.retain(|&i| i != slot);
         }
     }
     graph.free_slots.push(slot);
-}
-
-/// Scoped de-duplication (R2/R13) for [`UnitGraph::recompute_scoped`]:
-/// collapses `fresh` by [`dedup_key`] exactly like [`dedup_edges`],
-/// then checks each surviving edge's `from` id against whatever *that
-/// same id* still authors elsewhere in the graph (via
-/// `forward_index`, not a scan of every edge in the graph) for a
-/// collision — e.g. two different now-freshly-re-resolved edges from
-/// the same unit landing on the same target. The cost stays
-/// proportional to the number of edges this update actually touches
-/// (the `fresh` batch plus the touched `from` ids' own untouched
-/// edges), never the graph's total size.
-fn dedup_against_graph(
-    graph: &UnitGraph,
-    fresh: Vec<Edge>,
-    superseded: &mut HashSet<usize>,
-) -> Vec<Edge> {
-    let mut by_key: HashMap<DedupKey, Edge> = HashMap::new();
-    for edge in fresh {
-        let key = dedup_key(&edge);
-        match by_key.get(&key) {
-            Some(existing) if keeps_priority(existing, &edge) => {}
-            _ => {
-                by_key.insert(key, edge);
-            }
-        }
-    }
-
-    let froms: HashSet<String> = by_key.values().map(|e| e.from.clone()).collect();
-    for from in froms {
-        let Some(idxs) = graph.forward_index.get(&from).cloned() else {
-            continue;
-        };
-        for i in idxs {
-            if superseded.contains(&i) {
-                continue;
-            }
-            let Some(existing) = graph.edges[i].clone() else {
-                continue;
-            };
-            let key = dedup_key(&existing);
-            let Some(survivor) = by_key.get(&key) else {
-                continue;
-            };
-            if keeps_priority(&existing, survivor) {
-                // The untouched existing edge wins the tie-break;
-                // drop the fresh survivor rather than duplicating it.
-                by_key.remove(&key);
-            } else {
-                // The fresh survivor wins; the untouched existing
-                // edge must go so only one of the pair remains.
-                superseded.insert(i);
-            }
-        }
-    }
-
-    by_key.into_values().collect()
 }
 
 impl UnitGraph {
@@ -414,13 +318,21 @@ impl UnitGraph {
             }
         }
 
-        let edges = dedup_edges(edges);
-
+        // No storage-time de-duplication (R16): every raw link keeps
+        // its own indexed [`Edge`] record (and its own `match_index`
+        // entry), even when it currently resolves to the same target
+        // as another raw link on the same unit — collapsing duplicate
+        // query-output rows happens only in `crate::model`'s
+        // `get_edges`/`get_forward_links`/`get_backlinks`, never here,
+        // so an edge that currently shares a resolution with another
+        // can still be found and re-resolved independently once a
+        // later insert/remove makes the two diverge again.
         self.edges = Vec::new();
         self.free_slots = Vec::new();
         self.forward_index = HashMap::new();
         self.backward_index = HashMap::new();
         self.match_index = HashMap::new();
+        self.edge_keys = Vec::new();
         for edge in edges {
             insert_edge(self, edge);
         }
@@ -544,8 +456,10 @@ impl UnitGraph {
             }
         }
 
-        let fresh = dedup_against_graph(self, fresh, &mut superseded);
-
+        // No storage-time de-duplication here either (R16): `fresh`
+        // is inserted as-is, one `Edge` per raw link, even when two
+        // of them currently resolve to the same target (collapsed
+        // only at query time, see `crate::model::dedup_for_query`).
         for i in superseded {
             remove_edge(self, i);
         }

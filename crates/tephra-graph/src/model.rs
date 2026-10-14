@@ -197,6 +197,21 @@ pub struct UnitGraph {
     ///   since a *live* id's own backlinks must never include an
     ///   edge that didn't actually resolve to it (R11).
     pub(crate) match_index: HashMap<(String, String), Vec<usize>>,
+    /// Parallel to `edges`: the `match_index` key each slot was
+    /// inserted under (or `None`), captured once at insert time
+    /// rather than recomputed from `edge.from`'s node at removal time
+    /// (R17). `crate::ingest::remove_edge` must prune `match_index`
+    /// using the *same* key the edge was indexed under — but by the
+    /// time a removed unit's own authored edges are superseded,
+    /// `nodes` no longer has an entry for `edge.from` to recompute
+    /// that key from, so recomputing it at removal time silently
+    /// skips the prune and leaves a stale slot number sitting in
+    /// `match_index` forever (until a later `insert_edge` reuses the
+    /// slot via `free_slots` and a completely unrelated edge starts
+    /// answering lookups under the old key). Storing the key
+    /// alongside the slot sidesteps the need to recompute it from
+    /// state that might already be gone.
+    pub(crate) edge_keys: Vec<Option<(String, String)>>,
 }
 
 impl Default for UnitGraph {
@@ -222,6 +237,7 @@ impl UnitGraph {
             forward_index: HashMap::new(),
             backward_index: HashMap::new(),
             match_index: HashMap::new(),
+            edge_keys: Vec::new(),
         }
     }
 
@@ -282,7 +298,6 @@ impl UnitGraph {
             nodes: &self.nodes,
             stem_index: &self.stem_index,
             basename_index: &self.basename_index,
-            known_sources: &self.known_sources,
         }
     }
 
@@ -308,29 +323,30 @@ impl UnitGraph {
     }
 
     /// `graph.get_forward_links` (G4): every edge authored by `id`,
-    /// sorted for deterministic output, with every duplicate (R2 —
-    /// the same `(from, to)` pair reached via more than one raw link,
-    /// e.g. `[[A]]` and `[[#H]]` on a note named `A` both resolving to
-    /// a self-edge) already collapsed to one row by construction (see
-    /// `crate::ingest`'s edge de-duplication). Empty (never `null`,
-    /// never an error) if `id` has no outgoing edges or doesn't exist
-    /// at all.
+    /// de-duplicated for query output (R16/R2 — every raw link stays
+    /// its own indexed [`Edge`] record in storage, see
+    /// [`crate::ingest`]'s module doc; this is where duplicates
+    /// collapse, not at insert time) and sorted for deterministic
+    /// output. Empty (never `null`, never an error) if `id` has no
+    /// outgoing edges or doesn't exist at all.
     pub fn get_forward_links(&self, id: &str) -> Vec<Edge> {
-        let mut out: Vec<Edge> = self
+        let edges: Vec<Edge> = self
             .forward_index
             .get(id)
             .map(|idxs| idxs.iter().filter_map(|&i| self.edges[i].clone()).collect())
             .unwrap_or_default();
+        let mut out = dedup_for_query(edges);
         out.sort_by(edge_sort_key);
         out
     }
 
     /// `graph.get_backlinks` (G4): every edge whose target resolved
-    /// to `id`, sorted for deterministic output and already
-    /// de-duplicated (R2 — see [`UnitGraph::get_forward_links`]).
-    /// Looked up through [`UnitGraph::backward_index`], so this stays
-    /// bounded-time regardless of how many thousands of edges target
-    /// `id` (no linear scan over every edge in the graph).
+    /// to `id`, de-duplicated for query output (R16/R2 — see
+    /// [`UnitGraph::get_forward_links`]) and sorted for deterministic
+    /// output. Looked up through [`UnitGraph::backward_index`], so
+    /// this stays bounded-time regardless of how many thousands of
+    /// edges target `id` (no linear scan over every edge in the
+    /// graph).
     ///
     /// When `id` names no unit currently in the graph — most
     /// pointedly, the pre-rename path of a note PR-4's watcher just
@@ -376,16 +392,18 @@ impl UnitGraph {
 
         idxs.sort_unstable();
         idxs.dedup();
-        let mut out: Vec<Edge> = idxs.iter().filter_map(|&i| self.edges[i].clone()).collect();
+        let edges: Vec<Edge> = idxs.iter().filter_map(|&i| self.edges[i].clone()).collect();
+        let mut out = dedup_for_query(edges);
         out.sort_by(edge_sort_key);
         out
     }
 
-    /// `graph.get_edges` (G4): every edge in the graph, sorted for
-    /// deterministic output and de-duplicated (R2). Empty (never
-    /// `null`) for an empty graph.
+    /// `graph.get_edges` (G4): every edge in the graph, de-duplicated
+    /// for query output (R16/R2) and sorted for deterministic output.
+    /// Empty (never `null`) for an empty graph.
     pub fn get_edges(&self) -> Vec<Edge> {
-        let mut out: Vec<Edge> = self.edges.iter().filter_map(|e| e.clone()).collect();
+        let edges: Vec<Edge> = self.edges.iter().filter_map(|e| e.clone()).collect();
+        let mut out = dedup_for_query(edges);
         out.sort_by(edge_sort_key);
         out
     }
@@ -402,4 +420,70 @@ fn edge_sort_key(a: &Edge, b: &Edge) -> std::cmp::Ordering {
         b.kind.clone(),
         b.to_raw.clone(),
     ))
+}
+
+/// De-duplication key for one edge's query-output identity (R16/R2):
+/// every raw link that resolves to the *same* real unit collapses to
+/// one edge at query time (e.g. a note containing `[[B]]` twice, or
+/// `[[A]]`/`[[#H]]` both resolving to the note's own self-edge) —
+/// but, unlike the pre-R16 behaviour, the *other* raw link's own
+/// [`Edge`] record is never discarded from storage, only folded away
+/// here when building a query's output rows (see [`dedup_for_query`]
+/// and `crate::ingest`'s module doc for why that distinction matters:
+/// an edge that currently shares a dedup key with another can
+/// *diverge* from it again on a later insert/remove, and the only way
+/// to re-resolve it then is for its own `(to_raw, kind)` to still
+/// have its own indexed record to re-resolve).
+///
+/// A dangling edge is *not* collapsed just because another edge from
+/// the same unit is also dangling — two different unresolved targets
+/// (`[[Foo]]` and `[[Bar]]`, neither existing) are still two distinct,
+/// meaningful dangling edges, not duplicates of each other — so a
+/// dangling edge's key additionally includes its own `(kind, to_raw)`,
+/// collapsing only an exact repeat of the identical raw link.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum DedupKey {
+    Resolved(String, String),
+    Dangling(String, String, String),
+}
+
+fn dedup_key(edge: &Edge) -> DedupKey {
+    match &edge.to {
+        EdgeTarget::Resolved(id) => DedupKey::Resolved(edge.from.clone(), id.clone()),
+        EdgeTarget::Dangling => {
+            DedupKey::Dangling(edge.from.clone(), edge.kind.clone(), edge.to_raw.clone())
+        }
+    }
+}
+
+/// Picks, between two edges that share a [`DedupKey`], the one that
+/// survives in query output: the lexicographically smaller
+/// `(kind, to_raw)` pair, for a deterministic, input-order-independent
+/// winner.
+fn keeps_priority(a: &Edge, b: &Edge) -> bool {
+    (a.kind.as_str(), a.to_raw.as_str()) <= (b.kind.as_str(), b.to_raw.as_str())
+}
+
+/// Collapses `edges` by [`dedup_key`] (R16/R2), keeping, for each
+/// key, the edge with the lexicographically smallest `(kind, to_raw)`
+/// so the survivor is deterministic regardless of input order. Used
+/// only by [`UnitGraph::get_edges`]/[`UnitGraph::get_forward_links`]/
+/// [`UnitGraph::get_backlinks`] when building their returned rows —
+/// every raw link still has its own [`Edge`] record in `self.edges`
+/// and its own [`UnitGraph::match_index`] entry (R16), so an
+/// insert/remove that changes one raw link's resolution without
+/// affecting another's can still find and re-resolve it even after
+/// the two used to collapse to the same query-output row.
+fn dedup_for_query(edges: Vec<Edge>) -> Vec<Edge> {
+    let mut by_key: HashMap<DedupKey, Edge> = HashMap::new();
+    for edge in edges {
+        let key = dedup_key(&edge);
+        match by_key.get(&key) {
+            Some(existing) if keeps_priority(existing, &edge) => {}
+            _ => {
+                by_key.insert(key, edge);
+            }
+        }
+    }
+    by_key.into_values().collect()
 }

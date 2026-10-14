@@ -231,18 +231,20 @@ pub(crate) fn basename_of(stem: &str) -> &str {
     stem.rsplit('/').next().unwrap_or(stem)
 }
 
-/// Bundles the four pieces of [`crate::UnitGraph`] state that
+/// Bundles the three pieces of [`crate::UnitGraph`] state that
 /// resolution reads but never mutates (`nodes`, `stem_index`,
-/// `basename_index`, `known_sources`), so [`resolve_in_scope`] and
-/// [`resolve_edge_target`] take one borrow instead of four separate
+/// `basename_index`), so [`resolve_in_scope`] and
+/// [`resolve_edge_target`] take one borrow instead of three separate
 /// parameters each — kept under clippy's `too_many_arguments` limit
 /// without losing the "plain function over borrowed data" shape the
-/// rest of this module uses.
+/// rest of this module uses. Deliberately does *not* carry
+/// `known_sources` (R18): whether a scope is a currently-registered
+/// source must never gate whether an edge gets a match key at all —
+/// see [`edge_target_scope_key`].
 pub(crate) struct GraphIndex<'a> {
     pub nodes: &'a HashMap<String, NodeFacts>,
     pub stem_index: &'a HashMap<String, HashMap<String, Vec<String>>>,
     pub basename_index: &'a HashMap<String, HashMap<String, Vec<String>>>,
-    pub known_sources: &'a std::collections::HashSet<String>,
 }
 
 /// Resolves `target` (already normalized — NFC, extension stripped,
@@ -326,6 +328,22 @@ pub(crate) fn resolve_in_scope(
 /// resolve, so a later-added/renamed unit whose own stem or basename
 /// equals that key can be found in O(1) instead of rescanning every
 /// edge in the graph.
+///
+/// Returns a key for a wikilink's explicit `@source:` scope even
+/// when that source is not currently registered at all (R18): a
+/// federated link to a source that hasn't been added yet (or has
+/// been added but has no units yet) must still land in
+/// [`crate::UnitGraph::match_index`] under `(scope, key)`, so that
+/// once the source is registered and populated, the touched-id scan
+/// in [`crate::ingest::UnitGraph::recompute_scoped`] finds and
+/// re-resolves it the same way it would any other dangling edge —
+/// rather than the edge being invisible to every future re-resolution
+/// because it was never indexed under any key at all. Whether the
+/// scope is actually known only matters to [`resolve_in_scope`]'s own
+/// lookup (an unregistered source's `stem_index`/`basename_index`
+/// entry is simply absent, so resolution still correctly yields
+/// [`ResolveOutcome::NotFound`] and the edge stays dangling until a
+/// matching unit actually shows up).
 pub(crate) fn edge_target_scope_key(
     index: &GraphIndex<'_>,
     from_id: &str,
@@ -343,9 +361,6 @@ pub(crate) fn edge_target_scope_key(
             .as_deref()
             .unwrap_or(from_source)
             .to_string();
-        if !index.known_sources.contains(&scope) {
-            return None;
-        }
         Some((scope, normalize_wikilink_target(&wikilink.target)))
     } else {
         // Markdown-style `[text](target)` link: no `@source` prefix
