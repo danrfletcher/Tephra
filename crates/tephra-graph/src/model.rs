@@ -9,11 +9,15 @@
 
 use std::collections::{HashMap, HashSet};
 
+use serde::Serialize;
+
+use crate::resolver::{basename_of, normalize_key, strip_markdown_extension};
+
 /// One unit's identity and derived metadata, keyed by its federated
 /// `@source:path` id. This is the exact shape [`crate::ResolveResult`]
 /// and [`crate::Edge`] embed, and the one GP5 freezes for PR-6's RPC
 /// handler to return unmodified.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct UnitMetadata {
     /// The federated identifier, `"@<source>:<rel_path>"`.
     pub id: String,
@@ -21,7 +25,8 @@ pub struct UnitMetadata {
     /// The unit's path exactly as stored in `tephra-cache`'s
     /// `units.rel_path` — no case-folding, no Unicode normalization,
     /// so a non-ASCII or space-containing path round-trips byte for
-    /// byte.
+    /// byte. (Resolution internally normalizes a *copy* of this for
+    /// matching purposes, R6 — the stored value itself is untouched.)
     pub rel_path: String,
     pub frontmatter_json: Option<String>,
     pub tags: Vec<String>,
@@ -33,7 +38,12 @@ pub struct UnitMetadata {
 }
 
 /// What a wikilink/markdown-link edge's `to_raw` resolved to.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serialized externally-tagged with `rename_all = "snake_case"`
+/// (`{"resolved":"@source:path"}` or the plain string `"dangling"`) —
+/// the frozen GP5 wire shape; see `tests/unit/gp5_contract.rs`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EdgeTarget {
     /// Resolved to exactly one unit, named by its federated id.
     Resolved(String),
@@ -52,7 +62,7 @@ pub enum EdgeTarget {
 
 /// One forward/backward link in the graph, derived from a single
 /// `tephra-cache` `links` row.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Edge {
     pub from: String,
     pub to: EdgeTarget,
@@ -92,6 +102,16 @@ pub(crate) fn federated_id(source: &str, rel_path: &str) -> String {
     format!("@{source}:{rel_path}")
 }
 
+/// Splits a federated id (`"@<source>:<rel_path>"`) back into its two
+/// parts, or `None` if `id` isn't in that shape at all. Used by
+/// [`UnitGraph::get_backlinks`] to recover the `(source, rel_path)`
+/// a *stale* id (one with no current node, e.g. the pre-rename path
+/// in GP7's scenario) still names, so a dangling-edge lookup can be
+/// scoped to the right source without requiring the node to exist.
+fn parse_federated_id(id: &str) -> Option<(&str, &str)> {
+    id.strip_prefix('@')?.split_once(':')
+}
+
 /// The in-memory federated link graph (G4): nodes keyed by federated
 /// `@source:path` id, edges derived from each node's own outgoing
 /// links and resolved against the *current* node set every time the
@@ -112,9 +132,22 @@ pub struct UnitGraph {
     pub(crate) known_sources: HashSet<String>,
     pub(crate) offline_sources: HashSet<String>,
     /// Source name -> set of federated ids belonging to it, kept in
-    /// sync with `nodes` on every insert/remove so in-source target
-    /// resolution never has to scan every node in the graph.
+    /// sync with `nodes` on every insert/remove.
     pub(crate) by_source: HashMap<String, HashSet<String>>,
+    /// Source name -> normalized full stem (NFC, extension stripped)
+    /// -> ids sharing that exact stem (at most one in practice, since
+    /// `rel_path` is unique per source, but kept as a `Vec` for
+    /// robustness). The O(1)-average candidate lookup
+    /// [`crate::resolver::resolve_in_scope`] uses for a `/`-containing
+    /// target, instead of scanning every unit in the source (R3) —
+    /// the root cause of the pre-fix quadratic incremental-update
+    /// cost.
+    pub(crate) stem_index: HashMap<String, HashMap<String, Vec<String>>>,
+    /// Source name -> normalized basename (the final path component
+    /// of the stem) -> ids sharing that basename, possibly several
+    /// (E4's ambiguous-tie case). The O(1)-average candidate lookup
+    /// for a bare (no `/`) target.
+    pub(crate) basename_index: HashMap<String, HashMap<String, Vec<String>>>,
     pub(crate) edges: Vec<Edge>,
     /// Federated id -> indices into `edges` whose `from` is that id.
     pub(crate) forward_index: HashMap<String, Vec<usize>>,
@@ -123,6 +156,21 @@ pub struct UnitGraph {
     /// so [`UnitGraph::get_backlinks`] stays bounded-time even for a
     /// single unit with well over 1,000 incoming edges.
     pub(crate) backward_index: HashMap<String, Vec<usize>>,
+    /// `(scope_source, normalized_target_key)` -> indices into `edges`
+    /// of currently-[`EdgeTarget::Dangling`] edges whose own computed
+    /// match key equals that pair (see
+    /// [`crate::resolver::edge_target_scope_key`]) — the key *every*
+    /// edge, resolved or not, would be looked up under if a unit
+    /// existed at that path/name. Lets two things stay bounded-time
+    /// rather than rescanning every edge in the graph:
+    /// - a unit inserted or renamed into place can find which
+    ///   previously-dangling edges might now resolve to it (R3's
+    ///   scoped incremental update);
+    /// - [`UnitGraph::get_backlinks`], queried with a *stale* id (one
+    ///   with no current node — GP7's renamed-note scenario), can
+    ///   still surface every edge that still intends to target that
+    ///   path/name even though it no longer resolves (R4).
+    pub(crate) dangling_index: HashMap<(String, String), Vec<usize>>,
 }
 
 impl Default for UnitGraph {
@@ -141,9 +189,12 @@ impl UnitGraph {
             known_sources: HashSet::new(),
             offline_sources: HashSet::new(),
             by_source: HashMap::new(),
+            stem_index: HashMap::new(),
+            basename_index: HashMap::new(),
             edges: Vec::new(),
             forward_index: HashMap::new(),
             backward_index: HashMap::new(),
+            dangling_index: HashMap::new(),
         }
     }
 
@@ -154,12 +205,17 @@ impl UnitGraph {
     pub fn register_source(&mut self, source: &str) {
         self.known_sources.insert(source.to_string());
         self.by_source.entry(source.to_string()).or_default();
+        self.stem_index.entry(source.to_string()).or_default();
+        self.basename_index.entry(source.to_string()).or_default();
     }
 
     /// Marks `source` offline/online (E2/P4) and recomputes every
     /// edge's `offline` annotation accordingly. Does not drop or
-    /// otherwise touch the source's cached nodes/edges either way —
-    /// only [`Edge::offline`]/[`UnitMetadata::offline`] change.
+    /// otherwise touch the source's cached nodes/edges either way, and
+    /// — since toggling a source's status never changes what resolves
+    /// to what — never re-resolves a single link either; only
+    /// [`Edge::offline`]/[`UnitMetadata::offline`] change (R3: not a
+    /// rebuild of any kind, just an O(edges) annotation pass).
     pub fn set_source_offline(&mut self, source: &str, offline: bool) {
         self.register_source(source);
         if offline {
@@ -167,11 +223,39 @@ impl UnitGraph {
         } else {
             self.offline_sources.remove(source);
         }
-        self.rebuild_edges();
+        self.recompute_offline_flags();
+    }
+
+    pub(crate) fn recompute_offline_flags(&mut self) {
+        let nodes = &self.nodes;
+        let offline_sources = &self.offline_sources;
+        for edge in &mut self.edges {
+            let from_offline = nodes
+                .get(&edge.from)
+                .is_some_and(|n| offline_sources.contains(&n.source));
+            let to_offline = matches!(&edge.to, EdgeTarget::Resolved(to_id)
+                if nodes.get(to_id).is_some_and(|n| offline_sources.contains(&n.source)));
+            edge.offline = from_offline || to_offline;
+        }
     }
 
     pub fn is_source_offline(&self, source: &str) -> bool {
         self.offline_sources.contains(source)
+    }
+
+    /// Borrows the four index structures [`crate::resolver::resolve_in_scope`]/
+    /// [`crate::resolver::resolve_edge_target`] read, bundled as one
+    /// [`crate::resolver::GraphIndex`] — the shared borrow every
+    /// resolution call site (`crate::ingest`'s rebuild/recompute paths,
+    /// and [`UnitGraph::resolve_link`]) builds instead of repeating
+    /// four separate field borrows each.
+    pub(crate) fn index(&self) -> crate::resolver::GraphIndex<'_> {
+        crate::resolver::GraphIndex {
+            nodes: &self.nodes,
+            stem_index: &self.stem_index,
+            basename_index: &self.basename_index,
+            known_sources: &self.known_sources,
+        }
     }
 
     /// Every source name this graph currently knows about (G4's
@@ -196,8 +280,13 @@ impl UnitGraph {
     }
 
     /// `graph.get_forward_links` (G4): every edge authored by `id`,
-    /// sorted for deterministic output. Empty (never `null`, never an
-    /// error) if `id` has no outgoing edges or doesn't exist at all.
+    /// sorted for deterministic output, with every duplicate (R2 —
+    /// the same `(from, to)` pair reached via more than one raw link,
+    /// e.g. `[[A]]` and `[[#H]]` on a note named `A` both resolving to
+    /// a self-edge) already collapsed to one row by construction (see
+    /// `crate::ingest`'s edge de-duplication). Empty (never `null`,
+    /// never an error) if `id` has no outgoing edges or doesn't exist
+    /// at all.
     pub fn get_forward_links(&self, id: &str) -> Vec<Edge> {
         let mut out: Vec<Edge> = self
             .forward_index
@@ -209,23 +298,52 @@ impl UnitGraph {
     }
 
     /// `graph.get_backlinks` (G4): every edge whose target resolved
-    /// to `id`, sorted for deterministic output. Looked up through
-    /// [`UnitGraph::backward_index`], so this stays bounded-time
-    /// regardless of how many thousands of edges target `id` (no
-    /// linear scan over every edge in the graph). Empty (never
-    /// `null`, never an error) if nothing targets `id`.
+    /// to `id`, sorted for deterministic output and already
+    /// de-duplicated (R2 — see [`UnitGraph::get_forward_links`]).
+    /// Looked up through [`UnitGraph::backward_index`], so this stays
+    /// bounded-time regardless of how many thousands of edges target
+    /// `id` (no linear scan over every edge in the graph).
+    ///
+    /// Also includes every currently-[`EdgeTarget::Dangling`] edge
+    /// whose own match key equals `id`'s path or basename (R4/GP7):
+    /// when `id` names a unit no longer in the graph — most
+    /// pointedly, the pre-rename path of a note PR-4's watcher just
+    /// moved — the edges that used to resolve to it flip to dangling
+    /// on removal rather than vanishing from `get_backlinks`
+    /// altogether, so a refactor-preview caller (PR-8) can still find
+    /// every impacted incoming link across every source by querying
+    /// the *old* id, exactly as GP7 requires. This lookup is a no-op
+    /// when `id` currently does exist as a real node: any link that
+    /// would match its path/basename already resolved (so is not
+    /// dangling) rather than being left dangling alongside a live
+    /// match. Empty (never `null`, never an error) if nothing targets
+    /// `id` at all.
     pub fn get_backlinks(&self, id: &str) -> Vec<Edge> {
-        let mut out: Vec<Edge> = self
-            .backward_index
-            .get(id)
-            .map(|idxs| idxs.iter().map(|&i| self.edges[i].clone()).collect())
-            .unwrap_or_default();
+        let mut idxs: Vec<usize> = self.backward_index.get(id).cloned().unwrap_or_default();
+
+        if let Some((source, rel_path)) = parse_federated_id(id) {
+            let stem = normalize_key(strip_markdown_extension(rel_path));
+            let basename = basename_of(&stem).to_string();
+            if let Some(v) = self.dangling_index.get(&(source.to_string(), stem.clone())) {
+                idxs.extend(v.iter().copied());
+            }
+            if basename != stem {
+                if let Some(v) = self.dangling_index.get(&(source.to_string(), basename)) {
+                    idxs.extend(v.iter().copied());
+                }
+            }
+        }
+
+        idxs.sort_unstable();
+        idxs.dedup();
+        let mut out: Vec<Edge> = idxs.iter().map(|&i| self.edges[i].clone()).collect();
         out.sort_by(edge_sort_key);
         out
     }
 
     /// `graph.get_edges` (G4): every edge in the graph, sorted for
-    /// deterministic output. Empty (never `null`) for an empty graph.
+    /// deterministic output and de-duplicated (R2). Empty (never
+    /// `null`) for an empty graph.
     pub fn get_edges(&self) -> Vec<Edge> {
         let mut out = self.edges.clone();
         out.sort_by(edge_sort_key);
