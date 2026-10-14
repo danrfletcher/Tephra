@@ -322,3 +322,128 @@ fn a_dot_dot_relative_markdown_link_to_a_nonexistent_root_file_dangles_even_when
          not silently resolve to an unrelated same-named file elsewhere in the source"
     );
 }
+
+/// R22: a `..` that climbs past the source root, from a root-level
+/// linking file, must dangle rather than silently resolving to an
+/// unrelated in-source file that happens to share the remaining path
+/// components. Before the fix, `join_relative`'s `stack.pop()` on an
+/// empty stack was a no-op, so `../other/README.md` from a root file
+/// resolved to `other/README.md`.
+#[test]
+fn a_dot_dot_past_the_source_root_from_a_root_level_file_dangles() {
+    let mut graph = UnitGraph::new();
+    graph.upsert_unit(
+        "notes",
+        "N.md",
+        UnitFacts {
+            links: vec![(
+                "../other/README.md".to_string(),
+                tephra_parser::LINK_KIND_MARKDOWN.to_string(),
+            )],
+            ..Default::default()
+        },
+    );
+    // The unrelated file the pre-fix bug would have resolved to.
+    graph.upsert_unit("notes", "other/README.md", empty_facts());
+
+    let forward = graph.get_forward_links("@notes:N.md");
+    assert_eq!(forward.len(), 1, "{forward:?}");
+    assert_eq!(
+        forward[0].to,
+        EdgeTarget::Dangling,
+        "R22: a ../ past the source root must dangle, not resolve to an unrelated \
+         in-source file"
+    );
+}
+
+/// R22: the same rule for a linking file nested one directory deep,
+/// where a *single* `..` only reaches back to the source root (still
+/// valid) but a *second* `..` climbs past it. Before the fix this
+/// collapsed to `README.md` at the root, an unrelated file.
+#[test]
+fn a_double_dot_dot_past_the_source_root_from_a_nested_file_dangles() {
+    let mut graph = UnitGraph::new();
+    graph.upsert_unit(
+        "notes",
+        "sub/N.md",
+        UnitFacts {
+            links: vec![(
+                "../../README.md".to_string(),
+                tephra_parser::LINK_KIND_MARKDOWN.to_string(),
+            )],
+            ..Default::default()
+        },
+    );
+    // The unrelated file the pre-fix bug would have resolved to.
+    graph.upsert_unit("notes", "README.md", empty_facts());
+
+    let forward = graph.get_forward_links("@notes:sub/N.md");
+    assert_eq!(forward.len(), 1, "{forward:?}");
+    assert_eq!(
+        forward[0].to,
+        EdgeTarget::Dangling,
+        "R22: a ../.. that climbs past the source root from a nested file must dangle, \
+         not resolve to an unrelated root-level file"
+    );
+}
+
+/// R22: a root-absolute markdown target (`/docs/X.md`, standard in
+/// GitHub-style READMEs, which the `atlas-repo` code source is) is
+/// resolved from the *source root*, not from the linking file's own
+/// directory — from a root-level file this must behave identically
+/// to a bare relative link, resolving to `docs/X.md`.
+#[test]
+fn a_root_absolute_markdown_link_from_a_root_level_file_resolves_from_the_source_root() {
+    let mut graph = UnitGraph::new();
+    graph.upsert_unit(
+        "notes",
+        "N.md",
+        UnitFacts {
+            links: vec![(
+                "/docs/X.md".to_string(),
+                tephra_parser::LINK_KIND_MARKDOWN.to_string(),
+            )],
+            ..Default::default()
+        },
+    );
+    graph.upsert_unit("notes", "docs/X.md", empty_facts());
+
+    let forward = graph.get_forward_links("@notes:N.md");
+    assert_eq!(forward.len(), 1, "{forward:?}");
+    assert_eq!(
+        forward[0].to,
+        EdgeTarget::Resolved("@notes:docs/X.md".to_string())
+    );
+}
+
+/// R22: the same root-absolute target from a file nested in a
+/// subdirectory must resolve to the exact same unit as from the root
+/// — never joined onto the linking file's own directory. Before the
+/// fix, the leading `/` was simply dropped and the remainder joined
+/// onto `from_dir`, so this dangled (`sub/docs/X`) instead of
+/// matching `docs/X.md`.
+#[test]
+fn a_root_absolute_markdown_link_from_a_subdirectory_file_still_resolves_from_the_source_root() {
+    let mut graph = UnitGraph::new();
+    graph.upsert_unit(
+        "notes",
+        "sub/A.md",
+        UnitFacts {
+            links: vec![(
+                "/docs/X.md".to_string(),
+                tephra_parser::LINK_KIND_MARKDOWN.to_string(),
+            )],
+            ..Default::default()
+        },
+    );
+    graph.upsert_unit("notes", "docs/X.md", empty_facts());
+
+    let forward = graph.get_forward_links("@notes:sub/A.md");
+    assert_eq!(forward.len(), 1, "{forward:?}");
+    assert_eq!(
+        forward[0].to,
+        EdgeTarget::Resolved("@notes:docs/X.md".to_string()),
+        "R22: a root-absolute markdown link must resolve from the source root \
+         regardless of the linking file's own directory depth"
+    );
+}
