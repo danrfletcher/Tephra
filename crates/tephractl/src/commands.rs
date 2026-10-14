@@ -2,8 +2,13 @@
 //! `render::*` output (G8). This is the only module that decides
 //! *which* JSON-RPC method a command calls and with what params; it
 //! owns no resolution/refactor/registry logic of its own — every
-//! verb here is a thin, typed wrapper over a single `RpcClient::call`
-//! (PR-7's fence: "no RPC methods or server-side logic").
+//! verb here is a thin, typed wrapper over `RpcClient::call`
+//! (PR-7's fence: "no RPC methods or server-side logic"). Most
+//! commands issue exactly one RPC call; the one exception is
+//! `link refactor --apply` without `--yes`, which (R3) first calls
+//! `link.preview_refactor` to render the affected files/lines ahead
+//! of the confirmation prompt, then `link.apply_refactor` once
+//! confirmed — `--yes` still issues exactly one RPC.
 
 use std::io::{BufRead, Write};
 
