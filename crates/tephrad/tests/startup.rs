@@ -511,6 +511,141 @@ fn directory_stage_failure_reports_clear_error() {
     );
 }
 
+/// Extracts the `<port>` suffix from a captured "listening on
+/// 127.0.0.1:<port>" stderr line.
+fn port_from_listening_line(line: &str) -> String {
+    line.rsplit(':')
+        .next()
+        .expect("listening line has a port suffix")
+        .trim()
+        .to_string()
+}
+
+/// Sends one raw `POST /rpc` request over a plain TCP connection and
+/// returns the full response text (status line, headers, body).
+/// Deliberately bypasses any HTTP client crate: this file's tests run
+/// as plain, synchronous `#[test]`s (no tokio runtime), and a raw
+/// request is all R8's regression tests below need.
+fn send_rpc_request(port: &str, token: &str, body: &str) -> String {
+    use std::io::{Read, Write};
+    let request = format!(
+        "POST /rpc HTTP/1.1\r\n\
+         Host: 127.0.0.1:{port}\r\n\
+         Authorization: Bearer {token}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {len}\r\n\
+         Connection: close\r\n\r\n\
+         {body}",
+        len = body.len(),
+    );
+    let mut stream =
+        std::net::TcpStream::connect(format!("127.0.0.1:{port}")).expect("connect to /rpc");
+    stream
+        .write_all(request.as_bytes())
+        .expect("write RPC request");
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("read RPC response");
+    response
+}
+
+/// R8 regression: before the fix, the `graph:changed` forwarder task
+/// spawned in `main.rs` kept the last `Arc<SourceRegistry>` reference
+/// alive forever (its loop only ended on a `RecvError::Closed` that
+/// could never fire while the task itself held the registry's event
+/// sender). `drop(runtime)` then tore that task down by force from a
+/// tokio worker thread, and dropping `SourceRegistry`'s own internal
+/// `tokio::runtime::Runtime` from inside another runtime's worker
+/// thread panics ("Cannot drop a runtime in a context where blocking
+/// is not allowed") — live-reproduced 6/6 times in the review finding
+/// (3 idle, 3 after one `source.register`). The process still exited
+/// 0 even while panicking (a tokio task panic doesn't abort the
+/// process by default), so a bare exit-code assertion — every other
+/// shutdown test in this file already makes one — does not catch
+/// this; both tests below explicitly grep stderr for "panicked".
+#[test]
+fn sigterm_while_idle_does_not_panic_the_server_task() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let config_path = home.path().join(".config/tephra/config.toml");
+    let data_dir = home.path().join(".local/share/tephra");
+    write_config(&config_path, &data_dir, EPHEMERAL_ADDR);
+
+    let mut process = TephradProcess::spawn(home.path(), &config_path);
+    let found = process.wait_for_line("listening on 127.0.0.1:", Duration::from_secs(10));
+    assert!(
+        found,
+        "expected a listening line, got: {:?}",
+        process.captured_stderr_lines()
+    );
+
+    let code = process.terminate_and_wait(Duration::from_secs(5));
+    assert_eq!(code, Some(0), "expected clean exit after SIGTERM");
+
+    for line in process.captured_stderr_lines() {
+        assert!(
+            !line.contains("panicked"),
+            "stderr contained a panic after graceful shutdown: {line}"
+        );
+    }
+}
+
+/// Same as above, but after a real `source.register` RPC call on the
+/// running daemon (the exact live repro from the review finding: the
+/// forwarder task's own reference to the registry is what keeps the
+/// registry's internal runtime alive past `block_on`'s return).
+#[test]
+fn sigterm_after_source_register_does_not_panic_the_server_task() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let config_path = home.path().join(".config/tephra/config.toml");
+    let data_dir = home.path().join(".local/share/tephra");
+    write_config(&config_path, &data_dir, EPHEMERAL_ADDR);
+
+    let vault = tempfile::tempdir().expect("vault tempdir");
+    fs::write(vault.path().join("a.md"), "# A\n\n[[B]]\n").expect("write a.md");
+    fs::write(vault.path().join("b.md"), "# B\n").expect("write b.md");
+
+    let mut process = TephradProcess::spawn(home.path(), &config_path);
+    let found = process.wait_for_line("listening on 127.0.0.1:", Duration::from_secs(10));
+    assert!(
+        found,
+        "expected a listening line, got: {:?}",
+        process.captured_stderr_lines()
+    );
+    let listening_line = process
+        .captured_stderr_lines()
+        .into_iter()
+        .find(|l| l.contains("listening on 127.0.0.1:"))
+        .expect("a listening line was captured");
+    let port = port_from_listening_line(&listening_line);
+
+    let token_path = data_dir.join("token");
+    let token = fs::read_to_string(&token_path)
+        .expect("read token")
+        .trim()
+        .to_string();
+
+    let register_body = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"source.register\",\"params\":{{\"name\":\"notes\",\"root\":\"{}\"}}}}",
+        vault.path().display()
+    );
+    let response = send_rpc_request(&port, &token, &register_body);
+    assert!(
+        response.contains("units_written"),
+        "expected a successful source.register response, got: {response}"
+    );
+
+    let code = process.terminate_and_wait(Duration::from_secs(5));
+    assert_eq!(code, Some(0), "expected clean exit after SIGTERM");
+
+    for line in process.captured_stderr_lines() {
+        assert!(
+            !line.contains("panicked"),
+            "stderr contained a panic after graceful shutdown: {line}"
+        );
+    }
+}
+
 /// Best-effort detection of whether the current process can bypass
 /// directory permission checks (true for root). Avoids a false test
 /// failure in a container that runs tests as root.

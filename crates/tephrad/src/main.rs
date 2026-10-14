@@ -169,7 +169,7 @@ fn main() -> ExitCode {
 /// synchronous and must run before any async runtime exists) stay
 /// plain, directly-testable functions.
 ///
-/// Three ordering/thread details inside the async block below are
+/// Four ordering/thread details inside the async block below are
 /// load-bearing, not incidental — each one was found by directly
 /// reproducing an intermittent clean-shutdown test failure, not by
 /// inspection, so they're recorded here in full:
@@ -209,6 +209,19 @@ fn main() -> ExitCode {
 ///    happens in this function's plain synchronous frame, strictly
 ///    after `runtime.block_on` has already returned — never while
 ///    still inside it.
+/// 4. The `graph:changed` forwarder task spawned below holds its own
+///    `Arc<AppState>` (and, through it, another reference to the same
+///    `Arc<SourceRegistry>` from point 3). Before this was fixed
+///    (R8), that task's loop only ended on `RecvError::Closed`, which
+///    can never happen while the task itself keeps the registry's
+///    event sender alive — so the task ran forever, and `drop(runtime)`
+///    below tore it down by force from a tokio worker thread, which
+///    (by point 3's own rule) panics. The forwarder now selects on the
+///    same shutdown signal `axum::serve`'s graceful shutdown uses, and
+///    this function awaits its `JoinHandle` *inside* the async block,
+///    before constructing the tuple handed back out — so its
+///    `Arc<AppState>` clone, and the registry reference it carries,
+///    are already gone well before `registry` itself is returned.
 fn run_server(
     listen_addr: &str,
     cache_path: &std::path::Path,
@@ -223,17 +236,23 @@ fn run_server(
     };
 
     let (exit, registry_to_drop_after_runtime_shutdown) = runtime.block_on(async move {
+        // A `watch` channel rather than a one-shot: both `axum::serve`'s
+        // own graceful-shutdown future *and* the graph:changed forwarder
+        // task below need to independently observe the same shutdown
+        // signal (R8), and `watch::Receiver` is `Clone` where
+        // `oneshot::Receiver` is not.
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
         // Inline, no `.await` yet: see point 2 in this function's doc
         // comment for why this exact sequence must run synchronously,
         // right here, on the thread that called `block_on`.
         #[cfg(unix)]
-        let shutdown_rx = {
+        {
             use tokio::signal::unix::{signal, SignalKind};
             let sigterm = signal(SignalKind::terminate());
             let sigint = signal(SignalKind::interrupt());
             unblock_shutdown_signals();
 
-            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
             match (sigterm, sigint) {
                 (Ok(mut sigterm), Ok(mut sigint)) => {
                     tokio::spawn(async move {
@@ -242,7 +261,7 @@ fn run_server(
                             _ = sigint.recv() => {}
                         }
                         tracing::info!("received shutdown signal, stopping");
-                        let _ = shutdown_tx.send(());
+                        let _ = shutdown_tx.send(true);
                     });
                 }
                 _ => {
@@ -252,22 +271,19 @@ fn run_server(
                     tokio::spawn(async move {
                         let _ = tokio::signal::ctrl_c().await;
                         tracing::info!("received shutdown signal, stopping");
-                        let _ = shutdown_tx.send(());
+                        let _ = shutdown_tx.send(true);
                     });
                 }
             }
-            shutdown_rx
         };
 
         #[cfg(not(unix))]
-        let shutdown_rx = {
-            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        {
             tokio::spawn(async move {
                 let _ = tokio::signal::ctrl_c().await;
                 tracing::info!("received shutdown signal, stopping");
-                let _ = shutdown_tx.send(());
+                let _ = shutdown_tx.send(true);
             });
-            shutdown_rx
         };
 
         let listener = match server::bind(listen_addr).await {
@@ -324,38 +340,65 @@ fn run_server(
         // `graph:changed` notification, after first refreshing the
         // in-memory graph (R1) so the push actually corresponds to a
         // graph that has already changed by the time a client
-        // re-queries it. Ends only when the registry itself is
-        // dropped (daemon shutdown), at which point there is nothing
-        // left to forward.
+        // re-queries it.
+        //
+        // R8 fix: this task owns `forward_state` (an `Arc<AppState>`,
+        // which in turn holds the `Arc<dyn SourceBackend>` wrapping
+        // this same `registry`), so it must not outlive the point
+        // where this function hands `registry` back out to be dropped
+        // on the plain synchronous thread (see this function's doc
+        // comment, point 3). Before this fix, the loop only ended on
+        // `RecvError::Closed` — which can never happen while the task
+        // itself keeps `registry`'s event sender alive — so the task
+        // ran forever and was only ever torn down by force when
+        // `drop(runtime)` below cancelled every still-running task.
+        // That cancellation (and the resulting drop of `forward_state`,
+        // and transitively of the registry's own internal runtime) ran
+        // on a tokio worker thread, which is exactly the "context where
+        // blocking is not allowed" that panics on drop. Selecting on
+        // `shutdown_rx` here, and awaiting this task's `JoinHandle`
+        // below *before* `(ExitCode::SUCCESS, Some(registry))` is
+        // constructed, guarantees `forward_state` is already dropped,
+        // and `registry`'s refcount already back down to the single
+        // reference this block is about to hand out, while still
+        // inside `block_on` — never during `runtime`'s own shutdown.
         let forward_state = state.clone();
         let mut events = registry.subscribe();
-        tokio::spawn(async move {
+        let mut forwarder_shutdown_rx = shutdown_rx.clone();
+        let forwarder_handle = tokio::spawn(async move {
             loop {
-                match events.recv().await {
-                    Ok(DaemonEvent::SourceChanged { source, paths }) => {
-                        if let Some(refresh) = forward_state.graph_refresh.clone() {
-                            let refreshed = tokio::task::spawn_blocking(move || refresh.refresh()).await;
-                            match refreshed {
-                                Ok(Ok(())) => {}
-                                Ok(Err(e)) => {
-                                    tracing::warn!(error = %e, "failed to refresh the in-memory graph after a watcher event");
-                                }
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "graph refresh task panicked");
-                                }
-                            }
-                        }
-                        let payload = json!({
-                            "source": source,
-                            "paths": paths
-                                .iter()
-                                .map(|p| p.display().to_string())
-                                .collect::<Vec<_>>(),
-                        });
-                        forward_state.broadcast_graph_changed(payload);
+                tokio::select! {
+                    _ = forwarder_shutdown_rx.changed() => {
+                        break;
                     }
-                    Err(RecvError::Lagged(_)) => continue,
-                    Err(RecvError::Closed) => break,
+                    recv = events.recv() => {
+                        match recv {
+                            Ok(DaemonEvent::SourceChanged { source, paths }) => {
+                                if let Some(refresh) = forward_state.graph_refresh.clone() {
+                                    let refreshed = tokio::task::spawn_blocking(move || refresh.refresh()).await;
+                                    match refreshed {
+                                        Ok(Ok(())) => {}
+                                        Ok(Err(e)) => {
+                                            tracing::warn!(error = %e, "failed to refresh the in-memory graph after a watcher event");
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(error = %e, "graph refresh task panicked");
+                                        }
+                                    }
+                                }
+                                let payload = json!({
+                                    "source": source,
+                                    "paths": paths
+                                        .iter()
+                                        .map(|p| p.display().to_string())
+                                        .collect::<Vec<_>>(),
+                                });
+                                forward_state.broadcast_graph_changed(payload);
+                            }
+                            Err(RecvError::Lagged(_)) => continue,
+                            Err(RecvError::Closed) => break,
+                        }
+                    }
                 }
             }
         });
@@ -366,8 +409,9 @@ fn run_server(
         // line other tools wait on.
         tracing::info!("listening on {bound_addr}");
 
-        let shutdown = async {
-            let _ = shutdown_rx.await;
+        let mut shutdown_rx_for_serve = shutdown_rx.clone();
+        let shutdown = async move {
+            let _ = shutdown_rx_for_serve.changed().await;
         };
 
         if let Err(e) = axum::serve(listener, app)
@@ -376,6 +420,12 @@ fn run_server(
         {
             tracing::error!("server error: {e}");
         }
+
+        // R8: join the forwarder task (it will already have observed
+        // `shutdown_rx` by now, since `axum::serve` above only returned
+        // after the same signal fired) so `forward_state` is guaranteed
+        // dropped before `registry` is handed back out below.
+        let _ = forwarder_handle.await;
 
         (ExitCode::SUCCESS, Some(registry))
     });
