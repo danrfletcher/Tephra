@@ -1,0 +1,12 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "files_seen": 42,
+    "files_ignored": 3,
+    "units_written": 39,
+    "links_written": 12,
+    "tags_written": 5,
+    "blocks_written": 8
+  }
+}
