@@ -11,7 +11,7 @@ use serde_json::json;
 use tephra_graph::{Edge, EdgeTarget};
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::rpc_fixtures::{connect_ws, spawn, MockGraph, MockSources};
+use crate::rpc_fixtures::{connect_ws, spawn, spawn_with_token_and_any_sources, MockGraph, MockSources, SlowSources};
 
 /// E10: table-driven over N = 1, 2, 10 concurrent WebSocket clients,
 /// each authenticating independently and issuing its own request, so
@@ -315,4 +315,76 @@ async fn an_abrupt_tcp_reset_mid_websocket_frame_does_not_affect_later_clients()
     let reply = next_client.next().await.unwrap().unwrap();
     let body: serde_json::Value = serde_json::from_str(&reply.into_text().unwrap()).unwrap();
     assert_eq!(body["id"], json!(1));
+}
+
+/// R6: `source.register`/`source.rescan` (a full synchronous
+/// filesystem walk plus SQLite writes in production) must run off the
+/// async runtime's own worker thread(s), via
+/// `tokio::task::spawn_blocking` — otherwise, on a large source (E1),
+/// one slow call pins a worker thread for the whole scan and starves
+/// every other connection, including `graph:changed` pushes.
+///
+/// Deliberately runs on the *default*, single-worker-thread
+/// `#[tokio::test]` runtime (this crate's convention throughout this
+/// file) specifically so a regression is visible without needing
+/// several real OS threads to race: if dispatch ever stopped using
+/// `spawn_blocking` for `SourceBackend` calls, this test would hang
+/// until `SLOW_REGISTER_DELAY` elapses, because the single async
+/// worker would be stuck inside `SlowSources::register`'s
+/// `std::thread::sleep` instead of free to poll the concurrent
+/// `graph.get_edges` connection at all.
+#[tokio::test]
+async fn a_slow_source_register_does_not_block_a_concurrent_request() {
+    const SLOW_REGISTER_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+
+    let server = spawn_with_token_and_any_sources(
+        MockGraph::new(),
+        SlowSources::new(SLOW_REGISTER_DELAY),
+        "b".repeat(64).as_str(),
+    )
+    .await;
+
+    let register_url = server.http_url();
+    let register_token = server.token.clone();
+    let register_task = tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        client
+            .post(&register_url)
+            .bearer_auth(&register_token)
+            .json(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "source.register",
+                "params": { "name": "slow", "root": "/tmp/whatever" }
+            }))
+            .send()
+            .await
+            .unwrap()
+    });
+
+    // Give the register call a moment to actually start (and start
+    // sleeping) before firing the concurrent request, so this isn't
+    // just a race that happens to pass because the register request
+    // hadn't been dispatched yet.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let concurrent_start = std::time::Instant::now();
+    let client = reqwest::Client::new();
+    let concurrent_response = client
+        .post(server.http_url())
+        .bearer_auth(&server.token)
+        .json(&json!({ "jsonrpc": "2.0", "id": 2, "method": "graph.get_edges", "params": {} }))
+        .send()
+        .await
+        .expect("the concurrent request must complete, not hang behind the slow register call");
+    let concurrent_elapsed = concurrent_start.elapsed();
+
+    assert_eq!(concurrent_response.status(), reqwest::StatusCode::OK);
+    assert!(
+        concurrent_elapsed < SLOW_REGISTER_DELAY,
+        "a concurrent graph.get_edges call took {concurrent_elapsed:?}, as long as the slow \
+         source.register call itself ({SLOW_REGISTER_DELAY:?}) — it was blocked behind it \
+         rather than served concurrently"
+    );
+
+    let register_response = register_task.await.expect("register task must not panic");
+    assert_eq!(register_response.status(), reqwest::StatusCode::OK);
 }

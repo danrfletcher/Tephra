@@ -162,6 +162,53 @@ impl SourceBackend for MockSources {
     }
 }
 
+/// A [`SourceBackend`] whose `register` call blocks the calling
+/// (OS) thread for `delay` before returning — used only by
+/// `rpc_concurrency.rs`'s R6 test, which proves dispatch runs
+/// `SourceBackend` calls via `tokio::task::spawn_blocking` (not
+/// directly on an async worker thread) by checking that a concurrent
+/// `graph.get_edges` call completes long before this slow
+/// `source.register` call does, even under a single-worker-thread
+/// `#[tokio::test]` runtime — if dispatch ever stopped using
+/// `spawn_blocking`, this same test would hang until `delay` elapses,
+/// since a current-thread runtime's one worker would be stuck inside
+/// `std::thread::sleep` instead of free to poll the other connection.
+pub struct SlowSources {
+    delay: std::time::Duration,
+}
+
+impl SlowSources {
+    pub fn new(delay: std::time::Duration) -> Self {
+        SlowSources { delay }
+    }
+}
+
+impl SourceBackend for SlowSources {
+    fn register(&self, _name: &str, _root: &str) -> Result<ScanStatsWire, String> {
+        std::thread::sleep(self.delay);
+        Ok(ScanStatsWire {
+            files_seen: 1,
+            files_ignored: 0,
+            units_written: 1,
+            links_written: 0,
+            tags_written: 0,
+            blocks_written: 0,
+        })
+    }
+
+    fn unregister(&self, _name: &str) -> Result<(), String> {
+        Err("SlowSources only implements register".to_string())
+    }
+
+    fn list(&self) -> Result<Vec<SourceRowWire>, String> {
+        Ok(Vec::new())
+    }
+
+    fn rescan(&self, _name: &str) -> Result<ScanStatsWire, String> {
+        Err("SlowSources only implements register".to_string())
+    }
+}
+
 /// A running RPC server bound to an ephemeral loopback port, backed
 /// by mocks, with its own disposable tempdir token file. Dropping
 /// this aborts the background server task and deletes the tempdir —
@@ -230,6 +277,19 @@ pub async fn spawn(graph: MockGraph, sources: MockSources) -> TestServer {
 /// that need to know the token value up front (e.g. to assert a
 /// *different* value is rejected).
 pub async fn spawn_with_token(graph: MockGraph, sources: MockSources, token: &str) -> TestServer {
+    spawn_with_token_and_any_sources(graph, sources, token).await
+}
+
+/// Generic counterpart of [`spawn_with_token`] for any
+/// [`SourceBackend`] implementation, not just [`MockSources`] — used
+/// by the R6 concurrency test to back a server with [`SlowSources`]
+/// while still reusing the exact same `build_router`/token-file setup
+/// every other fixture-backed test goes through.
+pub async fn spawn_with_token_and_any_sources(
+    graph: MockGraph,
+    sources: impl SourceBackend + 'static,
+    token: &str,
+) -> TestServer {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let token_path = tempdir.path().join("token");
     write_token_file(&token_path, token);
