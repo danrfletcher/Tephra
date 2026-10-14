@@ -182,7 +182,13 @@ fn proof() -> tephrad::rpc::auth::Authenticated {
 }
 
 fn backends<'a>(graph: &'a NullGraph, sources: &'a NullSources) -> Backends<'a> {
-    Backends { graph, sources }
+    static NULL_REFACTOR: tephrad::rpc::backend::UnsupportedRefactor =
+        tephrad::rpc::backend::UnsupportedRefactor;
+    Backends {
+        graph,
+        sources,
+        refactor: &NULL_REFACTOR,
+    }
 }
 
 #[test]
@@ -202,8 +208,8 @@ fn unknown_method_returns_method_not_found() {
 }
 
 #[test]
-fn method_table_is_exactly_the_eight_named_verbs() {
-    assert_eq!(METHOD_NAMES.len(), 8);
+fn method_table_is_exactly_the_ten_named_verbs() {
+    assert_eq!(METHOD_NAMES.len(), 10);
     for name in [
         "unit.resolve_link",
         "graph.get_backlinks",
@@ -213,6 +219,8 @@ fn method_table_is_exactly_the_eight_named_verbs() {
         "source.unregister",
         "source.list",
         "source.rescan",
+        "link.preview_refactor",
+        "link.apply_refactor",
     ] {
         assert!(METHOD_NAMES.contains(&name), "missing method {name}");
     }
@@ -372,4 +380,50 @@ fn source_list_takes_no_params() {
 
     let result = dispatch(&p, "source.list", &json!({}), &backends(&graph, &sources));
     assert_eq!(result.unwrap(), json!([]));
+}
+
+#[test]
+fn link_preview_refactor_without_required_params_is_invalid_params() {
+    let graph = NullGraph;
+    let sources = NullSources;
+    let p = proof();
+
+    for params in [
+        json!({}),
+        json!({"source": "notes"}),
+        json!({"source": "notes", "old_path": "OldDoc.md"}),
+        json!({"old_path": "OldDoc.md", "new_path": "NewDoc.md"}),
+    ] {
+        let err = dispatch(
+            &p,
+            "link.preview_refactor",
+            &params,
+            &backends(&graph, &sources),
+        )
+        .unwrap_err();
+        assert_eq!(err.0, INVALID_PARAMS, "params: {params}");
+    }
+}
+
+#[test]
+fn link_apply_refactor_without_required_params_is_invalid_params() {
+    let graph = NullGraph;
+    let sources = NullSources;
+    let p = proof();
+
+    for params in [
+        json!({}),
+        json!({"source": "notes"}),
+        json!({"source": "notes", "old_path": "OldDoc.md"}),
+        json!({"old_path": "OldDoc.md", "new_path": "NewDoc.md"}),
+    ] {
+        let err = dispatch(
+            &p,
+            "link.apply_refactor",
+            &params,
+            &backends(&graph, &sources),
+        )
+        .unwrap_err();
+        assert_eq!(err.0, INVALID_PARAMS, "params: {params}");
+    }
 }

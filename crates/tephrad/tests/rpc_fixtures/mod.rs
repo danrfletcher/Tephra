@@ -23,7 +23,9 @@ use std::sync::{Arc, Mutex};
 
 use tempfile::TempDir;
 use tephra_graph::{Edge, ResolveError, ResolveResult};
-use tephrad::rpc::backend::{GraphBackend, ScanStatsWire, SourceBackend, SourceRowWire};
+use tephrad::rpc::backend::{
+    GraphBackend, RefactorBackend, ScanStatsWire, SourceBackend, SourceRowWire,
+};
 use tephrad::rpc::server::{build_router, AppState};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -334,6 +336,15 @@ pub async fn spawn_with_token_and_any_sources(
         token_path,
         Arc::new(graph) as Arc<dyn GraphBackend>,
         Arc::new(sources) as Arc<dyn SourceBackend>,
+        // Same rationale as the graph refresh `None` below: none of
+        // these shared fixture-backed tests exercise
+        // `link.preview_refactor`/`link.apply_refactor` (those get
+        // their own dedicated real-engine integration tests —
+        // `tests/link_refactor_integration.rs`,
+        // `tests/link_refactor_auth.rs`), so there is nothing for a
+        // refactor backend to do here beyond erroring if one of those
+        // methods were ever accidentally called against it.
+        Arc::new(tephrad::rpc::backend::UnsupportedRefactor) as Arc<dyn RefactorBackend>,
         // These fixtures always back `AppState` with a canned
         // `MockGraph`, never a real `tephrad::rpc::backend::SharedGraph`
         // — there is nothing for a successful `source.*` mutation to
