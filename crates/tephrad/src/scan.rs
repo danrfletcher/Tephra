@@ -58,6 +58,7 @@ use rusqlite::{Transaction, TransactionBehavior};
 use tephra_cache::Cache;
 
 use crate::ignore::IgnoreRules;
+use crate::refactor;
 use crate::writer_gate::{self, WriterGate, WriterGateGuard};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -446,6 +447,33 @@ fn walk_and_write(
             Ok(r) => r,
             Err(_) => continue,
         };
+
+        if let Some(file_name) = entry.path().file_name().and_then(|n| n.to_str()) {
+            if refactor::is_stale_temp_file_name(file_name) {
+                // R3 review finding: a process killed between
+                // `rewrite_links_atomic`'s `write_new` and `rename`
+                // can leave one of these behind in the user's own
+                // source tree forever, since nothing else ever
+                // revisits it. Every full walk — `register`'s
+                // initial scan and every `rescan` — already visits
+                // every file here anyway, so sweep any stale one away
+                // now rather than leaving it on disk indefinitely or
+                // indexing it as if it were real note content.
+                match fs::remove_file(entry.path()) {
+                    Ok(()) => tracing::info!(
+                        path = %entry.path().display(),
+                        "removed a stale refactor temp file left behind by a killed apply_refactor"
+                    ),
+                    Err(e) => tracing::warn!(
+                        path = %entry.path().display(),
+                        error = %e,
+                        "failed to remove a stale refactor temp file"
+                    ),
+                }
+                continue;
+            }
+        }
+
         stats.files_seen += 1;
         if ignore.is_ignored(rel) {
             stats.files_ignored += 1;
