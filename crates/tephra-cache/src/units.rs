@@ -133,6 +133,80 @@ pub(crate) fn get_unit(conn: &Connection, id: i64) -> Result<Option<UnitRow>, Ca
     .map_err(CacheError::from)
 }
 
+/// The one `units` row at `(source_id, rel_path)`, if any — the
+/// `UNIQUE(source_id, rel_path)` constraint guarantees at most one.
+/// Used by a caller (e.g. the watcher's debounced change-apply
+/// pipeline, PR-4) that knows a file's path but not its row id, to
+/// find the existing row it needs to replace on an edit.
+pub(crate) fn get_unit_by_rel_path(
+    conn: &Connection,
+    source_id: i64,
+    rel_path: &str,
+) -> Result<Option<UnitRow>, CacheError> {
+    conn.query_row(
+        "SELECT id, source_id, rel_path, mtime, frontmatter_json \
+         FROM units WHERE source_id = ?1 AND rel_path = ?2",
+        rusqlite::params![source_id, rel_path],
+        |row| {
+            Ok(UnitRow {
+                id: row.get(0)?,
+                source_id: row.get(1)?,
+                rel_path: row.get(2)?,
+                mtime: row.get(3)?,
+                frontmatter_json: row.get(4)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(CacheError::from)
+}
+
+/// Deletes one `units` row and everything that cascades from it:
+/// `links` rows it authored (`from_unit_id = unit_id`), its `tags`
+/// and `blocks` rows, and — defensively, since nothing in this
+/// workspace resolves `to_unit_id` yet (that's PR-5's job) — any
+/// `links.to_unit_id` elsewhere that happened to point at it is first
+/// nulled out rather than left dangling or rejected by the foreign
+/// key. A no-op (not an error) if `unit_id` doesn't exist.
+pub(crate) fn delete_unit(conn: &Connection, unit_id: i64) -> Result<(), CacheError> {
+    conn.execute(
+        "UPDATE links SET to_unit_id = NULL WHERE to_unit_id = ?1",
+        [unit_id],
+    )?;
+    conn.execute("DELETE FROM links WHERE from_unit_id = ?1", [unit_id])?;
+    conn.execute("DELETE FROM tags WHERE unit_id = ?1", [unit_id])?;
+    conn.execute("DELETE FROM blocks WHERE unit_id = ?1", [unit_id])?;
+    conn.execute("DELETE FROM units WHERE id = ?1", [unit_id])?;
+    Ok(())
+}
+
+/// Deletes every `units`/`links`/`tags`/`blocks` row belonging to
+/// `source_id`, leaving every other source's rows (and the `sources`
+/// row itself) untouched — the scoped clear a rescan uses before
+/// re-walking just this one source (never a global rebuild; that's
+/// [`crate::Cache::rebuild`]'s job, gated by schema version, F2).
+pub(crate) fn delete_units_for_source(conn: &Connection, source_id: i64) -> Result<(), CacheError> {
+    conn.execute(
+        "UPDATE links SET to_unit_id = NULL \
+         WHERE to_unit_id IN (SELECT id FROM units WHERE source_id = ?1)",
+        [source_id],
+    )?;
+    conn.execute(
+        "DELETE FROM links WHERE from_unit_id IN (SELECT id FROM units WHERE source_id = ?1)",
+        [source_id],
+    )?;
+    conn.execute(
+        "DELETE FROM tags WHERE unit_id IN (SELECT id FROM units WHERE source_id = ?1)",
+        [source_id],
+    )?;
+    conn.execute(
+        "DELETE FROM blocks WHERE unit_id IN (SELECT id FROM units WHERE source_id = ?1)",
+        [source_id],
+    )?;
+    conn.execute("DELETE FROM units WHERE source_id = ?1", [source_id])?;
+    Ok(())
+}
+
 /// Every `units` row belonging to the source named `source_name`,
 /// each paired with that source's current status. Returns cached rows
 /// for an offline source too (E2) rather than an empty result — the

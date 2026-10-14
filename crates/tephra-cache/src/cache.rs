@@ -242,6 +242,43 @@ impl Cache {
         units::get_unit(&self.conn, id)
     }
 
+    /// The one `units` row at `(source_id, rel_path)`, if any.
+    pub fn get_unit_by_rel_path(
+        &self,
+        source_id: i64,
+        rel_path: &str,
+    ) -> Result<Option<UnitRow>, CacheError> {
+        units::get_unit_by_rel_path(&self.conn, source_id, rel_path)
+    }
+
+    /// Deletes one `units` row and its cascading `links`/`tags`/
+    /// `blocks` rows. A no-op if `unit_id` doesn't exist.
+    pub fn delete_unit(&self, unit_id: i64) -> Result<(), CacheError> {
+        units::delete_unit(&self.conn, unit_id)
+    }
+
+    /// Deletes every `units`/`links`/`tags`/`blocks` row belonging to
+    /// `source_id`, scoped to that one source — every other source's
+    /// rows, and the `sources` row itself, are untouched. Used by
+    /// `source.rescan` to clear a source's rows before re-walking it.
+    pub fn delete_units_for_source(&self, source_id: i64) -> Result<(), CacheError> {
+        units::delete_units_for_source(&self.conn, source_id)
+    }
+
+    /// Deletes the named source's row and every `units`/`links`/
+    /// `tags`/`blocks` row that belonged to it. Idempotent: a no-op
+    /// (not an error) if no source with this name exists, so
+    /// `source.unregister` can be called twice on an already-removed
+    /// source without erroring.
+    pub fn delete_source(&self, name: &str) -> Result<(), CacheError> {
+        if let Some(row) = self.get_source(name)? {
+            units::delete_units_for_source(&self.conn, row.id)?;
+            self.conn
+                .execute("DELETE FROM sources WHERE id = ?1", [row.id])?;
+        }
+        Ok(())
+    }
+
     /// Every `units` row belonging to the named source, each paired
     /// with that source's current status. Returns the last-cached rows
     /// for an offline source (E2), never an empty result just because
