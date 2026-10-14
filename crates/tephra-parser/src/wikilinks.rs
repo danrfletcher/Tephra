@@ -39,6 +39,20 @@ pub struct WikiLink {
     pub line: usize,
 }
 
+/// Parses a wikilink's raw inner text (the content between `[[` and
+/// `]]`) into its structured form, standalone — no surrounding file,
+/// no line number. Exposed via [`crate::parse_wikilink_inner`] for a
+/// caller (`tephra-graph`'s resolver, PR-5) that has only a stored
+/// `WikiLink::raw` / `LinkRow::to_raw` string and needs to re-derive
+/// the `@source` prefix / target / anchor / alias it encodes, without
+/// this crate's wikilink grammar (G3) being redefined a second time
+/// elsewhere and risking drift. `line` on the result is always
+/// whatever the caller passes (see [`crate::parse_wikilink_inner`]'s
+/// doc comment: `0`, since there is no real file context).
+pub(crate) fn parse_inner_standalone(inner: &str, line: usize) -> WikiLink {
+    parse_inner(inner, line)
+}
+
 /// Scans `body` for `[[wikilinks]]`. Returns the parsed links
 /// alongside the full raw byte span (including both pairs of
 /// brackets) of every successfully-closed `[[...]]` occurrence, so
