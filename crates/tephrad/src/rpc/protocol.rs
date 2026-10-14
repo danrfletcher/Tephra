@@ -30,6 +30,12 @@ pub const INVALID_PARAMS: i64 = -32602;
 pub const UNAUTHORIZED: i64 = -32001;
 pub const RESOLVE_ERROR: i64 = -32010;
 pub const SOURCE_ERROR: i64 = -32011;
+/// `link.preview_refactor`/`link.apply_refactor` plumbing failures
+/// (unknown source, no prior preview for an apply, an I/O error
+/// listing sources) — never used for an `apply_refactor` that ran
+/// but reported `"aborted"`/`"partial"` in its *result*; that is a
+/// normal successful RPC response, not an error (G7).
+pub const REFACTOR_ERROR: i64 = -32012;
 /// Standard JSON-RPC 2.0 "Internal error" (§5.1): used only when a
 /// dispatch call panicked inside its `tokio::task::spawn_blocking`
 /// task (R6) — a bug, not a client-facing validation/auth/domain

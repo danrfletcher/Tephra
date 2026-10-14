@@ -279,3 +279,164 @@ impl SourceBackend for SourceRegistry {
 fn registry_err_to_string(e: RegistryError) -> String {
     e.to_string()
 }
+
+/// Wire shape for one `link.preview_refactor` diff entry — a
+/// field-for-field mirror of [`crate::refactor::LinkChange`], kept
+/// separate (rather than deriving `Serialize` directly on that type
+/// and reusing it) only to match this module's existing convention of
+/// every wire shape living here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LinkChangeWire {
+    pub file: String,
+    pub line: usize,
+    pub before: String,
+    pub after: String,
+}
+
+impl From<crate::refactor::LinkChange> for LinkChangeWire {
+    fn from(c: crate::refactor::LinkChange) -> Self {
+        LinkChangeWire {
+            file: c.file,
+            line: c.line,
+            before: c.before,
+            after: c.after,
+        }
+    }
+}
+
+/// `link.preview_refactor`'s result shape: `{"changes": [...]}`.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RefactorPreviewWire {
+    pub changes: Vec<LinkChangeWire>,
+}
+
+/// One failed file in a `"partial"` `link.apply_refactor` result —
+/// field-for-field mirror of [`crate::refactor::FailedFile`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FailedFileWire {
+    pub file: String,
+    pub error: String,
+}
+
+impl From<crate::refactor::FailedFile> for FailedFileWire {
+    fn from(f: crate::refactor::FailedFile) -> Self {
+        FailedFileWire {
+            file: f.file,
+            error: f.error,
+        }
+    }
+}
+
+/// `link.apply_refactor`'s result shape. Serializes to exactly
+/// `{"status":"applied","files_changed":N}`,
+/// `{"status":"aborted","reason":"..."}`, or (the permission-denied-
+/// mid-apply edge case) `{"status":"partial","files_changed":N,"failed":[...]}` —
+/// `tephractl`'s own PR-7 render/CLI code only ever reads `"status"`
+/// and (for `"applied"`) `"files_changed"`, so `"partial"`'s extra
+/// `"failed"` field is additive and does not change that contract.
+#[derive(Debug, Clone, Serialize)]
+pub struct RefactorApplyWire {
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files_changed: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed: Option<Vec<FailedFileWire>>,
+}
+
+impl From<crate::refactor::ApplyOutcome> for RefactorApplyWire {
+    fn from(outcome: crate::refactor::ApplyOutcome) -> Self {
+        use crate::refactor::ApplyOutcome;
+        match outcome {
+            ApplyOutcome::Applied { files_changed } => RefactorApplyWire {
+                status: "applied".to_string(),
+                files_changed: Some(files_changed),
+                reason: None,
+                failed: None,
+            },
+            ApplyOutcome::Aborted { reason } => RefactorApplyWire {
+                status: "aborted".to_string(),
+                files_changed: None,
+                reason: Some(reason),
+                failed: None,
+            },
+            ApplyOutcome::Partial {
+                files_changed,
+                failed,
+            } => RefactorApplyWire {
+                status: "partial".to_string(),
+                files_changed: Some(files_changed),
+                reason: None,
+                failed: Some(failed.into_iter().map(FailedFileWire::from).collect()),
+            },
+        }
+    }
+}
+
+/// `link.preview_refactor` / `link.apply_refactor` (G7), behind a
+/// trait for the same reason as [`GraphBackend`]/[`SourceBackend`]:
+/// so a test substitutes an in-memory fake for the real
+/// [`crate::refactor::RefactorEngine`] without a real graph, registry,
+/// or filesystem.
+pub trait RefactorBackend: Send + Sync {
+    fn preview_refactor(
+        &self,
+        source: &str,
+        old_path: &str,
+        new_path: &str,
+    ) -> Result<RefactorPreviewWire, String>;
+    fn apply_refactor(
+        &self,
+        source: &str,
+        old_path: &str,
+        new_path: &str,
+    ) -> Result<RefactorApplyWire, String>;
+}
+
+impl RefactorBackend for crate::refactor::RefactorEngine {
+    fn preview_refactor(
+        &self,
+        source: &str,
+        old_path: &str,
+        new_path: &str,
+    ) -> Result<RefactorPreviewWire, String> {
+        self.preview(source, old_path, new_path)
+            .map(|changes| RefactorPreviewWire {
+                changes: changes.into_iter().map(LinkChangeWire::from).collect(),
+            })
+    }
+    fn apply_refactor(
+        &self,
+        source: &str,
+        old_path: &str,
+        new_path: &str,
+    ) -> Result<RefactorApplyWire, String> {
+        self.apply(source, old_path, new_path)
+            .map(RefactorApplyWire::from)
+    }
+}
+
+/// A [`RefactorBackend`] that always errors — for tests/fixtures that
+/// construct an [`crate::rpc::server::AppState`] without exercising
+/// `link.preview_refactor`/`link.apply_refactor` at all.
+pub struct UnsupportedRefactor;
+
+impl RefactorBackend for UnsupportedRefactor {
+    fn preview_refactor(
+        &self,
+        _source: &str,
+        _old_path: &str,
+        _new_path: &str,
+    ) -> Result<RefactorPreviewWire, String> {
+        Err("refactor backend not configured for this test fixture".to_string())
+    }
+    fn apply_refactor(
+        &self,
+        _source: &str,
+        _old_path: &str,
+        _new_path: &str,
+    ) -> Result<RefactorApplyWire, String> {
+        Err("refactor backend not configured for this test fixture".to_string())
+    }
+}

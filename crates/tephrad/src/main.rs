@@ -21,7 +21,7 @@ use std::sync::Arc;
 use cli::Action;
 use serde_json::json;
 use tephrad::registry::{DaemonEvent, SourceRegistry};
-use tephrad::rpc::backend::{GraphBackend, SourceBackend};
+use tephrad::rpc::backend::{GraphBackend, RefactorBackend, SourceBackend};
 use tephrad::rpc::server::{build_router, AppState};
 use tokio::sync::broadcast::error::RecvError;
 
@@ -346,8 +346,13 @@ fn run_server(
 
         let state = Arc::new(AppState::with_shutdown(
             token_path.to_path_buf(),
-            shared_graph as Arc<dyn GraphBackend>,
+            shared_graph.clone() as Arc<dyn GraphBackend>,
             registry.clone() as Arc<dyn SourceBackend>,
+            Arc::new(tephrad::refactor::RefactorEngine::new(
+                shared_graph as Arc<dyn GraphBackend>,
+                registry.clone() as Arc<dyn SourceBackend>,
+                registry.clone() as Arc<dyn tephrad::refactor::WatcherPauseControl>,
+            )) as Arc<dyn RefactorBackend>,
             Some(graph_refresh),
             Some(shutdown_rx.clone()),
         ));
