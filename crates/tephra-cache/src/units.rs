@@ -133,6 +133,146 @@ pub(crate) fn get_unit(conn: &Connection, id: i64) -> Result<Option<UnitRow>, Ca
     .map_err(CacheError::from)
 }
 
+/// The one `units` row at `(source_id, rel_path)`, if any — the
+/// `UNIQUE(source_id, rel_path)` constraint guarantees at most one.
+/// Used by a caller (e.g. the watcher's debounced change-apply
+/// pipeline, PR-4) that knows a file's path but not its row id, to
+/// find the existing row it needs to replace on an edit.
+pub(crate) fn get_unit_by_rel_path(
+    conn: &Connection,
+    source_id: i64,
+    rel_path: &str,
+) -> Result<Option<UnitRow>, CacheError> {
+    conn.query_row(
+        "SELECT id, source_id, rel_path, mtime, frontmatter_json \
+         FROM units WHERE source_id = ?1 AND rel_path = ?2",
+        rusqlite::params![source_id, rel_path],
+        |row| {
+            Ok(UnitRow {
+                id: row.get(0)?,
+                source_id: row.get(1)?,
+                rel_path: row.get(2)?,
+                mtime: row.get(3)?,
+                frontmatter_json: row.get(4)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(CacheError::from)
+}
+
+/// Deletes one `units` row and everything that cascades from it:
+/// `links` rows it authored (`from_unit_id = unit_id`), its `tags`
+/// and `blocks` rows, and — defensively, since nothing in this
+/// workspace resolves `to_unit_id` yet (that's PR-5's job) — any
+/// `links.to_unit_id` elsewhere that happened to point at it is first
+/// nulled out rather than left dangling or rejected by the foreign
+/// key. A no-op (not an error) if `unit_id` doesn't exist.
+pub(crate) fn delete_unit(conn: &Connection, unit_id: i64) -> Result<(), CacheError> {
+    conn.execute(
+        "UPDATE links SET to_unit_id = NULL WHERE to_unit_id = ?1",
+        [unit_id],
+    )?;
+    conn.execute("DELETE FROM links WHERE from_unit_id = ?1", [unit_id])?;
+    conn.execute("DELETE FROM tags WHERE unit_id = ?1", [unit_id])?;
+    conn.execute("DELETE FROM blocks WHERE unit_id = ?1", [unit_id])?;
+    conn.execute("DELETE FROM units WHERE id = ?1", [unit_id])?;
+    Ok(())
+}
+
+/// Deletes every `units`/`links`/`tags`/`blocks` row belonging to
+/// `source_id`, leaving every other source's rows (and the `sources`
+/// row itself) untouched — the scoped clear a rescan uses before
+/// re-walking just this one source (never a global rebuild; that's
+/// [`crate::Cache::rebuild`]'s job, gated by schema version, F2).
+pub(crate) fn delete_units_for_source(conn: &Connection, source_id: i64) -> Result<(), CacheError> {
+    conn.execute(
+        "UPDATE links SET to_unit_id = NULL \
+         WHERE to_unit_id IN (SELECT id FROM units WHERE source_id = ?1)",
+        [source_id],
+    )?;
+    conn.execute(
+        "DELETE FROM links WHERE from_unit_id IN (SELECT id FROM units WHERE source_id = ?1)",
+        [source_id],
+    )?;
+    conn.execute(
+        "DELETE FROM tags WHERE unit_id IN (SELECT id FROM units WHERE source_id = ?1)",
+        [source_id],
+    )?;
+    conn.execute(
+        "DELETE FROM blocks WHERE unit_id IN (SELECT id FROM units WHERE source_id = ?1)",
+        [source_id],
+    )?;
+    conn.execute("DELETE FROM units WHERE source_id = ?1", [source_id])?;
+    Ok(())
+}
+
+/// Deletes every `units` row (and cascading `links`/`tags`/`blocks`
+/// rows) whose `rel_path` is nested under `rel_prefix` — i.e. starts
+/// with `"<rel_prefix>/"` — scoped to `source_id`. Leaves a row at
+/// `rel_prefix` itself (an exact match, not a nested one) untouched;
+/// callers that also need that exact row gone call
+/// [`delete_unit`]/[`get_unit_by_rel_path`] separately.
+///
+/// Used by the watcher's batch-apply path (PR-4) when a changed path
+/// no longer exists on disk and was a directory rather than a file: a
+/// shell `mv` of a directory out of a source arrives as exactly one
+/// such event, naming only the directory itself, so every unit row
+/// that used to live under it must be cleaned up explicitly or it
+/// would be left behind as a stale row forever. Returns the number of
+/// `units` rows removed, so a caller can tell whether anything was
+/// actually there to delete.
+///
+/// Matches via a plain binary range comparison, not `LIKE` (R10
+/// review finding): SQLite's `LIKE` is case-insensitive for ASCII by
+/// default (so a sibling directory differing only in case, e.g.
+/// `Docs` vs `docs`, would also match) and treats a bare `_` or `%` in
+/// the pattern as a wildcard rather than a literal character (so a
+/// real directory named `a_b` or `a%` would delete unrelated rows
+/// under `acb`/`aQQ` or any single-character variant) — neither
+/// requires an actual nested path, just an unlucky name. Every
+/// `rel_path` nested under `rel_prefix` starts with
+/// `"<rel_prefix>/"`; in a byte-wise (`BINARY`, SQLite's default
+/// collation) comparison, every such string sorts at or after
+/// `"<rel_prefix>/"` and strictly before `"<rel_prefix>0"`, because
+/// `/` (0x2F) sorts immediately before `0` (0x30) and nothing can sort
+/// between two adjacent byte values — so this range exactly (and only
+/// ever) captures paths nested under `rel_prefix`, with no escaping
+/// and no case-folding surprises.
+pub(crate) fn delete_units_under_prefix(
+    conn: &Connection,
+    source_id: i64,
+    rel_prefix: &str,
+) -> Result<usize, CacheError> {
+    let lower = format!("{rel_prefix}/");
+    let upper = format!("{rel_prefix}0");
+    conn.execute(
+        "UPDATE links SET to_unit_id = NULL WHERE to_unit_id IN \
+         (SELECT id FROM units WHERE source_id = ?1 AND rel_path >= ?2 AND rel_path < ?3)",
+        rusqlite::params![source_id, lower, upper],
+    )?;
+    conn.execute(
+        "DELETE FROM links WHERE from_unit_id IN \
+         (SELECT id FROM units WHERE source_id = ?1 AND rel_path >= ?2 AND rel_path < ?3)",
+        rusqlite::params![source_id, lower, upper],
+    )?;
+    conn.execute(
+        "DELETE FROM tags WHERE unit_id IN \
+         (SELECT id FROM units WHERE source_id = ?1 AND rel_path >= ?2 AND rel_path < ?3)",
+        rusqlite::params![source_id, lower, upper],
+    )?;
+    conn.execute(
+        "DELETE FROM blocks WHERE unit_id IN \
+         (SELECT id FROM units WHERE source_id = ?1 AND rel_path >= ?2 AND rel_path < ?3)",
+        rusqlite::params![source_id, lower, upper],
+    )?;
+    let deleted = conn.execute(
+        "DELETE FROM units WHERE source_id = ?1 AND rel_path >= ?2 AND rel_path < ?3",
+        rusqlite::params![source_id, lower, upper],
+    )?;
+    Ok(deleted)
+}
+
 /// Every `units` row belonging to the source named `source_name`,
 /// each paired with that source's current status. Returns cached rows
 /// for an offline source too (E2) rather than an empty result — the
