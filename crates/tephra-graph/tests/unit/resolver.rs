@@ -123,11 +123,15 @@ fn table_driven_resolve_link_cases() {
                 );
             }
             Expect::Ambiguous => match result {
-                Err(ResolveError::Ambiguous { candidates, .. }) => {
+                Err(ResolveError::Ambiguous { mut candidates, .. }) => {
+                    candidates.sort();
                     assert_eq!(
-                        candidates.len(),
-                        2,
-                        "case \"{}\": expected exactly 2 tied candidates",
+                        candidates,
+                        vec![
+                            "@notes:teamA/Shared.md".to_string(),
+                            "@notes:teamB/Shared.md".to_string(),
+                        ],
+                        "case \"{}\": expected every tied candidate listed, not just a count",
                         case.name
                     );
                 }
@@ -189,4 +193,74 @@ fn an_offline_source_is_still_resolvable_and_flagged_offline() {
 
     let resolved = graph.resolve_link("[[Journal]]", Some("notes")).unwrap();
     assert!(resolved.unit.offline);
+}
+
+/// R6: a file whose name is stored NFD-normalized on disk (common on
+/// macOS/HFS+/APFS — `cafe` + combining U+0301, byte-distinct from
+/// the precomposed `é`) still resolves from an NFC-typed `[[café]]`
+/// wikilink target, rather than silently failing with `Unresolved`
+/// because the two strings differ byte-for-byte.
+#[test]
+fn an_nfd_normalized_stored_filename_resolves_from_an_nfc_typed_link_target() {
+    let nfd_name = "cafe\u{0301} notes.md"; // "café notes.md", NFD form
+    let nfc_target = "caf\u{00e9} notes"; // "café notes", NFC form
+
+    let mut graph = UnitGraph::new();
+    graph.upsert_unit("notes", nfd_name, empty_facts());
+
+    let resolved = graph
+        .resolve_link(&format!("[[{nfc_target}]]"), Some("notes"))
+        .expect("an NFC-typed link should resolve an NFD-stored filename");
+    assert_eq!(resolved.unit.id, format!("@notes:{nfd_name}"));
+    // The stored rel_path itself is untouched — byte-exact, still NFD.
+    assert_eq!(resolved.unit.rel_path, nfd_name);
+}
+
+/// E4's "resolves to the shortest relative path" branch, exercised
+/// directly rather than only asserted via `candidates.len()`: a root
+/// `Shared.md` (matched length 6) and a nested `teamA/Shared.md`
+/// (matched length 12) are not a tie — the shorter one wins outright,
+/// with no `Ambiguous` error at all.
+#[test]
+fn a_shorter_candidate_wins_outright_over_a_longer_one_rather_than_tying() {
+    let mut graph = UnitGraph::new();
+    graph.upsert_unit("notes", "Shared.md", empty_facts());
+    graph.upsert_unit("notes", "teamA/Shared.md", empty_facts());
+
+    let resolved = graph
+        .resolve_link("[[Shared]]", Some("notes"))
+        .expect("the shorter root-level candidate should win outright");
+    assert_eq!(resolved.unit.id, "@notes:Shared.md");
+}
+
+/// R1: a markdown-style link target with its file extension still on
+/// it (`B.md`, as a real editor writes one) resolves exactly like the
+/// bare-name wikilink form, not as a dangling edge.
+#[test]
+fn a_wikilink_target_with_a_file_extension_resolves_the_same_as_without_one() {
+    let mut graph = UnitGraph::new();
+    graph.upsert_unit("notes", "B.md", empty_facts());
+
+    let resolved = graph
+        .resolve_link("[[B.md]]", Some("notes"))
+        .expect("a .md-suffixed wikilink target should resolve");
+    assert_eq!(resolved.unit.id, "@notes:B.md");
+}
+
+/// R6: a target with a `#`/`^` anchor resolves by its target alone,
+/// both for a plain heading anchor and a federated cross-source
+/// target — the anchor text itself is never part of the match key.
+#[test]
+fn a_target_with_a_heading_or_block_anchor_resolves_by_its_target_alone() {
+    let graph = fixture_graph();
+
+    let resolved = graph
+        .resolve_link("[[teamA/Shared#Some Heading]]", Some("notes"))
+        .expect("the #anchor suffix must not prevent resolution");
+    assert_eq!(resolved.unit.id, "@notes:teamA/Shared.md");
+
+    let resolved = graph
+        .resolve_link("[[@atlas-repo:README#^some-block]]", Some("notes"))
+        .expect("a federated target with a block anchor should still resolve");
+    assert_eq!(resolved.unit.id, "@atlas-repo:README.md");
 }

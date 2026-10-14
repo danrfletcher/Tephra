@@ -49,10 +49,14 @@ fn builds_a_federated_graph_from_two_real_sources_and_resolves_across_them() {
     );
 
     // Journal.md's own outgoing links: cross-source to README, a
-    // self-link by name, a same-file anchor self-link, and a
-    // dangling target — four edges, exactly one dangling.
+    // self-link, and a dangling target. The self-link by name
+    // ([[Journal]]) and the same-file anchor self-link ([[#Journal]])
+    // both resolve to the exact same (from, to) pair, so they
+    // collapse to one edge (R2: "a self-reference is represented once
+    // per direction, no duplicate edges") rather than two — three
+    // edges total, exactly one dangling.
     let journal_forward = graph.get_forward_links("@notes:Journal.md");
-    assert_eq!(journal_forward.len(), 4);
+    assert_eq!(journal_forward.len(), 3);
     let dangling_count = journal_forward
         .iter()
         .filter(|e| e.to == EdgeTarget::Dangling)
@@ -76,8 +80,16 @@ fn an_ambiguous_basename_target_in_the_repo_fixture_is_reported_as_ambiguous() {
 
     let result = graph.resolve_link("[[Guide]]", Some("atlas-repo"));
     match result {
-        Err(tephra_graph::ResolveError::Ambiguous { candidates, .. }) => {
-            assert_eq!(candidates.len(), 2);
+        Err(tephra_graph::ResolveError::Ambiguous { mut candidates, .. }) => {
+            candidates.sort();
+            assert_eq!(
+                candidates,
+                vec![
+                    "@atlas-repo:api/Guide.md".to_string(),
+                    "@atlas-repo:lib/Guide.md".to_string(),
+                ],
+                "E4: every tied candidate is listed, not just the count"
+            );
         }
         other => panic!("expected Ambiguous, got {other:?}"),
     }

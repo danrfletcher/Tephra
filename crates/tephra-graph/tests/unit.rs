@@ -4,6 +4,8 @@
 
 #[path = "unit/large_fan_in.rs"]
 mod large_fan_in;
+#[path = "unit/markdown_links.rs"]
+mod markdown_links;
 #[path = "unit/model.rs"]
 mod model;
 #[path = "unit/query.rs"]

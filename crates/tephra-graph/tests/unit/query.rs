@@ -83,4 +83,58 @@ fn get_edges_is_returned_in_a_stable_sorted_order_across_calls() {
     let second = graph.get_edges();
     assert_eq!(first, second);
     assert!(first.len() >= 2);
+
+    // Not just equal across calls — actually sorted: shuffling the
+    // result and re-sorting it the same way must be a no-op.
+    let mut resorted = first.clone();
+    resorted.sort_by(|a, b| {
+        (
+            a.from.as_str(),
+            format!("{:?}", a.to),
+            a.kind.as_str(),
+            a.to_raw.as_str(),
+        )
+            .cmp(&(
+                b.from.as_str(),
+                format!("{:?}", b.to),
+                b.kind.as_str(),
+                b.to_raw.as_str(),
+            ))
+    });
+    assert_eq!(
+        first, resorted,
+        "get_edges' own output must already be sorted"
+    );
+}
+
+/// R2: two unresolved links from the same unit to two genuinely
+/// different, nonexistent targets are *not* collapsed into one
+/// dangling edge just because both are dangling — only an exact
+/// repeat of the identical raw link collapses.
+#[test]
+fn two_different_dangling_targets_from_the_same_unit_both_survive() {
+    let mut graph = UnitGraph::new();
+    graph.upsert_unit("notes", "A.md", facts_with_links(&["Foo", "Bar"]));
+
+    let forward = graph.get_forward_links("@notes:A.md");
+    assert_eq!(forward.len(), 2, "{forward:?}");
+    assert!(forward.iter().all(|e| e.to == EdgeTarget::Dangling));
+    let mut raws: Vec<&str> = forward.iter().map(|e| e.to_raw.as_str()).collect();
+    raws.sort();
+    assert_eq!(raws, vec!["Bar", "Foo"]);
+}
+
+/// R2: `get_edges`, `get_forward_links`, and `get_backlinks` are all
+/// de-duplicated against the exact same underlying edge set — a
+/// duplicate link shows up exactly once in every one of them, not
+/// just in `get_edges`.
+#[test]
+fn every_query_verb_agrees_on_the_same_deduplicated_edge_count() {
+    let mut graph = UnitGraph::new();
+    graph.upsert_unit("notes", "A.md", facts_with_links(&["B", "B", "B"]));
+    graph.upsert_unit("notes", "B.md", empty_facts());
+
+    assert_eq!(graph.get_edges().len(), 1);
+    assert_eq!(graph.get_forward_links("@notes:A.md").len(), 1);
+    assert_eq!(graph.get_backlinks("@notes:B.md").len(), 1);
 }

@@ -10,10 +10,12 @@
 //! `tephrad` (F3).
 
 use std::path::Path;
+use std::time::Instant;
 
 use tempfile::tempdir;
 
 use crate::fixtures::open_temp_cache;
+use tephra_cache::{Cache, NewLink, NewUnit, SourceStatus};
 use tephra_graph::{ChangeNotification, EdgeTarget, UnitGraph};
 
 /// Writes `rel_path` under `source_root` with `content`, inserting
@@ -189,4 +191,112 @@ fn apply_change_notification_rejects_an_unregistered_source_name() {
         result,
         Err(tephra_graph::GraphError::UnknownSource(_))
     ));
+}
+
+/// R3: `apply_change_notification`'s incremental update is scoped to
+/// the changed unit's own links plus whatever already-dangling edges
+/// might now resolve to it — not a full re-resolution of every link
+/// in the source. A full rebuild (the pre-fix behaviour) costs
+/// quadratically more as the source grows (the probe measured 0.63s
+/// at 2,000 units, 2.7s at 4,000, 11.1s at 8,000, with 5 links per
+/// unit); a properly scoped update costs roughly the same regardless
+/// of source size.
+#[test]
+fn applying_one_edit_in_a_large_source_recomputes_in_roughly_constant_time_not_proportional_to_source_size(
+) {
+    fn seed(cache: &Cache, source_id: i64, n: usize) {
+        for i in 0..n {
+            let rel_path = format!("Unit{i}.md");
+            let unit_id = cache
+                .insert_unit(&NewUnit {
+                    source_id,
+                    rel_path: &rel_path,
+                    mtime: None,
+                    frontmatter_json: None,
+                })
+                .expect("insert unit");
+            for k in 1..=5 {
+                let target = format!("Unit{}", (i + k) % n);
+                cache
+                    .insert_link(&NewLink {
+                        from_unit_id: unit_id,
+                        to_raw: &target,
+                        to_unit_id: None,
+                        kind: tephra_parser::LINK_KIND_WIKILINK,
+                    })
+                    .expect("insert link");
+            }
+        }
+    }
+
+    fn time_one_edit(n: usize) -> std::time::Duration {
+        let dir = tempdir().expect("tempdir");
+        let cache = Cache::open(dir.path().join("cache.db")).expect("open cache");
+        let source_id = cache
+            .register_source("notes", "/tmp/notes", SourceStatus::Active)
+            .expect("register_source");
+        seed(&cache, source_id, n);
+
+        // Building the full graph (one-time O(nodes + edges) cost) is
+        // not counted against the per-edit bound below.
+        let mut graph = UnitGraph::build_from_cache(&cache).expect("build_from_cache");
+
+        // Edit Unit0's own content: same scenario the probe measured
+        // as quadratic before the fix ("editing one file").
+        let existing = cache
+            .get_unit_by_rel_path(source_id, "Unit0.md")
+            .expect("get_unit_by_rel_path")
+            .expect("Unit0.md exists");
+        cache.delete_unit(existing.id).expect("delete_unit");
+        let new_unit_id = cache
+            .insert_unit(&NewUnit {
+                source_id,
+                rel_path: "Unit0.md",
+                mtime: None,
+                frontmatter_json: None,
+            })
+            .expect("re-insert unit");
+        for k in 1..=5 {
+            let target = format!("Unit{}", k % n);
+            cache
+                .insert_link(&NewLink {
+                    from_unit_id: new_unit_id,
+                    to_raw: &target,
+                    to_unit_id: None,
+                    kind: tephra_parser::LINK_KIND_WIKILINK,
+                })
+                .expect("insert link");
+        }
+
+        let started = Instant::now();
+        graph
+            .apply_change_notification(
+                &cache,
+                &ChangeNotification {
+                    source: "notes".to_string(),
+                    rel_paths: vec!["Unit0.md".to_string()],
+                },
+            )
+            .expect("apply_change_notification");
+        started.elapsed()
+    }
+
+    let small = time_one_edit(2_000);
+    let large = time_one_edit(8_000);
+
+    // A quadratic rebuild would cost roughly 16x more at 4x the
+    // units; a properly scoped update costs roughly the same
+    // regardless of source size. Generous multiplicative bound (plus
+    // a fixed slack term) to avoid flaking on a slow CI box while
+    // still catching a regression back to a full, O(units-in-source)
+    // rebuild per edit.
+    assert!(
+        large.as_secs_f64() < small.as_secs_f64() * 4.0 + 0.05,
+        "editing one unit at 8,000 units took {large:?}, at 2,000 units took {small:?} \
+         — expected roughly constant time, not scaling with source size"
+    );
+    assert!(
+        large.as_millis() < 100,
+        "a single scoped update should stay well under 100ms even at 8,000 units: {large:?}"
+    );
 }

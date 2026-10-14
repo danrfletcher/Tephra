@@ -95,7 +95,14 @@ fn removing_a_unit_removes_its_node_and_every_edge_that_targeted_it() {
     let forward = graph.get_forward_links("@notes:One.md");
     assert_eq!(forward.len(), 1);
     assert_eq!(forward[0].to, EdgeTarget::Dangling);
-    assert!(graph.get_backlinks("@notes:Two.md").is_empty());
+    // R4/GP7: querying backlinks on the now-removed id still finds
+    // the edge that still intends to target it (now dangling) — see
+    // `get_backlinks_on_a_renamed_notes_old_id_still_finds_every_impacted_incoming_link`
+    // for the full cross-source rename scenario this enables.
+    let stale_backlinks = graph.get_backlinks("@notes:Two.md");
+    assert_eq!(stale_backlinks.len(), 1);
+    assert_eq!(stale_backlinks[0].from, "@notes:One.md");
+    assert_eq!(stale_backlinks[0].to, EdgeTarget::Dangling);
 }
 
 #[test]
@@ -162,4 +169,117 @@ fn an_empty_target_wikilink_resolves_to_the_referring_unit_itself() {
         forward[0].to,
         EdgeTarget::Resolved("@notes:Journal.md".to_string())
     );
+}
+
+/// R2: a note that links to the same target twice (identical raw
+/// text) produces exactly one edge, and the target has exactly one
+/// backlink, not two.
+#[test]
+fn a_duplicate_identical_link_is_represented_once_not_twice() {
+    let mut graph = UnitGraph::new();
+    graph.upsert_unit(
+        "notes",
+        "A.md",
+        facts(&[("B", "wikilink"), ("B", "wikilink")], &[], &[]),
+    );
+    graph.upsert_unit("notes", "B.md", facts(&[], &[], &[]));
+
+    assert_eq!(graph.get_forward_links("@notes:A.md").len(), 1);
+    assert_eq!(graph.get_backlinks("@notes:B.md").len(), 1);
+    assert_eq!(graph.get_edges().len(), 1);
+}
+
+/// R2: three differently-spelled self-references — a same-file
+/// anchor-only link, a bare self-name, and a self-name with an
+/// anchor — all resolve to the exact same (from, to) self-edge, so
+/// they collapse to one, not three.
+#[test]
+fn three_different_spellings_of_a_self_reference_collapse_to_one_edge() {
+    let mut graph = UnitGraph::new();
+    graph.upsert_unit(
+        "notes",
+        "A.md",
+        facts(
+            &[("A", "wikilink"), ("#H", "wikilink"), ("A#H", "wikilink")],
+            &[],
+            &[],
+        ),
+    );
+
+    let forward = graph.get_forward_links("@notes:A.md");
+    assert_eq!(forward.len(), 1, "{forward:?}");
+    assert_eq!(
+        forward[0].to,
+        EdgeTarget::Resolved("@notes:A.md".to_string())
+    );
+    assert_eq!(graph.get_edges().len(), 1);
+}
+
+/// R8: a unit's tags and blocks are replaced, not accumulated, on an
+/// update — the same guarantee `updating_a_unit_replaces_its_old_links_rather_than_accumulating_them`
+/// already proves for links.
+#[test]
+fn updating_a_unit_replaces_its_old_tags_and_blocks_rather_than_accumulating_them() {
+    let mut graph = UnitGraph::new();
+    graph.upsert_unit("notes", "One.md", facts(&[], &["old-tag"], &["old-block"]));
+    assert_eq!(
+        graph.unit("@notes:One.md").unwrap().tags,
+        vec!["old-tag".to_string()]
+    );
+
+    graph.upsert_unit("notes", "One.md", facts(&[], &["new-tag"], &["new-block"]));
+
+    let unit = graph.unit("@notes:One.md").unwrap();
+    assert_eq!(unit.tags, vec!["new-tag".to_string()]);
+    assert_eq!(unit.blocks, vec!["new-block".to_string()]);
+}
+
+/// R8: removing a unit removes its tags/blocks along with the node
+/// itself — there is nowhere left to read them back from.
+#[test]
+fn removing_a_unit_leaves_no_trace_of_its_tags_or_blocks() {
+    let mut graph = UnitGraph::new();
+    graph.upsert_unit("notes", "One.md", facts(&[], &["tag"], &["block"]));
+    assert!(graph.unit("@notes:One.md").is_some());
+
+    graph.remove_unit("notes", "One.md");
+
+    assert!(graph.unit("@notes:One.md").is_none());
+}
+
+/// GP7 (partial): a renamed note's incoming links, from both its own
+/// source and a federated cross-source reference, are still
+/// discoverable via `get_backlinks` queried with the *old* id after
+/// the watcher's remove+upsert pair has applied the rename — the
+/// exact candidate set PR-8's refactor preview must consume (R4).
+#[test]
+fn get_backlinks_on_a_renamed_notes_old_id_still_finds_every_impacted_incoming_link() {
+    let mut graph = UnitGraph::new();
+    graph.upsert_unit("notes", "OldDoc.md", facts(&[], &[], &[]));
+    graph.upsert_unit("notes", "N1.md", facts(&[("OldDoc", "wikilink")], &[], &[]));
+    graph.upsert_unit(
+        "atlas-repo",
+        "R1.md",
+        facts(&[("@notes:OldDoc", "wikilink")], &[], &[]),
+    );
+
+    assert_eq!(graph.get_backlinks("@notes:OldDoc.md").len(), 2);
+
+    // The watcher applies the rename as remove-old, then upsert-new.
+    graph.remove_unit("notes", "OldDoc.md");
+    graph.upsert_unit("notes", "NewDoc.md", facts(&[], &[], &[]));
+
+    // The old id is gone as a node, but every link that still names
+    // it (now dangling) remains discoverable through it, across both
+    // sources.
+    let stale_backlinks = graph.get_backlinks("@notes:OldDoc.md");
+    assert_eq!(stale_backlinks.len(), 2, "{stale_backlinks:?}");
+    let mut froms: Vec<&str> = stale_backlinks.iter().map(|e| e.from.as_str()).collect();
+    froms.sort();
+    assert_eq!(froms, vec!["@atlas-repo:R1.md", "@notes:N1.md"]);
+    assert!(stale_backlinks.iter().all(|e| e.to == EdgeTarget::Dangling));
+
+    // The new id has no backlinks yet — nothing has been repointed at
+    // it (that's PR-8's `link.apply_refactor` job, out of scope here).
+    assert!(graph.get_backlinks("@notes:NewDoc.md").is_empty());
 }

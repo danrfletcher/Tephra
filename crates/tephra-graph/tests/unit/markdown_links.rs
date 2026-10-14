@@ -1,0 +1,157 @@
+//! `tests/unit/markdown_links.rs` (R1): a markdown-style
+//! `[text](target)` link resolves with its file extension still on
+//! it, a leading `./`, percent-encoding, and — the part most prone to
+//! silent breakage — relative to the *linking file's own directory*,
+//! not the source root. Built from the real `tephra_parser` markdown
+//! pass (not hand-written `UnitFacts::links` tuples) for the
+//! extension/encoding cases, so this exercises the exact `to_raw`
+//! shape a real file produces.
+
+use tephra_graph::{EdgeTarget, UnitFacts, UnitGraph};
+
+fn markdown_links_in(path: &str, body: &str) -> Vec<(String, String)> {
+    let parsed = tephra_parser::parse_unit_bytes(std::path::Path::new(path), body.as_bytes())
+        .expect("fixture body is valid UTF-8");
+    parsed
+        .to_new_links(1)
+        .iter()
+        .map(|l| (l.to_raw.to_string(), l.kind.to_string()))
+        .collect()
+}
+
+fn empty_facts() -> UnitFacts {
+    UnitFacts::default()
+}
+
+#[test]
+fn markdown_links_with_extensions_dot_slash_and_percent_encoding_all_resolve() {
+    let body = "# A\n\n\
+        [x](B.md) and again [z](./B.md), plus [y](sub/C.md) and \
+        [w](caf%C3%A9%20notes.md).\n";
+    let links = markdown_links_in("A.md", body);
+    assert_eq!(
+        links.len(),
+        4,
+        "sanity: the real parser found all four links"
+    );
+
+    let mut graph = UnitGraph::new();
+    graph.upsert_unit(
+        "notes",
+        "A.md",
+        UnitFacts {
+            links,
+            ..Default::default()
+        },
+    );
+    graph.upsert_unit("notes", "B.md", empty_facts());
+    graph.upsert_unit("notes", "sub/C.md", empty_facts());
+    graph.upsert_unit("notes", "café notes.md", empty_facts());
+
+    let forward = graph.get_forward_links("@notes:A.md");
+    assert!(
+        forward
+            .iter()
+            .all(|e| matches!(e.to, EdgeTarget::Resolved(_))),
+        "every markdown link should resolve, none dangling: {forward:?}"
+    );
+
+    // [x](B.md) and [z](./B.md) both resolve to the exact same unit,
+    // so they collapse to one edge (R2) — three distinct resolved
+    // targets, not four edges.
+    assert_eq!(forward.len(), 3, "{forward:?}");
+    let targets: std::collections::HashSet<String> = forward
+        .iter()
+        .map(|e| match &e.to {
+            EdgeTarget::Resolved(id) => id.clone(),
+            EdgeTarget::Dangling => unreachable!(),
+        })
+        .collect();
+    assert!(targets.contains("@notes:B.md"));
+    assert!(targets.contains("@notes:sub/C.md"));
+    assert!(targets.contains("@notes:café notes.md"));
+}
+
+/// R1's core fix: a bare (no leading `./`) relative markdown target
+/// resolves against the *linking file's own directory*, not the
+/// source root — even when a same-named file also exists at the
+/// root, and even though the root file would otherwise look like the
+/// "shortest" E4 candidate.
+#[test]
+fn a_markdown_link_resolves_relative_to_its_own_directory_not_the_source_root() {
+    let mut graph = UnitGraph::new();
+    graph.upsert_unit(
+        "notes",
+        "sub/A.md",
+        UnitFacts {
+            links: vec![(
+                "Sibling.md".to_string(),
+                tephra_parser::LINK_KIND_MARKDOWN.to_string(),
+            )],
+            ..Default::default()
+        },
+    );
+    graph.upsert_unit("notes", "sub/Sibling.md", empty_facts());
+    // A root-level file of the same bare name: the directory-relative
+    // sibling must win, not this one, even though it's "shorter".
+    graph.upsert_unit("notes", "Sibling.md", empty_facts());
+
+    let forward = graph.get_forward_links("@notes:sub/A.md");
+    assert_eq!(forward.len(), 1);
+    assert_eq!(
+        forward[0].to,
+        EdgeTarget::Resolved("@notes:sub/Sibling.md".to_string())
+    );
+}
+
+/// A `../`-relative markdown target resolves against the parent of
+/// the linking file's own directory.
+#[test]
+fn a_markdown_link_with_dot_dot_resolves_relative_to_the_parent_directory() {
+    let mut graph = UnitGraph::new();
+    graph.upsert_unit(
+        "notes",
+        "sub/A.md",
+        UnitFacts {
+            links: vec![(
+                "../Root.md".to_string(),
+                tephra_parser::LINK_KIND_MARKDOWN.to_string(),
+            )],
+            ..Default::default()
+        },
+    );
+    graph.upsert_unit("notes", "Root.md", empty_facts());
+
+    let forward = graph.get_forward_links("@notes:sub/A.md");
+    assert_eq!(forward.len(), 1);
+    assert_eq!(
+        forward[0].to,
+        EdgeTarget::Resolved("@notes:Root.md".to_string())
+    );
+}
+
+/// A markdown link's `#anchor` suffix is stripped before matching,
+/// the same as a wikilink's.
+#[test]
+fn a_markdown_link_with_a_heading_anchor_resolves_by_its_target_alone() {
+    let mut graph = UnitGraph::new();
+    graph.upsert_unit(
+        "notes",
+        "A.md",
+        UnitFacts {
+            links: vec![(
+                "B.md#Some-Heading".to_string(),
+                tephra_parser::LINK_KIND_MARKDOWN.to_string(),
+            )],
+            ..Default::default()
+        },
+    );
+    graph.upsert_unit("notes", "B.md", empty_facts());
+
+    let forward = graph.get_forward_links("@notes:A.md");
+    assert_eq!(forward.len(), 1);
+    assert_eq!(
+        forward[0].to,
+        EdgeTarget::Resolved("@notes:B.md".to_string())
+    );
+}
