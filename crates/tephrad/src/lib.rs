@@ -9,3 +9,4 @@ pub mod ignore;
 pub mod registry;
 pub mod scan;
 pub mod watcher;
+mod writer_gate;
