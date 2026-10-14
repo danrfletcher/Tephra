@@ -112,6 +112,14 @@ where
 }
 
 /// Parses the full argv (excluding argv[0]) into an [`Action`].
+///
+/// `--json`/`--addr` are accepted both as leading flags (before the
+/// subcommand word, matching the `GLOBAL OPTIONS` section of
+/// [`USAGE`]) and as trailing flags (after a subcommand's own
+/// positional args, matching every existing fixture/test) — R7: the
+/// documented usage showed them as global, but only the trailing
+/// form used to parse; `tephractl --json source list` failed with
+/// "unrecognized command: --json".
 pub fn parse_args<I, S>(args: I) -> Result<Action, ArgsError>
 where
     I: IntoIterator<Item = S>,
@@ -122,14 +130,38 @@ where
         return Ok(Action::Help);
     }
 
-    let mut iter = owned.iter().map(String::as_str);
-    let head = iter.next().expect("non-empty checked above");
+    let mut iter = owned.iter().map(String::as_str).peekable();
+
+    // R7: consume any `--json`/`--addr <addr>` that appear *before*
+    // the subcommand word, so the documented "GLOBAL OPTIONS" usage
+    // (`tephractl --json source list`, `tephractl --addr <addr>
+    // status`) actually parses.
+    let mut leading_json = false;
+    let mut leading_addr: Option<String> = None;
+    loop {
+        match iter.peek() {
+            Some(&"--json") => {
+                iter.next();
+                leading_json = true;
+            }
+            Some(&"--addr") => {
+                iter.next();
+                leading_addr = Some(take_value(&mut iter, "--addr")?);
+            }
+            _ => break,
+        }
+    }
+
+    let head = match iter.next() {
+        Some(h) => h,
+        None => return Ok(Action::Help),
+    };
 
     if head == "-h" || head == "--help" {
         return Ok(Action::Help);
     }
 
-    let (command, json, addr) = match head {
+    let (command, trailing_json, trailing_addr) = match head {
         "source" => parse_source(&mut iter)?,
         "status" => parse_status(&mut iter)?,
         "link" => parse_link(&mut iter)?,
@@ -138,8 +170,8 @@ where
 
     Ok(Action::Run(ParsedArgs {
         command,
-        json,
-        addr,
+        json: leading_json || trailing_json,
+        addr: trailing_addr.or(leading_addr),
     }))
 }
 
@@ -353,6 +385,46 @@ mod tests {
         .unwrap();
         assert!(parsed.json);
         assert_eq!(parsed.addr, Some("127.0.0.1:9999".to_string()));
+    }
+
+    /// R7: the documented `USAGE` lists `--json`/`--addr` under
+    /// "GLOBAL OPTIONS", shown *before* the subcommand — but only the
+    /// trailing position used to parse. `tephractl --json source
+    /// list` must work exactly like `tephractl source list --json`.
+    #[test]
+    fn leading_json_and_addr_flags_before_the_subcommand_are_accepted() {
+        let parsed = run(&["--json", "source", "list"]).unwrap();
+        assert_eq!(parsed.command, Command::SourceList);
+        assert!(parsed.json);
+
+        let parsed = run(&["--addr", "127.0.0.1:48199", "status"]).unwrap();
+        assert_eq!(parsed.command, Command::Status);
+        assert_eq!(parsed.addr, Some("127.0.0.1:48199".to_string()));
+    }
+
+    /// R7 (companion): leading and trailing global flags both work
+    /// together, and can even both be given on the same invocation.
+    #[test]
+    fn leading_and_trailing_global_flags_can_combine() {
+        let parsed = run(&[
+            "--addr",
+            "127.0.0.1:48199",
+            "source",
+            "add",
+            "notes",
+            "/home/dan/Notes",
+            "--json",
+        ])
+        .unwrap();
+        assert_eq!(
+            parsed.command,
+            Command::SourceAdd {
+                name: "notes".to_string(),
+                path: "/home/dan/Notes".to_string(),
+            }
+        );
+        assert!(parsed.json);
+        assert_eq!(parsed.addr, Some("127.0.0.1:48199".to_string()));
     }
 
     #[test]
