@@ -67,6 +67,39 @@ fn test_percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// R14 review finding: this suite is flaky under the default macOS
+/// per-process file-descriptor soft limit (256). Every [`TestDaemon`]
+/// opens its own tokio runtime kqueue, `notify` watcher, several
+/// `cache.db`/`-wal`/`-shm` SQLite handles, and sockets; running the
+/// ~20 tests in this binary in parallel (the default `cargo test`
+/// behaviour) can peak well past 256 open fds for the process as a
+/// whole, so a `source.register` call fails with EMFILE partway
+/// through the run — nondeterministically, depending on scheduling —
+/// and every test after that point sees a registry that silently
+/// never registered its source. Raise the *process*'s own soft limit
+/// once (up to the hard limit, or a generous 10,240 ceiling,
+/// whichever is lower) before any `TestDaemon` starts, exactly as a
+/// real `tephrad` deployment would be run under a raised limit in
+/// production rather than a bare interactive shell's default.
+fn raise_fd_limit_for_this_process() {
+    static DONE: std::sync::Once = std::sync::Once::new();
+    DONE.call_once(|| unsafe {
+        let mut limit: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
+            let ceiling: libc::rlim_t = 10_240;
+            let want = if limit.rlim_max == libc::RLIM_INFINITY {
+                ceiling
+            } else {
+                limit.rlim_max.min(ceiling)
+            };
+            if want > limit.rlim_cur {
+                limit.rlim_cur = want;
+                let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+            }
+        }
+    });
+}
+
 struct TestDaemon {
     addr: std::net::SocketAddr,
     token: String,
@@ -94,6 +127,8 @@ impl TestDaemon {
     /// starts serving — so a test using this exercises the real fix,
     /// not a hand-rolled approximation of it.
     async fn start_in(cache_dir: tempfile::TempDir) -> Self {
+        raise_fd_limit_for_this_process();
+
         let cache_path = cache_dir.path().join("cache.db");
         let token_path = cache_dir.path().join("token");
         let token = "c".repeat(64);
@@ -280,12 +315,13 @@ async fn zero_incoming_links_previews_empty_and_applies_as_a_successful_no_op() 
     let notes = fixtures::empty_source();
     notes.write("Lonely.md", "# Lonely\n\nNo one links here.\n");
 
-    daemon
+    let register = daemon
         .call(
             "source.register",
             json!({"name": "notes", "root": notes.root().to_string_lossy()}),
         )
         .await;
+    assert!(register.get("error").is_none(), "{register:?}");
 
     let preview = daemon
         .call(
@@ -316,12 +352,13 @@ async fn identical_old_and_new_path_is_a_no_op_on_both_preview_and_apply() {
     notes.write("Doc.md", "# Doc\n");
     notes.write("Journal.md", "See [[Doc]].\n");
 
-    daemon
+    let register = daemon
         .call(
             "source.register",
             json!({"name": "notes", "root": notes.root().to_string_lossy()}),
         )
         .await;
+    assert!(register.get("error").is_none(), "{register:?}");
 
     let preview = daemon
         .call(
@@ -354,12 +391,13 @@ async fn case_only_rename_rewrites_exactly_once() {
     notes.write("OldDoc.md", "# Old Doc\n");
     notes.write("Journal.md", "See [[OldDoc]] here.\n");
 
-    daemon
+    let register = daemon
         .call(
             "source.register",
             json!({"name": "notes", "root": notes.root().to_string_lossy()}),
         )
         .await;
+    assert!(register.get("error").is_none(), "{register:?}");
 
     let apply = daemon
         .call(
@@ -409,12 +447,13 @@ async fn new_path_already_existing_does_not_block_the_refactor_or_move_any_file(
     notes.write("NewDoc.md", "# A distinct, pre-existing file\n");
     notes.write("Journal.md", "See [[OldDoc]] here.\n");
 
-    daemon
+    let register = daemon
         .call(
             "source.register",
             json!({"name": "notes", "root": notes.root().to_string_lossy()}),
         )
         .await;
+    assert!(register.get("error").is_none(), "{register:?}");
 
     let preview = daemon
         .call(
@@ -459,12 +498,13 @@ async fn unicode_and_space_filenames_round_trip_through_preview_and_apply() {
     notes.write("Café Notes.md", "# Caf\u{e9} Notes\n");
     notes.write("Journal.md", "See [[Café Notes]] for details.\n");
 
-    daemon
+    let register = daemon
         .call(
             "source.register",
             json!({"name": "notes", "root": notes.root().to_string_lossy()}),
         )
         .await;
+    assert!(register.get("error").is_none(), "{register:?}");
 
     let preview = daemon
         .call(
@@ -504,12 +544,13 @@ async fn markdown_links_unicode_and_space_filenames_round_trip_through_preview_a
     );
     notes.write("sub/Deep.md", "[doc](../OldDoc.md)\n");
 
-    daemon
+    let register = daemon
         .call(
             "source.register",
             json!({"name": "notes", "root": notes.root().to_string_lossy()}),
         )
         .await;
+    assert!(register.get("error").is_none(), "{register:?}");
 
     let preview = daemon
         .call(
@@ -569,12 +610,13 @@ async fn markdown_link_with_backslash_escaped_destination_applies_end_to_end() {
     notes.write("Old(2).md", "# Old doc\n");
     notes.write("Journal.md", "[doc](Old\\(2\\).md)\n");
 
-    daemon
+    let register = daemon
         .call(
             "source.register",
             json!({"name": "notes", "root": notes.root().to_string_lossy()}),
         )
         .await;
+    assert!(register.get("error").is_none(), "{register:?}");
 
     let preview = daemon
         .call(
@@ -613,12 +655,13 @@ async fn staleness_between_preview_and_apply_aborts_before_any_write() {
     notes.write("Journal.md", "See [[OldDoc]] here.\n");
     notes.write("Index.md", "Also [[OldDoc]] here.\n");
 
-    daemon
+    let register = daemon
         .call(
             "source.register",
             json!({"name": "notes", "root": notes.root().to_string_lossy()}),
         )
         .await;
+    assert!(register.get("error").is_none(), "{register:?}");
 
     let preview = daemon
         .call(
@@ -677,12 +720,13 @@ async fn apply_without_a_prior_preview_is_rejected() {
     notes.write("OldDoc.md", "# Old Doc\n");
     notes.write("Journal.md", "See [[OldDoc]].\n");
 
-    daemon
+    let register = daemon
         .call(
             "source.register",
             json!({"name": "notes", "root": notes.root().to_string_lossy()}),
         )
         .await;
+    assert!(register.get("error").is_none(), "{register:?}");
 
     let apply = daemon
         .call(
@@ -717,12 +761,13 @@ async fn a_file_that_becomes_unreadable_between_preview_and_apply_is_reported_no
     notes.write("Journal.md", "See [[OldDoc]] here.\n");
     notes.write("Index.md", "Also [[OldDoc]] here.\n");
 
-    daemon
+    let register = daemon
         .call(
             "source.register",
             json!({"name": "notes", "root": notes.root().to_string_lossy()}),
         )
         .await;
+    assert!(register.get("error").is_none(), "{register:?}");
 
     let preview = daemon
         .call(
@@ -792,12 +837,13 @@ async fn preview_refactor_names_an_unreadable_referring_file_as_skipped() {
     notes.write("Journal.md", "See [[OldDoc]] here.\n");
     notes.write("Secret.md", "Also see [[OldDoc]].\n");
 
-    daemon
+    let register = daemon
         .call(
             "source.register",
             json!({"name": "notes", "root": notes.root().to_string_lossy()}),
         )
         .await;
+    assert!(register.get("error").is_none(), "{register:?}");
 
     let secret_path = notes.root().join("Secret.md");
     let mut perms = std::fs::metadata(&secret_path).unwrap().permissions();
@@ -854,12 +900,13 @@ async fn both_refactor_methods_require_authentication_over_http() {
     let notes = fixtures::empty_source();
     notes.write("OldDoc.md", "# Old Doc\n");
 
-    daemon
+    let register = daemon
         .call(
             "source.register",
             json!({"name": "notes", "root": notes.root().to_string_lossy()}),
         )
         .await;
+    assert!(register.get("error").is_none(), "{register:?}");
 
     let preview_resp = daemon
         .call_no_auth(
@@ -895,12 +942,13 @@ async fn preview_refactor_never_writes_even_against_a_read_only_source_root() {
     notes.write("OldDoc.md", "# Old Doc\n");
     notes.write("Journal.md", "See [[OldDoc]] here.\n");
 
-    daemon
+    let register = daemon
         .call(
             "source.register",
             json!({"name": "notes", "root": notes.root().to_string_lossy()}),
         )
         .await;
+    assert!(register.get("error").is_none(), "{register:?}");
 
     // R6(b) review finding: chmod only the directory to 0500 (as this
     // test originally did) stops *new* files being created inside it
@@ -1109,18 +1157,20 @@ async fn large_fan_in_completes_as_one_bounded_apply_without_blocking_other_rpc_
     let other = fixtures::empty_source();
     other.write("Solo.md", "# Solo\n\nNothing to do with notes.\n");
 
-    daemon
+    let register = daemon
         .call(
             "source.register",
             json!({"name": "notes", "root": notes.root().to_string_lossy()}),
         )
         .await;
-    daemon
+    assert!(register.get("error").is_none(), "{register:?}");
+    let register = daemon
         .call(
             "source.register",
             json!({"name": "other", "root": other.root().to_string_lossy()}),
         )
         .await;
+    assert!(register.get("error").is_none(), "{register:?}");
 
     let preview = daemon
         .call(
@@ -1189,12 +1239,13 @@ async fn no_leftover_temp_files_and_nothing_to_reapply_after_restart() {
     notes.write("Journal.md", "See [[OldDoc]] here.\n");
     notes.write("Index.md", "Also [[OldDoc]] here.\n");
 
-    daemon
+    let register = daemon
         .call(
             "source.register",
             json!({"name": "notes", "root": notes.root().to_string_lossy()}),
         )
         .await;
+    assert!(register.get("error").is_none(), "{register:?}");
     daemon
         .call(
             "link.preview_refactor",
@@ -1230,12 +1281,13 @@ async fn no_leftover_temp_files_and_nothing_to_reapply_after_restart() {
     let index_after_restart = std::fs::read_to_string(notes.root().join("Index.md")).unwrap();
 
     let daemon2 = TestDaemon::start().await;
-    daemon2
+    let register = daemon2
         .call(
             "source.register",
             json!({"name": "notes", "root": notes.root().to_string_lossy()}),
         )
         .await;
+    assert!(register.get("error").is_none(), "{register:?}");
     let preview_after_restart = daemon2
         .call(
             "link.preview_refactor",
@@ -1416,12 +1468,13 @@ async fn two_concurrent_applies_targeting_overlapping_files_are_serialized() {
     notes.write("OldB.md", "# Old B\n");
     notes.write("Journal.md", "See [[OldA]] and [[OldB]] here.\n");
 
-    daemon
+    let register = daemon
         .call(
             "source.register",
             json!({"name": "notes", "root": notes.root().to_string_lossy()}),
         )
         .await;
+    assert!(register.get("error").is_none(), "{register:?}");
 
     let preview_a = daemon
         .call(
