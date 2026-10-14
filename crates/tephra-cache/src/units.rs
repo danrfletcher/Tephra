@@ -306,6 +306,81 @@ pub(crate) fn units_with_status_for_source(
     Ok(out)
 }
 
+/// Every `tags` row belonging to `unit_id`, in insertion order. Read
+/// counterpart to [`insert_tag`] — used by a caller (e.g.
+/// `tephra-graph`'s graph-construction path, PR-5) that has already
+/// looked up a unit's own row and now needs its full tag set, rather
+/// than reaching for `Cache::connection()`'s raw-SQL escape hatch.
+pub(crate) fn tags_for_unit(conn: &Connection, unit_id: i64) -> Result<Vec<TagRow>, CacheError> {
+    let mut stmt =
+        conn.prepare("SELECT id, unit_id, tag FROM tags WHERE unit_id = ?1 ORDER BY id")?;
+    let mut rows = stmt.query([unit_id])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(TagRow {
+            id: row.get(0)?,
+            unit_id: row.get(1)?,
+            tag: row.get(2)?,
+        });
+    }
+    Ok(out)
+}
+
+/// Every `blocks` row belonging to `unit_id`, in insertion order. Read
+/// counterpart to [`insert_block`]; see [`tags_for_unit`]'s doc
+/// comment for why this exists as a typed helper rather than raw SQL.
+pub(crate) fn blocks_for_unit(
+    conn: &Connection,
+    unit_id: i64,
+) -> Result<Vec<BlockRow>, CacheError> {
+    let mut stmt = conn
+        .prepare("SELECT id, unit_id, block_id, line FROM blocks WHERE unit_id = ?1 ORDER BY id")?;
+    let mut rows = stmt.query([unit_id])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(BlockRow {
+            id: row.get(0)?,
+            unit_id: row.get(1)?,
+            block_id: row.get(2)?,
+            line: row.get(3)?,
+        });
+    }
+    Ok(out)
+}
+
+/// Every `links` row authored by `from_unit_id` (i.e. the outgoing
+/// wikilinks/markdown-links this unit's own content contains), in
+/// insertion order. Read counterpart to [`insert_link`]; see
+/// [`tags_for_unit`]'s doc comment for why this exists as a typed
+/// helper rather than raw SQL. `to_unit_id` on the returned rows is
+/// whatever this crate's writers last stored for it — always `NULL`
+/// from every production write path today, since resolving a link
+/// against the registry is `tephra-graph`'s job (PR-5), not this
+/// crate's or `tephra-parser`'s; a caller resolving links itself
+/// (`tephra-graph`) re-derives the target fresh from `to_raw` rather
+/// than trusting this column.
+pub(crate) fn links_from_unit(
+    conn: &Connection,
+    from_unit_id: i64,
+) -> Result<Vec<LinkRow>, CacheError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, from_unit_id, to_raw, to_unit_id, kind FROM links \
+         WHERE from_unit_id = ?1 ORDER BY id",
+    )?;
+    let mut rows = stmt.query([from_unit_id])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(LinkRow {
+            id: row.get(0)?,
+            from_unit_id: row.get(1)?,
+            to_raw: row.get(2)?,
+            to_unit_id: row.get(3)?,
+            kind: row.get(4)?,
+        });
+    }
+    Ok(out)
+}
+
 /// The closed set of real table names this crate ever counts rows in.
 /// [`count_rows`] checks `table` against this allow-list with a real,
 /// always-enforced `if` (not a `debug_assert!`, which compiles out of

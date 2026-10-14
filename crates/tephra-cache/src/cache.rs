@@ -9,7 +9,10 @@ use rusqlite::Connection;
 
 use crate::schema;
 use crate::sources::{self, SourceRow, SourceStatus};
-use crate::units::{self, NewBlock, NewLink, NewTag, NewUnit, UnitRow, UnitWithSourceStatus};
+use crate::units::{
+    self, BlockRow, LinkRow, NewBlock, NewLink, NewTag, NewUnit, TagRow, UnitRow,
+    UnitWithSourceStatus,
+};
 use crate::{CacheError, CURRENT_SCHEMA_VERSION};
 
 /// A connection to `cache.db`, plus the path it was opened against.
@@ -303,6 +306,30 @@ impl Cache {
         source_name: &str,
     ) -> Result<Vec<UnitWithSourceStatus>, CacheError> {
         units::units_with_status_for_source(&self.conn, source_name)
+    }
+
+    /// Every `tags` row belonging to `unit_id`. Read counterpart to
+    /// [`Cache::insert_tag`] — the typed read path a caller (e.g.
+    /// `tephra-graph`'s graph-construction code, PR-5) uses instead of
+    /// [`Cache::connection`]'s raw-SQL escape hatch.
+    pub fn tags_for_unit(&self, unit_id: i64) -> Result<Vec<TagRow>, CacheError> {
+        units::tags_for_unit(&self.conn, unit_id)
+    }
+
+    /// Every `blocks` row belonging to `unit_id`. Read counterpart to
+    /// [`Cache::insert_block`]; see [`Cache::tags_for_unit`]'s doc
+    /// comment.
+    pub fn blocks_for_unit(&self, unit_id: i64) -> Result<Vec<BlockRow>, CacheError> {
+        units::blocks_for_unit(&self.conn, unit_id)
+    }
+
+    /// Every `links` row authored by `from_unit_id`. Read counterpart
+    /// to [`Cache::insert_link`]; see [`Cache::tags_for_unit`]'s doc
+    /// comment. `to_unit_id` on the returned rows is not trustworthy
+    /// as a resolved target — resolving a link against the registry
+    /// is `tephra-graph`'s job (PR-5), done fresh from `to_raw`.
+    pub fn links_from_unit(&self, from_unit_id: i64) -> Result<Vec<LinkRow>, CacheError> {
+        units::links_from_unit(&self.conn, from_unit_id)
     }
 
     /// Direct access to the underlying connection, for tests and
