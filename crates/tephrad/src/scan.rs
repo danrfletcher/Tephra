@@ -142,6 +142,32 @@ impl From<rusqlite::Error> for ScanError {
 /// transaction boundaries.
 const SCAN_COMMIT_CHUNK_SIZE: usize = 500;
 
+/// How long [`walk_and_write`] sleeps after committing each chunk,
+/// before opening the next chunk's `BEGIN IMMEDIATE` (R16 review
+/// finding). Committing a chunk releases SQLite's write lock, but
+/// another connection that's currently waiting for it (stuck in its
+/// own `busy_timeout`'s internal sleep-and-poll loop, e.g. a
+/// concurrent `register()`'s insert, `source.rescan`'s own
+/// transition, or another source's debounced batch) does not notice
+/// a released lock the instant it's released — it only notices the
+/// next time its own backoff timer happens to wake it up. Without
+/// this sleep, this thread's next `begin_immediate` call (made with
+/// no delay at all right after the commit) almost always wins that
+/// race before the waiter's timer ever fires, so a long scan could
+/// starve every other writer for its *entire* duration even though
+/// the write lock is, technically, only held for a bounded chunk at a
+/// time (the review's probe: a concurrent `register()` issued partway
+/// through a long scan returned only once the scan fully finished,
+/// and a second, longer scan made a concurrent `register()` fail
+/// outright with "database is locked"). This sleep gives any waiting
+/// connection's poll a real chance to land in the gap, on every single
+/// chunk boundary rather than only once at the very end. Kept short
+/// (10ms, not e.g. 100ms+) so this stays a small fraction of a
+/// chunk's own work (parsing and writing up to
+/// [`SCAN_COMMIT_CHUNK_SIZE`] files) rather than a dominant cost on a
+/// very large source's scan time.
+const CHUNK_COMMIT_YIELD: Duration = Duration::from_millis(10);
+
 /// How many times a `SQLITE_BUSY` failure is retried, and the backoff
 /// slept between attempts (R11). SQLite's own `busy_timeout` (set on
 /// every connection, see `tephra_cache::cache::apply_pragmas`) already
@@ -255,6 +281,24 @@ fn file_mtime(path: &Path) -> Option<i64> {
 /// responsible for only calling this on a path that has already
 /// passed [`is_markdown_path`]; this function itself does not
 /// re-check the extension.
+///
+/// Always an upsert, never a blind insert (R15 review finding): any
+/// existing row at this `(source_id, rel_path)` is deleted first.
+/// Before this fix, only [`upsert_directory`] and
+/// [`apply_change_batch_once`] deleted the old row first — the plain
+/// full-walk path ([`walk_and_write`]'s main loop, shared by
+/// [`scan_source`] and [`rescan_source`]) called `insert_unit`
+/// directly. That blind insert hits `UNIQUE(source_id, rel_path)` and
+/// aborts the whole walk whenever a row for this path already exists
+/// when the walk reaches it — which a forced rescan can trigger on
+/// its own: `rescan_source` clears a source's rows and commits that
+/// clear in its very first chunk ([`SCAN_COMMIT_CHUNK_SIZE`]), so the
+/// live watcher's own debounced batch can land on a not-yet-walked
+/// file in a later chunk — via its own, independent connection —
+/// after the clear committed but before this walk gets there,
+/// upserting a fresh row for it. Deleting any existing row here first
+/// makes every write-path in this module idempotent with respect to a
+/// pre-existing row, regardless of how it got there.
 fn write_unit(
     cache: &Cache,
     source_id: i64,
@@ -281,6 +325,10 @@ fn write_unit(
             return Ok(None);
         }
     };
+
+    // R15: delete any existing row for this path before inserting the
+    // freshly parsed one, so this is always an upsert.
+    delete_existing_unit(cache, source_id, &rel_path)?;
 
     let mtime = file_mtime(abs_path);
     let unit_id = cache.insert_unit(&parsed.to_new_unit(source_id, &rel_path, mtime))?;
@@ -406,6 +454,11 @@ fn walk_and_write(
             tx.take()
                 .expect("a transaction is always open mid-walk")
                 .commit()?;
+            // R16: give any connection currently waiting on this
+            // database's write lock a real chance to grab it before
+            // immediately reclaiming it for the next chunk — see
+            // `CHUNK_COMMIT_YIELD`'s doc comment.
+            std::thread::sleep(CHUNK_COMMIT_YIELD);
             tx = Some(begin_immediate(cache)?);
             since_commit = 0;
         }
