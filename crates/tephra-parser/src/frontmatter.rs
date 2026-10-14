@@ -38,12 +38,18 @@ pub struct Frontmatter {
 /// Splits `content` into an optional frontmatter block plus the
 /// remaining body, with the body's first line's 1-indexed line number
 /// in the original file (so later passes over the body can report
-/// absolute line numbers). Any frontmatter diagnostics are appended to
-/// `diagnostics`.
+/// absolute line numbers) and the body's absolute *byte* offset
+/// within the original, un-stripped `content` argument passed to
+/// `parse_unit` (R1 review finding: `tephrad::refactor` needs an
+/// exact byte range to rewrite a link span by, not just a line
+/// number, so every absolute-position value this function hands back
+/// must be expressed in terms of the caller's own original bytes,
+/// including any BOM, never the locally-stripped slice). Any
+/// frontmatter diagnostics are appended to `diagnostics`.
 pub(crate) fn extract<'a>(
     content: &'a str,
     diagnostics: &mut Vec<Diagnostic>,
-) -> (Option<Frontmatter>, &'a str, usize) {
+) -> (Option<Frontmatter>, &'a str, usize, usize) {
     // A leading BOM is invisible in every editor that doesn't show
     // it, so a vault note saved by a Windows/legacy editor often has
     // one; strip it before any delimiter comparison so it doesn't
@@ -52,16 +58,18 @@ pub(crate) fn extract<'a>(
     // input — the content hash computed in `lib.rs` is taken from
     // the original, un-stripped `content` argument to `parse_unit`,
     // so it still covers the raw bytes including the BOM.
+    let had_bom = content.starts_with('\u{FEFF}');
+    let bom_len = if had_bom { '\u{FEFF}'.len_utf8() } else { 0 };
     let content = content.strip_prefix('\u{FEFF}').unwrap_or(content);
 
     let Some(first_line_end) = content.find('\n') else {
         // Single-line (or empty) file: a bare "---" with nothing
         // after it can't contain a closing delimiter either way.
-        return (None, content, 1);
+        return (None, content, 1, bom_len);
     };
     let first_line = content[..first_line_end].trim_end_matches('\r');
     if first_line != "---" {
-        return (None, content, 1);
+        return (None, content, 1, bom_len);
     }
 
     let after_open = &content[first_line_end + 1..];
@@ -92,11 +100,12 @@ pub(crate) fn extract<'a>(
 
     let Some((raw_end, body_start_rel)) = closing else {
         // No closing delimiter anywhere in the file: not frontmatter.
-        return (None, content, 1);
+        return (None, content, 1, bom_len);
     };
 
     let raw = after_open[..raw_end].to_string();
     let body = &after_open[body_start_rel..];
+    let body_start_byte = bom_len + first_line_end + 1 + body_start_rel;
 
     let start_line = 1;
     let end_line = line_number_at(content, first_line_end + 1 + raw_end);
@@ -146,6 +155,7 @@ pub(crate) fn extract<'a>(
         }),
         body,
         body_start_line,
+        body_start_byte,
     )
 }
 

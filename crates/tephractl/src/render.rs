@@ -240,35 +240,55 @@ pub fn render_resolve_error(err: &RpcCallError) -> String {
 // ---- link.preview_refactor / link.apply_refactor ----------------------
 
 /// `link refactor` preview rendering: a diff-style list of every
-/// file and line that would be rewritten. The exact response shape
-/// here (`changes: [{file, line, before, after}]`) is a judgement
-/// call pinned by this PR's tests/fixtures, since PR-8 (which owns
-/// the real on-disk refactor algorithm) had not yet frozen a wire
-/// contract for these two methods at the time this PR was written —
-/// only the *request* shape (`{source, old_path, new_path}`) was
-/// settled (ticket round-3 delta, impl °). Falls back to a pretty
-/// JSON dump if the response doesn't have the expected shape, so an
-/// eventual contract mismatch degrades to "ugly but visible", never
-/// to silently showing nothing.
+/// file and line that would be rewritten, followed (R10 review
+/// finding) by any referring file the preview could not read or
+/// stat at all — named explicitly rather than just missing from the
+/// list above with no indication anything was left out. The exact
+/// response shape here (`changes: [{file, line, before, after}]`,
+/// `skipped: [{file, error}]`) is a judgement call pinned by this
+/// PR's tests/fixtures, since PR-8 (which owns the real on-disk
+/// refactor algorithm) had not yet frozen a wire contract for these
+/// two methods at the time this PR was written — only the *request*
+/// shape (`{source, old_path, new_path}`) was settled (ticket
+/// round-3 delta, impl °). Falls back to a pretty JSON dump if the
+/// response doesn't have the expected shape, so an eventual contract
+/// mismatch degrades to "ugly but visible", never to silently
+/// showing nothing.
 pub fn render_refactor_preview(result: &Value) -> String {
     let changes = match result.get("changes").and_then(Value::as_array) {
         Some(c) => c,
         None => return format!("{}\n", pretty(result)),
     };
 
-    if changes.is_empty() {
-        return "no incoming links would be affected\n".to_string();
+    let mut out = if changes.is_empty() {
+        "no incoming links would be affected\n".to_string()
+    } else {
+        let mut out = format!("{} affected link(s):\n", changes.len());
+        for change in changes {
+            let file = str_field(change, "file");
+            let line = change.get("line").and_then(Value::as_u64).unwrap_or(0);
+            let before = str_field(change, "before");
+            let after = str_field(change, "after");
+            out.push_str(&format!("  {file}:{line}  - {before}\n"));
+            out.push_str(&format!("  {file}:{line}  + {after}\n"));
+        }
+        out
+    };
+
+    if let Some(skipped) = result.get("skipped").and_then(Value::as_array) {
+        if !skipped.is_empty() {
+            out.push_str(&format!(
+                "{} file(s) skipped (could not be read or checked):\n",
+                skipped.len()
+            ));
+            for s in skipped {
+                let file = str_field(s, "file");
+                let error = str_field(s, "error");
+                out.push_str(&format!("  {file}: {error}\n"));
+            }
+        }
     }
 
-    let mut out = format!("{} affected link(s):\n", changes.len());
-    for change in changes {
-        let file = str_field(change, "file");
-        let line = change.get("line").and_then(Value::as_u64).unwrap_or(0);
-        let before = str_field(change, "before");
-        let after = str_field(change, "after");
-        out.push_str(&format!("  {file}:{line}  - {before}\n"));
-        out.push_str(&format!("  {file}:{line}  + {after}\n"));
-    }
     out
 }
 
@@ -287,6 +307,46 @@ pub fn render_refactor_apply(result: &Value) -> String {
         Some("aborted") => {
             let reason = str_field(result, "reason");
             format!("Refactor aborted: {reason}\n")
+        }
+        // R5 review finding: this PR introduced "partial" (some files
+        // rewritten, a later one failed) and owns the end-to-end CLI
+        // wiring for it, so it must be rendered explicitly — falling
+        // through to the raw-JSON-dump fallback arm below would print
+        // an unreadable blob instead of naming exactly which files
+        // succeeded and which failed.
+        Some("partial") => {
+            let files_changed = result
+                .get("files_changed")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let mut out = format!(
+                "Refactor partially applied: {files_changed} file(s) changed before a failure\n"
+            );
+            let succeeded = result
+                .get("succeeded")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if !succeeded.is_empty() {
+                out.push_str("  succeeded:\n");
+                for file in &succeeded {
+                    out.push_str(&format!("    {}\n", file.as_str().unwrap_or("")));
+                }
+            }
+            let failed = result
+                .get("failed")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if !failed.is_empty() {
+                out.push_str("  failed:\n");
+                for failure in &failed {
+                    let file = str_field(failure, "file");
+                    let error = str_field(failure, "error");
+                    out.push_str(&format!("    {file}: {error}\n"));
+                }
+            }
+            out
         }
         _ => format!("{}\n", pretty(result)),
     }
@@ -425,6 +485,35 @@ mod tests {
         assert!(rendered.contains("@notes:Journal.md:12"));
         assert!(rendered.contains("- [[OldDoc]]"));
         assert!(rendered.contains("+ [[NewDoc]]"));
+    }
+
+    /// R10 review finding: a file the daemon couldn't read or stat
+    /// must be named, with its error, in the rendered human-readable
+    /// preview — never silently missing with no trace at all.
+    #[test]
+    fn refactor_preview_renders_skipped_files() {
+        let result = json!({
+            "changes": [
+                {"file": "@notes:Journal.md", "line": 1, "before": "[[OldDoc]]", "after": "[[NewDoc]]"}
+            ],
+            "skipped": [
+                {"file": "@notes:Secret.md", "error": "Permission denied (os error 13)"}
+            ]
+        });
+        let rendered = render_refactor_preview(&result);
+        assert!(rendered.contains("1 file(s) skipped"));
+        assert!(rendered.contains("@notes:Secret.md: Permission denied (os error 13)"));
+    }
+
+    /// An empty `skipped` list must add nothing to the rendered
+    /// output — the common case stays exactly as before.
+    #[test]
+    fn refactor_preview_with_empty_skipped_list_renders_nothing_extra() {
+        let result = json!({"changes": [], "skipped": []});
+        assert_eq!(
+            render_refactor_preview(&result),
+            "no incoming links would be affected\n"
+        );
     }
 
     #[test]

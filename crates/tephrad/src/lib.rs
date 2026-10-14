@@ -9,6 +9,7 @@
 //! startup-sequence concerns with no API surface a later crate or
 //! test needs to call directly.
 pub mod ignore;
+pub mod refactor;
 pub mod registry;
 pub mod rpc;
 pub mod scan;

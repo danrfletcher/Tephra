@@ -14,8 +14,10 @@
 use serde_json::Value;
 
 use crate::rpc::auth::Authenticated;
-use crate::rpc::backend::{GraphBackend, SourceBackend};
-use crate::rpc::protocol::{INVALID_PARAMS, METHOD_NOT_FOUND, RESOLVE_ERROR, SOURCE_ERROR};
+use crate::rpc::backend::{GraphBackend, RefactorBackend, SourceBackend};
+use crate::rpc::protocol::{
+    INVALID_PARAMS, METHOD_NOT_FOUND, REFACTOR_ERROR, RESOLVE_ERROR, SOURCE_ERROR,
+};
 
 /// Every JSON-RPC method this server exposes, exactly matching the
 /// plan's named verbs (F4: "no bespoke client-convenience endpoints").
@@ -32,14 +34,17 @@ pub const METHOD_NAMES: &[&str] = &[
     "source.unregister",
     "source.list",
     "source.rescan",
+    "link.preview_refactor",
+    "link.apply_refactor",
 ];
 
-/// The two backends one `dispatch` call reads through, bundled so the
-/// function signature doesn't grow a parameter every time a new verb
-/// needs a new backend.
+/// The three backends one `dispatch` call reads through, bundled so
+/// the function signature doesn't grow a parameter every time a new
+/// verb needs a new backend.
 pub struct Backends<'a> {
     pub graph: &'a dyn GraphBackend,
     pub sources: &'a dyn SourceBackend,
+    pub refactor: &'a dyn RefactorBackend,
 }
 
 /// `(code, message, optional structured data)` — the shape every
@@ -84,6 +89,8 @@ pub fn dispatch(
         "source.unregister" => source_unregister(params, backends.sources),
         "source.list" => source_list(backends.sources),
         "source.rescan" => source_rescan(params, backends.sources),
+        "link.preview_refactor" => link_preview_refactor(params, backends.refactor),
+        "link.apply_refactor" => link_apply_refactor(params, backends.refactor),
         other => Err((
             METHOD_NOT_FOUND,
             format!("unknown method \"{other}\""),
@@ -150,6 +157,26 @@ fn source_rescan(params: &Value, sources: &dyn SourceBackend) -> DispatchResult 
         .map_err(|e| (SOURCE_ERROR, e, None))
 }
 
+fn link_preview_refactor(params: &Value, refactor: &dyn RefactorBackend) -> DispatchResult {
+    let source = require_str(params, "source")?;
+    let old_path = require_str(params, "old_path")?;
+    let new_path = require_str(params, "new_path")?;
+    refactor
+        .preview_refactor(source, old_path, new_path)
+        .map(|wire| serde_json::to_value(wire).expect("RefactorPreviewWire always serializes"))
+        .map_err(|e| (REFACTOR_ERROR, e, None))
+}
+
+fn link_apply_refactor(params: &Value, refactor: &dyn RefactorBackend) -> DispatchResult {
+    let source = require_str(params, "source")?;
+    let old_path = require_str(params, "old_path")?;
+    let new_path = require_str(params, "new_path")?;
+    refactor
+        .apply_refactor(source, old_path, new_path)
+        .map(|wire| serde_json::to_value(wire).expect("RefactorApplyWire always serializes"))
+        .map_err(|e| (REFACTOR_ERROR, e, None))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,6 +202,8 @@ mod tests {
                 "source.unregister",
                 "source.list",
                 "source.rescan",
+                "link.preview_refactor",
+                "link.apply_refactor",
             ]
         );
     }

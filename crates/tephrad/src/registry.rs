@@ -19,7 +19,7 @@
 //!   (and by `tests/registry_lifecycle.rs` specifically for
 //!   register/rescan/unregister against a real cache and filesystem).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -247,6 +247,12 @@ impl From<ScanError> for RegistryError {
 
 struct RunningSource {
     handle: WatcherHandle,
+    /// GP8's pause/resume control, wrapping the same `on_batch` this
+    /// source's watcher was started with (see `start_watcher`) — so
+    /// [`SourceRegistry::pause_all_watchers`]/[`resume_all_watchers`]
+    /// can gate every running source's debounced reindex around a
+    /// `link.apply_refactor`'s own writes.
+    pause: watcher::WatcherPause,
     /// Shared with the live watcher's event filter (R12 review
     /// finding): `rescan` writes a freshly-reloaded `.tephraignore`
     /// into this same lock so the running watcher's filtering (and
@@ -638,21 +644,63 @@ impl SourceRegistry {
             }
         };
 
+        // GP8: wrap `on_batch` behind a pause/resume gate so a
+        // `link.apply_refactor` can hold off this source's debounced
+        // reindex for the duration of its own writes (see
+        // `crate::refactor::RefactorEngine::apply` and
+        // `SourceRegistry::pause_all_watchers`/`resume_all_watchers`
+        // below) without losing any event that fires during that
+        // window — only deferring it past the matching `resume_all`.
+        let pause = watcher::WatcherPause::new(on_batch);
+        let pause_for_handler = pause.clone();
+
         let handle = watcher::spawn_debounce(
             tap,
             root,
             self.runtime.handle().clone(),
-            on_batch,
+            move |batch| pause_for_handler.handle(batch),
             on_root_removed,
         );
         self.running.lock().unwrap().insert(
             name,
             RunningSource {
                 handle,
+                pause,
                 ignore_rules,
             },
         );
         Ok(())
+    }
+
+    /// GP8: pauses every currently-running source's watcher batch
+    /// handler (see [`watcher::WatcherPause`]) — a filesystem event
+    /// that fires while paused is queued, not dropped, and only
+    /// processed into a reindex once [`SourceRegistry::resume_all_watchers`]
+    /// is called. Idempotent; a source with no running watcher (not
+    /// yet started, or already stopped) is simply skipped.
+    pub fn pause_all_watchers(&self) {
+        for running in self.running.lock().unwrap().values() {
+            running.pause.pause();
+        }
+    }
+
+    /// GP8: resumes every currently-running source's watcher, after
+    /// [`pause_all_watchers`](Self::pause_all_watchers), flushing
+    /// anything that fired during the pause window as one merged
+    /// batch per source. Idempotent. Equivalent to
+    /// `resume_all_watchers_except(&HashSet::new())`.
+    pub fn resume_all_watchers(&self) {
+        self.resume_all_watchers_except(&HashSet::new());
+    }
+
+    /// Same as [`resume_all_watchers`](Self::resume_all_watchers), but
+    /// every absolute path in `written_paths` is discarded from each
+    /// source's pending batch before it's flushed (R4 review finding
+    /// — see `crate::refactor::WatcherPauseControl`'s doc comment).
+    pub fn resume_all_watchers_except(&self, written_paths: &HashSet<PathBuf>) {
+        for running in self.running.lock().unwrap().values() {
+            running.pause.resume_except(written_paths);
+        }
     }
 
     /// `source.unregister` (G1): stops the watcher task (if one is

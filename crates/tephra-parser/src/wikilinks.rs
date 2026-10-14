@@ -37,6 +37,16 @@ pub struct WikiLink {
     pub raw: String,
     /// 1-indexed line number, absolute within the original file.
     pub line: usize,
+    /// Absolute byte range `[start, end)` within the original file's
+    /// content — the exact bytes `"[[" + raw + "]]"` occupies (R1
+    /// review finding): `tephrad::refactor` rewrites a link by this
+    /// exact span rather than a textual search-and-replace, so a
+    /// textually-identical occurrence elsewhere (e.g. the same raw
+    /// text inside an inline code span, or on a different line) is
+    /// never mistaken for this one. `(0, 0)` for a [`WikiLink`]
+    /// produced by [`parse_inner_standalone`] (no real file context
+    /// — mirrors `line`'s `0` convention there).
+    pub span: (usize, usize),
 }
 
 /// Parses a wikilink's raw inner text (the content between `[[` and
@@ -50,7 +60,7 @@ pub struct WikiLink {
 /// whatever the caller passes (see [`crate::parse_wikilink_inner`]'s
 /// doc comment: `0`, since there is no real file context).
 pub(crate) fn parse_inner_standalone(inner: &str, line: usize) -> WikiLink {
-    parse_inner(inner, line)
+    parse_inner(inner, line, (0, 0))
 }
 
 /// Scans `body` for `[[wikilinks]]`. Returns the parsed links
@@ -61,6 +71,7 @@ pub(crate) fn parse_inner_standalone(inner: &str, line: usize) -> WikiLink {
 pub(crate) fn scan(
     body: &str,
     body_start_line: usize,
+    body_start_byte: usize,
     excluded_ranges: &[(usize, usize)],
     diagnostics: &mut Vec<Diagnostic>,
 ) -> (Vec<WikiLink>, Vec<(usize, usize)>) {
@@ -98,7 +109,8 @@ pub(crate) fn scan(
                             "empty wikilink [[]]",
                         ));
                     } else {
-                        out.push(parse_inner(inner, line));
+                        let span = (body_start_byte + open_at, body_start_byte + close_at + 2);
+                        out.push(parse_inner(inner, line, span));
                     }
                     spans.push((open_at, close_at + 2));
                     i = close_at + 2;
@@ -120,7 +132,7 @@ pub(crate) fn scan(
     (out, spans)
 }
 
-fn parse_inner(inner: &str, line: usize) -> WikiLink {
+fn parse_inner(inner: &str, line: usize, span: (usize, usize)) -> WikiLink {
     let (before_alias, alias) = match inner.split_once('|') {
         Some((a, b)) => (a, Some(b.to_string())),
         None => (inner, None),
@@ -146,5 +158,6 @@ fn parse_inner(inner: &str, line: usize) -> WikiLink {
         alias,
         raw: inner.to_string(),
         line,
+        span,
     }
 }

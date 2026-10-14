@@ -9,7 +9,10 @@
 //! [`UnitGraph::get_forward_links`] (`graph.get_forward_links`), and
 //! [`UnitGraph::get_edges`] (`graph.get_edges`) — against an
 //! in-memory graph built from `tephra-cache` rows, independent of any
-//! RPC transport.
+//! RPC transport. A fifth, [`UnitGraph::get_backlinks_all`], is the
+//! same lookup without `get_backlinks`'s query-display dedup — used
+//! by PR-8's link refactor engine, which needs every raw occurrence
+//! of an incoming link, not just one row per referring unit.
 //!
 //! Out of scope for this crate (F3): RPC transport, authentication,
 //! CLI plumbing, and on-disk link refactoring — all later PRs. This

@@ -26,14 +26,22 @@
       "anchor": null,
       "alias": "Atlas Repo README",
       "raw": "@atlas-repo:README|Atlas Repo README",
-      "line": 8
+      "line": 8,
+      "span": [
+        82,
+        122
+      ]
     }
   ],
   "markdown_links": [
     {
       "text": "project site",
       "target": "https://example.com/project",
-      "line": 8
+      "line": 8,
+      "span": [
+        144,
+        171
+      ]
     }
   ],
   "tags": [

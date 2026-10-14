@@ -19,3 +19,14 @@ serde_json = "1.0.154"
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }
+axum = { version = "0.8.9", features = ["ws"] }
+tephrad = { path = "../tephrad" }
+tephra-cache = { path = "../tephra-cache" }
+tephra-graph = { path = "../tephra-graph" }
+# R11 review finding: simulates an external edit to a referring file
+# between preview and apply by bumping its mtime, exactly like
+# `tephrad/tests/link_refactor_integration.rs`'s own staleness test
+# — the only way to actually reach the staleness gate's "aborted"
+# result rather than the unrelated "no prior preview" error path.
+filetime = "0.2.29"

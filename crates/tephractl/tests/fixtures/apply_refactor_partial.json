@@ -1,0 +1,12 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "status": "partial",
+    "files_changed": 1,
+    "succeeded": ["@notes:Journal.md"],
+    "failed": [
+      { "file": "@notes:Index.md", "error": "permission denied" }
+    ]
+  }
+}

@@ -21,7 +21,7 @@ use std::sync::Arc;
 use cli::Action;
 use serde_json::json;
 use tephrad::registry::{DaemonEvent, SourceRegistry};
-use tephrad::rpc::backend::{GraphBackend, SourceBackend};
+use tephrad::rpc::backend::{GraphBackend, RefactorBackend, SourceBackend};
 use tephrad::rpc::server::{build_router, AppState};
 use tokio::sync::broadcast::error::RecvError;
 
@@ -329,6 +329,54 @@ fn run_server(
             Ok(r) => Arc::new(r),
             Err(e) => return (fail(stage::CACHE, e), None),
         };
+
+        // R8 fix: sweep every registered source's root for stale
+        // `.{name}.tephra-tmp-{n}` leftovers right here, at startup —
+        // see `tephrad::scan::sweep_stale_temp_files`'s doc comment
+        // for why a plain restart otherwise never does this (neither
+        // `SourceRegistry::new` above nor re-registering an
+        // already-registered source walk the filesystem at all, and
+        // `tephractl` has no rescan command either). Runs via
+        // `spawn_blocking`, like every other blocking disk operation
+        // in this file, and a failure here is logged but never a hard
+        // startup failure — a stray temp file left behind by a failed
+        // sweep is a cleanliness issue, not a reason to refuse to
+        // serve.
+        let registry_for_sweep = registry.clone();
+        let sweep_outcome = tokio::task::spawn_blocking(move || {
+            let rows = registry_for_sweep.list().map_err(|e| e.to_string())?;
+            for row in rows {
+                match tephrad::scan::sweep_stale_temp_files(std::path::Path::new(&row.path)) {
+                    Ok(removed) if removed > 0 => {
+                        tracing::info!(
+                            source = %row.name,
+                            removed,
+                            "swept stale refactor temp files at startup"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            source = %row.name,
+                            error = %e,
+                            "failed to sweep stale refactor temp files at startup"
+                        );
+                    }
+                }
+            }
+            Ok::<(), String>(())
+        })
+        .await;
+        match sweep_outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "failed to list sources for the startup temp-file sweep");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "startup temp-file sweep task panicked");
+            }
+        }
+
         let shared_graph = {
             let graph_cache = match tephra_cache::Cache::open(cache_path) {
                 Ok(c) => c,
@@ -346,8 +394,13 @@ fn run_server(
 
         let state = Arc::new(AppState::with_shutdown(
             token_path.to_path_buf(),
-            shared_graph as Arc<dyn GraphBackend>,
+            shared_graph.clone() as Arc<dyn GraphBackend>,
             registry.clone() as Arc<dyn SourceBackend>,
+            Arc::new(tephrad::refactor::RefactorEngine::new(
+                shared_graph as Arc<dyn GraphBackend>,
+                registry.clone() as Arc<dyn SourceBackend>,
+                registry.clone() as Arc<dyn tephrad::refactor::WatcherPauseControl>,
+            )) as Arc<dyn RefactorBackend>,
             Some(graph_refresh),
             Some(shutdown_rx.clone()),
         ));

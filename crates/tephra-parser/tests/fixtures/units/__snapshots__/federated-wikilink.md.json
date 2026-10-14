@@ -10,7 +10,11 @@
       "anchor": null,
       "alias": null,
       "raw": "Note",
-      "line": 1
+      "line": 1,
+      "span": [
+        12,
+        20
+      ]
     },
     {
       "source_prefix": null,
@@ -18,7 +22,11 @@
       "anchor": "Heading",
       "alias": null,
       "raw": "Note#Heading",
-      "line": 1
+      "line": 1,
+      "span": [
+        22,
+        38
+      ]
     },
     {
       "source_prefix": null,
@@ -26,7 +34,11 @@
       "anchor": "^block-anchor",
       "alias": null,
       "raw": "Note#^block-anchor",
-      "line": 1
+      "line": 1,
+      "span": [
+        40,
+        62
+      ]
     },
     {
       "source_prefix": null,
@@ -34,7 +46,11 @@
       "anchor": null,
       "alias": "Alias Text",
       "raw": "Note|Alias Text",
-      "line": 1
+      "line": 1,
+      "span": [
+        64,
+        83
+      ]
     },
     {
       "source_prefix": "atlas-repo",
@@ -42,7 +58,11 @@
       "anchor": null,
       "alias": null,
       "raw": "@atlas-repo:README",
-      "line": 1
+      "line": 1,
+      "span": [
+        85,
+        107
+      ]
     },
     {
       "source_prefix": "atlas-repo",
@@ -50,7 +70,11 @@
       "anchor": "Section",
       "alias": "Display",
       "raw": "@atlas-repo:README#Section|Display",
-      "line": 1
+      "line": 1,
+      "span": [
+        109,
+        147
+      ]
     }
   ],
   "markdown_links": [],

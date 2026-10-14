@@ -327,9 +327,14 @@ fn link_refactor<R: BufRead, W: Write>(
 
     match client.call("link.apply_refactor", params) {
         Ok(result) => {
-            let aborted = result.get("status").and_then(Value::as_str) == Some("aborted");
+            let status = result.get("status").and_then(Value::as_str);
+            // R5 review finding: a "partial" result (some files
+            // rewritten, a later one failed) is not success — a
+            // script driving `tephractl` must be able to tell from
+            // the exit code alone. Only a clean "applied" exits 0.
+            let is_failure = matches!(status, Some("aborted") | Some("partial"));
             let rendered = json_or(&result, || render::render_refactor_apply(&result), json);
-            if aborted {
+            if is_failure {
                 CommandOutcome {
                     exit_code: 1,
                     stdout: String::new(),

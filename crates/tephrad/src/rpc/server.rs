@@ -29,7 +29,7 @@ use serde_json::Value;
 use tokio::sync::{broadcast, watch, Notify};
 
 use crate::rpc::auth::{self, Authenticated};
-use crate::rpc::backend::{GraphBackend, GraphRefresh, SourceBackend};
+use crate::rpc::backend::{GraphBackend, GraphRefresh, RefactorBackend, SourceBackend};
 use crate::rpc::dispatch::{self, Backends};
 use crate::rpc::protocol;
 
@@ -55,7 +55,19 @@ const EVENT_CHANNEL_CAPACITY: usize = 1024;
 /// [`AppState::graph_refresh`] (when configured) before replying, so
 /// the very next `unit.resolve_link`/`graph.get_*` call on this same
 /// running daemon already sees the update — no restart required.
-const MUTATING_SOURCE_METHODS: &[&str] = &["source.register", "source.unregister", "source.rescan"];
+const MUTATING_SOURCE_METHODS: &[&str] = &[
+    "source.register",
+    "source.unregister",
+    "source.rescan",
+    // GP8: a successful `link.apply_refactor` writes directly to the
+    // affected files' content (not through `source.rescan`'s RPC
+    // path) and synchronously re-scans every touched source itself
+    // (see `crate::refactor::RefactorEngine::write_all`) before
+    // returning — this entry is what makes that newly up-to-date
+    // cache get rebuilt into the live in-memory graph too, on this
+    // same running daemon, before the RPC response goes out (R1).
+    "link.apply_refactor",
+];
 
 /// Tracks every currently-running [`handle_socket`] task so shutdown
 /// (R10) can wait, bounded, for all of them to actually finish —
@@ -136,6 +148,7 @@ pub struct AppState {
     pub token_path: PathBuf,
     pub graph: Arc<dyn GraphBackend>,
     pub sources: Arc<dyn SourceBackend>,
+    pub refactor: Arc<dyn RefactorBackend>,
     events_tx: broadcast::Sender<Value>,
     /// `Some` only in production (`main.rs`'s real `SharedGraph`-backed
     /// wiring); `None` in every test that uses a canned/mocked
@@ -161,9 +174,10 @@ impl AppState {
         token_path: PathBuf,
         graph: Arc<dyn GraphBackend>,
         sources: Arc<dyn SourceBackend>,
+        refactor: Arc<dyn RefactorBackend>,
         graph_refresh: Option<GraphRefresh>,
     ) -> Self {
-        Self::with_shutdown(token_path, graph, sources, graph_refresh, None)
+        Self::with_shutdown(token_path, graph, sources, refactor, graph_refresh, None)
     }
 
     /// Same as [`AppState::new`], but also wires in the shutdown
@@ -174,6 +188,7 @@ impl AppState {
         token_path: PathBuf,
         graph: Arc<dyn GraphBackend>,
         sources: Arc<dyn SourceBackend>,
+        refactor: Arc<dyn RefactorBackend>,
         graph_refresh: Option<GraphRefresh>,
         shutdown_rx: Option<watch::Receiver<bool>>,
     ) -> Self {
@@ -182,6 +197,7 @@ impl AppState {
             token_path,
             graph,
             sources,
+            refactor,
             events_tx,
             graph_refresh,
             shutdown_rx,
@@ -275,6 +291,7 @@ async fn handle_single_request(proof: Authenticated, raw: Value, state: Arc<AppS
 
     let graph = state.graph.clone();
     let sources = state.sources.clone();
+    let refactor = state.refactor.clone();
     let refresh = state.graph_refresh.clone();
     let method = req.method.clone();
     let params = req.params.clone();
@@ -283,6 +300,7 @@ async fn handle_single_request(proof: Authenticated, raw: Value, state: Arc<AppS
         let backends = Backends {
             graph: graph.as_ref(),
             sources: sources.as_ref(),
+            refactor: refactor.as_ref(),
         };
         let result = dispatch::dispatch(&proof, &method, &params, &backends);
         if result.is_ok() && MUTATING_SOURCE_METHODS.contains(&method.as_str()) {

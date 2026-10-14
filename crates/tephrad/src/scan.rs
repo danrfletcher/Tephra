@@ -51,6 +51,7 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -58,6 +59,7 @@ use rusqlite::{Transaction, TransactionBehavior};
 use tephra_cache::Cache;
 
 use crate::ignore::IgnoreRules;
+use crate::refactor;
 use crate::writer_gate::{self, WriterGate, WriterGateGuard};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -446,6 +448,33 @@ fn walk_and_write(
             Ok(r) => r,
             Err(_) => continue,
         };
+
+        if let Some(file_name) = entry.path().file_name().and_then(|n| n.to_str()) {
+            if refactor::is_stale_temp_file_name(file_name) {
+                // R3 review finding: a process killed between
+                // `rewrite_links_atomic`'s `write_new` and `rename`
+                // can leave one of these behind in the user's own
+                // source tree forever, since nothing else ever
+                // revisits it. Every full walk — `register`'s
+                // initial scan and every `rescan` — already visits
+                // every file here anyway, so sweep any stale one away
+                // now rather than leaving it on disk indefinitely or
+                // indexing it as if it were real note content.
+                match fs::remove_file(entry.path()) {
+                    Ok(()) => tracing::info!(
+                        path = %entry.path().display(),
+                        "removed a stale refactor temp file left behind by a killed apply_refactor"
+                    ),
+                    Err(e) => tracing::warn!(
+                        path = %entry.path().display(),
+                        error = %e,
+                        "failed to remove a stale refactor temp file"
+                    ),
+                }
+                continue;
+            }
+        }
+
         stats.files_seen += 1;
         if ignore.is_ignored(rel) {
             stats.files_ignored += 1;
@@ -482,6 +511,85 @@ fn walk_and_write(
         tx.commit()?;
     }
     Ok(stats)
+}
+
+/// Sweeps every stale `.{original-file-name}.tephra-tmp-{n}` leftover
+/// (see [`refactor::is_stale_temp_file_name`]) out of `root`, without
+/// touching the cache at all — a plain filesystem walk, safe to call
+/// with no open transaction and no `WriterGate` permit held.
+///
+/// R8 review finding: the only sweep that previously existed ran
+/// inside [`walk_and_write`] above, so it only ever happened on
+/// `source.register`'s initial scan or a `source.rescan` — neither of
+/// which a plain daemon restart performs (`SourceRegistry::new` only
+/// re-reads the existing cache rows; it never walks the filesystem,
+/// and re-registering an already-registered source is refused). A
+/// file left behind by a process killed between `write_new` and
+/// `rename` in `crate::refactor::rewrite_links_atomic_with` therefore
+/// survived a restart indefinitely, with no RPC call able to trigger
+/// a sweep either. This is meant to be called once per registered
+/// source at daemon startup (see `main.rs`), independent of
+/// `register`/`rescan`.
+///
+/// Directory-level ignore rules ([`IgnoreRules::is_ignored`]) are
+/// still honored for *pruning which directories are even walked*
+/// (consistent with, and for the same performance reason as,
+/// [`walk_and_write`]'s own walk) — but a stale temp file is removed
+/// purely by its own name, never gated on whether the file itself
+/// would be ignored, since it was never real note content to begin
+/// with.
+pub fn sweep_stale_temp_files(root: &Path) -> io::Result<usize> {
+    let ignore = IgnoreRules::load(root)?;
+    let mut removed = 0usize;
+
+    let walker = walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            if !entry.file_type().is_dir() {
+                return true;
+            }
+            let rel = match entry.path().strip_prefix(root) {
+                Ok(r) => r,
+                Err(_) => return true,
+            };
+            !ignore.is_ignored(rel)
+        });
+
+    for entry in walker {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to walk a directory entry while sweeping stale refactor temp files; skipping");
+                continue;
+            }
+        };
+        if entry.file_type().is_dir() {
+            continue;
+        }
+        let Some(file_name) = entry.path().file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !refactor::is_stale_temp_file_name(file_name) {
+            continue;
+        }
+        match fs::remove_file(entry.path()) {
+            Ok(()) => {
+                removed += 1;
+                tracing::info!(
+                    path = %entry.path().display(),
+                    "removed a stale refactor temp file left behind by a killed apply_refactor"
+                );
+            }
+            Err(e) => tracing::warn!(
+                path = %entry.path().display(),
+                error = %e,
+                "failed to remove a stale refactor temp file"
+            ),
+        }
+    }
+
+    Ok(removed)
 }
 
 /// `source.register`'s initial full scan (GP2/GP3), against a source

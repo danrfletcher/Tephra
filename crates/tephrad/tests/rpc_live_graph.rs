@@ -25,7 +25,9 @@ use serde_json::json;
 use tephra_cache::Cache;
 use tephra_graph::UnitGraph;
 use tephrad::registry::SourceRegistry;
-use tephrad::rpc::backend::{GraphBackend, GraphRefresh, SharedGraph, SourceBackend};
+use tephrad::rpc::backend::{
+    GraphBackend, GraphRefresh, RefactorBackend, SharedGraph, SourceBackend,
+};
 use tephrad::rpc::server::{build_router, AppState};
 use tokio::net::TcpListener;
 
@@ -58,8 +60,13 @@ async fn registering_a_source_over_rpc_makes_it_resolvable_on_the_same_running_d
 
     let state = Arc::new(AppState::new(
         token_path,
-        shared_graph as Arc<dyn GraphBackend>,
-        registry as Arc<dyn SourceBackend>,
+        shared_graph.clone() as Arc<dyn GraphBackend>,
+        registry.clone() as Arc<dyn SourceBackend>,
+        Arc::new(tephrad::refactor::RefactorEngine::new(
+            shared_graph as Arc<dyn GraphBackend>,
+            registry.clone() as Arc<dyn SourceBackend>,
+            registry as Arc<dyn tephrad::refactor::WatcherPauseControl>,
+        )) as Arc<dyn RefactorBackend>,
         Some(graph_refresh),
     ));
     let router = build_router(state);
@@ -182,8 +189,13 @@ async fn concurrent_source_register_calls_leave_both_sources_resolvable() {
 
     let state = Arc::new(AppState::new(
         token_path,
-        shared_graph as Arc<dyn GraphBackend>,
-        registry as Arc<dyn SourceBackend>,
+        shared_graph.clone() as Arc<dyn GraphBackend>,
+        registry.clone() as Arc<dyn SourceBackend>,
+        Arc::new(tephrad::refactor::RefactorEngine::new(
+            shared_graph as Arc<dyn GraphBackend>,
+            registry.clone() as Arc<dyn SourceBackend>,
+            registry as Arc<dyn tephrad::refactor::WatcherPauseControl>,
+        )) as Arc<dyn RefactorBackend>,
         Some(graph_refresh),
     ));
     let router = build_router(state);
