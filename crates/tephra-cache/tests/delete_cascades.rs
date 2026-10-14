@@ -203,6 +203,81 @@ fn delete_units_under_prefix_clears_only_the_nested_rel_paths() {
 }
 
 #[test]
+fn delete_units_under_prefix_does_not_match_on_underscore_percent_or_case() {
+    // R10: `_`/`%` must never be treated as SQL `LIKE` wildcards here,
+    // and the comparison must be case-sensitive — a prefix match is a
+    // real path-component boundary, not a pattern.
+    use tephra_cache::NewUnit;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cache = open_temp_cache(&dir);
+    let source_id = cache
+        .register_source("notes", "/vault/notes", SourceStatus::Active)
+        .expect("register_source");
+
+    let insert = |rel_path: &str| {
+        cache
+            .insert_unit(&NewUnit {
+                source_id,
+                rel_path,
+                mtime: None,
+                frontmatter_json: None,
+            })
+            .unwrap_or_else(|_| panic!("insert {rel_path}"))
+    };
+
+    // Nested under "a_b": must be deleted.
+    let a_b_x = insert("a_b/x.md");
+    // Nested under "a%": must be deleted.
+    let a_pct_z = insert("a%/z.md");
+    // A naive `LIKE 'a_b/%'` would also match "acb/y.md" (`_` as a
+    // one-char wildcard); a naive `LIKE 'a%/%'` would match almost
+    // anything. Neither must be touched by deleting "a_b" or "a%".
+    let acb_y = insert("acb/y.md");
+    // A naive `LIKE 'a_b/%'` or `LIKE 'a%/%'` would also match this
+    // via the single-character wildcard semantics of `_`.
+    let a_qq_q = insert("aQQ/q.md");
+    // A case-differing sibling: default SQLite `LIKE` is
+    // case-insensitive for ASCII, so a naive prefix match on "docs"
+    // would also delete "Docs/x.md".
+    let docs_x = insert("docs/x.md");
+    let big_docs_x = insert("Docs/x.md");
+
+    let deleted_ab = cache
+        .delete_units_under_prefix(source_id, "a_b")
+        .expect("delete_units_under_prefix a_b");
+    assert_eq!(deleted_ab, 1, "only a_b/x.md is nested under \"a_b\"");
+    assert!(cache.get_unit(a_b_x).expect("get_unit").is_none());
+    assert!(
+        cache.get_unit(acb_y).expect("get_unit").is_some(),
+        "acb/y.md must survive deleting \"a_b\" -- \"_\" is not a wildcard here"
+    );
+
+    let deleted_apct = cache
+        .delete_units_under_prefix(source_id, "a%")
+        .expect("delete_units_under_prefix a%");
+    assert_eq!(deleted_apct, 1, "only a%/z.md is nested under \"a%\"");
+    assert!(cache.get_unit(a_pct_z).expect("get_unit").is_none());
+    assert!(
+        cache.get_unit(a_qq_q).expect("get_unit").is_some(),
+        "aQQ/q.md must survive deleting \"a%\" -- \"%\" is not a wildcard here"
+    );
+
+    let deleted_docs = cache
+        .delete_units_under_prefix(source_id, "docs")
+        .expect("delete_units_under_prefix docs");
+    assert_eq!(
+        deleted_docs, 1,
+        "only docs/x.md matches the lowercase prefix"
+    );
+    assert!(cache.get_unit(docs_x).expect("get_unit").is_none());
+    assert!(
+        cache.get_unit(big_docs_x).expect("get_unit").is_some(),
+        "Docs/x.md (different case) must survive deleting \"docs\""
+    );
+}
+
+#[test]
 fn delete_source_is_idempotent_on_an_already_removed_source() {
     let dir = tempfile::tempdir().unwrap();
     let cache = open_temp_cache(&dir);
