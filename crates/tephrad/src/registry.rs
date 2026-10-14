@@ -262,6 +262,56 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+/// How many times a `SQLITE_BUSY` [`CacheError`] is retried, and the
+/// backoff slept between attempts, for the handful of quick writes
+/// this module makes against the shared `self.cache` connection (R16
+/// review finding) — `register()`'s insert and `on_root_removed`'s
+/// offline transition specifically, named in the review, but every
+/// other write below the same `self.cache.lock()` mutex is wrapped
+/// too (status transitions, `set_last_scanned`, `delete_source`),
+/// since any of them can just as easily land while another source's
+/// scan is mid-chunk and briefly holding the write lock. Mirrors
+/// `scan::retry_on_busy`'s shape (same retry count and backoff), but
+/// against [`CacheError`] rather than `ScanError` since every write
+/// here goes through `tephra_cache::Cache`'s typed API, not this
+/// crate's own transaction helpers.
+const MAX_CACHE_BUSY_RETRIES: u32 = 8;
+const CACHE_BUSY_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Whether `err` is SQLite's `SQLITE_BUSY`, the same classification
+/// `scan::is_database_busy` applies to a `ScanError`.
+fn is_cache_busy(err: &CacheError) -> bool {
+    matches!(
+        err,
+        CacheError::Sqlite(rusqlite::Error::SqliteFailure(inner, _))
+            if inner.code == rusqlite::ErrorCode::DatabaseBusy
+    )
+}
+
+/// Retries `attempt` up to [`MAX_CACHE_BUSY_RETRIES`] times, sleeping
+/// [`CACHE_BUSY_RETRY_BACKOFF`] between attempts, whenever it fails
+/// with a `SQLITE_BUSY`-classified [`CacheError`] (R16) — any other
+/// error is returned immediately on its first occurrence. Before this
+/// fix, a scan whose chunked commits held the write lock past the
+/// 5-second `busy_timeout` pragma (R11) made every one of these
+/// quick registry writes fail outright with "database is locked"
+/// rather than simply waiting its turn.
+fn retry_cache_on_busy<T>(
+    mut attempt: impl FnMut() -> Result<T, CacheError>,
+) -> Result<T, CacheError> {
+    let mut tries = 0;
+    loop {
+        match attempt() {
+            Ok(v) => return Ok(v),
+            Err(e) if is_cache_busy(&e) && tries < MAX_CACHE_BUSY_RETRIES => {
+                tries += 1;
+                std::thread::sleep(CACHE_BUSY_RETRY_BACKOFF);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// The live orchestrator: owns the shared `Cache` (used only for
 /// quick, infrequent operations — registering/listing/transitioning a
 /// source row), the path that `Cache` was opened against (so a scan
@@ -360,11 +410,13 @@ impl SourceRegistry {
                 })
                 .collect();
             validate_register(&existing, name, &canonical_root, probe)?;
-            cache.register_source(
-                name,
-                &canonical_root.to_string_lossy(),
-                SourceStatus::Active,
-            )?
+            retry_cache_on_busy(|| {
+                cache.register_source(
+                    name,
+                    &canonical_root.to_string_lossy(),
+                    SourceStatus::Active,
+                )
+            })?
         };
 
         match self.scan_and_watch(name, source_id, &canonical_root) {
@@ -379,7 +431,7 @@ impl SourceRegistry {
             }
             Err(e) => {
                 let cache = self.cache.lock().unwrap();
-                if let Err(cleanup_err) = cache.delete_source(name) {
+                if let Err(cleanup_err) = retry_cache_on_busy(|| cache.delete_source(name)) {
                     tracing::warn!(
                         source = %name,
                         error = %cleanup_err,
@@ -438,7 +490,7 @@ impl SourceRegistry {
 
         {
             let cache = self.cache.lock().unwrap();
-            cache.set_last_scanned(name, now_unix())?;
+            retry_cache_on_busy(|| cache.set_last_scanned(name, now_unix()))?;
         }
 
         self.start_watcher(
@@ -541,8 +593,9 @@ impl SourceRegistry {
         let name_for_offline = name.clone();
         let on_root_removed = move || {
             let cache = cache_for_offline.lock().unwrap();
-            if let Err(e) = cache.transition_source_status(&name_for_offline, SourceStatus::Offline)
-            {
+            if let Err(e) = retry_cache_on_busy(|| {
+                cache.transition_source_status(&name_for_offline, SourceStatus::Offline)
+            }) {
                 tracing::warn!(source = %name_for_offline, error = %e, "failed to mark source offline");
             } else {
                 tracing::warn!(source = %name_for_offline, "source root is missing; marked offline");
@@ -576,7 +629,7 @@ impl SourceRegistry {
             running.handle.stop();
         }
         let cache = self.cache.lock().unwrap();
-        cache.delete_source(name)?;
+        retry_cache_on_busy(|| cache.delete_source(name))?;
         Ok(())
     }
 
@@ -618,7 +671,9 @@ impl SourceRegistry {
         if probe_path(&root) != PathProbe::Ok {
             let cache = self.cache.lock().unwrap();
             if status != SourceStatus::Offline {
-                cache.transition_source_status(name, SourceStatus::Offline)?;
+                retry_cache_on_busy(|| {
+                    cache.transition_source_status(name, SourceStatus::Offline)
+                })?;
             }
             return Ok(ScanStats::default());
         }
@@ -626,7 +681,7 @@ impl SourceRegistry {
         {
             let cache = self.cache.lock().unwrap();
             if status != SourceStatus::Stale {
-                cache.transition_source_status(name, SourceStatus::Stale)?;
+                retry_cache_on_busy(|| cache.transition_source_status(name, SourceStatus::Stale))?;
             }
         }
 
@@ -661,8 +716,8 @@ impl SourceRegistry {
 
         {
             let cache = self.cache.lock().unwrap();
-            cache.transition_source_status(name, SourceStatus::Active)?;
-            cache.set_last_scanned(name, now_unix())?;
+            retry_cache_on_busy(|| cache.transition_source_status(name, SourceStatus::Active))?;
+            retry_cache_on_busy(|| cache.set_last_scanned(name, now_unix()))?;
         }
 
         Ok(stats)
@@ -931,6 +986,72 @@ mod tests {
                 with: "notes".to_string(),
                 reason: ConflictReason::SameRoot,
             })
+        );
+    }
+
+    // ---- retry_cache_on_busy (R16) -------------------------------------
+
+    /// A `SQLITE_BUSY` [`CacheError`], the exact shape
+    /// `retry_cache_on_busy` and `is_cache_busy` classify as
+    /// retryable — built without any real database or lock
+    /// contention, so these tests are fast and deterministic (unlike
+    /// `tests/register_busy_retry.rs`'s real-lock integration test,
+    /// which proves the same helper is actually wired into
+    /// `register()`'s call site against a genuine busy connection).
+    fn busy_error() -> CacheError {
+        CacheError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("database is locked".to_string()),
+        ))
+    }
+
+    #[test]
+    fn retry_cache_on_busy_succeeds_once_the_operation_stops_failing() {
+        let mut calls = 0u32;
+        let result: Result<&str, CacheError> = retry_cache_on_busy(|| {
+            calls += 1;
+            if calls < 4 {
+                Err(busy_error())
+            } else {
+                Ok("done")
+            }
+        });
+        assert!(matches!(result, Ok("done")));
+        assert_eq!(
+            calls, 4,
+            "must retry exactly as many times as needed, no more"
+        );
+    }
+
+    #[test]
+    fn retry_cache_on_busy_gives_up_after_the_retry_budget_is_exhausted() {
+        let mut calls = 0u32;
+        let result: Result<(), CacheError> = retry_cache_on_busy(|| {
+            calls += 1;
+            Err(busy_error())
+        });
+        assert!(
+            matches!(result, Err(e) if is_cache_busy(&e)),
+            "must surface the busy error once retries run out, not hang forever"
+        );
+        assert_eq!(
+            calls,
+            MAX_CACHE_BUSY_RETRIES + 1,
+            "one initial attempt plus exactly MAX_CACHE_BUSY_RETRIES retries"
+        );
+    }
+
+    #[test]
+    fn retry_cache_on_busy_does_not_retry_a_non_busy_error() {
+        let mut calls = 0u32;
+        let result: Result<(), CacheError> = retry_cache_on_busy(|| {
+            calls += 1;
+            Err(CacheError::DuplicateSource("notes".to_string()))
+        });
+        assert!(matches!(result, Err(CacheError::DuplicateSource(n)) if n == "notes"));
+        assert_eq!(
+            calls, 1,
+            "a non-busy error must be returned immediately on the first attempt"
         );
     }
 }
