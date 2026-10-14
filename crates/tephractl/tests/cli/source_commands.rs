@@ -40,7 +40,7 @@ fn source_add_sends_register_with_name_and_path_and_renders_stats() {
     let received = server.received();
     assert_eq!(received[0].body["method"], "source.register");
     assert_eq!(received[0].body["params"]["name"], "notes");
-    assert_eq!(received[0].body["params"]["path"], "/home/dan/Notes");
+    assert_eq!(received[0].body["params"]["root"], "/home/dan/Notes");
 }
 
 #[test]

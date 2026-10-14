@@ -93,7 +93,10 @@ pub fn execute<R: BufRead>(
 }
 
 fn source_add(name: &str, path: &str, json: bool, client: &RpcClient) -> CommandOutcome {
-    match client.call("source.register", json!({"name": name, "path": path})) {
+    // Wire param is "root" (`tephrad::rpc::dispatch::source_register`),
+    // not "path" — the CLI's own flag/display vocabulary ("path") is
+    // deliberately kept distinct from the wire field name here.
+    match client.call("source.register", json!({"name": name, "root": path})) {
         Ok(stats) => CommandOutcome::ok(json_or(
             &stats,
             || render::render_source_added(name, path, &stats),
