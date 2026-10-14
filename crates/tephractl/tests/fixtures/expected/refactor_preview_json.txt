@@ -1,0 +1,19 @@
+{
+  "changes": [
+    {
+      "after": "[[NewDoc]]",
+      "before": "[[OldDoc]]",
+      "file": "@notes:Journal.md",
+      "line": 12
+    },
+    {
+      "after": "[[NewDoc|Old Doc]]",
+      "before": "[[OldDoc|Old Doc]]",
+      "file": "@notes:Index.md",
+      "line": 3
+    }
+  ],
+  "new_path": "NewDoc.md",
+  "old_path": "OldDoc.md",
+  "source": "notes"
+}

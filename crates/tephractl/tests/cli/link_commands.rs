@@ -1,16 +1,19 @@
-//! `tests/cli/link_commands.test` (G8/GP5/E4): `link resolve`/
+//! `tests/cli/link_commands.test` (G8/GP5/E4/R4/R5): `link resolve`/
 //! `link refactor` against the mock RPC server — correct method and
 //! params, GP5's cross-source distinction, the ambiguous-candidate
-//! rendering, the `--apply`/`--yes` confirmation gate (asserting no
-//! RPC call happens until confirmed), and the preview/apply
-//! rendering for the provisional response shape documented in
-//! `src/render.rs`.
+//! rendering, the `--apply`/`--yes` confirmation gate (asserting
+//! exactly which RPCs happen before/after confirmation, R3), the
+//! preview/apply rendering, and (R5) the offline-source marker and
+//! unicode-wikilink round trip at the wire level. Rendered and
+//! `--json` output, and exit codes, are asserted byte-for-byte
+//! (`assert_eq!`) against golden fixtures under
+//! `tests/fixtures/expected/` (R4) rather than `contains` checks.
 
 use tephractl::cli::Command;
 use tephractl::commands;
 use tephractl::transport::RpcClient;
 
-use crate::support::{load_fixture, Behavior, MockServer};
+use crate::support::{load_expected, load_fixture, Behavior, MockServer};
 
 fn client_for(server: &MockServer) -> RpcClient {
     RpcClient::new(server.addr.clone(), "test-token".to_string())
@@ -43,7 +46,7 @@ fn link_resolve_sends_the_link_and_default_source_params() {
 }
 
 #[test]
-fn link_resolve_cross_source_output_distinguishes_resolving_from_target_source() {
+fn link_resolve_cross_source_renders_exactly() {
     // GP5: resolving a federated link from "notes" into "atlas-repo"
     // must visibly distinguish the two, not just print one undifferentiated
     // "source" field.
@@ -65,18 +68,33 @@ fn link_resolve_cross_source_output_distinguishes_resolving_from_target_source()
     );
 
     assert_eq!(outcome.exit_code, 0);
-    let resolving_line = outcome
-        .stdout
-        .lines()
-        .find(|l| l.contains("Resolving from"))
-        .expect("a 'Resolving from' line");
-    let target_line = outcome
-        .stdout
-        .lines()
-        .find(|l| l.contains("Target source"))
-        .expect("a 'Target source' line");
-    assert!(resolving_line.contains("notes"));
-    assert!(target_line.contains("atlas-repo"));
+    assert_eq!(
+        outcome.stdout,
+        load_expected("resolve_cross_source_rendered")
+    );
+}
+
+#[test]
+fn link_resolve_json_flag_prints_raw_result_byte_for_byte() {
+    let server = MockServer::start(vec![Behavior::Respond {
+        status: 200,
+        body: load_fixture("resolve_success_cross_source"),
+    }]);
+    let client = client_for(&server);
+
+    let mut stdin: &[u8] = &[];
+    let outcome = commands::execute(
+        &Command::LinkResolve {
+            target: "[[@atlas-repo:README]]".to_string(),
+            default_source: Some("notes".to_string()),
+        },
+        true,
+        &client,
+        &mut stdin,
+    );
+
+    assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
+    assert_eq!(outcome.stdout, load_expected("resolve_cross_source_json"));
 }
 
 #[test]
@@ -104,7 +122,7 @@ fn link_resolve_without_default_source_sends_no_default_source_param() {
 }
 
 #[test]
-fn link_resolve_ambiguous_renders_numbered_candidate_list_not_raw_blob() {
+fn link_resolve_ambiguous_renders_exactly_and_exits_nonzero() {
     let server = MockServer::start(vec![Behavior::Respond {
         status: 200,
         body: load_fixture("resolve_ambiguous"),
@@ -122,14 +140,36 @@ fn link_resolve_ambiguous_renders_numbered_candidate_list_not_raw_blob() {
         &mut stdin,
     );
 
-    assert_ne!(outcome.exit_code, 0);
-    assert!(outcome.stderr.contains("1. @vault:lib/guide.md"));
-    assert!(outcome.stderr.contains("2. @vault:api/guide.md"));
-    assert!(!outcome.stderr.contains("\"data\":"));
+    assert_eq!(outcome.exit_code, 1);
+    assert_eq!(outcome.stderr, load_expected("resolve_ambiguous_rendered"));
+    assert_eq!(outcome.stdout, "");
 }
 
 #[test]
-fn link_resolve_unresolved_prints_a_plain_clear_message() {
+fn link_resolve_ambiguous_json_flag_prints_the_error_envelope_byte_for_byte() {
+    let server = MockServer::start(vec![Behavior::Respond {
+        status: 200,
+        body: load_fixture("resolve_ambiguous"),
+    }]);
+    let client = client_for(&server);
+
+    let mut stdin: &[u8] = &[];
+    let outcome = commands::execute(
+        &Command::LinkResolve {
+            target: "[[guide]]".to_string(),
+            default_source: Some("vault".to_string()),
+        },
+        true,
+        &client,
+        &mut stdin,
+    );
+
+    assert_eq!(outcome.exit_code, 1);
+    assert_eq!(outcome.stderr, load_expected("resolve_ambiguous_json"));
+}
+
+#[test]
+fn link_resolve_unresolved_renders_exactly_and_exits_nonzero() {
     let server = MockServer::start(vec![Behavior::Respond {
         status: 200,
         body: load_fixture("resolve_unresolved"),
@@ -147,14 +187,70 @@ fn link_resolve_unresolved_prints_a_plain_clear_message() {
         &mut stdin,
     );
 
-    assert_ne!(outcome.exit_code, 0);
-    assert!(outcome
-        .stderr
-        .contains("no unit in source \"vault\" matches \"missing\""));
+    assert_eq!(outcome.exit_code, 1);
+    assert_eq!(outcome.stderr, load_expected("resolve_unresolved_rendered"));
+}
+
+/// R5: an offline-source fixture response (`unit.offline` and
+/// `edge.offline` both `true`) must render both the unit-level
+/// "offline: yes" line and the edge-level "(offline)" marker.
+#[test]
+fn link_resolve_offline_source_renders_offline_markers_exactly() {
+    let server = MockServer::start(vec![Behavior::Respond {
+        status: 200,
+        body: load_fixture("resolve_success_offline"),
+    }]);
+    let client = client_for(&server);
+
+    let mut stdin: &[u8] = &[];
+    let outcome = commands::execute(
+        &Command::LinkResolve {
+            target: "[[Other]]".to_string(),
+            default_source: Some("old-vault".to_string()),
+        },
+        false,
+        &client,
+        &mut stdin,
+    );
+
+    assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
+    assert_eq!(outcome.stdout, load_expected("resolve_offline_rendered"));
+    assert!(outcome.stdout.contains("offline: yes"));
+    assert!(outcome.stdout.contains("(offline)"));
+}
+
+/// R5: a unicode wikilink target (`[[@notes:Café Notes]]`) must be
+/// sent to the daemon byte-for-byte untouched (not normalized,
+/// percent-encoded, or otherwise mangled), and the resolved unicode
+/// path must render correctly in the default (non-`--json`) output.
+#[test]
+fn link_resolve_unicode_target_round_trips_on_the_wire_and_in_output() {
+    let server = MockServer::start(vec![Behavior::Respond {
+        status: 200,
+        body: load_fixture("resolve_success_unicode"),
+    }]);
+    let client = client_for(&server);
+    let target = "[[@notes:Café Notes]]";
+
+    let mut stdin: &[u8] = &[];
+    let outcome = commands::execute(
+        &Command::LinkResolve {
+            target: target.to_string(),
+            default_source: None,
+        },
+        false,
+        &client,
+        &mut stdin,
+    );
+
+    assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
+    assert_eq!(server.received()[0].body["params"]["link"], target);
+    assert_eq!(outcome.stdout, load_expected("resolve_unicode_rendered"));
+    assert!(outcome.stdout.contains("Café Notes.md"));
 }
 
 #[test]
-fn link_refactor_preview_sends_source_old_new_params_and_renders_diff() {
+fn link_refactor_preview_sends_source_old_new_params_and_renders_exactly() {
     let server = MockServer::start(vec![Behavior::Respond {
         status: 200,
         body: load_fixture("preview_refactor_success"),
@@ -181,13 +277,72 @@ fn link_refactor_preview_sends_source_old_new_params_and_renders_diff() {
     assert_eq!(sent[0].body["params"]["source"], "notes");
     assert_eq!(sent[0].body["params"]["old_path"], "OldDoc.md");
     assert_eq!(sent[0].body["params"]["new_path"], "NewDoc.md");
-    assert!(outcome.stdout.contains("@notes:Journal.md:12"));
-    assert!(outcome.stdout.contains("- [[OldDoc]]"));
-    assert!(outcome.stdout.contains("+ [[NewDoc]]"));
+    assert_eq!(outcome.stdout, load_expected("refactor_preview_rendered"));
 }
 
 #[test]
-fn link_refactor_apply_with_yes_skips_the_confirmation_prompt() {
+fn link_refactor_preview_json_flag_prints_raw_result_byte_for_byte() {
+    let server = MockServer::start(vec![Behavior::Respond {
+        status: 200,
+        body: load_fixture("preview_refactor_success"),
+    }]);
+    let client = client_for(&server);
+
+    let mut stdin: &[u8] = &[];
+    let outcome = commands::execute(
+        &Command::LinkRefactor {
+            source: "notes".to_string(),
+            old_path: "OldDoc.md".to_string(),
+            new_path: "NewDoc.md".to_string(),
+            apply: false,
+            yes: false,
+        },
+        true,
+        &client,
+        &mut stdin,
+    );
+
+    assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
+    assert_eq!(outcome.stdout, load_expected("refactor_preview_json"));
+}
+
+/// R5: a unicode `--old`/`--new` path (`Café Notes.md`) must be sent
+/// to the daemon byte-for-byte untouched, and must render correctly
+/// (not mangled/escaped) in the preview diff.
+#[test]
+fn link_refactor_preview_unicode_old_path_round_trips_on_the_wire_and_in_output() {
+    let server = MockServer::start(vec![Behavior::Respond {
+        status: 200,
+        body: load_fixture("preview_refactor_unicode"),
+    }]);
+    let client = client_for(&server);
+
+    let mut stdin: &[u8] = &[];
+    let outcome = commands::execute(
+        &Command::LinkRefactor {
+            source: "notes".to_string(),
+            old_path: "Café Notes.md".to_string(),
+            new_path: "Café Notes Renamed.md".to_string(),
+            apply: false,
+            yes: false,
+        },
+        false,
+        &client,
+        &mut stdin,
+    );
+
+    assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
+    let sent = server.received();
+    assert_eq!(sent[0].body["params"]["old_path"], "Café Notes.md");
+    assert_eq!(sent[0].body["params"]["new_path"], "Café Notes Renamed.md");
+    assert_eq!(
+        outcome.stdout,
+        load_expected("refactor_preview_unicode_rendered")
+    );
+}
+
+#[test]
+fn link_refactor_apply_with_yes_skips_the_confirmation_prompt_and_renders_exactly() {
     let server = MockServer::start(vec![Behavior::Respond {
         status: 200,
         body: load_fixture("apply_refactor_success"),
@@ -213,14 +368,39 @@ fn link_refactor_apply_with_yes_skips_the_confirmation_prompt() {
     );
 
     assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
+    assert_eq!(server.received().len(), 1, "--yes issues exactly one RPC");
     assert_eq!(server.received()[0].body["method"], "link.apply_refactor");
-    assert!(outcome
-        .stdout
-        .contains("Refactor applied: 2 file(s) changed"));
+    assert_eq!(outcome.stdout, load_expected("refactor_apply_rendered"));
 }
 
 #[test]
-fn link_refactor_apply_without_yes_prompts_and_a_refusal_makes_no_rpc_call() {
+fn link_refactor_apply_with_yes_json_flag_prints_raw_result_byte_for_byte() {
+    let server = MockServer::start(vec![Behavior::Respond {
+        status: 200,
+        body: load_fixture("apply_refactor_success"),
+    }]);
+    let client = client_for(&server);
+
+    let mut stdin: &[u8] = &[];
+    let outcome = commands::execute(
+        &Command::LinkRefactor {
+            source: "notes".to_string(),
+            old_path: "OldDoc.md".to_string(),
+            new_path: "NewDoc.md".to_string(),
+            apply: true,
+            yes: true,
+        },
+        true,
+        &client,
+        &mut stdin,
+    );
+
+    assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
+    assert_eq!(outcome.stdout, load_expected("refactor_apply_json"));
+}
+
+#[test]
+fn link_refactor_apply_without_yes_prompts_and_a_refusal_makes_no_apply_rpc_call() {
     // R3: the interactive path fetches a preview to show the user
     // before asking for confirmation, so one request is expected (the
     // preview) — but a refusal must still make zero `apply_refactor`
@@ -245,7 +425,9 @@ fn link_refactor_apply_without_yes_prompts_and_a_refusal_makes_no_rpc_call() {
         &mut stdin,
     );
 
-    assert_ne!(outcome.exit_code, 0);
+    assert_eq!(outcome.exit_code, 1);
+    assert_eq!(outcome.stderr, "aborted: refactor not confirmed\n");
+    assert_eq!(outcome.stdout, "");
     assert_eq!(
         server.call_count(),
         1,
@@ -255,7 +437,7 @@ fn link_refactor_apply_without_yes_prompts_and_a_refusal_makes_no_rpc_call() {
 }
 
 #[test]
-fn link_refactor_apply_without_yes_confirmed_with_y_does_call_the_rpc() {
+fn link_refactor_apply_without_yes_confirmed_with_y_does_call_preview_then_apply() {
     let server = MockServer::start(vec![
         Behavior::Respond {
             status: 200,
@@ -287,33 +469,7 @@ fn link_refactor_apply_without_yes_confirmed_with_y_does_call_the_rpc() {
     assert_eq!(received.len(), 2, "a preview call, then the apply call");
     assert_eq!(received[0].body["method"], "link.preview_refactor");
     assert_eq!(received[1].body["method"], "link.apply_refactor");
-}
-
-#[test]
-fn link_refactor_apply_aborted_result_is_reported_as_a_failure() {
-    let server = MockServer::start(vec![Behavior::Respond {
-        status: 200,
-        body: load_fixture("apply_refactor_aborted"),
-    }]);
-    let client = client_for(&server);
-
-    let mut stdin: &[u8] = &[];
-    let outcome = commands::execute(
-        &Command::LinkRefactor {
-            source: "notes".to_string(),
-            old_path: "OldDoc.md".to_string(),
-            new_path: "NewDoc.md".to_string(),
-            apply: true,
-            yes: true,
-        },
-        false,
-        &client,
-        &mut stdin,
-    );
-
-    assert_ne!(outcome.exit_code, 0);
-    assert!(outcome.stderr.contains("Refactor aborted"));
-    assert!(outcome.stderr.contains("file modified since preview"));
+    assert_eq!(outcome.stdout, load_expected("refactor_apply_rendered"));
 }
 
 /// R2/R3: the confirmation prompt for `--apply` without `--yes`
@@ -403,6 +559,7 @@ fn link_refactor_apply_json_without_yes_keeps_stdout_as_valid_json() {
     );
 
     assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
+    assert_eq!(outcome.stdout, load_expected("refactor_apply_json"));
     let parsed: serde_json::Value =
         serde_json::from_str(&outcome.stdout).expect("stdout must be valid JSON end to end");
     assert_eq!(parsed["status"], "applied");
@@ -410,4 +567,60 @@ fn link_refactor_apply_json_without_yes_keeps_stdout_as_valid_json() {
     // not mixed into the JSON stdout.
     let prompt = String::from_utf8(prompt_out).expect("prompt is valid utf8");
     assert!(prompt.contains("Apply this refactor"));
+}
+
+#[test]
+fn link_refactor_apply_aborted_result_renders_exactly_and_exits_nonzero() {
+    let server = MockServer::start(vec![Behavior::Respond {
+        status: 200,
+        body: load_fixture("apply_refactor_aborted"),
+    }]);
+    let client = client_for(&server);
+
+    let mut stdin: &[u8] = &[];
+    let outcome = commands::execute(
+        &Command::LinkRefactor {
+            source: "notes".to_string(),
+            old_path: "OldDoc.md".to_string(),
+            new_path: "NewDoc.md".to_string(),
+            apply: true,
+            yes: true,
+        },
+        false,
+        &client,
+        &mut stdin,
+    );
+
+    assert_eq!(outcome.exit_code, 1);
+    assert_eq!(
+        outcome.stderr,
+        load_expected("refactor_apply_aborted_rendered")
+    );
+    assert_eq!(outcome.stdout, "");
+}
+
+#[test]
+fn link_refactor_apply_aborted_json_flag_prints_raw_result_byte_for_byte() {
+    let server = MockServer::start(vec![Behavior::Respond {
+        status: 200,
+        body: load_fixture("apply_refactor_aborted"),
+    }]);
+    let client = client_for(&server);
+
+    let mut stdin: &[u8] = &[];
+    let outcome = commands::execute(
+        &Command::LinkRefactor {
+            source: "notes".to_string(),
+            old_path: "OldDoc.md".to_string(),
+            new_path: "NewDoc.md".to_string(),
+            apply: true,
+            yes: true,
+        },
+        true,
+        &client,
+        &mut stdin,
+    );
+
+    assert_eq!(outcome.exit_code, 1);
+    assert_eq!(outcome.stderr, load_expected("refactor_apply_aborted_json"));
 }

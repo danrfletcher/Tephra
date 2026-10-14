@@ -1,0 +1,3 @@
+"guide" is ambiguous in source "vault"; candidates:
+  1. @vault:lib/guide.md
+  2. @vault:api/guide.md

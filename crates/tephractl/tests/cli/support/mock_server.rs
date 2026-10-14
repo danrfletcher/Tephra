@@ -219,3 +219,23 @@ pub fn load_fixture(name: &str) -> Value {
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading fixture {path}: {e}"));
     serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parsing fixture {path}: {e}"))
 }
+
+/// Loads a golden expected-output fixture under
+/// `tests/fixtures/expected/<name>.txt`, for an exact (`assert_eq!`)
+/// comparison against rendered/`--json` `tephractl` output (R4).
+pub fn load_expected(name: &str) -> String {
+    let path = format!(
+        "{}/tests/fixtures/expected/{name}.txt",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("reading expected fixture {path}: {e}"))
+}
+
+/// Like [`load_expected`], but for a golden file that contains the
+/// literal placeholder `{ADDR}` in place of the mock server's
+/// (per-run, ephemeral-port) address — used for `status`'s output,
+/// which embeds the daemon address it was told to dial.
+pub fn load_expected_templated(name: &str, addr: &str) -> String {
+    load_expected(name).replace("{ADDR}", addr)
+}

@@ -1,0 +1,5 @@
+Daemon address: {ADDR}
+Daemon uptime: unavailable (tephrad does not expose an uptime RPC method)
+NAME                 STATUS    PATH
+notes                active    /home/dan/Notes
+old-vault            offline   /home/dan/Old (offline)

@@ -1,0 +1,8 @@
+Resolving from source: notes
+Target source:         atlas-repo
+Resolved unit: @atlas-repo:README.md
+  path: README.md
+  tags: project
+  offline: no
+Outgoing edges (1):
+  [wikilink] [[Setup]] -> @atlas-repo:docs/Setup.md

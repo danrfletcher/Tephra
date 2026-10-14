@@ -1,0 +1,5 @@
+2 affected link(s):
+  @notes:Journal.md:12  - [[OldDoc]]
+  @notes:Journal.md:12  + [[NewDoc]]
+  @notes:Index.md:3  - [[OldDoc|Old Doc]]
+  @notes:Index.md:3  + [[NewDoc|Old Doc]]

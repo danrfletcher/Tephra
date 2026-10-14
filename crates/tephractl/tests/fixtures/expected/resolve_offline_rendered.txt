@@ -1,0 +1,8 @@
+Resolving from source: old-vault
+Target source:         old-vault
+Resolved unit: @old-vault:Notes.md
+  path: Notes.md
+  tags: (none)
+  offline: yes
+Outgoing edges (1):
+  [wikilink] [[Other]] -> @old-vault:Other.md (offline)

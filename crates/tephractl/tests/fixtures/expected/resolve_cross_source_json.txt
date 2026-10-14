@@ -1,0 +1,24 @@
+{
+  "edges": [
+    {
+      "from": "@atlas-repo:README.md",
+      "kind": "wikilink",
+      "offline": false,
+      "to": {
+        "resolved": "@atlas-repo:docs/Setup.md"
+      },
+      "to_raw": "[[Setup]]"
+    }
+  ],
+  "unit": {
+    "blocks": [],
+    "frontmatter_json": null,
+    "id": "@atlas-repo:README.md",
+    "offline": false,
+    "rel_path": "README.md",
+    "source": "atlas-repo",
+    "tags": [
+      "project"
+    ]
+  }
+}

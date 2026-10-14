@@ -1,0 +1,3 @@
+NAME                 STATUS    PATH
+notes                active    /home/dan/Notes
+old-vault            offline   /home/dan/Old (offline)
