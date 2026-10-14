@@ -283,3 +283,103 @@ fn get_backlinks_on_a_renamed_notes_old_id_still_finds_every_impacted_incoming_l
     // it (that's PR-8's `link.apply_refactor` job, out of scope here).
     assert!(graph.get_backlinks("@notes:NewDoc.md").is_empty());
 }
+
+/// R9: re-upserting the exact same path (a watcher's debounced edit
+/// of a file whose own rel_path didn't change) must not leave a
+/// stale duplicate of this id behind in its own stem/basename index
+/// entry. Before the fix, a second `upsert_unit` for the same path
+/// left `[id, id]` in both indices, so the id became "ambiguous with
+/// itself" and anything that later tried to link to it went
+/// dangling.
+#[test]
+fn re_upserting_the_same_path_does_not_make_it_ambiguous_with_itself() {
+    let mut graph = UnitGraph::new();
+    graph.upsert_unit("notes", "B.md", facts(&[], &[], &[]));
+
+    // Resolves fine after the first upsert.
+    assert_eq!(
+        graph
+            .resolve_link("[[B]]", Some("notes"))
+            .expect("unique after the first upsert")
+            .unit
+            .id,
+        "@notes:B.md"
+    );
+
+    // A second upsert of the exact same path — the scenario a
+    // watcher's edit of B.md itself produces.
+    graph.upsert_unit("notes", "B.md", facts(&[], &[], &[]));
+
+    assert_eq!(
+        graph
+            .resolve_link("[[B]]", Some("notes"))
+            .expect("must still resolve uniquely after a re-upsert, not go ambiguous with itself")
+            .unit
+            .id,
+        "@notes:B.md"
+    );
+
+    // And a brand-new unit linking to it afterwards must resolve, not
+    // dangle.
+    graph.upsert_unit("notes", "A.md", facts(&[("B", "wikilink")], &[], &[]));
+    let forward = graph.get_forward_links("@notes:A.md");
+    assert_eq!(forward.len(), 1);
+    assert_eq!(
+        forward[0].to,
+        EdgeTarget::Resolved("@notes:B.md".to_string())
+    );
+}
+
+/// R9: several re-upserts in a row (repeated edits) still leave
+/// exactly one index entry, not one per edit.
+#[test]
+fn many_re_upserts_of_the_same_path_still_resolve_uniquely() {
+    let mut graph = UnitGraph::new();
+    for _ in 0..5 {
+        graph.upsert_unit("notes", "B.md", facts(&[], &[], &[]));
+    }
+
+    graph.upsert_unit("notes", "A.md", facts(&[("B", "wikilink")], &[], &[]));
+    let forward = graph.get_forward_links("@notes:A.md");
+    assert_eq!(forward.len(), 1, "{forward:?}");
+    assert_eq!(
+        forward[0].to,
+        EdgeTarget::Resolved("@notes:B.md".to_string())
+    );
+}
+
+/// R11: `get_backlinks` for a *live* unit must never include a
+/// dangling edge just because that edge's unresolved raw target
+/// happens to share the unit's basename with some other, unrelated
+/// unit elsewhere in the source. Unlike the GP7 stale-id case (both
+/// `teamA/Shared.md` and `teamB/Shared.md` below are live nodes, not
+/// a removed/renamed one), an edge that merely ties on basename with
+/// one of them never actually resolved to either — reporting it as
+/// one of their backlinks would contradict `get_backlinks`'s own
+/// contract ("edges whose target resolved to id").
+#[test]
+fn get_backlinks_for_a_live_unit_never_includes_an_edge_that_only_shares_its_basename() {
+    let mut graph = UnitGraph::new();
+    graph.upsert_unit("notes", "teamA/Shared.md", facts(&[], &[], &[]));
+    graph.upsert_unit("notes", "teamB/Shared.md", facts(&[], &[], &[]));
+    graph.upsert_unit("notes", "N.md", facts(&[("Shared", "wikilink")], &[], &[]));
+
+    // The ambiguous tie means N's own link is dangling, not resolved
+    // to either team's file.
+    let forward = graph.get_forward_links("@notes:N.md");
+    assert_eq!(forward.len(), 1);
+    assert_eq!(forward[0].to, EdgeTarget::Dangling);
+
+    // Neither teamA's nor teamB's own backlinks may include this
+    // dangling edge: it never actually resolved to either of them.
+    assert!(
+        graph.get_backlinks("@notes:teamA/Shared.md").is_empty(),
+        "{:?}",
+        graph.get_backlinks("@notes:teamA/Shared.md")
+    );
+    assert!(
+        graph.get_backlinks("@notes:teamB/Shared.md").is_empty(),
+        "{:?}",
+        graph.get_backlinks("@notes:teamB/Shared.md")
+    );
+}

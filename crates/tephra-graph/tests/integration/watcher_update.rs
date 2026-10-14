@@ -300,3 +300,496 @@ fn applying_one_edit_in_a_large_source_recomputes_in_roughly_constant_time_not_p
         "a single scoped update should stay well under 100ms even at 8,000 units: {large:?}"
     );
 }
+
+/// R13: the previous fix made resolution itself O(1)-average per
+/// link, but `recompute_scoped` still cloned every edge in the graph
+/// and rebuilt every index from scratch on every call, so one edit's
+/// *wall-clock* cost still grew linearly with the graph's total edge
+/// count (measured: 15ms at 10k units, 122ms at 50k, 316ms at 100k —
+/// roughly linear, 5 links/unit). A 4x-data/"4x+50ms" bound (the
+/// previous scaling test above) cannot catch a linear regression,
+/// since linear growth satisfies it too; this test uses a much
+/// larger data ratio (10x) with a tight multiplicative bound a
+/// linear-in-total-edges cost cannot satisfy, to actually catch the
+/// regression R13 describes.
+#[test]
+fn applying_one_edit_does_not_grow_linearly_with_total_graph_size() {
+    fn seed(cache: &Cache, source_id: i64, n: usize) {
+        for i in 0..n {
+            let rel_path = format!("Unit{i}.md");
+            let unit_id = cache
+                .insert_unit(&NewUnit {
+                    source_id,
+                    rel_path: &rel_path,
+                    mtime: None,
+                    frontmatter_json: None,
+                })
+                .expect("insert unit");
+            for k in 1..=5 {
+                let target = format!("Unit{}", (i + k) % n);
+                cache
+                    .insert_link(&NewLink {
+                        from_unit_id: unit_id,
+                        to_raw: &target,
+                        to_unit_id: None,
+                        kind: tephra_parser::LINK_KIND_WIKILINK,
+                    })
+                    .expect("insert link");
+            }
+        }
+    }
+
+    fn time_one_edit(n: usize) -> std::time::Duration {
+        let dir = tempdir().expect("tempdir");
+        let cache = Cache::open(dir.path().join("cache.db")).expect("open cache");
+        let source_id = cache
+            .register_source("notes", "/tmp/notes", SourceStatus::Active)
+            .expect("register_source");
+        seed(&cache, source_id, n);
+
+        let mut graph = UnitGraph::build_from_cache(&cache).expect("build_from_cache");
+
+        let existing = cache
+            .get_unit_by_rel_path(source_id, "Unit0.md")
+            .expect("get_unit_by_rel_path")
+            .expect("Unit0.md exists");
+        cache.delete_unit(existing.id).expect("delete_unit");
+        let new_unit_id = cache
+            .insert_unit(&NewUnit {
+                source_id,
+                rel_path: "Unit0.md",
+                mtime: None,
+                frontmatter_json: None,
+            })
+            .expect("re-insert unit");
+        for k in 1..=5 {
+            let target = format!("Unit{}", k % n);
+            cache
+                .insert_link(&NewLink {
+                    from_unit_id: new_unit_id,
+                    to_raw: &target,
+                    to_unit_id: None,
+                    kind: tephra_parser::LINK_KIND_WIKILINK,
+                })
+                .expect("insert link");
+        }
+
+        let started = Instant::now();
+        graph
+            .apply_change_notification(
+                &cache,
+                &ChangeNotification {
+                    source: "notes".to_string(),
+                    rel_paths: vec!["Unit0.md".to_string()],
+                },
+            )
+            .expect("apply_change_notification");
+        started.elapsed()
+    }
+
+    let small = time_one_edit(10_000);
+    let large = time_one_edit(100_000);
+
+    // A cost linear in total edges would take roughly 10x longer at
+    // 10x the units (100k vs 10k); an in-place scoped update (R13)
+    // costs roughly the same regardless of total graph size. A tight
+    // multiplicative bound (3x) catches a linear-in-total-edges
+    // regression that a looser one would miss, while still leaving
+    // slack for machine noise.
+    assert!(
+        large.as_secs_f64() < small.as_secs_f64() * 3.0 + 0.05,
+        "editing one unit at 100,000 units took {large:?}, at 10,000 units took {small:?} \
+         — this grows with source size, which means the per-edit cost scales with total \
+         edges again, not with what the edit actually touched"
+    );
+    assert!(
+        large.as_millis() < 150,
+        "a single scoped update should stay well under 150ms even at 100,000 units: {large:?}"
+    );
+}
+
+/// R10: inserting a shorter same-named candidate must pull an
+/// already-resolved edge away from a longer one, matching what a
+/// fresh rebuild from the same cache state would produce — not leave
+/// the edge pointing at the old, no-longer-shortest, candidate.
+#[test]
+fn inserting_a_shorter_candidate_repoints_an_already_resolved_edge_to_match_a_fresh_rebuild() {
+    let cache_dir = tempdir().expect("cache tempdir");
+    let source_dir = tempdir().expect("source tempdir");
+    let cache = open_temp_cache(&cache_dir);
+    let source_id = cache
+        .register_source(
+            "notes",
+            &source_dir.path().to_string_lossy(),
+            tephra_cache::SourceStatus::Active,
+        )
+        .expect("register_source");
+
+    write_and_cache(
+        &cache,
+        source_id,
+        source_dir.path(),
+        "N.md",
+        "See [[Shared]].\n",
+    );
+    write_and_cache(
+        &cache,
+        source_id,
+        source_dir.path(),
+        "teamA/Shared.md",
+        "# Shared A\n",
+    );
+
+    let mut graph = UnitGraph::build_from_cache(&cache).expect("initial build");
+    assert_eq!(
+        graph.get_forward_links("@notes:N.md")[0].to,
+        EdgeTarget::Resolved("@notes:teamA/Shared.md".to_string())
+    );
+
+    write_and_cache(
+        &cache,
+        source_id,
+        source_dir.path(),
+        "Shared.md",
+        "# Shared root\n",
+    );
+    graph
+        .apply_change_notification(
+            &cache,
+            &ChangeNotification {
+                source: "notes".to_string(),
+                rel_paths: vec!["Shared.md".to_string()],
+            },
+        )
+        .expect("apply_change_notification");
+
+    assert_eq!(
+        graph.get_forward_links("@notes:N.md")[0].to,
+        EdgeTarget::Resolved("@notes:Shared.md".to_string()),
+        "E4: the newly inserted shorter root candidate must win"
+    );
+
+    let fresh = UnitGraph::build_from_cache(&cache).expect("fresh rebuild");
+    assert_eq!(
+        graph.get_edges(),
+        fresh.get_edges(),
+        "incremental update must agree with a full rebuild from the same cache state"
+    );
+}
+
+/// R10: inserting a second, equal-length candidate must turn a
+/// previously unique resolution into an ambiguous (dangling) one —
+/// not leave the edge pointing at its old candidate as if nothing
+/// changed.
+#[test]
+fn inserting_a_tying_candidate_dangles_a_previously_resolved_edge_to_match_a_fresh_rebuild() {
+    let cache_dir = tempdir().expect("cache tempdir");
+    let source_dir = tempdir().expect("source tempdir");
+    let cache = open_temp_cache(&cache_dir);
+    let source_id = cache
+        .register_source(
+            "notes",
+            &source_dir.path().to_string_lossy(),
+            tephra_cache::SourceStatus::Active,
+        )
+        .expect("register_source");
+
+    write_and_cache(
+        &cache,
+        source_id,
+        source_dir.path(),
+        "N.md",
+        "See [[Shared]].\n",
+    );
+    write_and_cache(
+        &cache,
+        source_id,
+        source_dir.path(),
+        "teamA/Shared.md",
+        "# Shared A\n",
+    );
+
+    let mut graph = UnitGraph::build_from_cache(&cache).expect("initial build");
+    assert_eq!(
+        graph.get_forward_links("@notes:N.md")[0].to,
+        EdgeTarget::Resolved("@notes:teamA/Shared.md".to_string())
+    );
+
+    write_and_cache(
+        &cache,
+        source_id,
+        source_dir.path(),
+        "teamB/Shared.md",
+        "# Shared B\n",
+    );
+    graph
+        .apply_change_notification(
+            &cache,
+            &ChangeNotification {
+                source: "notes".to_string(),
+                rel_paths: vec!["teamB/Shared.md".to_string()],
+            },
+        )
+        .expect("apply_change_notification");
+
+    assert_eq!(
+        graph.get_forward_links("@notes:N.md")[0].to,
+        EdgeTarget::Dangling,
+        "E4: an equal-length second candidate must turn a unique match into a tie"
+    );
+
+    let fresh = UnitGraph::build_from_cache(&cache).expect("fresh rebuild");
+    assert_eq!(graph.get_edges(), fresh.get_edges());
+}
+
+/// R10: removing one half of an existing tie must let the edge
+/// resolve to the one remaining candidate — not leave it dangling
+/// just because it was already dangling before the removal.
+#[test]
+fn removing_one_half_of_a_tie_resolves_the_edge_to_the_remaining_candidate() {
+    let cache_dir = tempdir().expect("cache tempdir");
+    let source_dir = tempdir().expect("source tempdir");
+    let cache = open_temp_cache(&cache_dir);
+    let source_id = cache
+        .register_source(
+            "notes",
+            &source_dir.path().to_string_lossy(),
+            tephra_cache::SourceStatus::Active,
+        )
+        .expect("register_source");
+
+    write_and_cache(
+        &cache,
+        source_id,
+        source_dir.path(),
+        "N.md",
+        "See [[Shared]].\n",
+    );
+    write_and_cache(
+        &cache,
+        source_id,
+        source_dir.path(),
+        "teamA/Shared.md",
+        "# Shared A\n",
+    );
+    write_and_cache(
+        &cache,
+        source_id,
+        source_dir.path(),
+        "teamB/Shared.md",
+        "# Shared B\n",
+    );
+
+    let mut graph = UnitGraph::build_from_cache(&cache).expect("initial build");
+    assert_eq!(
+        graph.get_forward_links("@notes:N.md")[0].to,
+        EdgeTarget::Dangling,
+        "an equal-length tie starts out dangling"
+    );
+
+    let teamb = cache
+        .get_unit_by_rel_path(source_id, "teamB/Shared.md")
+        .expect("get_unit_by_rel_path")
+        .expect("teamB/Shared.md exists");
+    cache.delete_unit(teamb.id).expect("delete_unit");
+    graph
+        .apply_change_notification(
+            &cache,
+            &ChangeNotification {
+                source: "notes".to_string(),
+                rel_paths: vec!["teamB/Shared.md".to_string()],
+            },
+        )
+        .expect("apply_change_notification");
+
+    assert_eq!(
+        graph.get_forward_links("@notes:N.md")[0].to,
+        EdgeTarget::Resolved("@notes:teamA/Shared.md".to_string()),
+        "R10: removing one half of a tie must resolve to the remaining candidate, \
+         not stay dangling"
+    );
+
+    let fresh = UnitGraph::build_from_cache(&cache).expect("fresh rebuild");
+    assert_eq!(graph.get_edges(), fresh.get_edges());
+}
+
+/// R10: removing the shortest candidate must fall the edge back to
+/// the next-shortest remaining one, rather than leaving it dangling.
+#[test]
+fn removing_the_shortest_candidate_falls_back_to_the_next_shortest() {
+    let cache_dir = tempdir().expect("cache tempdir");
+    let source_dir = tempdir().expect("source tempdir");
+    let cache = open_temp_cache(&cache_dir);
+    let source_id = cache
+        .register_source(
+            "notes",
+            &source_dir.path().to_string_lossy(),
+            tephra_cache::SourceStatus::Active,
+        )
+        .expect("register_source");
+
+    write_and_cache(
+        &cache,
+        source_id,
+        source_dir.path(),
+        "N.md",
+        "See [[Shared]].\n",
+    );
+    write_and_cache(
+        &cache,
+        source_id,
+        source_dir.path(),
+        "Shared.md",
+        "# Shared root\n",
+    );
+    write_and_cache(
+        &cache,
+        source_id,
+        source_dir.path(),
+        "teamA/Shared.md",
+        "# Shared A\n",
+    );
+
+    let mut graph = UnitGraph::build_from_cache(&cache).expect("initial build");
+    assert_eq!(
+        graph.get_forward_links("@notes:N.md")[0].to,
+        EdgeTarget::Resolved("@notes:Shared.md".to_string())
+    );
+
+    let root = cache
+        .get_unit_by_rel_path(source_id, "Shared.md")
+        .expect("get_unit_by_rel_path")
+        .expect("Shared.md exists");
+    cache.delete_unit(root.id).expect("delete_unit");
+    graph
+        .apply_change_notification(
+            &cache,
+            &ChangeNotification {
+                source: "notes".to_string(),
+                rel_paths: vec!["Shared.md".to_string()],
+            },
+        )
+        .expect("apply_change_notification");
+
+    assert_eq!(
+        graph.get_forward_links("@notes:N.md")[0].to,
+        EdgeTarget::Resolved("@notes:teamA/Shared.md".to_string()),
+        "R10: removing the shortest candidate must fall back to the next-shortest, \
+         not go dangling"
+    );
+
+    let fresh = UnitGraph::build_from_cache(&cache).expect("fresh rebuild");
+    assert_eq!(graph.get_edges(), fresh.get_edges());
+}
+
+/// R9 (via `apply_change_notification`): re-applying a change
+/// notification for the exact same, unchanged path — a watcher's
+/// debounced "touch" event — must not make the path ambiguous with
+/// itself. A file that later links to it must still resolve.
+#[test]
+fn reapplying_a_change_notification_for_the_same_path_does_not_self_ambiguate() {
+    let cache_dir = tempdir().expect("cache tempdir");
+    let source_dir = tempdir().expect("source tempdir");
+    let cache = open_temp_cache(&cache_dir);
+    let source_id = cache
+        .register_source(
+            "notes",
+            &source_dir.path().to_string_lossy(),
+            tephra_cache::SourceStatus::Active,
+        )
+        .expect("register_source");
+
+    write_and_cache(&cache, source_id, source_dir.path(), "One.md", "# One\n");
+    let mut graph = UnitGraph::build_from_cache(&cache).expect("initial build");
+
+    for _ in 0..3 {
+        write_and_cache(&cache, source_id, source_dir.path(), "One.md", "# One\n");
+        graph
+            .apply_change_notification(
+                &cache,
+                &ChangeNotification {
+                    source: "notes".to_string(),
+                    rel_paths: vec!["One.md".to_string()],
+                },
+            )
+            .expect("apply_change_notification");
+    }
+
+    write_and_cache(
+        &cache,
+        source_id,
+        source_dir.path(),
+        "Two.md",
+        "# Two\n\nSee [[One]].\n",
+    );
+    graph
+        .apply_change_notification(
+            &cache,
+            &ChangeNotification {
+                source: "notes".to_string(),
+                rel_paths: vec!["Two.md".to_string()],
+            },
+        )
+        .expect("apply_change_notification");
+
+    let forward = graph.get_forward_links("@notes:Two.md");
+    assert_eq!(forward.len(), 1, "{forward:?}");
+    assert_eq!(
+        forward[0].to,
+        EdgeTarget::Resolved("@notes:One.md".to_string()),
+        "R9: repeated re-upserts of One.md must not make it ambiguous with itself"
+    );
+}
+
+/// R12: when `apply_change_notification` observes a source's status
+/// flip (Active -> Offline in the cache), it must re-annotate every
+/// edge in the graph, not only the edges this particular batch's
+/// scoped recompute happens to touch.
+#[test]
+fn apply_change_notification_offline_transition_reannotates_every_edge() {
+    let cache_dir = tempdir().expect("cache tempdir");
+    let source_dir = tempdir().expect("source tempdir");
+    let cache = open_temp_cache(&cache_dir);
+    let source_id = cache
+        .register_source(
+            "notes",
+            &source_dir.path().to_string_lossy(),
+            tephra_cache::SourceStatus::Active,
+        )
+        .expect("register_source");
+
+    write_and_cache(&cache, source_id, source_dir.path(), "A.md", "See [[B]].\n");
+    write_and_cache(&cache, source_id, source_dir.path(), "B.md", "# B\n");
+    write_and_cache(&cache, source_id, source_dir.path(), "C.md", "# C\n");
+
+    let mut graph = UnitGraph::build_from_cache(&cache).expect("initial build");
+    assert!(!graph.get_forward_links("@notes:A.md")[0].offline);
+
+    cache
+        .transition_source_status("notes", tephra_cache::SourceStatus::Offline)
+        .expect("active -> offline is a legal transition");
+
+    // The notification only names C.md — entirely unrelated to the
+    // A->B edge — the way a watcher batch for one specific file
+    // change would.
+    write_and_cache(&cache, source_id, source_dir.path(), "C.md", "# C still\n");
+    graph
+        .apply_change_notification(
+            &cache,
+            &ChangeNotification {
+                source: "notes".to_string(),
+                rel_paths: vec!["C.md".to_string()],
+            },
+        )
+        .expect("apply_change_notification");
+
+    assert!(
+        graph.unit("@notes:A.md").unwrap().offline,
+        "A's own node metadata reflects the new status"
+    );
+    assert!(
+        graph.get_forward_links("@notes:A.md")[0].offline,
+        "R12: A->B's edge must also be re-annotated offline even though this notification \
+         only named C.md"
+    );
+}

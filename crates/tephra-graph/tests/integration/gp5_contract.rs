@@ -23,26 +23,45 @@ fn resolve_link_s_gp5_example_serializes_to_the_frozen_wire_shape() {
 
     let json = serde_json::to_value(&resolved).expect("ResolveResult must serialize");
 
-    assert_eq!(json["unit"]["id"], "@atlas-repo:README.md");
-    assert_eq!(json["unit"]["source"], "atlas-repo");
-    assert_eq!(json["unit"]["rel_path"], "README.md");
-    assert_eq!(json["unit"]["offline"], false);
-    assert!(json["unit"]["tags"].is_array());
-    assert!(json["unit"]["blocks"].is_array());
-    assert!(json["edges"].is_array());
-
-    // Every edge embeds the externally-tagged, snake_case EdgeTarget
-    // shape: `{"resolved": "<id>"}` or the bare string `"dangling"`.
-    for edge in json["edges"].as_array().expect("edges is an array") {
-        assert!(edge["from"].is_string());
-        assert!(edge["to"].is_object() || edge["to"] == "dangling");
-        if let Some(obj) = edge["to"].as_object() {
-            assert!(obj.contains_key("resolved"));
-        }
-        assert!(edge["to_raw"].is_string());
-        assert!(edge["kind"].is_string());
-        assert!(edge["offline"].is_boolean());
-    }
+    // R14: the *full* shape, asserted by exact equality — not just a
+    // handful of spot-checked fields (`is_array`/`is_string`), which
+    // would silently pass a renamed, added, or dropped field. README
+    // has no frontmatter (`frontmatter_json: null`), no tags, no
+    // blocks, and its two real outgoing edges: a same-source wikilink
+    // to `one.md` and a cross-source one to `@notes:Journal.md`, in
+    // `get_edges`'s sorted order.
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "unit": {
+                "id": "@atlas-repo:README.md",
+                "source": "atlas-repo",
+                "rel_path": "README.md",
+                "frontmatter_json": null,
+                "tags": [],
+                "blocks": [],
+                "offline": false
+            },
+            "edges": [
+                {
+                    "from": "@atlas-repo:README.md",
+                    "to": {"resolved": "@atlas-repo:one.md"},
+                    "to_raw": "one",
+                    "kind": "wikilink",
+                    "offline": false
+                },
+                {
+                    "from": "@atlas-repo:README.md",
+                    "to": {"resolved": "@notes:Journal.md"},
+                    "to_raw": "@notes:Journal",
+                    "kind": "wikilink",
+                    "offline": false
+                }
+            ]
+        }),
+        "the frozen GP5 wire shape must match exactly, field-for-field — a renamed or \
+         added field must fail this test, not silently pass it"
+    );
 }
 
 /// R7: a `ResolveError` serializes adjacently-tagged
@@ -60,8 +79,17 @@ fn resolve_link_s_ambiguous_error_serializes_to_the_frozen_wire_shape() {
         .expect_err("Guide.md is ambiguous between api/ and lib/");
 
     let json = serde_json::to_value(&err).expect("ResolveError must serialize");
-    assert_eq!(json["error"], "ambiguous");
-    assert_eq!(json["data"]["source"], "atlas-repo");
-    assert_eq!(json["data"]["target"], "Guide");
-    assert!(json["data"]["candidates"].is_array());
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "error": "ambiguous",
+            "data": {
+                "source": "atlas-repo",
+                "target": "Guide",
+                "candidates": ["@atlas-repo:api/Guide.md", "@atlas-repo:lib/Guide.md"]
+            }
+        }),
+        "the frozen GP5 ambiguous-error wire shape must match exactly, including the \
+         actual tied candidate ids, not just that `candidates` is some array"
+    );
 }

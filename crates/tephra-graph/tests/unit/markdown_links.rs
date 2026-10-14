@@ -72,6 +72,43 @@ fn markdown_links_with_extensions_dot_slash_and_percent_encoding_all_resolve() {
     assert!(targets.contains("@notes:café notes.md"));
 }
 
+/// R15: when the percent-decoded bytes aren't valid UTF-8,
+/// `percent_decode` must fall back to the original, still-encoded
+/// text unchanged rather than lossily replacing the invalid bytes
+/// with U+FFFD, exactly as its own doc comment promises. `%FF` alone
+/// decodes to one invalid UTF-8 byte, so this proves the fallback
+/// through the public API: a markdown link to `caf%FF.md` resolves
+/// against a unit whose literal rel_path still carries that exact,
+/// un-decoded escape — a lossy decode would instead produce a
+/// replacement character no real file's name would ever contain, so
+/// the link would stay dangling.
+#[test]
+fn a_markdown_link_with_invalid_percent_encoding_falls_back_to_the_original_text_unchanged() {
+    let body = "# A\n\nSee [x](caf%FF.md).\n";
+    let links = markdown_links_in("A.md", body);
+    assert_eq!(links.len(), 1);
+
+    let mut graph = UnitGraph::new();
+    graph.upsert_unit(
+        "notes",
+        "A.md",
+        UnitFacts {
+            links,
+            ..Default::default()
+        },
+    );
+    graph.upsert_unit("notes", "caf%FF.md", empty_facts());
+
+    let forward = graph.get_forward_links("@notes:A.md");
+    assert_eq!(forward.len(), 1, "{forward:?}");
+    assert_eq!(
+        forward[0].to,
+        EdgeTarget::Resolved("@notes:caf%FF.md".to_string()),
+        "a malformed percent-escape must fall back to the original text unchanged (R15), \
+         not a lossily-decoded replacement character matching no real file"
+    );
+}
+
 /// R1's core fix: a bare (no leading `./`) relative markdown target
 /// resolves against the *linking file's own directory*, not the
 /// source root — even when a same-named file also exists at the
