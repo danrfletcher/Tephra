@@ -50,6 +50,21 @@ pub const LINK_KIND_WIKILINK: &str = "wikilink";
 /// `[markdown](link)`.
 pub const LINK_KIND_MARKDOWN: &str = "markdown";
 
+/// Parses a wikilink's raw inner text — the content between `[[` and
+/// `]]`, exactly the string stored in `WikiLink::raw` / a wikilink-kind
+/// `LinkRow::to_raw` — into its structured [`WikiLink`] form, with no
+/// surrounding file or line context. The returned `line` is always
+/// `0`: there is no real file position to report, and a caller
+/// resolving an already-stored link (`tephra-graph`'s resolver, PR-5)
+/// never needs one. This is the one supported way to re-derive a
+/// stored link's `@source` prefix / target / anchor / alias outside
+/// this crate — the grammar lives here (G3) and must not be
+/// redefined a second time elsewhere, where it could drift out of
+/// sync with [`parse_unit`]'s own wikilink scan.
+pub fn parse_wikilink_inner(raw: &str) -> WikiLink {
+    wikilinks::parse_inner_standalone(raw, 0)
+}
+
 /// Practical size cap this parser is bounded-time/bounded-memory
 /// tested against (see `tests/unit/large_file.rs`). `parse_unit` does
 /// not refuse to parse a larger file — there is no hard limit — but
