@@ -222,6 +222,22 @@ fn main() -> ExitCode {
 ///    before constructing the tuple handed back out — so its
 ///    `Arc<AppState>` clone, and the registry reference it carries,
 ///    are already gone well before `registry` itself is returned.
+/// 5. Every upgraded WebSocket connection's `handle_socket` task
+///    (`rpc::server`) also holds an `Arc<AppState>` clone — and
+///    `axum::serve`'s own graceful shutdown has no visibility into
+///    upgraded connections at all, so it returns as soon as every
+///    in-flight *plain HTTP* request finishes, regardless of whether
+///    any WebSocket task is still running (R10's live repro: a single
+///    open, authenticated WS connection across SIGTERM panicked on
+///    shutdown exactly like point 4's pre-fix forwarder did). Each
+///    `handle_socket` task now also selects on `shutdown_rx` and
+///    returns promptly on it (after sending a `Close` frame), and
+///    every such task registers itself in `AppState::socket_tasks`
+///    for its exact lifetime; this function awaits
+///    `socket_tasks.wait_until_idle(..)` (bounded, in case some client
+///    never acknowledges the close) immediately after joining the
+///    forwarder above and before constructing the tuple handed back
+///    out, for the same reason as point 4.
 fn run_server(
     listen_addr: &str,
     cache_path: &std::path::Path,
@@ -328,11 +344,12 @@ fn run_server(
             cache_path.to_path_buf(),
         );
 
-        let state = Arc::new(AppState::new(
+        let state = Arc::new(AppState::with_shutdown(
             token_path.to_path_buf(),
             shared_graph as Arc<dyn GraphBackend>,
             registry.clone() as Arc<dyn SourceBackend>,
             Some(graph_refresh),
+            Some(shutdown_rx.clone()),
         ));
 
         // Forwards every `DaemonEvent` the registry's watchers/rescans
@@ -403,6 +420,7 @@ fn run_server(
             }
         });
 
+        let socket_tasks = state.socket_tasks.clone();
         let app = build_router(state);
 
         // Stage 5: ready log. This is the single unambiguous "listening"
@@ -426,6 +444,21 @@ fn run_server(
         // after the same signal fired) so `forward_state` is guaranteed
         // dropped before `registry` is handed back out below.
         let _ = forwarder_handle.await;
+
+        // R10: `axum::serve`'s own graceful shutdown above only waits
+        // on in-flight plain HTTP requests — it has no idea an
+        // upgraded WebSocket connection exists at all, so a client
+        // holding one open is not guaranteed to have been torn down
+        // yet just because `axum::serve` already returned. Each
+        // `handle_socket` task does watch the same `shutdown_rx` (see
+        // `rpc::server::run_socket_loop`) and sends a `Close` frame
+        // promptly on it, so this wait is normally immediate; the
+        // bound below exists only so a client that never acknowledges
+        // the close (e.g. a frozen/unresponsive peer) cannot hang
+        // shutdown forever.
+        socket_tasks
+            .wait_until_idle(std::time::Duration::from_secs(5))
+            .await;
 
         (ExitCode::SUCCESS, Some(registry))
     });

@@ -646,6 +646,89 @@ fn sigterm_after_source_register_does_not_panic_the_server_task() {
     }
 }
 
+/// R10 regression: before the fix, an upgraded WebSocket connection's
+/// `handle_socket` task held its own `Arc<AppState>` (and, through
+/// it, the same `Arc<SourceRegistry>` R8 was about to drop) and never
+/// watched the shutdown signal at all — its `RecvError::Closed` arm
+/// even parked on `future::pending` forever — so `axum::serve`'s own
+/// graceful shutdown (which has no visibility into upgraded
+/// connections) returned while the socket task was still alive, and
+/// `drop(runtime)` later tore it down by force from a tokio worker
+/// thread, panicking exactly as R8 described for the forwarder task.
+/// Live-reproduced 3/3 times in the review finding (complete a WS
+/// handshake, keep it open, SIGTERM). This test holds a real,
+/// authenticated WebSocket connection open across SIGTERM and asserts
+/// both a prompt, clean exit and no panic on stderr — the same
+/// assertions the two tests above make for the idle/post-register
+/// cases, extended to cover an open WS client.
+#[test]
+fn sigterm_with_open_websocket_connection_does_not_panic_the_server_task() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let config_path = home.path().join(".config/tephra/config.toml");
+    let data_dir = home.path().join(".local/share/tephra");
+    write_config(&config_path, &data_dir, EPHEMERAL_ADDR);
+
+    let mut process = TephradProcess::spawn(home.path(), &config_path);
+    let found = process.wait_for_line("listening on 127.0.0.1:", Duration::from_secs(10));
+    assert!(
+        found,
+        "expected a listening line, got: {:?}",
+        process.captured_stderr_lines()
+    );
+    let listening_line = process
+        .captured_stderr_lines()
+        .into_iter()
+        .find(|l| l.contains("listening on 127.0.0.1:"))
+        .expect("a listening line was captured");
+    let port = port_from_listening_line(&listening_line);
+
+    let token_path = data_dir.join("token");
+    let token = fs::read_to_string(&token_path)
+        .expect("read token")
+        .trim()
+        .to_string();
+
+    // Complete a real WebSocket handshake with a valid Bearer token
+    // and keep the connection open across the SIGTERM below — the
+    // exact live repro from R10's review finding. A dedicated tokio
+    // runtime drives just this handshake; every other test in this
+    // file stays plain/synchronous, same as before.
+    let ws_runtime = tokio::runtime::Runtime::new().expect("tokio runtime for the WS client");
+    let socket = ws_runtime.block_on(async {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::tungstenite::http::HeaderValue;
+
+        let url = format!("ws://127.0.0.1:{port}/rpc");
+        let mut request = url.into_client_request().expect("build ws request");
+        request.headers_mut().insert(
+            "Authorization",
+            HeaderValue::from_str(&format!("Bearer {token}")).expect("header value"),
+        );
+        let (stream, _response) = tokio_tungstenite::connect_async(request)
+            .await
+            .expect("ws handshake must succeed with a valid token");
+        stream
+    });
+
+    let code = process.terminate_and_wait(Duration::from_secs(5));
+    assert_eq!(
+        code,
+        Some(0),
+        "expected a prompt, clean exit after SIGTERM with an open WebSocket connection"
+    );
+
+    for line in process.captured_stderr_lines() {
+        assert!(
+            !line.contains("panicked"),
+            "stderr contained a panic after graceful shutdown with an open WebSocket \
+             connection: {line}"
+        );
+    }
+
+    drop(socket);
+    drop(ws_runtime);
+}
+
 /// Best-effort detection of whether the current process can bypass
 /// directory permission checks (true for root). Avoids a false test
 /// failure in a container that runs tests as root.

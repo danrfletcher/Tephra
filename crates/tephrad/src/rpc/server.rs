@@ -16,16 +16,17 @@
 //! [`GraphRefresh::refresh`].
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
 use serde_json::Value;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch, Notify};
 
 use crate::rpc::auth::{self, Authenticated};
 use crate::rpc::backend::{GraphBackend, GraphRefresh, SourceBackend};
@@ -56,6 +57,78 @@ const EVENT_CHANNEL_CAPACITY: usize = 1024;
 /// running daemon already sees the update — no restart required.
 const MUTATING_SOURCE_METHODS: &[&str] = &["source.register", "source.unregister", "source.rescan"];
 
+/// Tracks every currently-running [`handle_socket`] task so shutdown
+/// (R10) can wait, bounded, for all of them to actually finish —
+/// and so drop the last `Arc<AppState>` clone each one holds — before
+/// the caller hands its `Arc<SourceRegistry>` back out to be dropped
+/// on a plain synchronous thread (see `main.rs`'s doc comment, point
+/// 3). axum's own graceful shutdown only waits on in-flight HTTP
+/// requests; it has no idea an upgraded WebSocket connection exists
+/// at all, so without this, a socket task holding `Arc<AppState>`
+/// (and, through it, the registry) can easily outlive `block_on`.
+#[derive(Clone)]
+pub struct SocketTasks {
+    count: Arc<AtomicUsize>,
+    idle: Arc<Notify>,
+}
+
+impl SocketTasks {
+    pub fn new() -> Self {
+        SocketTasks {
+            count: Arc::new(AtomicUsize::new(0)),
+            idle: Arc::new(Notify::new()),
+        }
+    }
+
+    /// Registers one running task, returning a guard that
+    /// decrements the count (and wakes any waiter once it reaches
+    /// zero) when dropped — including on panic, since this is a
+    /// plain `Drop` impl, not a manual decrement at the end of
+    /// [`handle_socket`].
+    fn enter(&self) -> SocketTaskGuard {
+        self.count.fetch_add(1, Ordering::SeqCst);
+        SocketTaskGuard {
+            tasks: self.clone(),
+        }
+    }
+
+    /// Waits until every currently-tracked task has finished, or
+    /// `timeout` elapses, whichever comes first. A bounded wait, not
+    /// an unconditional one: a misbehaving client that never responds
+    /// to a `Close` frame must not hang shutdown forever.
+    pub async fn wait_until_idle(&self, timeout: std::time::Duration) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.count.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+            let _ = tokio::time::timeout(remaining, self.idle.notified()).await;
+        }
+    }
+}
+
+impl Default for SocketTasks {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+struct SocketTaskGuard {
+    tasks: SocketTasks,
+}
+
+impl Drop for SocketTaskGuard {
+    fn drop(&mut self) {
+        if self.tasks.count.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.tasks.idle.notify_waiters();
+        }
+    }
+}
+
 /// Shared state behind every request handler in this module. Always
 /// held as `Arc<AppState>` — never cloned field-by-field — so every
 /// connection/request sees the same token path and backend instances.
@@ -68,6 +141,19 @@ pub struct AppState {
     /// wiring); `None` in every test that uses a canned/mocked
     /// [`GraphBackend`] with nothing to rebuild from (R1).
     pub graph_refresh: Option<GraphRefresh>,
+    /// `Some` only in production: the same shutdown signal
+    /// `axum::serve`'s graceful shutdown and the `graph:changed`
+    /// forwarder task select on (R8). `handle_socket` (R10) selects
+    /// on this too, so an open WebSocket connection sends a `Close`
+    /// frame and returns promptly on shutdown instead of parking
+    /// forever and keeping this `AppState` (and the registry it
+    /// carries) alive past `block_on`'s return. `None` in every test
+    /// fixture that has no shutdown signal to observe.
+    pub shutdown_rx: Option<watch::Receiver<bool>>,
+    /// Every running [`handle_socket`] task registers itself here
+    /// (R10), so shutdown can wait, bounded, for all of them to
+    /// actually finish before the registry is handed back out.
+    pub socket_tasks: SocketTasks,
 }
 
 impl AppState {
@@ -77,6 +163,20 @@ impl AppState {
         sources: Arc<dyn SourceBackend>,
         graph_refresh: Option<GraphRefresh>,
     ) -> Self {
+        Self::with_shutdown(token_path, graph, sources, graph_refresh, None)
+    }
+
+    /// Same as [`AppState::new`], but also wires in the shutdown
+    /// signal (R10) that `handle_socket` selects on. Production
+    /// (`main.rs`) is the only caller that passes `Some`; every test
+    /// fixture keeps using plain [`AppState::new`].
+    pub fn with_shutdown(
+        token_path: PathBuf,
+        graph: Arc<dyn GraphBackend>,
+        sources: Arc<dyn SourceBackend>,
+        graph_refresh: Option<GraphRefresh>,
+        shutdown_rx: Option<watch::Receiver<bool>>,
+    ) -> Self {
         let (events_tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         AppState {
             token_path,
@@ -84,6 +184,8 @@ impl AppState {
             sources,
             events_tx,
             graph_refresh,
+            shutdown_rx,
+            socket_tasks: SocketTasks::new(),
         }
     }
 
@@ -279,16 +381,90 @@ async fn ws_rpc_handler(
 /// already-open socket is therefore rejected on this socket's very
 /// next message, not just on the next new handshake, matching G6/E11.
 ///
+/// R10 fix: this is a thin wrapper around [`run_socket_loop`] that
+/// registers one entry in `state.socket_tasks` for as long as *any*
+/// `Arc<AppState>` clone tied to this connection could still be
+/// alive, and only releases it after that — never concurrently with
+/// it. `run_socket_loop` takes `state` *by value*, so by the time its
+/// `.await` resolves here, every local binding inside it (including
+/// its own `Arc<AppState>` parameter) has already, synchronously,
+/// finished dropping as an ordinary consequence of that function
+/// returning; this wrapper itself never holds a second clone past
+/// that point; only `_task_guard`, which carries no reference to
+/// `AppState` at all, is live in this frame, so there is no ordering
+/// ambiguity for `shutdown`'s caller (`main.rs`'s
+/// `socket_tasks.wait_until_idle`) to race against. The guard still
+/// decrements (and wakes any waiter) on every exit path, including a
+/// panic inside `run_socket_loop`, since it's a plain `Drop` impl.
+async fn handle_socket(socket: WebSocket, state: Arc<AppState>, bearer: String) {
+    let _task_guard = state.socket_tasks.enter();
+    run_socket_loop(socket, state, bearer).await;
+}
+
+/// Drives one authenticated WebSocket connection for its whole
+/// lifetime: client messages are parsed/dispatched/replied to exactly
+/// like an HTTP request, and `graph:changed` broadcasts are forwarded
+/// as JSON-RPC notifications whenever one fires, interleaved via
+/// [`tokio::select!`] so a connection with no pending client request
+/// can still receive a push (E "receive without issuing a request
+/// first").
+///
+/// `bearer` is the raw credential value presented at the handshake
+/// (see [`ws_rpc_handler`]); it is re-verified against the token
+/// file's *current* contents (via [`auth::verify_bearer`]) before
+/// every single message this connection ever dispatches (R2 fix) —
+/// there is no per-frame `Authorization` header in the WebSocket
+/// protocol to re-extract, so the connection retains the value itself
+/// instead of the one-time proof. A token rotated out from under an
+/// already-open socket is therefore rejected on this socket's very
+/// next message, not just on the next new handshake, matching G6/E11.
+///
 /// A client abruptly disconnecting (TCP reset, close frame, or any
 /// socket error) simply ends this loop and drops the connection
 /// handle (E12) — never a panic, and never a state leak into any
 /// other connection, since every connection gets its own `rx`
 /// subscription and owns its own `socket`.
-async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, bearer: String) {
+///
+/// R10 fix: when `state` carries a production shutdown signal
+/// (`state.shutdown_rx`), this loop also selects on it. Before this
+/// fix, it never watched shutdown at all — its `RecvError::Closed`
+/// arm even parked on `future::pending` forever — so an open
+/// socket's `Arc<AppState>` (and the registry it carries) reliably
+/// outlived `block_on`, panicking on drop exactly as R8 described for
+/// the forwarder task. On shutdown this loop now sends a `1001 going
+/// away` close frame and returns promptly instead, which (per
+/// [`handle_socket`]'s own doc comment) is what lets its caller's
+/// `Arc<AppState>` parameter actually finish dropping before
+/// `state.socket_tasks`'s guard is released.
+async fn run_socket_loop(mut socket: WebSocket, state: Arc<AppState>, bearer: String) {
     let mut rx = state.events_tx.subscribe();
+    let mut shutdown_rx = state.shutdown_rx.clone();
 
     loop {
         tokio::select! {
+            _ = async {
+                match shutdown_rx.as_mut() {
+                    Some(rx) => {
+                        // `Err` here means the sender was dropped
+                        // without ever observing a new value since
+                        // this receiver's last check — treated the
+                        // same as an actual shutdown signal, since
+                        // either way there is nothing more to select
+                        // on and holding this connection open any
+                        // longer serves no purpose.
+                        let _ = rx.changed().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            }, if shutdown_rx.is_some() => {
+                let _ = socket
+                    .send(Message::Close(Some(CloseFrame {
+                        code: close_code::AWAY,
+                        reason: "server is shutting down".into(),
+                    })))
+                    .await;
+                break;
+            }
             incoming = socket.recv() => {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
@@ -306,8 +482,8 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, bearer: Stri
                                     .expect("a constructed JSON-RPC response always serializes");
                                 let _ = socket.send(Message::Text(text.into())).await;
                                 let _ = socket
-                                    .send(Message::Close(Some(axum::extract::ws::CloseFrame {
-                                        code: axum::extract::ws::close_code::POLICY,
+                                    .send(Message::Close(Some(CloseFrame {
+                                        code: close_code::POLICY,
                                         reason: "bearer token no longer valid".into(),
                                     })))
                                     .await;
