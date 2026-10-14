@@ -35,6 +35,20 @@ pub trait GraphBackend: Send + Sync {
         default_source: Option<&str>,
     ) -> Result<ResolveResult, ResolveError>;
     fn get_backlinks(&self, id: &str) -> Vec<Edge>;
+    /// Same lookup as [`GraphBackend::get_backlinks`], but without
+    /// its query-display dedup (T1 review finding): a referring file
+    /// that links to `id` more than once, via a different link kind
+    /// or a differently-spelled raw target, must have *every* such
+    /// occurrence found and rewritten, not just whichever one
+    /// `get_backlinks`'s dedup happens to keep. Defaults to
+    /// `get_backlinks` itself — correct for a test double that never
+    /// populates more than one edge per `(from, resolved-target)`
+    /// pair anyway — and is overridden by the real
+    /// [`UnitGraph`]/[`SharedGraph`] backends below, which do need the
+    /// distinction.
+    fn get_backlinks_all(&self, id: &str) -> Vec<Edge> {
+        self.get_backlinks(id)
+    }
     fn get_forward_links(&self, id: &str) -> Vec<Edge>;
     fn get_edges(&self) -> Vec<Edge>;
 }
@@ -49,6 +63,9 @@ impl GraphBackend for UnitGraph {
     }
     fn get_backlinks(&self, id: &str) -> Vec<Edge> {
         UnitGraph::get_backlinks(self, id)
+    }
+    fn get_backlinks_all(&self, id: &str) -> Vec<Edge> {
+        UnitGraph::get_backlinks_all(self, id)
     }
     fn get_forward_links(&self, id: &str) -> Vec<Edge> {
         UnitGraph::get_forward_links(self, id)
@@ -106,6 +123,9 @@ impl GraphBackend for SharedGraph {
     }
     fn get_backlinks(&self, id: &str) -> Vec<Edge> {
         self.inner.read().unwrap().get_backlinks(id)
+    }
+    fn get_backlinks_all(&self, id: &str) -> Vec<Edge> {
+        self.inner.read().unwrap().get_backlinks_all(id)
     }
     fn get_forward_links(&self, id: &str) -> Vec<Edge> {
         self.inner.read().unwrap().get_forward_links(id)

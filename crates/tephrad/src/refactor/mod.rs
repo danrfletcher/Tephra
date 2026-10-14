@@ -96,17 +96,21 @@ pub struct LinkChange {
 
 /// Computes every [`LinkChange`] implied by renaming `old_path` to
 /// `new_path`, given `edges` (the graph's current backlink edges for
-/// the old unit's federated id — see [`tephra_graph::UnitGraph::get_backlinks`],
-/// which resolves a stale/renamed id's dangling edges too) and the
-/// full current text content of every referring file named by those
-/// edges' `from` id.
+/// the old unit's federated id — see [`tephra_graph::UnitGraph::get_backlinks_all`],
+/// which resolves a stale/renamed id's dangling edges too, and —
+/// unlike [`tephra_graph::UnitGraph::get_backlinks`] — never
+/// collapses two distinct raw occurrences in the same referring file
+/// into one, even when they share a resolved target: T1 review
+/// finding) and the full current text content of every referring file
+/// named by those edges' `from` id.
 ///
 /// Pure: no filesystem, no SQLite, no RPC — every input is already an
 /// in-memory value, which is what lets this be tested directly
 /// against small hand-built fixtures (single-source match,
 /// cross-source match, zero matches, identical old/new path,
-/// case-only rename — see this module's tests below) rather than
-/// only through a slower, real-filesystem integration test.
+/// case-only rename, mixed-kind double-occurrence — see this module's
+/// tests below) rather than only through a slower, real-filesystem
+/// integration test.
 ///
 /// `old_path == new_path` always returns an empty diff (one of this
 /// PR's explicit edge cases) without even inspecting `edges`.
@@ -117,6 +121,17 @@ pub struct LinkChange {
 /// only ever populates `file_contents` with files it could actually
 /// read, so a missing entry here just means "nothing to show for
 /// that file in this preview", not an error.
+///
+/// `edges` may contain more than one edge for the exact same `(from,
+/// kind, to_raw)` triple — the same raw link occurring twice,
+/// verbatim, in the same referring file produces one `tephra-cache`
+/// row (hence one [`Edge`]) per occurrence (T1 review finding), and
+/// [`locate_and_diff`] already finds *every* occurrence of a given
+/// `(kind, to_raw)` pair in one pass. Processing such a duplicate
+/// edge a second time would therefore re-locate and re-emit the exact
+/// same span(s) already covered by the first, so each distinct
+/// `(from, kind, to_raw)` triple is only ever dispatched to
+/// `locate_and_diff` once.
 pub fn compute_changes(
     edges: &[Edge],
     file_contents: &HashMap<String, String>,
@@ -126,11 +141,19 @@ pub fn compute_changes(
     if old_path == new_path {
         return Vec::new();
     }
+    let mut seen: HashSet<(String, String, String)> = HashSet::new();
     let mut out = Vec::new();
     for edge in edges {
         let Some(content) = file_contents.get(&edge.from) else {
             continue;
         };
+        let key = (edge.from.clone(), edge.kind.clone(), edge.to_raw.clone());
+        if !seen.insert(key) {
+            // Same referring file, same link kind, same raw target
+            // text as an edge already processed above — `locate_and_diff`
+            // already found every occurrence of it on that first pass.
+            continue;
+        }
         let new_raw = if edge.kind.as_str() == tephra_parser::LINK_KIND_WIKILINK {
             rewrite_wikilink_raw(&edge.to_raw, new_path)
         } else {
@@ -1011,7 +1034,7 @@ impl RefactorEngine {
         self.require_source(&roots, source)?;
 
         let old_id = format!("@{source}:{old_path}");
-        let edges = self.graph.get_backlinks(&old_id);
+        let edges = self.graph.get_backlinks_all(&old_id);
 
         let mut mtimes = HashMap::new();
         let mut skipped = Vec::new();
@@ -1648,6 +1671,200 @@ mod tests {
         // No entry in `files` for "@notes:Journal.md".
         let changes = compute_changes(&edges, &HashMap::new(), "OldDoc.md", "NewDoc.md");
         assert!(changes.is_empty());
+    }
+
+    // --- T1: a file linking to the same target via more than one ------------
+    // --- link style/spelling must have every occurrence rewritten -----------
+
+    /// T1 review finding, exact repro: a file containing both a
+    /// wikilink and a markdown link to the same renamed target used
+    /// to have only one of the two rewritten, because
+    /// `tephra_graph::UnitGraph::get_backlinks`'s query-display dedup
+    /// collapsed both edges (same `from`, same resolved target) into
+    /// one before `compute_changes` ever saw them — whichever
+    /// `(kind, to_raw)` pair sorted first silently became the only
+    /// one considered for that file. `compute_changes` (fed by
+    /// `get_backlinks_all` now, via `RefactorEngine::preview`) must
+    /// see both edges and rewrite both occurrences.
+    #[test]
+    fn compute_changes_rewrites_every_link_style_to_the_same_target_in_one_file() {
+        let edges = vec![
+            edge(
+                "@notes:Journal.md",
+                "@notes:OldDoc.md",
+                "OldDoc",
+                tephra_parser::LINK_KIND_WIKILINK,
+            ),
+            edge(
+                "@notes:Journal.md",
+                "@notes:OldDoc.md",
+                "OldDoc.md",
+                tephra_parser::LINK_KIND_MARKDOWN,
+            ),
+        ];
+        let content = "Link to [[OldDoc]] and also [desc](OldDoc.md).\n";
+        let mut files = HashMap::new();
+        files.insert("@notes:Journal.md".to_string(), content.to_string());
+        let changes = compute_changes(&edges, &files, "OldDoc.md", "NewDoc.md");
+        assert_eq!(changes.len(), 2, "{changes:?}");
+
+        let refs: Vec<&LinkChange> = changes.iter().collect();
+        let result = apply_changes_to_content(content, &refs).expect("spans match");
+        assert_eq!(result, "Link to [[NewDoc]] and also [desc](NewDoc.md).\n");
+    }
+
+    /// T1: the spec's own unicode/space rename, with a bare markdown
+    /// link, a titled markdown link, and a wikilink all pointing at
+    /// the same target in one file — all three must be found and
+    /// rewritten, not just one.
+    #[test]
+    fn compute_changes_rewrites_three_mixed_link_styles_to_the_same_unicode_target() {
+        let edges = vec![
+            edge(
+                "@notes:Journal.md",
+                "@notes:Café Notes.md",
+                "Café Notes",
+                tephra_parser::LINK_KIND_WIKILINK,
+            ),
+            edge(
+                "@notes:Journal.md",
+                "@notes:Café Notes.md",
+                "Caf%C3%A9%20Notes.md",
+                tephra_parser::LINK_KIND_MARKDOWN,
+            ),
+            edge(
+                "@notes:Journal.md",
+                "@notes:Café Notes.md",
+                "Caf%C3%A9%20Notes.md",
+                tephra_parser::LINK_KIND_MARKDOWN,
+            ),
+        ];
+        let content = "Wiki: [[Café Notes]]\nBare: [b](Caf%C3%A9%20Notes.md)\nTitled: [t](Caf%C3%A9%20Notes.md \"Notes\")\n";
+        let mut files = HashMap::new();
+        files.insert("@notes:Journal.md".to_string(), content.to_string());
+        // Two of the three edges above share the exact same
+        // (kind, to_raw) pair but target two genuinely distinct
+        // occurrences in `content` (the bare and titled links) — both
+        // must still be found, via `locate_and_diff`'s own full scan,
+        // not just one.
+        let changes = compute_changes(&edges, &files, "Café Notes.md", "Café Notes (2).md");
+        assert_eq!(changes.len(), 3, "{changes:?}");
+
+        let refs: Vec<&LinkChange> = changes.iter().collect();
+        let result = apply_changes_to_content(content, &refs).expect("spans match");
+        let reparsed = tephra_parser::parse_unit(Path::new("@notes:Journal.md"), &result);
+        assert_eq!(reparsed.wikilinks.len(), 1);
+        assert_eq!(reparsed.wikilinks[0].raw, "Café Notes (2)");
+        assert_eq!(reparsed.markdown_links.len(), 2);
+        for m in &reparsed.markdown_links {
+            assert_eq!(
+                percent_decode(&m.target),
+                "Café Notes (2).md",
+                "{:?}",
+                reparsed.markdown_links
+            );
+        }
+    }
+
+    /// T1: two `Edge` records for the exact same `(from, kind, to_raw)`
+    /// triple (the same raw link occurring twice, verbatim, in the
+    /// same file — one cache row per occurrence, R16) must not cause
+    /// `compute_changes` to re-locate and double-emit the same
+    /// span(s): `apply_changes_to_content` would then try to rewrite
+    /// an already-rewritten span and fail.
+    #[test]
+    fn compute_changes_does_not_duplicate_a_repeated_identical_raw_link() {
+        let edges = vec![
+            edge(
+                "@notes:Journal.md",
+                "@notes:OldDoc.md",
+                "OldDoc",
+                tephra_parser::LINK_KIND_WIKILINK,
+            ),
+            edge(
+                "@notes:Journal.md",
+                "@notes:OldDoc.md",
+                "OldDoc",
+                tephra_parser::LINK_KIND_WIKILINK,
+            ),
+        ];
+        let content = "See [[OldDoc]] and again [[OldDoc]].\n";
+        let mut files = HashMap::new();
+        files.insert("@notes:Journal.md".to_string(), content.to_string());
+        let changes = compute_changes(&edges, &files, "OldDoc.md", "NewDoc.md");
+        assert_eq!(
+            changes.len(),
+            2,
+            "two real occurrences, not four from the duplicate edge: {changes:?}"
+        );
+
+        let refs: Vec<&LinkChange> = changes.iter().collect();
+        let result = apply_changes_to_content(content, &refs).expect("spans match");
+        assert_eq!(result, "See [[NewDoc]] and again [[NewDoc]].\n");
+    }
+
+    // --- T1: RefactorEngine::preview/apply (not just compute_changes) --------
+    // --- also rewrite every link style in one file --------------------------
+
+    /// T1, engine-level: the live repro from the review/tester finding
+    /// — `RefactorEngine::preview` then `apply` against a file
+    /// containing both a wikilink and a markdown link to the same
+    /// renamed target must rewrite both, and the preview must have
+    /// already reported both as changes (GP7/GP8).
+    #[test]
+    fn apply_rewrites_every_link_style_to_the_same_target_in_one_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "tephra-refactor-mixed-kind-test-{}",
+            rand::random::<u32>()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let journal = dir.join("Journal.md");
+        fs::write(&journal, "Link to [[OldDoc]] and also [desc](OldDoc.md).\n").unwrap();
+
+        let graph = FakeGraphBackend {
+            edges: vec![
+                edge(
+                    "@notes:Journal.md",
+                    "@notes:OldDoc.md",
+                    "OldDoc",
+                    tephra_parser::LINK_KIND_WIKILINK,
+                ),
+                edge(
+                    "@notes:Journal.md",
+                    "@notes:OldDoc.md",
+                    "OldDoc.md",
+                    tephra_parser::LINK_KIND_MARKDOWN,
+                ),
+            ],
+        };
+        let sources = FakeSourceBackend {
+            name: "notes".to_string(),
+            path: dir.to_string_lossy().to_string(),
+        };
+        let watcher = std::sync::Arc::new(NoopWatcherPause);
+        let engine = RefactorEngine::new(
+            std::sync::Arc::new(graph),
+            std::sync::Arc::new(sources),
+            watcher,
+        );
+
+        let preview = engine.preview("notes", "OldDoc.md", "NewDoc.md").unwrap();
+        assert_eq!(
+            preview.changes.len(),
+            2,
+            "preview must list both the wikilink and the markdown link: {:?}",
+            preview.changes
+        );
+
+        let outcome = engine.apply("notes", "OldDoc.md", "NewDoc.md").unwrap();
+        assert_eq!(outcome, ApplyOutcome::Applied { files_changed: 1 });
+        assert_eq!(
+            fs::read_to_string(&journal).unwrap(),
+            "Link to [[NewDoc]] and also [desc](NewDoc.md).\n",
+            "both link styles must be rewritten, not just one"
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     // --- apply_changes_to_content ------------------------------------------

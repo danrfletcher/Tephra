@@ -306,6 +306,138 @@ async fn preview_then_apply_rewrites_links_across_two_sources_with_exact_byte_di
     daemon.stop();
 }
 
+/// T1 review/tester finding, exact live repro: a single file
+/// containing both a wikilink and a markdown link to the same
+/// renamed target must have *both* rewritten by `apply_refactor`, and
+/// the `preview_refactor` response must already list both as
+/// changes. Before the T1 fix, `tephra_graph::UnitGraph::get_backlinks`'s
+/// query-display dedup silently collapsed both edges into one before
+/// `compute_changes` ever saw them, so only one of the two links was
+/// ever rewritten, while `apply_refactor` still reported a successful
+/// `files_changed` count with no indication anything was left out.
+#[tokio::test]
+async fn preview_then_apply_rewrites_every_link_style_to_the_same_target_in_one_file() {
+    let daemon = TestDaemon::start().await;
+
+    let notes = fixtures::empty_source();
+    notes.write("OldDoc.md", "# Old Doc\n\nContent here.\n");
+    notes.write(
+        "Journal.md",
+        "Link to [[OldDoc]] and also [desc](OldDoc.md).\n",
+    );
+
+    let register = daemon
+        .call(
+            "source.register",
+            json!({"name": "notes", "root": notes.root().to_string_lossy()}),
+        )
+        .await;
+    assert!(register.get("error").is_none(), "{register:?}");
+
+    let preview = daemon
+        .call(
+            "link.preview_refactor",
+            json!({"source": "notes", "old_path": "OldDoc.md", "new_path": "NewDoc.md"}),
+        )
+        .await;
+    assert!(preview.get("error").is_none(), "{preview:?}");
+    let changes = preview["result"]["changes"]
+        .as_array()
+        .expect("changes array");
+    assert_eq!(
+        changes.len(),
+        2,
+        "the preview must list both the wikilink and the markdown link occurrence: {changes:?}"
+    );
+
+    let apply = daemon
+        .call(
+            "link.apply_refactor",
+            json!({"source": "notes", "old_path": "OldDoc.md", "new_path": "NewDoc.md"}),
+        )
+        .await;
+    assert!(apply.get("error").is_none(), "{apply:?}");
+    assert_eq!(apply["result"]["status"], json!("applied"));
+    assert_eq!(apply["result"]["files_changed"], json!(1));
+
+    let journal_after = std::fs::read_to_string(notes.root().join("Journal.md")).unwrap();
+    assert_eq!(
+        journal_after, "Link to [[NewDoc]] and also [desc](NewDoc.md).\n",
+        "both link styles must be rewritten, not just one"
+    );
+
+    daemon.stop();
+}
+
+/// T1, same bug but the spec's own unicode/space rename and three
+/// mixed link styles (bare markdown, titled markdown, wikilink) all
+/// pointing at the same target in one file — every occurrence must
+/// be rewritten.
+#[tokio::test]
+async fn preview_then_apply_rewrites_three_mixed_link_styles_to_a_unicode_space_rename() {
+    let daemon = TestDaemon::start().await;
+
+    let notes = fixtures::empty_source();
+    notes.write("Café Notes.md", "# Café Notes\n\nContent here.\n");
+    notes.write(
+        "Journal.md",
+        "Wiki: [[Café Notes]]\n\
+         Bare: [b](Caf%C3%A9%20Notes.md)\n\
+         Titled: [t](Caf%C3%A9%20Notes.md \"Notes\")\n",
+    );
+
+    let register = daemon
+        .call(
+            "source.register",
+            json!({"name": "notes", "root": notes.root().to_string_lossy()}),
+        )
+        .await;
+    assert!(register.get("error").is_none(), "{register:?}");
+
+    let preview = daemon
+        .call(
+            "link.preview_refactor",
+            json!({"source": "notes", "old_path": "Café Notes.md", "new_path": "Café Notes (2).md"}),
+        )
+        .await;
+    assert!(preview.get("error").is_none(), "{preview:?}");
+    let changes = preview["result"]["changes"]
+        .as_array()
+        .expect("changes array");
+    assert_eq!(
+        changes.len(),
+        3,
+        "all three link occurrences (wikilink, bare markdown, titled markdown) must be listed: {changes:?}"
+    );
+
+    let apply = daemon
+        .call(
+            "link.apply_refactor",
+            json!({"source": "notes", "old_path": "Café Notes.md", "new_path": "Café Notes (2).md"}),
+        )
+        .await;
+    assert!(apply.get("error").is_none(), "{apply:?}");
+    assert_eq!(apply["result"]["status"], json!("applied"));
+    assert_eq!(apply["result"]["files_changed"], json!(1));
+
+    let journal_after = std::fs::read_to_string(notes.root().join("Journal.md")).unwrap();
+    let reparsed =
+        tephra_parser::parse_unit(std::path::Path::new("@notes:Journal.md"), &journal_after);
+    assert_eq!(reparsed.wikilinks.len(), 1, "{journal_after:?}");
+    assert_eq!(reparsed.wikilinks[0].raw, "Café Notes (2)");
+    assert_eq!(reparsed.markdown_links.len(), 2, "{journal_after:?}");
+    for m in &reparsed.markdown_links {
+        assert_eq!(
+            test_percent_decode(&m.target),
+            "Café Notes (2).md",
+            "{:?}",
+            reparsed.markdown_links
+        );
+    }
+
+    daemon.stop();
+}
+
 /// Edge case: moving a file with zero incoming links returns an
 /// empty preview, and the matching apply performs no writes and
 /// still reports success.

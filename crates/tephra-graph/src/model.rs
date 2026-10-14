@@ -370,6 +370,44 @@ impl UnitGraph {
     /// true. Empty (never `null`, never an error) if nothing targets
     /// `id` at all.
     pub fn get_backlinks(&self, id: &str) -> Vec<Edge> {
+        let edges = self.backlink_candidates(id);
+        let mut out = dedup_for_query(edges);
+        out.sort_by(edge_sort_key);
+        out
+    }
+
+    /// Same lookup as [`UnitGraph::get_backlinks`], but without that
+    /// method's query-display [`dedup_for_query`] collapse. For a
+    /// `Resolved` target, [`DedupKey::Resolved`] deliberately ignores
+    /// `kind`/`to_raw` entirely — exactly right for `get_backlinks`'s
+    /// own display RPC (G4), where one row per distinct *referring
+    /// unit* is what a caller wants to see, but wrong for a caller
+    /// (PR-8's link refactor engine) that must find and rewrite
+    /// *every* raw occurrence of an incoming link to `id`, including a
+    /// file that links to it more than once via a different link kind
+    /// or a differently-spelled raw target: `get_backlinks` would
+    /// silently report only one of those occurrences, picking
+    /// whichever (`kind`, `to_raw`) pair sorts first, and this PR's
+    /// refactor engine would then never even consider rewriting the
+    /// others.
+    ///
+    /// Still sorted for deterministic output, and a dangling-edge
+    /// lookup for a stale id (GP7's renamed-note scenario) behaves
+    /// exactly as `get_backlinks` documents.
+    pub fn get_backlinks_all(&self, id: &str) -> Vec<Edge> {
+        let mut out = self.backlink_candidates(id);
+        out.sort_by(edge_sort_key);
+        out
+    }
+
+    /// The raw, not-yet-deduplicated edge set [`UnitGraph::get_backlinks`]
+    /// and [`UnitGraph::get_backlinks_all`] both start from: every
+    /// edge indexed under `id` in [`UnitGraph::backward_index`], plus
+    /// — when `id` names no current node — every still-dangling edge
+    /// whose match key equals `id`'s stale path or basename (see
+    /// `get_backlinks`'s own doc comment for why that lookup is
+    /// skipped for a *live* id, R11).
+    fn backlink_candidates(&self, id: &str) -> Vec<Edge> {
         let mut idxs: Vec<usize> = self.backward_index.get(id).cloned().unwrap_or_default();
 
         if !self.nodes.contains_key(id) {
@@ -392,10 +430,7 @@ impl UnitGraph {
 
         idxs.sort_unstable();
         idxs.dedup();
-        let edges: Vec<Edge> = idxs.iter().filter_map(|&i| self.edges[i].clone()).collect();
-        let mut out = dedup_for_query(edges);
-        out.sort_by(edge_sort_key);
-        out
+        idxs.iter().filter_map(|&i| self.edges[i].clone()).collect()
     }
 
     /// `graph.get_edges` (G4): every edge in the graph, de-duplicated

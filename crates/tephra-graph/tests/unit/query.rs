@@ -138,3 +138,54 @@ fn every_query_verb_agrees_on_the_same_deduplicated_edge_count() {
     assert_eq!(graph.get_forward_links("@notes:A.md").len(), 1);
     assert_eq!(graph.get_backlinks("@notes:B.md").len(), 1);
 }
+
+/// T1 review finding: `get_backlinks`'s query-display dedup
+/// deliberately ignores `kind`/`to_raw` for a resolved target (R16/R2
+/// — right for a display RPC, one row per referring unit), but PR-8's
+/// link refactor engine needs to find and rewrite *every* raw
+/// occurrence, including a file that links to the same target via two
+/// different link kinds. `get_backlinks_all` must not collapse those.
+#[test]
+fn get_backlinks_all_does_not_collapse_different_kinds_to_the_same_target() {
+    let mut graph = UnitGraph::new();
+    graph.upsert_unit(
+        "notes",
+        "A.md",
+        UnitFacts {
+            frontmatter_json: None,
+            tags: Vec::new(),
+            blocks: Vec::new(),
+            links: vec![
+                ("Hub".to_string(), "wikilink".to_string()),
+                ("Hub.md".to_string(), "markdown".to_string()),
+            ],
+        },
+    );
+    graph.upsert_unit("notes", "Hub.md", empty_facts());
+
+    // get_backlinks collapses both raw occurrences into one row,
+    // exactly as G4's display RPC intends.
+    assert_eq!(graph.get_backlinks("@notes:Hub.md").len(), 1);
+
+    // get_backlinks_all must see both distinct raw occurrences.
+    let all = graph.get_backlinks_all("@notes:Hub.md");
+    assert_eq!(all.len(), 2, "{all:?}");
+    let mut kinds: Vec<&str> = all.iter().map(|e| e.kind.as_str()).collect();
+    kinds.sort();
+    assert_eq!(kinds, vec!["markdown", "wikilink"]);
+}
+
+/// T1: an exact repeat of the identical raw link still has its own
+/// indexed `Edge` record (R16: no storage-time dedup) — `get_backlinks_all`
+/// returns both; collapsing an exact repeat down to one rewrite
+/// dispatch is the refactor engine's own job
+/// (`crate::refactor::compute_changes`), not this graph's.
+#[test]
+fn get_backlinks_all_still_returns_both_records_of_an_exact_repeated_raw_link() {
+    let mut graph = UnitGraph::new();
+    graph.upsert_unit("notes", "A.md", facts_with_links(&["B", "B"]));
+    graph.upsert_unit("notes", "B.md", empty_facts());
+
+    assert_eq!(graph.get_backlinks("@notes:B.md").len(), 1);
+    assert_eq!(graph.get_backlinks_all("@notes:B.md").len(), 2);
+}
