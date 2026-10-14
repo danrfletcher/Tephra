@@ -1,9 +1,15 @@
 //! `tests/cli/transport.test` (E "daemon not running"/"dropped
-//! connection mid-request"): the two transport-level failure modes
-//! that aren't server behavior at all, against a real (if
-//! deliberately unhelpful) TCP listener.
+//! connection mid-request", R1): the two transport-level failure
+//! modes that aren't server behavior at all, against a real (if
+//! deliberately unhelpful) TCP listener, plus (R1) the
+//! timeout-vs-dropped-connection and mutating-method-retry fixes:
+//! a slow/dropped response to a mutating method (`source.register`,
+//! `link.apply_refactor`) must never be silently re-sent, and a
+//! timeout must be reported as ambiguous rather than as either a
+//! dropped connection (which retries) or a plain transport failure.
 
 use std::net::TcpListener;
+use std::time::Duration;
 
 use tephractl::transport::{RpcCallError, RpcClient};
 
@@ -93,4 +99,160 @@ fn each_rpc_client_is_an_independent_fresh_connection() {
         Err(RpcCallError::Unauthorized) => {}
         other => panic!("expected the second, differently-tokened client to be rejected independently, got {other:?}"),
     }
+}
+
+/// R1: a timeout on a mutating method (`source.register` runs a full
+/// synchronous scan, which on a large source (E1) can routinely take
+/// longer than a short per-attempt budget) must be reported as
+/// ambiguous — and, crucially, must result in exactly one request:
+/// the previous behavior misclassified a timeout as a dropped
+/// connection and re-POSTed the same mutating call, which the
+/// reviewer reproduced as a real daemon-side duplicate registration.
+#[test]
+fn source_register_times_out_without_a_retry_and_reports_ambiguous() {
+    let server = MockServer::start(vec![Behavior::Slow {
+        delay: Duration::from_millis(300),
+        status: 200,
+        body: ok_envelope(serde_json::json!({"files_seen": 1})),
+    }]);
+    let client = RpcClient::with_timeouts(
+        server.addr.clone(),
+        "token".to_string(),
+        Duration::from_millis(50),
+        Duration::from_millis(50),
+        Duration::from_millis(50),
+    );
+
+    let result = client.call(
+        "source.register",
+        serde_json::json!({"name": "big", "root": "/big"}),
+    );
+
+    match result {
+        Err(RpcCallError::Ambiguous(msg)) => {
+            assert!(
+                msg.contains("source.register"),
+                "ambiguous message should name the method: {msg}"
+            );
+        }
+        other => panic!("expected Ambiguous on timeout, got {other:?}"),
+    }
+    assert_eq!(
+        server.call_count(),
+        1,
+        "a timed-out mutating call must never be automatically re-sent"
+    );
+}
+
+/// R1: `link.apply_refactor` must never be automatically re-sent on a
+/// dropped connection — a retry after a drop that in fact followed a
+/// successful apply would hit the daemon's staleness guard and the
+/// CLI would wrongly report "aborted" while files on disk had already
+/// been rewritten. This must stay ambiguous, with exactly one request
+/// sent, even though the *second* configured behavior below would
+/// otherwise serve a clean success (proving the retry genuinely never
+/// happens, not just that it would have failed anyway).
+#[test]
+fn apply_refactor_is_never_retried_on_a_dropped_connection() {
+    let server = MockServer::start(vec![
+        Behavior::Drop,
+        Behavior::Respond {
+            status: 200,
+            body: ok_envelope(serde_json::json!({"status": "applied", "files_changed": 1})),
+        },
+    ]);
+    let client = RpcClient::new(server.addr.clone(), "token".to_string());
+
+    let result = client.call(
+        "link.apply_refactor",
+        serde_json::json!({"source": "notes", "old_path": "A.md", "new_path": "B.md"}),
+    );
+
+    match result {
+        Err(RpcCallError::Ambiguous(msg)) => {
+            assert!(msg.contains("link.apply_refactor"));
+        }
+        other => panic!("expected Ambiguous, got {other:?}"),
+    }
+    assert_eq!(
+        server.call_count(),
+        1,
+        "link.apply_refactor must not be automatically re-sent after a dropped connection"
+    );
+}
+
+/// R1: `source.unregister` (mutating, but not long-running) is also
+/// never retried on a dropped connection, for the same duplicate-effect
+/// reason as `apply_refactor` — only non-mutating methods get the
+/// automatic single retry.
+#[test]
+fn source_unregister_is_never_retried_on_a_dropped_connection() {
+    let server = MockServer::start(vec![
+        Behavior::Drop,
+        Behavior::Respond {
+            status: 200,
+            body: ok_envelope(serde_json::Value::Null),
+        },
+    ]);
+    let client = RpcClient::new(server.addr.clone(), "token".to_string());
+
+    let result = client.call("source.unregister", serde_json::json!({"name": "notes"}));
+
+    assert!(matches!(result, Err(RpcCallError::Ambiguous(_))));
+    assert_eq!(server.call_count(), 1);
+}
+
+/// R1: a long-running method (`source.register`) gets a longer
+/// per-attempt timeout than an ordinary method, so a daemon that is
+/// merely slow (not hung forever) on a big scan succeeds instead of
+/// being misreported as ambiguous.
+#[test]
+fn long_running_methods_get_a_longer_timeout_than_ordinary_methods() {
+    let server = MockServer::start(vec![Behavior::Slow {
+        delay: Duration::from_millis(150),
+        status: 200,
+        body: ok_envelope(serde_json::json!({"files_seen": 1})),
+    }]);
+    let client = RpcClient::with_timeouts(
+        server.addr.clone(),
+        "token".to_string(),
+        Duration::from_millis(50),
+        Duration::from_millis(400),
+        Duration::from_millis(50),
+    );
+
+    let result = client.call(
+        "source.register",
+        serde_json::json!({"name": "big", "root": "/big"}),
+    );
+
+    assert!(
+        result.is_ok(),
+        "a 150ms-slow register should fit the 400ms long-running budget: {result:?}"
+    );
+    assert_eq!(server.call_count(), 1);
+}
+
+/// R1 (companion to the above): the same 150ms delay against the
+/// *short* (50ms) budget used for an ordinary, non-long-running
+/// method is reported as ambiguous rather than retried.
+#[test]
+fn ordinary_methods_use_the_short_timeout_and_report_ambiguous_on_a_slow_response() {
+    let server = MockServer::start(vec![Behavior::Slow {
+        delay: Duration::from_millis(150),
+        status: 200,
+        body: ok_envelope(serde_json::json!([])),
+    }]);
+    let client = RpcClient::with_timeouts(
+        server.addr.clone(),
+        "token".to_string(),
+        Duration::from_millis(50),
+        Duration::from_millis(400),
+        Duration::from_millis(50),
+    );
+
+    let result = client.call("source.list", serde_json::json!({}));
+
+    assert!(matches!(result, Err(RpcCallError::Ambiguous(_))));
+    assert_eq!(server.call_count(), 1);
 }

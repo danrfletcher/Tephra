@@ -24,6 +24,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -46,6 +47,17 @@ pub enum Behavior {
     /// writing any response at all — simulates the daemon dropping
     /// the connection mid-request/mid-response.
     Drop,
+    /// Read the request fully, sleep for `delay`, then respond with
+    /// `status`/`body` — simulates a daemon that is simply slow (a
+    /// large synchronous `source.register` scan, an in-progress
+    /// `link.apply_refactor`), as distinct from [`Behavior::Drop`]'s
+    /// dropped connection (R1: a timeout must not be treated the same
+    /// way as a dropped connection).
+    Slow {
+        delay: Duration,
+        status: u16,
+        body: Value,
+    },
 }
 
 pub struct MockServer {
@@ -113,6 +125,14 @@ fn handle_connection(
             // written) closes the socket out from under the client
             // mid-request, which is exactly the "connection dropped"
             // failure mode `transport.rs`'s retry logic must handle.
+        }
+        Behavior::Slow {
+            delay,
+            status,
+            body,
+        } => {
+            thread::sleep(delay);
+            write_response(&mut stream, status, &body);
         }
     }
 }

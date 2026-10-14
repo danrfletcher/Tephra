@@ -55,12 +55,30 @@ fn json_or(value: &Value, rendered: impl FnOnce() -> String, json: bool) -> Stri
 /// Executes one parsed [`Command`] against `client`, reading a
 /// confirmation prompt (for `link refactor --apply` without `--yes`)
 /// from `stdin` rather than the real terminal, so tests can supply a
-/// deterministic answer.
+/// deterministic answer. The confirmation prompt itself (and, when
+/// shown, the refactor preview rendered ahead of it) is written to
+/// the real stderr — never stdout, so `--json` output stays valid
+/// JSON (R2) — via [`execute_with_prompt_writer`]. Use that function
+/// directly to capture the prompt text instead (e.g. in tests).
 pub fn execute<R: BufRead>(
     command: &Command,
     json: bool,
     client: &RpcClient,
     stdin: &mut R,
+) -> CommandOutcome {
+    execute_with_prompt_writer(command, json, client, stdin, &mut std::io::stderr())
+}
+
+/// Same as [`execute`], but writes the interactive confirmation
+/// prompt/preview to `prompt_out` instead of assuming the real
+/// stderr, so tests can assert on exactly what the user would see
+/// before they answer (R2/R3) without capturing real stderr.
+pub fn execute_with_prompt_writer<R: BufRead, W: Write>(
+    command: &Command,
+    json: bool,
+    client: &RpcClient,
+    stdin: &mut R,
+    prompt_out: &mut W,
 ) -> CommandOutcome {
     match command {
         Command::SourceAdd { name, path } => source_add(name, path, json, client),
@@ -88,6 +106,7 @@ pub fn execute<R: BufRead>(
             json,
             client,
             stdin,
+            prompt_out,
         ),
     }
 }
@@ -221,11 +240,12 @@ struct RefactorRequest<'a> {
     yes: bool,
 }
 
-fn link_refactor<R: BufRead>(
+fn link_refactor<R: BufRead, W: Write>(
     req: RefactorRequest,
     json: bool,
     client: &RpcClient,
     stdin: &mut R,
+    prompt_out: &mut W,
 ) -> CommandOutcome {
     let params = json!({"source": req.source, "old_path": req.old_path, "new_path": req.new_path});
 
@@ -240,12 +260,35 @@ fn link_refactor<R: BufRead>(
         };
     }
 
-    if !req.yes && !confirm(stdin) {
-        return CommandOutcome {
-            exit_code: 1,
-            stdout: String::new(),
-            stderr: "aborted: refactor not confirmed\n".to_string(),
+    if !req.yes {
+        // R3: an interactive confirmation for an irreversible,
+        // multi-file on-disk rewrite must not be blind. Fetch the
+        // same preview `link refactor` (without `--apply`) would show
+        // and render it ahead of the prompt, so the user sees exactly
+        // which files/lines are about to change before they answer —
+        // in addition to naming the source/old/new paths in the
+        // prompt itself. This costs one extra RPC call, but only on
+        // the interactive path: `--yes` still issues exactly one RPC
+        // (`link.apply_refactor`).
+        let preview = match client.call("link.preview_refactor", params.clone()) {
+            Ok(result) => result,
+            Err(e) => return CommandOutcome::err(describe_error(&e)),
         };
+        let preview_text = render::render_refactor_preview(&preview);
+        if !confirm(
+            req.source,
+            req.old_path,
+            req.new_path,
+            &preview_text,
+            stdin,
+            prompt_out,
+        ) {
+            return CommandOutcome {
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: "aborted: refactor not confirmed\n".to_string(),
+            };
+        }
     }
 
     match client.call("link.apply_refactor", params) {
@@ -268,9 +311,19 @@ fn link_refactor<R: BufRead>(
 
 /// Reads one line from `stdin` and treats `y`/`yes` (any case) as
 /// confirmation, anything else (including EOF) as a refusal — never
-/// defaults to "yes" on an unreadable/empty answer.
-fn confirm<R: BufRead>(stdin: &mut R) -> bool {
-    print_prompt();
+/// defaults to "yes" on an unreadable/empty answer. Prints the prompt
+/// (naming `source`/`old_path`/`new_path` and the rendered
+/// `preview_text` diff, R3) to `out` — never the real stdout, so
+/// `--json` output is never interleaved with it (R2).
+fn confirm<R: BufRead, W: Write>(
+    source: &str,
+    old_path: &str,
+    new_path: &str,
+    preview_text: &str,
+    stdin: &mut R,
+    out: &mut W,
+) -> bool {
+    print_prompt(source, old_path, new_path, preview_text, out);
     let mut line = String::new();
     match stdin.read_line(&mut line) {
         Ok(0) | Err(_) => false,
@@ -278,9 +331,20 @@ fn confirm<R: BufRead>(stdin: &mut R) -> bool {
     }
 }
 
-fn print_prompt() {
-    print!("Apply this refactor? [y/N]: ");
-    let _ = std::io::stdout().flush();
+fn print_prompt<W: Write>(
+    source: &str,
+    old_path: &str,
+    new_path: &str,
+    preview_text: &str,
+    out: &mut W,
+) {
+    let _ = writeln!(
+        out,
+        "About to rewrite links in source \"{source}\": {old_path} -> {new_path}"
+    );
+    let _ = write!(out, "{preview_text}");
+    let _ = write!(out, "Apply this refactor? [y/N]: ");
+    let _ = out.flush();
 }
 
 fn describe_error(e: &RpcCallError) -> String {
@@ -292,19 +356,52 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    fn confirm_with(stdin_text: &[u8]) -> (bool, String) {
+        let mut stdin = Cursor::new(stdin_text.to_vec());
+        let mut out: Vec<u8> = Vec::new();
+        let answer = confirm(
+            "notes",
+            "OldDoc.md",
+            "NewDoc.md",
+            "1 affected link(s):\n  @notes:Journal.md:12  - [[OldDoc]]\n  @notes:Journal.md:12  + [[NewDoc]]\n",
+            &mut stdin,
+            &mut out,
+        );
+        (
+            answer,
+            String::from_utf8(out).expect("prompt is valid utf8"),
+        )
+    }
+
     #[test]
     fn confirm_accepts_y_and_yes_case_insensitively() {
-        assert!(confirm(&mut Cursor::new(b"y\n".to_vec())));
-        assert!(confirm(&mut Cursor::new(b"Y\n".to_vec())));
-        assert!(confirm(&mut Cursor::new(b"yes\n".to_vec())));
-        assert!(confirm(&mut Cursor::new(b"YES\n".to_vec())));
+        assert!(confirm_with(b"y\n").0);
+        assert!(confirm_with(b"Y\n").0);
+        assert!(confirm_with(b"yes\n").0);
+        assert!(confirm_with(b"YES\n").0);
     }
 
     #[test]
     fn confirm_rejects_anything_else_including_empty_and_eof() {
-        assert!(!confirm(&mut Cursor::new(b"n\n".to_vec())));
-        assert!(!confirm(&mut Cursor::new(b"\n".to_vec())));
-        assert!(!confirm(&mut Cursor::new(b"".to_vec())));
-        assert!(!confirm(&mut Cursor::new(b"maybe\n".to_vec())));
+        assert!(!confirm_with(b"n\n").0);
+        assert!(!confirm_with(b"\n").0);
+        assert!(!confirm_with(b"").0);
+        assert!(!confirm_with(b"maybe\n").0);
+    }
+
+    #[test]
+    fn confirm_prompt_names_source_and_old_and_new_paths_and_shows_the_preview_diff() {
+        // R3: the prompt for an irreversible multi-file rewrite must
+        // name what is about to change, not just ask a bare
+        // yes/no — and (R2) it must go to the writer passed in, never
+        // the real stdout.
+        let (_, prompt) = confirm_with(b"n\n");
+        assert!(prompt.contains("notes"));
+        assert!(prompt.contains("OldDoc.md"));
+        assert!(prompt.contains("NewDoc.md"));
+        assert!(prompt.contains("@notes:Journal.md:12"));
+        assert!(prompt.contains("- [[OldDoc]]"));
+        assert!(prompt.contains("+ [[NewDoc]]"));
+        assert!(prompt.contains("Apply this refactor? [y/N]: "));
     }
 }

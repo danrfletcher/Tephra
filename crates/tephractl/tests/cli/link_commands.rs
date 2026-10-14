@@ -221,11 +221,14 @@ fn link_refactor_apply_with_yes_skips_the_confirmation_prompt() {
 
 #[test]
 fn link_refactor_apply_without_yes_prompts_and_a_refusal_makes_no_rpc_call() {
-    // Zero configured behaviors: if `execute` called the RPC before
-    // honoring a "no" answer, this server would have nothing to
-    // serve and the test would hang/fail on a connection error
-    // instead of cleanly asserting zero calls.
-    let server = MockServer::start(vec![]);
+    // R3: the interactive path fetches a preview to show the user
+    // before asking for confirmation, so one request is expected (the
+    // preview) — but a refusal must still make zero `apply_refactor`
+    // calls.
+    let server = MockServer::start(vec![Behavior::Respond {
+        status: 200,
+        body: load_fixture("preview_refactor_success"),
+    }]);
     let client = client_for(&server);
 
     let mut stdin: &[u8] = b"n\n".as_ref();
@@ -245,17 +248,24 @@ fn link_refactor_apply_without_yes_prompts_and_a_refusal_makes_no_rpc_call() {
     assert_ne!(outcome.exit_code, 0);
     assert_eq!(
         server.call_count(),
-        0,
-        "a refused confirmation must never call the daemon"
+        1,
+        "only the preview call, never apply_refactor, on a refused confirmation"
     );
+    assert_eq!(server.received()[0].body["method"], "link.preview_refactor");
 }
 
 #[test]
 fn link_refactor_apply_without_yes_confirmed_with_y_does_call_the_rpc() {
-    let server = MockServer::start(vec![Behavior::Respond {
-        status: 200,
-        body: load_fixture("apply_refactor_success"),
-    }]);
+    let server = MockServer::start(vec![
+        Behavior::Respond {
+            status: 200,
+            body: load_fixture("preview_refactor_success"),
+        },
+        Behavior::Respond {
+            status: 200,
+            body: load_fixture("apply_refactor_success"),
+        },
+    ]);
     let client = client_for(&server);
 
     let mut stdin: &[u8] = b"y\n".as_ref();
@@ -273,7 +283,10 @@ fn link_refactor_apply_without_yes_confirmed_with_y_does_call_the_rpc() {
     );
 
     assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
-    assert_eq!(server.call_count(), 1);
+    let received = server.received();
+    assert_eq!(received.len(), 2, "a preview call, then the apply call");
+    assert_eq!(received[0].body["method"], "link.preview_refactor");
+    assert_eq!(received[1].body["method"], "link.apply_refactor");
 }
 
 #[test]
@@ -301,4 +314,100 @@ fn link_refactor_apply_aborted_result_is_reported_as_a_failure() {
     assert_ne!(outcome.exit_code, 0);
     assert!(outcome.stderr.contains("Refactor aborted"));
     assert!(outcome.stderr.contains("file modified since preview"));
+}
+
+/// R2/R3: the confirmation prompt for `--apply` without `--yes`
+/// names the source and old/new paths and shows the preview diff —
+/// and (R2) is written to the caller-supplied writer, never folded
+/// into stdout, so `--json` output stays parseable even when a
+/// confirmation was shown first.
+#[test]
+fn link_refactor_apply_without_yes_prompt_names_paths_and_shows_preview_diff() {
+    let server = MockServer::start(vec![
+        Behavior::Respond {
+            status: 200,
+            body: load_fixture("preview_refactor_success"),
+        },
+        Behavior::Respond {
+            status: 200,
+            body: load_fixture("apply_refactor_success"),
+        },
+    ]);
+    let client = client_for(&server);
+
+    let mut stdin: &[u8] = b"y\n".as_ref();
+    let mut prompt_out: Vec<u8> = Vec::new();
+    let outcome = commands::execute_with_prompt_writer(
+        &Command::LinkRefactor {
+            source: "notes".to_string(),
+            old_path: "OldDoc.md".to_string(),
+            new_path: "NewDoc.md".to_string(),
+            apply: true,
+            yes: false,
+        },
+        false,
+        &client,
+        &mut stdin,
+        &mut prompt_out,
+    );
+
+    assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
+    let prompt = String::from_utf8(prompt_out).expect("prompt is valid utf8");
+    assert!(prompt.contains("notes"), "prompt must name the source");
+    assert!(prompt.contains("OldDoc.md"), "prompt must name old_path");
+    assert!(prompt.contains("NewDoc.md"), "prompt must name new_path");
+    assert!(
+        prompt.contains("@notes:Journal.md:12"),
+        "prompt must show the affected file/line from the preview"
+    );
+    assert!(prompt.contains("- [[OldDoc]]"));
+    assert!(prompt.contains("+ [[NewDoc]]"));
+    assert!(prompt.contains("Apply this refactor? [y/N]: "));
+    // The prompt must never leak into stdout, which holds only the
+    // final applied-refactor rendering.
+    assert!(!outcome.stdout.contains("Apply this refactor"));
+}
+
+/// R2: `--apply --json` without `--yes` must still produce stdout
+/// that is valid, parseable JSON — the interactive confirmation
+/// prompt (and the preview diff shown ahead of it) must go to the
+/// prompt writer, never interleaved into stdout.
+#[test]
+fn link_refactor_apply_json_without_yes_keeps_stdout_as_valid_json() {
+    let server = MockServer::start(vec![
+        Behavior::Respond {
+            status: 200,
+            body: load_fixture("preview_refactor_success"),
+        },
+        Behavior::Respond {
+            status: 200,
+            body: load_fixture("apply_refactor_success"),
+        },
+    ]);
+    let client = client_for(&server);
+
+    let mut stdin: &[u8] = b"y\n".as_ref();
+    let mut prompt_out: Vec<u8> = Vec::new();
+    let outcome = commands::execute_with_prompt_writer(
+        &Command::LinkRefactor {
+            source: "notes".to_string(),
+            old_path: "OldDoc.md".to_string(),
+            new_path: "NewDoc.md".to_string(),
+            apply: true,
+            yes: false,
+        },
+        true,
+        &client,
+        &mut stdin,
+        &mut prompt_out,
+    );
+
+    assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&outcome.stdout).expect("stdout must be valid JSON end to end");
+    assert_eq!(parsed["status"], "applied");
+    // The confirmation prompt happened, but on the separate writer —
+    // not mixed into the JSON stdout.
+    let prompt = String::from_utf8(prompt_out).expect("prompt is valid utf8");
+    assert!(prompt.contains("Apply this refactor"));
 }
