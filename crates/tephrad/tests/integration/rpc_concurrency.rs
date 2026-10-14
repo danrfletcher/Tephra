@@ -227,3 +227,92 @@ async fn an_abrupt_http_client_disconnect_does_not_affect_later_requests() {
         .expect("a later well-formed request must still succeed");
     assert_eq!(response.status(), reqwest::StatusCode::OK);
 }
+
+/// R5/E12, HTTP angle: a genuine partial request — real headers plus
+/// part of a declared `Content-Length` body — followed by a forced
+/// TCP `RST` (via `SO_LINGER 0`, not just a clean drop) must not
+/// panic the server or wedge its listener; a fresh, well-formed
+/// request must still succeed right after.
+#[tokio::test]
+async fn an_abrupt_tcp_reset_mid_http_request_does_not_affect_later_requests() {
+    let server = spawn(MockGraph::new(), MockSources::new()).await;
+
+    {
+        use tokio::io::AsyncWriteExt;
+
+        let mut stream = tokio::net::TcpStream::connect(server.addr).await.unwrap();
+        let declared_body = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"graph.get_edges\",\"params\":{}}";
+        let partial_body = &declared_body[..declared_body.len() / 2];
+        let request = format!(
+            "POST /rpc HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            server.addr,
+            server.token,
+            declared_body.len(),
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        stream.write_all(partial_body).await.unwrap();
+        stream.flush().await.unwrap();
+
+        // Force an abortive close (TCP RST), not the normal FIN
+        // handshake a plain `drop` would perform — this is what E12
+        // actually specifies ("abrupt client TCP reset mid-request"),
+        // not just an early disconnect.
+        stream.set_zero_linger().expect("SO_LINGER 0 must be settable on a loopback TCP stream");
+        drop(stream);
+    }
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(server.http_url())
+        .bearer_auth(&server.token)
+        .json(&json!({ "jsonrpc": "2.0", "id": 2, "method": "graph.get_edges", "params": {} }))
+        .send()
+        .await
+        .expect("a later well-formed request must still succeed");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+}
+
+/// R5/E12, WebSocket angle: a genuine partial WebSocket frame — a
+/// complete frame header declaring a payload length, then only part
+/// of that payload — followed by a forced TCP `RST`, must not panic
+/// the server or affect any other connection; a fresh WS client must
+/// still be served normally right after.
+#[tokio::test]
+async fn an_abrupt_tcp_reset_mid_websocket_frame_does_not_affect_later_clients() {
+    let server = spawn(MockGraph::new(), MockSources::new()).await;
+
+    {
+        use tokio::io::AsyncWriteExt;
+
+        let ws = connect_ws(&server.ws_url(), &server.token).await.expect("handshake succeeds");
+        let inner = ws.into_inner();
+        let mut tcp = match inner {
+            tokio_tungstenite::MaybeTlsStream::Plain(tcp) => tcp,
+            other => panic!("expected a plain (non-TLS) loopback stream, got {other:?}"),
+        };
+
+        // A syntactically valid masked WebSocket text-frame header
+        // (FIN + opcode=text, MASK bit set, 16-bit extended length of
+        // 1000 bytes, a 4-byte masking key) followed by only 10 bytes
+        // of that declared 1000-byte payload — a genuine mid-frame
+        // truncation, not an idle or pre-handshake disconnect.
+        let mut frame_start = vec![0x81u8, 0xFE, 0x03, 0xE8, 0x01, 0x02, 0x03, 0x04];
+        frame_start.extend(std::iter::repeat(0x41u8).take(10));
+        tcp.write_all(&frame_start).await.unwrap();
+        tcp.flush().await.unwrap();
+
+        tcp.set_zero_linger().expect("SO_LINGER 0 must be settable on a loopback TCP stream");
+        drop(tcp);
+    }
+
+    let mut next_client = connect_ws(&server.ws_url(), &server.token)
+        .await
+        .expect("a later client must still be able to connect");
+    next_client
+        .send(Message::Text(json!({ "jsonrpc": "2.0", "id": 1, "method": "graph.get_edges", "params": {} }).to_string().into()))
+        .await
+        .unwrap();
+    let reply = next_client.next().await.unwrap().unwrap();
+    let body: serde_json::Value = serde_json::from_str(&reply.into_text().unwrap()).unwrap();
+    assert_eq!(body["id"], json!(1));
+}
