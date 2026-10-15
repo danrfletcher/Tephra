@@ -33,7 +33,7 @@ Every pull request had to pass those last three before it was opened.
 
 ## How it was built
 
-Tephra was built by an agent pipeline that Dan Fletcher runs: a Python state machine hands each pull request to a coder agent, then to a separate reviewer agent, then to a tester agent that runs the real daemon in a container. A pull request only opens after both pass. Dan wrote none of the Rust. From the first commit (12 Oct 2026, 21:59 BST) to the opening of pull request 7 (14 Oct, 13:12 BST) took 39 hours of wall-clock time. For 23 of those hours the pipeline sat blocked until a human resumed it, and for 43 minutes more on another pull request, so about 15 hours was active build time. Pull requests 1 to 7 went through 38 reviewer runs and 10 tester runs. What those gates caught is in [docs/FINDINGS.md](docs/FINDINGS.md).
+Tephra is a proof-of-concept test for, and was built by Dan's autonomous build pipeline: a Python state machine hands each pull request to a coder agent, then to a separate reviewer agent, then to a tester agent that runs the real daemon in a container. A pull request only opens after both pass. Dan wrote no for Rust for this project. From the first commit (12 Oct 2026, 21:59 BST) to the opening of pull request 7 (14 Oct, 13:12 BST) took 39 hours of wall-clock time. For 24 of those hours the pipeline sat blocked overnight awaiting a human to resume it. Legitimate build time was about 15 hours, fully active and autonomous. Pull requests 1 to 7 went through 38 reviewer runs and 10 tester runs. What those gates caught is in [docs/FINDINGS.md](docs/FINDINGS.md).
 
 ## Docs
 
