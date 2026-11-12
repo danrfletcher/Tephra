@@ -1,0 +1,97 @@
+{
+  "path": "tests/fixtures/units/golden.txt",
+  "content_hash": "17dc6553e9b6ef2af5898d8014de7920a8a642aaf1ed7052a879f25efc136858",
+  "frontmatter": null,
+  "headings": [],
+  "wikilinks": [
+    {
+      "source_prefix": null,
+      "target": "Project Plan",
+      "anchor": null,
+      "alias": null,
+      "raw": "Project Plan",
+      "line": 3,
+      "span": [
+        19,
+        35
+      ]
+    },
+    {
+      "source_prefix": null,
+      "target": "Project Plan",
+      "anchor": "Goals",
+      "alias": "the goals",
+      "raw": "Project Plan#Goals|the goals",
+      "line": 3,
+      "span": [
+        40,
+        72
+      ]
+    },
+    {
+      "source_prefix": "work",
+      "target": "Roadmap",
+      "anchor": "^q3-goals",
+      "alias": null,
+      "raw": "@work:Roadmap#^q3-goals",
+      "line": 4,
+      "span": [
+        132,
+        159
+      ]
+    },
+    {
+      "source_prefix": null,
+      "target": "Inline Link",
+      "anchor": null,
+      "alias": null,
+      "raw": "Inline Link",
+      "line": 7,
+      "span": [
+        198,
+        213
+      ]
+    }
+  ],
+  "markdown_links": [
+    {
+      "text": "the spec",
+      "target": "docs/spec.md",
+      "line": 4,
+      "span": [
+        104,
+        116
+      ]
+    }
+  ],
+  "tags": [],
+  "blocks": [
+    {
+      "block_id": "notes-1",
+      "line": 5
+    }
+  ],
+  "paragraphs": [
+    {
+      "start_line": 1,
+      "end_line": 1,
+      "block_id": null
+    },
+    {
+      "start_line": 3,
+      "end_line": 5,
+      "block_id": "notes-1"
+    },
+    {
+      "start_line": 7,
+      "end_line": 7,
+      "block_id": null
+    },
+    {
+      "start_line": 9,
+      "end_line": 9,
+      "block_id": null
+    }
+  ],
+  "diagnostics": []
+}

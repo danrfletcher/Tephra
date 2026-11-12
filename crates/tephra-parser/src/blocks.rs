@@ -1,10 +1,19 @@
-//! `^block-id` anchor scanning.
+//! `^block-id` anchor scanning and paragraph blocks.
 //!
 //! A block anchor is a trailing `^id` token at the end of a line
 //! (optionally preceded by whitespace), where `id` is one or more
-//! ASCII letters/digits/hyphens. Anchors inside fenced/indented code
-//! blocks, inline code spans, or HTML blocks/inline HTML are
-//! skipped.
+//! ASCII letters/digits/hyphens (any length: G12's reading rule).
+//! Anchors inside fenced/indented code blocks, inline code spans, or
+//! HTML blocks/inline HTML (or, in a non-Markdown prose file, a
+//! native literal region) are skipped. Every occurrence is kept, in
+//! file order: a repeated ID is reported as a diagnostic but never
+//! dropped or merged.
+//!
+//! A [`Paragraph`] is one block of prose with its line range. An
+//! anchor on a paragraph's *last* line sets that paragraph's
+//! `block_id` ([`attach_ids`]); an anchor anywhere else (a heading
+//! line, a table row, the middle of a paragraph) stays a bare
+//! anchor.
 
 use serde::Serialize;
 
@@ -17,6 +26,37 @@ pub struct BlockAnchor {
     pub block_id: String,
     /// 1-indexed line number, absolute within the original file.
     pub line: usize,
+}
+
+/// One block of prose: a paragraph, or one list item's own text, with
+/// the lines it spans. `block_id` is the `^id` ending its last line,
+/// if there is one.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Paragraph {
+    /// 1-indexed first line, absolute within the original file.
+    pub start_line: usize,
+    /// 1-indexed last line (equal to `start_line` for one line).
+    pub end_line: usize,
+    /// Without the leading `^`.
+    pub block_id: Option<String>,
+}
+
+/// Sets `block_id` on each paragraph whose last line carries an
+/// anchor. `paragraphs` must not overlap (no two share a last line);
+/// a paragraph already holding an ID keeps it.
+pub(crate) fn attach_ids(paragraphs: &mut [Paragraph], anchors: &[BlockAnchor]) {
+    let mut by_end: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for (idx, p) in paragraphs.iter().enumerate() {
+        by_end.insert(p.end_line, idx);
+    }
+    for anchor in anchors {
+        if let Some(&idx) = by_end.get(&anchor.line) {
+            let p = &mut paragraphs[idx];
+            if p.block_id.is_none() {
+                p.block_id = Some(anchor.block_id.clone());
+            }
+        }
+    }
 }
 
 fn is_block_id_char(c: char) -> bool {

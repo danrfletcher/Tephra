@@ -167,3 +167,69 @@ fn a_fence_heavy_file_costs_no_more_time_or_memory_than_a_same_sized_fence_free_
         );
     }
 }
+
+// ---- G3: the other prose formats stay inside the same budget ----
+
+const TXT_UNIT_BLOCK: &str =
+    "Some text with a [[Note#^anchor|Alias]] link and a [md](other.md) link here. ^block-id\n\n";
+
+/// org: a heading, a paragraph with links, and a literal region, so
+/// the literal-region mask, heading rule and link pass all run.
+const ORG_UNIT_BLOCK: &str = "* Section\nSome text with a [[Note#^anchor|Alias]] link and [[file:x.org][X]] here. ^block-id\n\n#+BEGIN_SRC rust\nfn code() {}\n#+END_SRC\n\n";
+
+fn assert_extracted_prose(unit: &ParsedUnit, expect_headings: bool) {
+    assert!(!unit.wikilinks.is_empty());
+    assert!(!unit.blocks.is_empty());
+    assert!(!unit.paragraphs.is_empty());
+    assert_eq!(!unit.headings.is_empty(), expect_headings);
+}
+
+#[test]
+fn a_multi_megabyte_txt_parses_within_a_bounded_time_budget() {
+    let content = repeat_to_cap(TXT_UNIT_BLOCK);
+
+    let start = Instant::now();
+    let unit = parse_unit(Path::new("large.txt"), &content);
+    let elapsed = start.elapsed();
+
+    assert_extracted_prose(&unit, false);
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "parse_unit took {elapsed:?} on a {}-byte .txt file",
+        content.len()
+    );
+}
+
+#[test]
+fn a_multi_megabyte_org_parses_within_a_bounded_time_budget() {
+    let content = repeat_to_cap(ORG_UNIT_BLOCK);
+
+    let start = Instant::now();
+    let unit = parse_unit(Path::new("large.org"), &content);
+    let elapsed = start.elapsed();
+
+    assert_extracted_prose(&unit, true);
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "parse_unit took {elapsed:?} on a {}-byte .org file",
+        content.len()
+    );
+}
+
+#[test]
+fn a_multi_megabyte_single_paragraph_txt_is_still_bounded() {
+    // No blank line at all: one paragraph, one Markdown-link chunk.
+    let content = repeat_to_cap("a [[Note]] and [t](p.md) link on one line\n");
+
+    let start = Instant::now();
+    let unit = parse_unit(Path::new("one-paragraph.txt"), &content);
+    let elapsed = start.elapsed();
+
+    assert_eq!(unit.paragraphs.len(), 1);
+    assert!(!unit.wikilinks.is_empty());
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "parse_unit took {elapsed:?} on a {}-byte single-paragraph .txt",
+        content.len()
+    );
+}

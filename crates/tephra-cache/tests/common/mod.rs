@@ -70,7 +70,7 @@ pub fn seed_source_with_units(
             .insert_block(&NewBlock {
                 end_line: None,
                 unit_id,
-                block_id: "abcd1234",
+                block_id: Some("abcd1234"),
                 line: 1,
             })
             .expect("insert_block");

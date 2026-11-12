@@ -24,7 +24,29 @@ const FIXTURES: &[&str] = &[
     "nested-unicode-tags-with-fence.md",
     "duplicate-blocks.md",
     "federated-wikilink.md",
+    // G3: every prose format.
+    "golden.txt",
+    "golden.org",
+    "golden.rst",
+    "golden.adoc",
+    "duplicate-blocks.org",
+    "utf16-bom.txt",
 ];
+
+/// A fixture's text. `utf16-bom.txt` is UTF-16LE with a BOM on disk
+/// (G2: decoded before parsing, so it parses like its UTF-8 copy);
+/// every other fixture is UTF-8.
+fn read_fixture(name: &str) -> String {
+    let path = fixtures_dir().join(name);
+    let bytes =
+        std::fs::read(&path).unwrap_or_else(|e| panic!("read fixture {}: {e}", path.display()));
+    if let Some(rest) = bytes.strip_prefix(&[0xff, 0xfe]) {
+        let (pairs, _) = rest.as_chunks::<2>();
+        let units: Vec<u16> = pairs.iter().map(|c| u16::from_le_bytes(*c)).collect();
+        return String::from_utf16(&units).expect("valid UTF-16 fixture");
+    }
+    String::from_utf8(bytes).expect("valid UTF-8 fixture")
+}
 
 fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/units")
@@ -44,9 +66,7 @@ fn every_fixture_matches_its_committed_golden_snapshot() {
     let mut failures = Vec::new();
 
     for name in FIXTURES {
-        let md_path = fixtures_dir().join(name);
-        let content = std::fs::read_to_string(&md_path)
-            .unwrap_or_else(|e| panic!("read fixture {}: {e}", md_path.display()));
+        let content = read_fixture(name);
 
         // parse_unit is given a stable, fixture-relative path (not an
         // absolute, machine-specific one) so the snapshot is portable.
@@ -87,4 +107,17 @@ fn reparsing_a_fixture_twice_is_byte_identical() {
     let first = parse_unit(relative_path, &content);
     let second = parse_unit(relative_path, &content);
     assert_eq!(first, second);
+}
+
+#[test]
+fn the_utf16_bom_fixture_parses_the_same_as_its_utf8_copy() {
+    let decoded = read_fixture("utf16-bom.txt");
+    assert!(decoded.contains("Café"), "decoded text: {decoded:?}");
+    let path = Path::new("tests/fixtures/units/utf16-bom.txt");
+    let from_utf16 = parse_unit(path, &decoded);
+    // The same text, written as plain UTF-8.
+    let utf8_copy = decoded.clone();
+    assert_eq!(from_utf16, parse_unit(path, &utf8_copy));
+    assert_eq!(from_utf16.wikilinks[0].raw, "Café Plan");
+    assert_eq!(from_utf16.blocks[0].block_id, "u16-1");
 }

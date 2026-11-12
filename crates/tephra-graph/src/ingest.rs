@@ -16,7 +16,7 @@ use crate::resolver::{
     basename_of, edge_target_scope_key, normalize_key, resolve_edge_target,
     strip_markdown_extension,
 };
-use crate::{Edge, EdgeTarget, UnitGraph};
+use crate::{BlockFact, Edge, EdgeTarget, UnitGraph};
 
 /// One unit's facts in the shape [`UnitGraph::upsert_unit`] takes:
 /// everything [`crate::UnitMetadata`] needs, plus its own outgoing
@@ -26,7 +26,11 @@ use crate::{Edge, EdgeTarget, UnitGraph};
 pub struct UnitFacts {
     pub frontmatter_json: Option<String>,
     pub tags: Vec<String>,
-    pub blocks: Vec<String>,
+    /// Every `^id` occurrence in the unit, in file order, with its
+    /// line. Nothing is deduplicated: an ID that appears twice is two
+    /// facts, each with its own line (the ambiguity error on resolve
+    /// is a later PR's job, and needs them all).
+    pub blocks: Vec<BlockFact>,
     pub links: Vec<(String, String)>,
 }
 
@@ -83,10 +87,12 @@ fn load_unit_facts(
         .into_iter()
         .map(|t| t.tag)
         .collect();
+    // Paragraph rows without an ID are not facts about any ID. Every
+    // row that has one is kept, duplicates included.
     let blocks = cache
         .blocks_for_unit(unit_id)?
         .into_iter()
-        .map(|b| b.block_id)
+        .filter_map(|b| b.block_id.map(|id| BlockFact { id, line: b.line }))
         .collect();
     let links = cache
         .links_from_unit(unit_id)?

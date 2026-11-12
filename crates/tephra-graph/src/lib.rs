@@ -39,7 +39,7 @@ mod model;
 mod resolver;
 
 pub use ingest::{ChangeNotification, GraphError, UnitFacts};
-pub use model::{Edge, EdgeTarget, UnitGraph, UnitMetadata};
+pub use model::{BlockFact, Edge, EdgeTarget, UnitGraph, UnitMetadata};
 pub use resolver::{ResolveError, ResolveResult};
 
 impl UnitGraph {

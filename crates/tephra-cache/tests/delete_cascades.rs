@@ -308,3 +308,34 @@ fn delete_source_is_idempotent_on_an_already_removed_source() {
         .delete_source("never-existed")
         .expect("delete_source on an unknown name must not error");
 }
+
+#[test]
+fn delete_unit_removes_the_units_headings_too() {
+    // G3: prose files of every format write `headings` rows; deleting
+    // the unit (the watcher's delete path) must take them with it.
+    let dir = tempfile::tempdir().unwrap();
+    let cache = open_temp_cache(&dir);
+    let seeded = seed_source_with_units(&cache, "notes", "/vault/notes", SourceStatus::Active);
+    for unit_id in &seeded.unit_ids {
+        cache
+            .insert_heading(&tephra_cache::NewHeading {
+                unit_id: *unit_id,
+                level: 2,
+                text: "Heading",
+                line: 3,
+            })
+            .expect("insert_heading");
+    }
+
+    cache.delete_unit(seeded.unit_ids[0]).expect("delete_unit");
+
+    assert!(cache
+        .headings_for_unit(seeded.unit_ids[0])
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        cache.headings_for_unit(seeded.unit_ids[1]).unwrap().len(),
+        1,
+        "the other unit's heading survives"
+    );
+}

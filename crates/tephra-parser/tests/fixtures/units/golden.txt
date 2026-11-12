@@ -1,0 +1,9 @@
+Meeting notes
+
+See [[Project Plan]] and [[Project Plan#Goals|the goals]] before Friday.
+Also [the spec](docs/spec.md) and the block [[@work:Roadmap#^q3-goals]].
+A #not-a-tag here. ^notes-1
+
+"Quoted [[Inline Link]] stays a link."
+
+Last paragraph without an id.

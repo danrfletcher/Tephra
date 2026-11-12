@@ -334,7 +334,7 @@ fn unit_summary(
 }
 
 #[test]
-fn every_non_ignored_file_is_a_unit_with_its_kind_and_only_markdown_has_rows() {
+fn every_non_ignored_file_is_a_unit_with_its_kind_and_only_prose_has_rows() {
     // G2/G6/G15 through the real register -> scan path, a real temp
     // dir and a real cache.
     let fixture = fixtures::kinds_fixture();
@@ -369,18 +369,27 @@ fn every_non_ignored_file_is_a_unit_with_its_kind_and_only_markdown_has_rows() {
     for (path, kind) in fixtures::KINDS_EXPECTED {
         let (got_kind, links, tags, blocks) = &summary[path];
         assert_eq!(got_kind, kind, "{path}");
-        let is_markdown = path.to_ascii_lowercase().ends_with(".md");
-        if !is_markdown {
+        if got_kind != "prose" {
             assert_eq!(
                 (*links, *tags, *blocks),
                 (0, 0, 0),
-                "{path}: a non-Markdown unit has no links/tags/blocks"
+                "{path}: a non-prose unit has no links/tags/blocks"
             );
         }
     }
-    // The Markdown file with content still goes through the parser.
-    assert_eq!(summary["notes/one.md"], ("prose".to_string(), 1, 1, 1));
-    assert_eq!(summary["Notes.MD"], ("prose".to_string(), 1, 0, 0));
+    // Every prose file goes through the parser (G3), whatever its
+    // extension. `blocks` counts every row: paragraphs and anchors.
+    // one.md: two paragraphs (the second ends in `^block1`).
+    assert_eq!(summary["notes/one.md"], ("prose".to_string(), 1, 1, 2));
+    assert_eq!(summary["Notes.MD"], ("prose".to_string(), 1, 0, 1));
+    // A `.txt` gives its link and its paragraph (with the `^blk123`),
+    // but never a tag: `#tag` is read from Markdown only.
+    assert_eq!(summary["notes/two.txt"], ("prose".to_string(), 1, 0, 1));
+    assert_eq!(
+        summary["notes/café notes.txt"],
+        ("prose".to_string(), 1, 0, 1)
+    );
+    assert_eq!(summary["empty.md"], ("prose".to_string(), 0, 0, 0));
 
     for ignored in fixtures::KINDS_IGNORED {
         assert!(
@@ -449,4 +458,177 @@ fn a_scan_never_writes_into_a_source_file() {
         "the scan must not create, change or delete any source file"
     );
     registry.unregister("kinds").expect("unregister");
+}
+
+#[test]
+fn a_real_scan_of_a_mixed_format_tree_gives_the_expected_rows_and_writes_nothing() {
+    // G3 + F4/F5/F6/E2/E7 through the real register -> scan path: a
+    // real temp dir, a real cache, the real parser.
+    let fixture = fixtures::prose_fixture();
+    let before = fixtures::tree_snapshot(fixture.root());
+
+    let cache_dir = tempfile::tempdir().expect("cache tempdir");
+    let cache_path = cache_dir.path().join("cache.db");
+    let registry =
+        SourceRegistry::new(Cache::open(&cache_path).expect("open cache")).expect("registry");
+    let stats = registry
+        .register("prose", fixture.root())
+        .expect("register");
+    assert_eq!(
+        stats.units_written,
+        fixtures::PROSE_EXPECTED.len() + fixtures::PROSE_NO_ROWS.len()
+    );
+
+    // Every prose file: its headings, links, tags and blocks, exactly.
+    for expected in &fixtures::PROSE_EXPECTED {
+        let got = fixtures::unit_rows(&cache_path, "prose", expected.0)
+            .unwrap_or_else(|| panic!("{} is not a unit", expected.0));
+        assert_eq!(got, fixtures::expected_rows(expected), "{}", expected.0);
+    }
+
+    // E2/F5/F6: units, but no rows of any kind.
+    for path in fixtures::PROSE_NO_ROWS {
+        let got = fixtures::unit_rows(&cache_path, "prose", path)
+            .unwrap_or_else(|| panic!("{path} is not a unit"));
+        assert_ne!(got.kind, "prose", "{path}");
+        assert_eq!(
+            (
+                got.headings.len(),
+                got.links.len(),
+                got.tags.len(),
+                got.blocks.len()
+            ),
+            (0, 0, 0, 0),
+            "{path}"
+        );
+    }
+
+    // E7: both `^dup` occurrences are stored, one row each, with their
+    // own lines (asserted in PROSE_EXPECTED for NOTES.TXT above), and
+    // the scan wrote no byte and moved no mtime.
+    let after = fixtures::tree_snapshot(fixture.root());
+    assert_eq!(before, after, "indexing must never write to the source");
+
+    registry.unregister("prose").expect("unregister");
+}
+
+#[test]
+fn utf16_bom_prose_parses_the_same_as_its_utf8_copy() {
+    let fixture = fixtures::empty_source();
+    let text = "Plan\n\nsee [[Café]] ^id1\n";
+    fixture.write("utf8.txt", text);
+    let mut utf16 = vec![0xFF, 0xFE];
+    for unit in text.encode_utf16() {
+        utf16.extend_from_slice(&unit.to_le_bytes());
+    }
+    fixture.write_bytes("utf16.txt", &utf16);
+    // UTF-16BE with a BOM too.
+    let mut be = vec![0xFE, 0xFF];
+    for unit in text.encode_utf16() {
+        be.extend_from_slice(&unit.to_be_bytes());
+    }
+    fixture.write_bytes("utf16be.txt", &be);
+
+    let cache_dir = tempfile::tempdir().expect("cache tempdir");
+    let cache_path = cache_dir.path().join("cache.db");
+    let registry =
+        SourceRegistry::new(Cache::open(&cache_path).expect("open cache")).expect("registry");
+    registry.register("u", fixture.root()).expect("register");
+
+    let utf8 = fixtures::unit_rows(&cache_path, "u", "utf8.txt").unwrap();
+    assert_eq!(utf8.kind, "prose");
+    assert_eq!(utf8.links, [("wikilink".to_string(), "Café".to_string())]);
+    assert_eq!(utf8.blocks.len(), 2);
+    for name in ["utf16.txt", "utf16be.txt"] {
+        assert_eq!(
+            fixtures::unit_rows(&cache_path, "u", name).unwrap(),
+            utf8,
+            "{name}"
+        );
+    }
+    registry.unregister("u").expect("unregister");
+}
+
+#[test]
+fn prose_that_is_not_utf8_or_bom_utf16_is_not_parsed() {
+    // Latin-1 bytes with no BOM: valid text to a sniffer, invalid
+    // UTF-8 to the parser. Whatever kind it ends up with, it gives no
+    // rows and never fails the scan.
+    let fixture = fixtures::empty_source();
+    fixture.write("ok.txt", "[[Fine]]\n");
+    fixture.write_bytes("latin1.txt", b"caf\xe9 [[Nope]] ^x\n");
+
+    let cache_dir = tempfile::tempdir().expect("cache tempdir");
+    let cache_path = cache_dir.path().join("cache.db");
+    let registry =
+        SourceRegistry::new(Cache::open(&cache_path).expect("open cache")).expect("registry");
+    registry.register("l", fixture.root()).expect("register");
+
+    let ok = fixtures::unit_rows(&cache_path, "l", "ok.txt").unwrap();
+    assert_eq!(ok.links.len(), 1);
+    let latin = fixtures::unit_rows(&cache_path, "l", "latin1.txt").expect("still a unit");
+    assert_eq!(
+        (latin.links.len(), latin.blocks.len(), latin.headings.len()),
+        (0, 0, 0)
+    );
+    registry.unregister("l").expect("unregister");
+}
+
+#[test]
+fn an_empty_or_whitespace_only_prose_file_is_a_unit_with_no_rows_in_every_format() {
+    let fixture = fixtures::empty_source();
+    for name in ["e.md", "e.txt", "e.org", "e.rst", "e.adoc"] {
+        fixture.write(name, "");
+        fixture.write(&format!("w-{name}"), "  \n\t\n\r\n   ");
+    }
+    let cache_dir = tempfile::tempdir().expect("cache tempdir");
+    let cache_path = cache_dir.path().join("cache.db");
+    let registry =
+        SourceRegistry::new(Cache::open(&cache_path).expect("open cache")).expect("registry");
+    registry.register("e", fixture.root()).expect("register");
+
+    for name in ["e.md", "e.txt", "e.org", "e.rst", "e.adoc"] {
+        for path in [name.to_string(), format!("w-{name}")] {
+            let got = fixtures::unit_rows(&cache_path, "e", &path)
+                .unwrap_or_else(|| panic!("{path} must be a unit"));
+            assert_eq!(
+                (
+                    got.headings.len(),
+                    got.links.len(),
+                    got.tags.len(),
+                    got.blocks.len()
+                ),
+                (0, 0, 0, 0),
+                "{path}"
+            );
+        }
+    }
+    registry.unregister("e").expect("unregister");
+}
+
+#[test]
+fn malformed_prose_never_fails_the_scan() {
+    let fixture = fixtures::empty_source();
+    // Valid UTF-8 noise built from the constructs each format keys on.
+    let noise = "* [[ ][ ]] ^ #+BEGIN_SRC\n::\n.. code-block::\n----\n=====\n\n\
+                 ** ****** = == =\n[[a|[[b]]]] ^^ ^id ^id\n\n\u{0}\u{1}\u{7f}";
+    for name in ["m.md", "m.txt", "m.org", "m.rst", "m.adoc"] {
+        fixture.write(name, noise);
+    }
+    fixture.write(
+        "stars.org",
+        &format!("{} deep\n{}\n", "*".repeat(5_000), "*".repeat(10_000)),
+    );
+    let bar = "=".repeat(10_000);
+    fixture.write("bar.rst", &format!("{bar}\nT\n{bar}\n\n{bar}\n"));
+    fixture.write("ok.txt", "[[Fine]]\n");
+
+    let cache_dir = tempfile::tempdir().expect("cache tempdir");
+    let cache_path = cache_dir.path().join("cache.db");
+    let registry =
+        SourceRegistry::new(Cache::open(&cache_path).expect("open cache")).expect("registry");
+    let stats = registry.register("m", fixture.root()).expect("register");
+    assert_eq!(stats.units_written, 8);
+    assert!(fixtures::unit_rows(&cache_path, "m", "ok.txt").is_some());
+    registry.unregister("m").expect("unregister");
 }

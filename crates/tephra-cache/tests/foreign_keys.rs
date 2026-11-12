@@ -103,7 +103,7 @@ fn inserting_a_block_with_nonexistent_unit_id_is_rejected() {
     let result = cache.insert_block(&NewBlock {
         end_line: None,
         unit_id: 999_999,
-        block_id: "ghost",
+        block_id: Some("ghost"),
         line: 1,
     });
     assert!(
@@ -144,7 +144,7 @@ fn valid_rows_against_real_parents_insert_cleanly() {
         .insert_block(&NewBlock {
             end_line: None,
             unit_id,
-            block_id: "real-block",
+            block_id: Some("real-block"),
             line: 5,
         })
         .is_ok());

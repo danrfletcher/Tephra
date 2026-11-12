@@ -1,0 +1,105 @@
+{
+  "path": "tests/fixtures/units/golden.org",
+  "content_hash": "bfdba367e737c8e8e2f0ccdd4fd4878b519c5fbe7caeef95c08500badaac7cb1",
+  "frontmatter": null,
+  "headings": [
+    {
+      "level": 1,
+      "text": "Overview",
+      "line": 2
+    },
+    {
+      "level": 2,
+      "text": "Details",
+      "line": 5
+    },
+    {
+      "level": 3,
+      "text": "Deep",
+      "line": 11
+    }
+  ],
+  "wikilinks": [
+    {
+      "source_prefix": null,
+      "target": "Project Plan",
+      "anchor": null,
+      "alias": null,
+      "raw": "Project Plan",
+      "line": 3,
+      "span": [
+        38,
+        54
+      ]
+    },
+    {
+      "source_prefix": null,
+      "target": "Project Plan",
+      "anchor": null,
+      "alias": "the plan",
+      "raw": "Project Plan|the plan",
+      "line": 3,
+      "span": [
+        56,
+        81
+      ]
+    },
+    {
+      "source_prefix": null,
+      "target": "Deep Note",
+      "anchor": "Section",
+      "alias": null,
+      "raw": "Deep Note#Section",
+      "line": 12,
+      "span": [
+        292,
+        313
+      ]
+    }
+  ],
+  "markdown_links": [
+    {
+      "text": "the spec",
+      "target": "docs/spec.md",
+      "line": 4,
+      "span": [
+        129,
+        141
+      ]
+    }
+  ],
+  "tags": [],
+  "blocks": [
+    {
+      "block_id": "ov-1",
+      "line": 4
+    },
+    {
+      "block_id": "det-1",
+      "line": 10
+    }
+  ],
+  "paragraphs": [
+    {
+      "start_line": 1,
+      "end_line": 1,
+      "block_id": null
+    },
+    {
+      "start_line": 3,
+      "end_line": 4,
+      "block_id": "ov-1"
+    },
+    {
+      "start_line": 10,
+      "end_line": 10,
+      "block_id": "det-1"
+    },
+    {
+      "start_line": 12,
+      "end_line": 12,
+      "block_id": null
+    }
+  ],
+  "diagnostics": []
+}

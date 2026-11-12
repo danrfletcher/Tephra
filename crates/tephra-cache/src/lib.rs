@@ -27,7 +27,7 @@ pub use listing::{
 pub use schema::KindInferrer;
 pub use sources::{validate_transition, InvalidTransition, SourceRow, SourceStatus};
 pub use units::{
-    BlockRow, LinkRow, NewBlock, NewHeading, NewLink, NewTag, NewUnit, TagRow, UnitRow,
+    BlockRow, HeadingRow, LinkRow, NewBlock, NewHeading, NewLink, NewTag, NewUnit, TagRow, UnitRow,
     UnitWithSourceStatus,
 };
 

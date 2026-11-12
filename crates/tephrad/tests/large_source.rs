@@ -213,15 +213,23 @@ fn a_100k_plus_ignored_subtree_is_pruned_before_the_walk_descends_into_it() {
             huge.kind, "binary",
             "real kind from its first 8 KB (NULs), though never parsed"
         );
-        let non_markdown_rows: i64 = cache
+        let non_prose_rows: i64 = cache
             .connection()
             .query_row(
-                "SELECT (SELECT COUNT(*) FROM links) + (SELECT COUNT(*) FROM blocks)",
+                // Only prose units are parsed (G3): code, text-other,
+                // document and binary units carry no extracted rows.
+                "SELECT \
+                   (SELECT COUNT(*) FROM links l JOIN units u ON u.id = l.from_unit_id \
+                      WHERE u.kind <> 'prose') \
+                 + (SELECT COUNT(*) FROM blocks b JOIN units u ON u.id = b.unit_id \
+                      WHERE u.kind <> 'prose') \
+                 + (SELECT COUNT(*) FROM headings h JOIN units u ON u.id = h.unit_id \
+                      WHERE u.kind <> 'prose')",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(non_markdown_rows, 0);
+        assert_eq!(non_prose_rows, 0);
         for ignored in [".venv/lib/pkg-0/mod-0.py", "src/mod-0/__pycache__/m-0.pyc"] {
             assert!(cache
                 .get_unit_by_rel_path(source_id, ignored)

@@ -12,11 +12,16 @@
 //! Every non-ignored file becomes a unit (G2), not just Markdown. Each
 //! file is classified by [`crate::file_kind::classify`] into `prose`,
 //! `code`, `document`, `text-other` or `binary` from its name and its
-//! first 8 KB. Only `.md`/`.markdown` files (case-insensitive) that
-//! classify as `prose` are fed through the parser; every other file is
+//! first 8 KB. Every file that classifies as `prose` (`.md`,
+//! `.markdown`, `.txt`, `.org`, `.rst`, `.adoc`, any case) is fed
+//! through the parser (G3), which picks its rules from the extension:
+//! links, `^id` blocks, paragraphs and — for Markdown only — tags,
+//! plus headings for Markdown, org, rst and adoc. Every other file is
 //! written as a unit carrying name, kind, size and mtime and nothing
-//! else — no links, tags or blocks — so a code repository never ends
-//! up with false wikilinks/tags derived from its source files. The
+//! else — no links, headings or blocks — so a code repository never
+//! ends up with false wikilinks derived from its source files, and a
+//! `.txt` with a NUL byte (which classifies as `binary`) is never
+//! parsed. Parsing never writes to the file (F4). The
 //! walk ([`walk_and_write`]), the directory-upsert path and the
 //! debounced batch-apply path ([`apply_change_batch`]) all go through
 //! the same [`write_unit`], so they classify identically.
@@ -267,26 +272,6 @@ fn open_chunk<'c, 'g>(
     Ok((permit, tx))
 }
 
-/// File extensions (case-insensitive, no leading dot) whose files are
-/// parsed for links, tags and blocks. Every other kind is stored
-/// without extraction (G2). No per-source override in v1, matching
-/// G2's "no per-source override" precedent for the ignore rules.
-const MARKDOWN_EXTENSIONS: [&str; 2] = ["md", "markdown"];
-
-/// Whether `path`'s extension marks it as Markdown, i.e. as a file
-/// [`write_unit`] hands to the parser. This no longer decides whether
-/// a unit is created: every non-ignored file is one.
-fn is_markdown_path(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| {
-            MARKDOWN_EXTENSIONS
-                .iter()
-                .any(|md_ext| ext.eq_ignore_ascii_case(md_ext))
-        })
-        .unwrap_or(false)
-}
-
 /// Relative path, normalized to forward slashes regardless of
 /// platform, for storage in `units.rel_path` and for matching against
 /// [`IgnoreRules`].
@@ -346,8 +331,8 @@ fn passes_through_symlink(root: &Path, abs: &Path) -> bool {
     false
 }
 
-/// Classifies one file and writes its unit row (and, for Markdown, its
-/// link/tag/block/heading rows) under the given `source_id`. Returns
+/// Classifies one file and writes its unit row (and, for a prose file,
+/// its link/tag/block/heading rows) under the given `source_id`. Returns
 /// `Ok(None)` (not an error) for a file whose metadata or leading
 /// bytes couldn't be read at all (permission denied, deleted
 /// mid-walk) — a single unreadable file must not abort the rest of the
@@ -363,9 +348,9 @@ fn passes_through_symlink(root: &Path, abs: &Path) -> bool {
 /// and classified ([`file_kind::classify`]), so a too-large file keeps
 /// its real kind. Over [`MAX_INDEXED_BYTES`] that is all that is read:
 /// the file is stored by name only, with that kind and `too_large = 1`,
-/// and is never parsed. Otherwise only a Markdown file that classifies
-/// as `prose` is read in full and parsed (a UTF-16 Markdown file with a
-/// BOM is decoded first). A Markdown file whose later bytes turn out
+/// and is never parsed. Otherwise only a file that classifies
+/// as `prose` is read in full and parsed (a UTF-16 prose file with a
+/// BOM is decoded first). A prose file whose later bytes turn out
 /// not to be valid UTF-8 is stored as `binary`, by name only, with a
 /// warning — it is still a file in the source. Every other kind is
 /// stored with name, kind, size and mtime only.
@@ -388,7 +373,7 @@ fn passes_through_symlink(root: &Path, abs: &Path) -> bool {
 /// makes every write-path in this module idempotent with respect to a
 /// pre-existing row, regardless of how it got there. (That also
 /// flips a file's kind cleanly: the old row's links/tags/blocks go
-/// with it, so a Markdown file overwritten with binary bytes keeps no
+/// with it, so a prose file overwritten with binary bytes keeps no
 /// stale link rows.)
 fn write_unit(
     cache: &Cache,
@@ -439,7 +424,7 @@ fn write_unit(
     };
     let mut kind = file_kind::classify(file_name, &head);
     let mut parsed = None;
-    if !too_large && kind == FileKind::Prose && is_markdown_path(abs_path) {
+    if !too_large && kind == FileKind::Prose {
         let bytes = match read_capped(abs_path) {
             Ok(b) => b,
             Err(e) => {
@@ -459,7 +444,7 @@ fn write_unit(
             match result {
                 Ok(p) => parsed = Some(p),
                 Err(e) => {
-                    tracing::warn!(path = %abs_path.display(), error = %e, "markdown file is not valid UTF-8; indexed by name only as binary");
+                    tracing::warn!(path = %abs_path.display(), error = %e, "prose file is not valid UTF-8; indexed by name only as binary");
                     kind = FileKind::Binary;
                 }
             }
@@ -499,6 +484,19 @@ fn write_unit(
         })?;
         return Ok(Some(stats));
     };
+
+    // E7: an ID that appears twice is stored twice (below) and
+    // reported here. The file itself is never touched by a scan.
+    for diag in &parsed.diagnostics {
+        if diag.kind == tephra_parser::DiagnosticKind::DuplicateBlockId {
+            tracing::warn!(
+                path = %abs_path.display(),
+                line = diag.line,
+                "{}",
+                diag.message
+            );
+        }
+    }
 
     let mut new_unit = parsed.to_new_unit(source_id, &rel_path, mtime);
     new_unit.size = Some(size as i64);
@@ -541,7 +539,7 @@ fn delete_existing_unit(cache: &Cache, source_id: i64, rel_path: &str) -> Result
 /// `root` (streaming — see the module doc and E1), applying `ignore`
 /// before descending into any directory so an ignored subtree's files
 /// are never even listed, let alone parsed. Every non-ignored
-/// file is classified and written via `cache`; only Markdown is
+/// file is classified and written via `cache`; only prose files are
 /// parsed for links, tags and blocks (G2).
 ///
 /// A single unreadable directory entry (e.g. a permission-denied
@@ -913,7 +911,7 @@ fn upsert_directory(
 /// rename the project can tell apart (R4, a team lesson from the
 /// Obsidian side of this project too):
 /// - An existing regular file: its old row (if any) is replaced by a
-///   freshly classified one (and, for Markdown, a fresh parse), so a
+///   freshly classified one (and, for a prose file, a fresh parse), so a
 ///   file that changed kind leaves no stale rows of its old kind. A
 ///   file that can't be read is removed and skipped with a warning.
 /// - An existing directory (a create or a move-in): walked and every

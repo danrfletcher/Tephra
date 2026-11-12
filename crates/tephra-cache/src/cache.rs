@@ -11,8 +11,8 @@ use rusqlite::Connection;
 use crate::schema::{self, KindInferrer};
 use crate::sources::{self, SourceRow, SourceStatus};
 use crate::units::{
-    self, BlockRow, LinkRow, NewBlock, NewHeading, NewLink, NewTag, NewUnit, TagRow, UnitRow,
-    UnitWithSourceStatus,
+    self, BlockRow, HeadingRow, LinkRow, NewBlock, NewHeading, NewLink, NewTag, NewUnit, TagRow,
+    UnitRow, UnitWithSourceStatus,
 };
 use crate::{CacheError, CURRENT_SCHEMA_VERSION};
 
@@ -483,6 +483,11 @@ impl Cache {
         units::blocks_for_unit(&self.conn, unit_id)
     }
 
+    /// Every `headings` row belonging to `unit_id`, in file order.
+    pub fn headings_for_unit(&self, unit_id: i64) -> Result<Vec<HeadingRow>, CacheError> {
+        units::headings_for_unit(&self.conn, unit_id)
+    }
+
     /// Every `links` row authored by `from_unit_id`. Read counterpart
     /// to [`Cache::insert_link`]; see [`Cache::tags_for_unit`]'s doc
     /// comment. `to_unit_id` on the returned rows is not trustworthy
@@ -612,9 +617,13 @@ fn ensure_schema(
             schema::create_core_tables_if_not_exists(conn)?;
             schema::write_schema_version(conn, CURRENT_SCHEMA_VERSION)?;
         }
-        Some(v) if v == CURRENT_SCHEMA_VERSION => {
-            // Version matches: proceed without touching existing
-            // tables' data. `IF NOT EXISTS` here is purely defensive
+        Some(v) if v == CURRENT_SCHEMA_VERSION && !schema::blocks_block_id_is_not_null(conn)? => {
+            // Version matches (and this is not a file from the first
+            // v2 build, which declared `blocks.block_id` NOT NULL
+            // where the current v2 allows NULL for a paragraph with
+            // no `^id`: that one falls through to the rebuild arm
+            // below, same as a version mismatch). Proceed without
+            // touching existing tables' data. `IF NOT EXISTS` here is purely defensive
             // against a prior partial failure; against a healthy
             // database it is a guaranteed no-op.
             schema::create_core_tables_if_not_exists(conn)?;

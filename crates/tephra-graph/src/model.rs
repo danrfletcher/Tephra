@@ -13,6 +13,15 @@ use serde::Serialize;
 
 use crate::resolver::{basename_of, normalize_key, strip_markdown_extension};
 
+/// One `^id` occurrence in a unit: the ID (without the caret) and the
+/// first line of the block that carries it (1-based). A unit that
+/// repeats an ID has one `BlockFact` per occurrence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockFact {
+    pub id: String,
+    pub line: i64,
+}
+
 /// One unit's identity and derived metadata, keyed by its federated
 /// `@source:path` id. This is the exact shape [`crate::ResolveResult`]
 /// and [`crate::Edge`] embed, and the one GP5 freezes for PR-6's RPC
@@ -30,6 +39,9 @@ pub struct UnitMetadata {
     pub rel_path: String,
     pub frontmatter_json: Option<String>,
     pub tags: Vec<String>,
+    /// The unit's block IDs in file order, one entry per occurrence
+    /// (a repeated ID repeats here). The occurrences' lines are
+    /// [`UnitGraph::block_occurrences`].
     pub blocks: Vec<String>,
     /// Whether this unit's owning source is currently marked offline
     /// (E2/P4): a cached-but-possibly-stale unit is still returned,
@@ -89,7 +101,7 @@ pub(crate) struct NodeFacts {
     pub rel_path: String,
     pub frontmatter_json: Option<String>,
     pub tags: Vec<String>,
-    pub blocks: Vec<String>,
+    pub blocks: Vec<BlockFact>,
     /// `(to_raw, kind)` pairs, one per outgoing link this unit's
     /// content contains.
     pub links: Vec<(String, String)>,
@@ -307,6 +319,16 @@ impl UnitGraph {
         self.known_sources.iter().cloned().collect()
     }
 
+    /// Every `^id` occurrence of unit `id`, in file order, each with
+    /// its line, nothing deduplicated. Empty if the unit has none or
+    /// is not in the graph.
+    pub fn block_occurrences(&self, id: &str) -> Vec<BlockFact> {
+        self.nodes
+            .get(id)
+            .map(|f| f.blocks.clone())
+            .unwrap_or_default()
+    }
+
     /// The metadata for one unit, by federated id, or `None` if no
     /// such unit is currently in the graph (never an error — a stale
     /// id is simply absent).
@@ -317,7 +339,7 @@ impl UnitGraph {
             rel_path: f.rel_path.clone(),
             frontmatter_json: f.frontmatter_json.clone(),
             tags: f.tags.clone(),
-            blocks: f.blocks.clone(),
+            blocks: f.blocks.iter().map(|b| b.id.clone()).collect(),
             offline: self.offline_sources.contains(&f.source),
         })
     }

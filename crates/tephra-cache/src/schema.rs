@@ -114,11 +114,15 @@ const CREATE_TAGS: &str = "\
         tag TEXT NOT NULL \
     )";
 
+/// One row per block of a unit: a prose paragraph (`line` is its first
+/// line, `end_line` its last) or a bare `^id` occurrence. `block_id`
+/// is NULL for a paragraph with no `^id`. There is no uniqueness on
+/// `(unit_id, block_id)`: every occurrence of an ID is stored.
 const CREATE_BLOCKS: &str = "\
     CREATE TABLE blocks (\
         id INTEGER PRIMARY KEY AUTOINCREMENT, \
         unit_id INTEGER NOT NULL REFERENCES units(id), \
-        block_id TEXT NOT NULL, \
+        block_id TEXT, \
         line INTEGER NOT NULL, \
         end_line INTEGER \
     )";
@@ -375,6 +379,28 @@ fn table_has_columns(conn: &Connection, table: &str, columns: &[&str]) -> Result
         return Ok(false);
     }
     Ok(columns.iter().all(|c| existing.contains(*c)))
+}
+
+/// Whether the existing `blocks.block_id` column is declared
+/// `NOT NULL`. The first build of schema v2 declared it so; G3 made it
+/// nullable (a paragraph with no `^id` is a row with a NULL
+/// `block_id`). SQLite can't relax a constraint in place, and the
+/// version number did not change, so [`crate::cache`]'s open path uses
+/// this to spot a cache file written by that first v2 build and sends
+/// it through the one rebuild path. `false` if the table or column is
+/// missing (the matching-version `CREATE ... IF NOT EXISTS` then makes
+/// it).
+pub(crate) fn blocks_block_id_is_not_null(conn: &Connection) -> Result<bool, CacheError> {
+    let mut stmt = conn.prepare("PRAGMA table_info(blocks)")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == "block_id" {
+            let not_null: i64 = row.get(3)?;
+            return Ok(not_null != 0);
+        }
+    }
+    Ok(false)
 }
 
 /// Gate for [`snapshot_offline_rows`]: `true` only if the *current*

@@ -275,7 +275,7 @@ fn two_blocks_with_the_same_unit_and_block_id_both_persist() {
     cache
         .insert_block(&tephra_cache::NewBlock {
             unit_id,
-            block_id: "abcd1234",
+            block_id: Some("abcd1234"),
             line: 40,
             end_line: Some(44),
         })
@@ -283,7 +283,9 @@ fn two_blocks_with_the_same_unit_and_block_id_both_persist() {
 
     let blocks = cache.blocks_for_unit(unit_id).unwrap();
     assert_eq!(blocks.len(), 2);
-    assert!(blocks.iter().all(|b| b.block_id == "abcd1234"));
+    assert!(blocks
+        .iter()
+        .all(|b| b.block_id.as_deref() == Some("abcd1234")));
     assert_eq!(
         blocks
             .iter()

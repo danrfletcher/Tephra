@@ -52,3 +52,51 @@ fn parsed_unit_is_send_and_sync() {
     fn assert_bounds<T: Send + Sync>() {}
     assert_bounds::<tephra_parser::ParsedUnit>();
 }
+
+/// One small document per prose format, each with a heading (where
+/// the format has them), links, an anchor and a literal region.
+const PROSE_SAMPLES: [(&str, &str); 6] = [
+    ("s.md", SAMPLE),
+    (
+        "s.txt",
+        "Plain\n\nSee [[Other#^anchor|Alias]] and [t](x.md). ^b1\n",
+    ),
+    (
+        "s.org",
+        "* Head\nSee [[Other|Alias]]. ^b1\n#+BEGIN_SRC\n[[no]]\n#+END_SRC\n",
+    ),
+    (
+        "s.rst",
+        "Head\n====\n\nSee [[Other]]. ^b1\n\ncode::\n\n    [[no]]\n",
+    ),
+    (
+        "s.adoc",
+        "== Head\n\nSee [[Other]]. ^b1\n\n----\n[[no]]\n----\n",
+    ),
+    ("S.TXT", "upper [[Case]] ^b2\n"),
+];
+
+#[test]
+fn every_prose_format_reparses_byte_identically_sequentially_and_across_threads() {
+    for (file, content) in PROSE_SAMPLES {
+        let first = parse_unit(Path::new(file), content);
+        let second = parse_unit(Path::new(file), content);
+        assert_eq!(first, second, "{file}");
+        assert_eq!(
+            serde_json::to_string(&first).unwrap(),
+            serde_json::to_string(&second).unwrap(),
+            "{file}"
+        );
+
+        let shared: Arc<String> = Arc::new(content.to_string());
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let c = Arc::clone(&shared);
+                std::thread::spawn(move || parse_unit(Path::new(file), &c))
+            })
+            .collect();
+        for h in handles {
+            assert_eq!(h.join().expect("thread"), first, "{file}");
+        }
+    }
+}

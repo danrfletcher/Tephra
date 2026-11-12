@@ -20,5 +20,12 @@
     }
   ],
   "blocks": [],
+  "paragraphs": [
+    {
+      "start_line": 1,
+      "end_line": 1,
+      "block_id": null
+    }
+  ],
   "diagnostics": []
 }

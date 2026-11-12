@@ -298,7 +298,7 @@ fn offline_rows_of_a_v1_cache_survive_the_v2_rebuild_with_needs_rescan() {
     let blocks = cache.blocks_for_unit(1).unwrap();
     assert_eq!(blocks.len(), 1);
     assert_eq!(
-        (blocks[0].block_id.as_str(), blocks[0].line),
+        (blocks[0].block_id.as_deref().unwrap(), blocks[0].line),
         ("abcd1234", 7)
     );
     assert_eq!(blocks[0].end_line, None);

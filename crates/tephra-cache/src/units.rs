@@ -98,26 +98,41 @@ pub struct NewTag<'a> {
 pub struct BlockRow {
     pub id: i64,
     pub unit_id: i64,
-    pub block_id: String,
+    /// The block's `^id` (without the caret), or `None` for a
+    /// paragraph that has none. Not unique per `(unit_id, block_id)`:
+    /// every occurrence of an ID is stored.
+    pub block_id: Option<String>,
+    /// First line of the block.
     pub line: i64,
-    /// Last line of the block, when known. Not unique per
-    /// `(unit_id, block_id)`: every occurrence of an ID is stored.
+    /// Last line of the block, when known.
     pub end_line: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct NewBlock<'a> {
     pub unit_id: i64,
-    pub block_id: &'a str,
+    /// `None` for a block (a prose paragraph) with no `^id`.
+    pub block_id: Option<&'a str>,
     pub line: i64,
     pub end_line: Option<i64>,
 }
 
-/// One `headings` row to insert: a Markdown heading of a prose unit.
+/// One `headings` row read back: see [`NewHeading`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadingRow {
+    pub id: i64,
+    pub unit_id: i64,
+    pub level: i64,
+    pub text: String,
+    pub line: i64,
+}
+
+/// One `headings` row to insert: a heading of a prose unit (Markdown,
+/// org, rst or adoc).
 #[derive(Debug, Clone, Copy)]
 pub struct NewHeading<'a> {
     pub unit_id: i64,
-    /// 1 through 6.
+    /// 1 through 6 for Markdown and adoc; org and rst have no cap.
     pub level: i64,
     pub text: &'a str,
     /// 1-indexed line within the file.
@@ -414,6 +429,29 @@ pub(crate) fn blocks_for_unit(
             block_id: row.get(2)?,
             line: row.get(3)?,
             end_line: row.get(4)?,
+        });
+    }
+    Ok(out)
+}
+
+/// Every `headings` row belonging to `unit_id`, in file order (line,
+/// then insertion). Read counterpart to [`insert_heading`].
+pub(crate) fn headings_for_unit(
+    conn: &Connection,
+    unit_id: i64,
+) -> Result<Vec<HeadingRow>, CacheError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, unit_id, level, text, line FROM headings WHERE unit_id = ?1 ORDER BY line, id",
+    )?;
+    let mut rows = stmt.query([unit_id])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(HeadingRow {
+            id: row.get(0)?,
+            unit_id: row.get(1)?,
+            level: row.get(2)?,
+            text: row.get(3)?,
+            line: row.get(4)?,
         });
     }
     Ok(out)

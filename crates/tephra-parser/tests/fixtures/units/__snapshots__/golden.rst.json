@@ -1,0 +1,77 @@
+{
+  "path": "tests/fixtures/units/golden.rst",
+  "content_hash": "246e2a74f694d351e5aef9e8a3dc3add44c2f3baf662cc79a1316545461a6d0c",
+  "frontmatter": null,
+  "headings": [
+    {
+      "level": 1,
+      "text": "Golden RST",
+      "line": 2
+    },
+    {
+      "level": 2,
+      "text": "Section",
+      "line": 8
+    },
+    {
+      "level": 3,
+      "text": "Subsection",
+      "line": 15
+    }
+  ],
+  "wikilinks": [
+    {
+      "source_prefix": null,
+      "target": "Project Plan",
+      "anchor": null,
+      "alias": null,
+      "raw": "Project Plan",
+      "line": 5,
+      "span": [
+        55,
+        71
+      ]
+    }
+  ],
+  "markdown_links": [
+    {
+      "text": "text",
+      "target": "notes/closing.md",
+      "line": 22,
+      "span": [
+        286,
+        302
+      ]
+    }
+  ],
+  "tags": [],
+  "blocks": [
+    {
+      "block_id": "intro",
+      "line": 6
+    }
+  ],
+  "paragraphs": [
+    {
+      "start_line": 5,
+      "end_line": 6,
+      "block_id": "intro"
+    },
+    {
+      "start_line": 11,
+      "end_line": 11,
+      "block_id": null
+    },
+    {
+      "start_line": 22,
+      "end_line": 22,
+      "block_id": null
+    },
+    {
+      "start_line": 26,
+      "end_line": 26,
+      "block_id": null
+    }
+  ],
+  "diagnostics": []
+}

@@ -1,10 +1,17 @@
-//! `tephra-parser`: a pure, synchronous Markdown AST parser.
+//! `tephra-parser`: a pure, synchronous prose parser.
 //!
 //! [`parse_unit`] turns a path and a string of file content into a
 //! [`ParsedUnit`] in a single pass: YAML frontmatter, a heading tree,
 //! `[[wikilinks]]` (including the federated `[[@source:path]]`
-//! prefix form), `[markdown](links)`, `#tags`, and `^block` anchors,
-//! plus a stable content hash.
+//! prefix form), `[markdown](links)`, `#tags`, `^block` anchors and
+//! paragraph blocks with their line ranges, plus a stable content
+//! hash.
+//!
+//! The path's extension picks the rules ([`ProseFormat`]): Markdown
+//! (`.md`, `.markdown`) gets all of the above; `.txt`, `.org`, `.rst`
+//! and `.adoc` get links, `^id` anchors and paragraphs by the same
+//! link/anchor code, headings by their own native rules (none for
+//! `.txt`), no frontmatter and no tags. See the [`prose`] module.
 //!
 //! This crate does no I/O, owns no watcher, and never opens SQLite or
 //! resolves a link against a registry (those are PR-4/PR-5). Its row
@@ -27,6 +34,7 @@ mod frontmatter;
 mod hash;
 mod line_index;
 mod markdown_pass;
+mod prose;
 mod tags;
 mod wikilinks;
 
@@ -34,10 +42,11 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-pub use blocks::BlockAnchor;
+pub use blocks::{BlockAnchor, Paragraph};
 pub use diagnostics::{Diagnostic, DiagnosticKind};
 pub use frontmatter::Frontmatter;
 pub use markdown_pass::{Heading, MarkdownLink};
+pub use prose::ProseFormat;
 pub use tags::Tag;
 pub use wikilinks::WikiLink;
 
@@ -90,7 +99,13 @@ pub struct ParsedUnit {
     pub wikilinks: Vec<WikiLink>,
     pub markdown_links: Vec<MarkdownLink>,
     pub tags: Vec<Tag>,
+    /// Every `^id` occurrence, in file order, none merged or dropped
+    /// (a repeated ID is one entry per occurrence, each with its own
+    /// line, plus a [`DiagnosticKind::DuplicateBlockId`] diagnostic).
     pub blocks: Vec<BlockAnchor>,
+    /// Every paragraph block, in file order, with its line range and
+    /// the `^id` ending its last line, if any.
+    pub paragraphs: Vec<Paragraph>,
     /// Structured, non-fatal problems found while parsing (malformed
     /// frontmatter, empty/unterminated links, duplicate block ids).
     /// Diagnostics never replace or suppress whatever else could
@@ -113,7 +128,7 @@ impl ParsedUnit {
             rel_path,
             mtime,
             frontmatter_json: self.frontmatter.as_ref().and_then(|f| f.json.as_deref()),
-            // Only Markdown goes through this crate. The caller
+            // Only prose files go through this crate. The caller
             // overwrites `size` with the file's real length.
             kind: "prose",
             size: None,
@@ -133,19 +148,44 @@ impl ParsedUnit {
             .collect()
     }
 
-    /// One `tephra-cache` `NewBlock` per extracted block anchor.
+    /// The `tephra-cache` `blocks` rows of this unit, in line order:
+    /// one per paragraph (`line`..`end_line`, `block_id` set when a
+    /// `^id` ends its last line) plus one per `^id` occurrence that
+    /// is not at the end of a paragraph (a heading line, a table row,
+    /// the middle of a paragraph), stored as a one-line block. Every
+    /// occurrence of a repeated ID is its own row, never merged.
     /// `to_unit_id` resolution is out of scope for this crate — every
-    /// row here only ever describes *this* unit's own anchors.
+    /// row here only ever describes *this* unit's own blocks.
     pub fn to_new_blocks(&self, unit_id: i64) -> Vec<NewBlock<'_>> {
-        self.blocks
+        let attached: std::collections::HashSet<(&str, usize)> = self
+            .paragraphs
             .iter()
-            .map(|b| NewBlock {
+            .filter_map(|p| p.block_id.as_deref().map(|id| (id, p.end_line)))
+            .collect();
+        let mut rows: Vec<NewBlock<'_>> = self
+            .paragraphs
+            .iter()
+            .map(|p| NewBlock {
                 unit_id,
-                block_id: &b.block_id,
-                line: b.line as i64,
-                end_line: None,
+                block_id: p.block_id.as_deref(),
+                line: p.start_line as i64,
+                end_line: Some(p.end_line as i64),
             })
-            .collect()
+            .collect();
+        rows.extend(
+            self.blocks
+                .iter()
+                .filter(|b| !attached.contains(&(b.block_id.as_str(), b.line)))
+                .map(|b| NewBlock {
+                    unit_id,
+                    block_id: Some(&b.block_id),
+                    line: b.line as i64,
+                    end_line: Some(b.line as i64),
+                }),
+        );
+        // Stable: paragraphs and loose anchors interleave by line.
+        rows.sort_by_key(|r| r.line);
+        rows
     }
 
     /// One `tephra-cache` `NewHeading` per heading, in document
@@ -227,6 +267,15 @@ pub fn parse_unit_bytes(path: &Path, bytes: &[u8]) -> Result<ParsedUnit, Invalid
 /// multiple threads (see `tests/unit/determinism.rs`) since it reads
 /// only its own arguments and allocates only local state.
 pub fn parse_unit(path: &Path, content: &str) -> ParsedUnit {
+    let format = ProseFormat::from_path(path);
+    if format.is_markdown() {
+        parse_markdown(path, content)
+    } else {
+        parse_native(path, content, format)
+    }
+}
+
+fn parse_markdown(path: &Path, content: &str) -> ParsedUnit {
     let mut diagnostics = Vec::new();
 
     let (frontmatter, body, body_start_line, body_start_byte) =
@@ -253,6 +302,8 @@ pub fn parse_unit(path: &Path, content: &str) -> ParsedUnit {
         &pass.excluded_ranges,
         &mut diagnostics,
     );
+    let mut paragraphs = pass.paragraphs;
+    blocks::attach_ids(&mut paragraphs, &blocks);
 
     ParsedUnit {
         path: path.to_path_buf(),
@@ -263,6 +314,116 @@ pub fn parse_unit(path: &Path, content: &str) -> ParsedUnit {
         markdown_links: pass.links,
         tags,
         blocks,
+        paragraphs,
+        diagnostics,
+    }
+}
+
+/// The txt/org/rst/adoc path (G3): no frontmatter and no tags; native
+/// headings; links, anchors and paragraphs by the same scanners
+/// Markdown uses, with the format's literal regions excluded.
+fn parse_native(path: &Path, content: &str, format: ProseFormat) -> ParsedUnit {
+    let mut diagnostics = Vec::new();
+
+    // A leading BOM is not text. Offsets stay relative to `content`.
+    let bom_len = if content.starts_with('\u{FEFF}') {
+        '\u{FEFF}'.len_utf8()
+    } else {
+        0
+    };
+    let body = &content[bom_len..];
+
+    let lines = prose::split_lines(body);
+    let literal = prose::literal_mask(format, &lines);
+    let native = prose::headings::find(format, &lines, &literal);
+
+    // Literal regions as byte ranges, one per run of masked lines.
+    let mut excluded_ranges: Vec<(usize, usize)> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if literal[i] {
+            match excluded_ranges.last_mut() {
+                Some(last) if i > 0 && literal[i - 1] => last.1 = line.next,
+                _ => excluded_ranges.push((line.start, line.next)),
+            }
+        }
+    }
+
+    let (mut wikilinks, _spans) =
+        wikilinks::scan(body, 1, bom_len, &excluded_ranges, &mut diagnostics);
+    if format == ProseFormat::Org {
+        // Org's own `[[target][label]]` / `[[file:...]]` links share
+        // the wikilink brackets; they are not wikilinks.
+        wikilinks.retain(|w| !prose::is_native_org_link(&w.raw));
+    }
+
+    // Markdown links: the Markdown pass, run over each block of
+    // consecutive non-blank, non-literal lines on its own, starting at
+    // the first non-blank character (so source indentation never
+    // reads as an indented code block).
+    let mut markdown_links = Vec::new();
+    let mut i = 0usize;
+    while i < lines.len() {
+        if literal[i] || lines[i].is_blank() {
+            i += 1;
+            continue;
+        }
+        let first = i;
+        while i + 1 < lines.len() && !literal[i + 1] && !lines[i + 1].is_blank() {
+            i += 1;
+        }
+        let last = i;
+        i += 1;
+        let chunk_start =
+            lines[first].start + (lines[first].text.len() - lines[first].text.trim_start().len());
+        let chunk = &body[chunk_start..lines[last].end];
+        if !chunk.contains('[') && !chunk.contains('<') {
+            continue;
+        }
+        let pass = markdown_pass::run(chunk, first + 1, bom_len + chunk_start, &mut diagnostics);
+        markdown_links.extend(pass.links);
+    }
+
+    let blocks = blocks::scan(body, 1, &excluded_ranges, &mut diagnostics);
+
+    // Paragraphs: runs of lines that are not blank, literal, a
+    // heading's own lines or (adoc) a block delimiter.
+    let breaks = |idx: usize| {
+        literal[idx]
+            || native.heading_lines[idx]
+            || lines[idx].is_blank()
+            || (format == ProseFormat::Adoc && prose::is_adoc_block_delimiter(lines[idx].text))
+            || prose::is_transition(format, &lines, idx)
+    };
+    let mut paragraphs: Vec<Paragraph> = Vec::new();
+    let mut idx = 0usize;
+    while idx < lines.len() {
+        if breaks(idx) {
+            idx += 1;
+            continue;
+        }
+        let first = idx;
+        while idx + 1 < lines.len() && !breaks(idx + 1) {
+            idx += 1;
+        }
+        paragraphs.push(Paragraph {
+            start_line: first + 1,
+            end_line: idx + 1,
+            block_id: None,
+        });
+        idx += 1;
+    }
+    blocks::attach_ids(&mut paragraphs, &blocks);
+
+    ParsedUnit {
+        path: path.to_path_buf(),
+        content_hash: hash::content_hash(content),
+        frontmatter: None,
+        headings: native.headings,
+        wikilinks,
+        markdown_links,
+        tags: Vec::new(),
+        blocks,
+        paragraphs,
         diagnostics,
     }
 }

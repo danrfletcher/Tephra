@@ -52,7 +52,13 @@ fn registering_a_vault_source_runs_the_initial_scan_with_expected_rows() {
     assert_eq!(stats.units_written, 2);
     assert_eq!(stats.links_written, 1, "one.md's [[Two]] wikilink");
     assert_eq!(stats.tags_written, 1, "one.md's #project tag");
-    assert_eq!(stats.blocks_written, 1, "one.md's ^block1 anchor");
+    // G3: `blocks` holds a row per paragraph as well as per `^id`:
+    // one.md's two paragraphs (the second carries `^block1`) and
+    // two.md's one.
+    assert_eq!(
+        stats.blocks_written, 3,
+        "one.md's 2 paragraphs + two.md's 1"
+    );
 
     let sources = registry.list().expect("list");
     assert_eq!(sources.len(), 1);
@@ -146,8 +152,16 @@ fn editing_a_tracked_file_debounces_and_updates_only_that_files_row() {
     );
 
     // R7(a): the old `^block1` anchor must be gone too, not just
-    // uncounted in a stale aggregate.
-    let block_count: i64 = conn
+    // uncounted in a stale aggregate. The edited file is now one
+    // paragraph with no ID.
+    let anchored: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM blocks WHERE unit_id = ?1 AND block_id IS NOT NULL",
+            [unit.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let paragraph_rows: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM blocks WHERE unit_id = ?1",
             [unit.id],
@@ -155,9 +169,10 @@ fn editing_a_tracked_file_debounces_and_updates_only_that_files_row() {
         )
         .unwrap();
     assert_eq!(
-        block_count, 0,
+        anchored, 0,
         "the old ^block1 anchor must be gone after the edit"
     );
+    assert_eq!(paragraph_rows, 1, "exactly the edited file's one paragraph");
 
     // two.md's own row must be completely untouched by one.md's edit.
     let other_unit = verify_cache
@@ -804,8 +819,8 @@ fn the_watcher_path_classifies_every_kind_like_the_full_scan_and_flips_a_changed
     let via_scan = kinds_in_cache(&scan_path, "kinds");
     assert_eq!(kinds_in_cache(&cache_path, "kinds"), via_scan);
 
-    for (path, (_, links, tags, blocks)) in &via_scan {
-        if !path.to_ascii_lowercase().ends_with(".md") {
+    for (path, (kind, links, tags, blocks)) in &via_scan {
+        if kind != "prose" {
             assert_eq!((*links, *tags, *blocks), (0, 0, 0), "{path}");
         }
     }
@@ -826,7 +841,9 @@ fn the_watcher_path_classifies_every_kind_like_the_full_scan_and_flips_a_changed
 
     // A Markdown file overwritten with binary bytes flips to `binary`
     // and loses its link/tag/block rows.
-    assert_eq!(via_scan["notes/one.md"], ("prose".into(), 1, 1, 1));
+    assert_eq!(via_scan["notes/one.md"], ("prose".into(), 1, 1, 2));
+    // A `.txt` is parsed too (G3): its link and paragraph, no tag.
+    assert_eq!(via_scan["notes/two.txt"], ("prose".into(), 1, 0, 1));
     target.write_bytes("notes/one.md", &[0, 1, 2, 3, 0]);
     let flipped = wait_until(Duration::from_secs(20), || {
         kinds_in_cache(&cache_path, "kinds").get("notes/one.md")
@@ -849,4 +866,147 @@ fn the_watcher_path_classifies_every_kind_like_the_full_scan_and_flips_a_changed
 
     registry.unregister("kinds").expect("unregister");
     scan_registry.unregister("kinds").expect("unregister");
+}
+
+#[test]
+fn an_org_edit_and_an_rst_delete_through_the_watcher_update_links_headings_and_blocks() {
+    // G3 + F4: the real watcher over a mixed-format tree. An `.org`
+    // edit replaces its links, headings and blocks; an `.rst` delete
+    // cascades; a new `.txt` appears; nothing else is written.
+    let fixture = fixtures::prose_fixture();
+    let cache_dir = tempfile::tempdir().expect("cache tempdir");
+    let cache_path = cache_dir.path().join("cache.db");
+    let registry =
+        SourceRegistry::new(Cache::open(&cache_path).expect("open cache")).expect("registry");
+    registry
+        .register("prose", fixture.root())
+        .expect("register");
+    let rows = |rel: &str| fixtures::unit_rows(&cache_path, "prose", rel);
+
+    // Before: the initial scan's rows for the two files we touch.
+    assert_eq!(rows("Plan.Org").unwrap().headings.len(), 2);
+    assert_eq!(rows("doc.rst").unwrap().headings.len(), 2);
+
+    let before = fixtures::tree_snapshot(fixture.root());
+
+    // Edit Plan.Org: one heading, a new link, a paragraph with an ID.
+    fixture.write(
+        "Plan.Org",
+        "*** Rewritten\nnow links to [[New]] and [[Plan|p]]. ^org-1\n\n[[Third]]\n",
+    );
+    // Delete doc.rst.
+    fixture.remove("doc.rst");
+    // Create a .txt.
+    fixture.write("fresh.txt", "brand new [[Target]] ^fresh-1\n");
+
+    let settled = wait_until(Duration::from_secs(20), || {
+        rows("doc.rst").is_none()
+            && rows("fresh.txt").is_some()
+            && rows("Plan.Org").is_some_and(|r| r.headings == [(3, "Rewritten".to_string(), 1)])
+    });
+    assert!(
+        settled,
+        "watcher never applied the edits: Plan.Org={:?} doc.rst={:?} fresh.txt={:?}",
+        rows("Plan.Org"),
+        rows("doc.rst"),
+        rows("fresh.txt")
+    );
+
+    let org = rows("Plan.Org").unwrap();
+    assert_eq!(org.headings, [(3, "Rewritten".to_string(), 1)]);
+    assert_eq!(
+        org.links,
+        [
+            ("wikilink".to_string(), "New".to_string()),
+            ("wikilink".to_string(), "Plan|p".to_string()),
+            ("wikilink".to_string(), "Third".to_string()),
+        ],
+        "the old `Target|alias` link is gone, not accumulated"
+    );
+    assert_eq!(
+        org.blocks,
+        [(Some("org-1".to_string()), 2, 2), (None, 4, 4)],
+        "ranges and the new ID, with the old paragraph row gone"
+    );
+    let fresh = rows("fresh.txt").unwrap();
+    assert_eq!(
+        fresh.links,
+        [("wikilink".to_string(), "Target".to_string())]
+    );
+    assert_eq!(fresh.blocks, [(Some("fresh-1".to_string()), 1, 1)]);
+
+    // The delete cascaded: no orphan rows for the removed unit in any
+    // table, whatever its id was.
+    {
+        let cache = Cache::open(&cache_path).expect("reopen");
+        let conn = cache.connection();
+        for (table, column) in [
+            ("headings", "unit_id"),
+            ("blocks", "unit_id"),
+            ("tags", "unit_id"),
+            ("links", "from_unit_id"),
+        ] {
+            let orphans: i64 = conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM {table} WHERE {column} NOT IN (SELECT id FROM units)"
+                    ),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(orphans, 0, "{table} has rows for a deleted unit");
+        }
+    }
+
+    // F4: after the watcher's rescan, every file is byte- and
+    // mtime-identical to before, except the test's own three edits.
+    let after = fixtures::tree_snapshot(fixture.root());
+    let changed: std::collections::BTreeSet<&String> = before
+        .keys()
+        .chain(after.keys())
+        .filter(|k| before.get(*k) != after.get(*k))
+        .collect();
+    let expected: std::collections::BTreeSet<String> = ["Plan.Org", "doc.rst", "fresh.txt"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(
+        changed
+            .into_iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        expected,
+        "the watcher must write nothing of its own"
+    );
+
+    registry.unregister("prose").expect("unregister");
+}
+
+#[test]
+fn a_txt_that_gains_a_nul_byte_through_the_watcher_loses_its_rows() {
+    // E2 on the watcher path: classified `binary`, no stale rows.
+    let fixture = fixtures::empty_source();
+    fixture.write("n.txt", "[[A]] ^id1\n");
+    let cache_dir = tempfile::tempdir().expect("cache tempdir");
+    let cache_path = cache_dir.path().join("cache.db");
+    let registry =
+        SourceRegistry::new(Cache::open(&cache_path).expect("open cache")).expect("registry");
+    registry.register("n", fixture.root()).expect("register");
+    assert_eq!(
+        fixtures::unit_rows(&cache_path, "n", "n.txt")
+            .unwrap()
+            .links
+            .len(),
+        1
+    );
+
+    fixture.write_bytes("n.txt", b"[[A]] ^id1\0\n");
+    let flipped = wait_until(Duration::from_secs(20), || {
+        fixtures::unit_rows(&cache_path, "n", "n.txt").is_some_and(|r| r.kind == "binary")
+    });
+    assert!(flipped, "n.txt never flipped to binary");
+    let r = fixtures::unit_rows(&cache_path, "n", "n.txt").unwrap();
+    assert_eq!((r.links.len(), r.blocks.len(), r.headings.len()), (0, 0, 0));
+    registry.unregister("n").expect("unregister");
 }

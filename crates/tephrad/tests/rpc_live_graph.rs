@@ -500,3 +500,130 @@ fn concurrent_refresh_calls_are_serialized_not_run_in_parallel() {
          `rebuild_lock` (R9)"
     );
 }
+
+/// G3 over the real RPC transport and the real registry/graph: a `.md`
+/// target's backlinks list the `.txt`, `.org`, `.rst` and `.adoc` units
+/// that link to it, and `unit.resolve_link` from a `.txt` resolves.
+/// F7 rides along: an unprefixed `[[Foo]]` in source A's `.txt` goes to
+/// A's `Foo.md`, never B's, while `[[@b:Foo]]` goes to B's.
+#[tokio::test]
+async fn non_markdown_prose_units_are_backlinks_of_a_markdown_target_and_resolve() {
+    let a = fixtures::empty_source();
+    a.write("Foo.md", "# Foo\n\nThe target.\n");
+    a.write("from.txt", "plain text linking to [[Foo]]\n");
+    a.write(
+        "from.org",
+        "* Org\nlinking to [[Foo]] and [[file:x.org][X]]\n",
+    );
+    a.write("from.rst", "Title\n=====\n\nlinking to [[Foo|alias]]\n");
+    a.write("from.adoc", "= Doc\n\nlinking to [[Foo#Heading]]\n");
+    a.write(
+        "cross.txt",
+        "the other source's one: [[@b:Foo]], this one's: [[Foo]]\n",
+    );
+    let b = fixtures::empty_source();
+    b.write("Foo.md", "# Foo in B\n");
+
+    let data_dir = tempfile::tempdir().expect("data dir");
+    let cache_path = data_dir.path().join("cache.db");
+    let token_path = data_dir.path().join("token");
+    let token = "c".repeat(64);
+    std::fs::write(&token_path, &token).expect("write token");
+
+    let registry = Arc::new(
+        SourceRegistry::new(Cache::open(&cache_path).expect("open cache")).expect("registry"),
+    );
+    registry.register("a", a.root()).expect("register a");
+    registry.register("b", b.root()).expect("register b");
+
+    let graph_cache = Cache::open(&cache_path).expect("open cache for graph");
+    let shared_graph = Arc::new(SharedGraph::new(
+        UnitGraph::build_from_cache(&graph_cache).expect("build graph"),
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let state = Arc::new(AppState::new(
+        token_path,
+        shared_graph.clone() as Arc<dyn GraphBackend>,
+        registry.clone() as Arc<dyn SourceBackend>,
+        Arc::new(tephrad::refactor::RefactorEngine::new(
+            shared_graph as Arc<dyn GraphBackend>,
+            registry.clone() as Arc<dyn SourceBackend>,
+            registry as Arc<dyn tephrad::refactor::WatcherPauseControl>,
+        )) as Arc<dyn RefactorBackend>,
+        None,
+    ));
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, build_router(state)).await;
+    });
+
+    let client = reqwest::Client::new();
+    let url = format!("http://{addr}/rpc");
+    let call = |id: u32, method: &'static str, params: serde_json::Value| {
+        let client = client.clone();
+        let url = url.clone();
+        let token = token.clone();
+        async move {
+            client
+                .post(&url)
+                .bearer_auth(&token)
+                .json(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
+                .send()
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()
+        }
+    };
+
+    let backlinks = call(1, "graph.get_backlinks", json!({ "id": "@a:Foo.md" })).await;
+    assert!(backlinks.get("error").is_none(), "{backlinks:?}");
+    let mut from: Vec<String> = backlinks["result"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|e| e["from"].as_str().expect("from id").to_string())
+        .collect();
+    from.sort();
+    assert_eq!(
+        from,
+        [
+            "@a:cross.txt",
+            "@a:from.adoc",
+            "@a:from.org",
+            "@a:from.rst",
+            "@a:from.txt"
+        ],
+        "every non-md prose unit that links to Foo.md, and only those: {backlinks:?}"
+    );
+
+    // F7: B's Foo.md is linked from cross.txt only through `@b:Foo`.
+    let b_backlinks = call(2, "graph.get_backlinks", json!({ "id": "@b:Foo.md" })).await;
+    let b_from: Vec<_> = b_backlinks["result"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|e| e["from"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(b_from, ["@a:cross.txt"], "{b_backlinks:?}");
+
+    // `unit.resolve_link` from a `.txt`'s own source resolves.
+    let resolved = call(
+        3,
+        "unit.resolve_link",
+        json!({ "link": "[[Foo]]", "default_source": "a" }),
+    )
+    .await;
+    assert!(resolved.get("error").is_none(), "{resolved:?}");
+    assert_eq!(resolved["result"]["unit"]["id"], json!("@a:Foo.md"));
+    let federated = call(
+        4,
+        "unit.resolve_link",
+        json!({ "link": "[[@b:Foo]]", "default_source": "a" }),
+    )
+    .await;
+    assert_eq!(federated["result"]["unit"]["id"], json!("@b:Foo.md"));
+
+    server.abort();
+}

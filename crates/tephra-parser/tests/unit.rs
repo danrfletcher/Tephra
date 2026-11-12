@@ -15,6 +15,10 @@ mod headings;
 mod large_file;
 #[path = "unit/markdown_links.rs"]
 mod markdown_links;
+#[path = "unit/prose_formats.rs"]
+mod prose_formats;
+#[path = "unit/prose_headings.rs"]
+mod prose_headings;
 #[path = "unit/robustness.rs"]
 mod robustness;
 #[path = "unit/tags.rs"]

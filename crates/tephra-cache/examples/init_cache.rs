@@ -74,7 +74,7 @@ fn main() {
             .insert_block(&NewBlock {
                 end_line: None,
                 unit_id,
-                block_id: "demo-block",
+                block_id: Some("demo-block"),
                 line: 1,
             })
             .expect("insert_block");

@@ -4,13 +4,21 @@
 //! and backlink indices stay consistent after insert, update, and
 //! remove.
 
-use tephra_graph::{EdgeTarget, UnitFacts, UnitGraph};
+use tephra_graph::{BlockFact, EdgeTarget, UnitFacts, UnitGraph};
 
 fn facts(links: &[(&str, &str)], tags: &[&str], blocks: &[&str]) -> UnitFacts {
     UnitFacts {
         frontmatter_json: None,
         tags: tags.iter().map(|t| t.to_string()).collect(),
-        blocks: blocks.iter().map(|b| b.to_string()).collect(),
+        // Each block sits on its own line, 1-based, in the order given.
+        blocks: blocks
+            .iter()
+            .enumerate()
+            .map(|(i, b)| BlockFact {
+                id: b.to_string(),
+                line: i as i64 + 1,
+            })
+            .collect(),
         links: links
             .iter()
             .map(|(raw, kind)| (raw.to_string(), kind.to_string()))
@@ -33,6 +41,57 @@ fn inserting_a_unit_creates_a_node_carrying_its_tags_and_blocks() {
     assert_eq!(unit.tags, vec!["project".to_string(), "urgent".to_string()]);
     assert_eq!(unit.blocks, vec!["block1".to_string()]);
     assert!(!unit.offline);
+}
+
+/// G3: every occurrence of an ID is a fact with its own line; nothing
+/// is deduplicated on the way into the graph.
+#[test]
+fn a_repeated_block_id_keeps_every_occurrence_with_its_own_line() {
+    let mut graph = UnitGraph::new();
+    graph.upsert_unit(
+        "notes",
+        "Dup.md",
+        UnitFacts {
+            blocks: vec![
+                BlockFact {
+                    id: "dup".into(),
+                    line: 3,
+                },
+                BlockFact {
+                    id: "other".into(),
+                    line: 5,
+                },
+                BlockFact {
+                    id: "dup".into(),
+                    line: 9,
+                },
+            ],
+            ..UnitFacts::default()
+        },
+    );
+
+    assert_eq!(
+        graph.block_occurrences("@notes:Dup.md"),
+        vec![
+            BlockFact {
+                id: "dup".into(),
+                line: 3
+            },
+            BlockFact {
+                id: "other".into(),
+                line: 5
+            },
+            BlockFact {
+                id: "dup".into(),
+                line: 9
+            },
+        ]
+    );
+    assert_eq!(
+        graph.unit("@notes:Dup.md").unwrap().blocks,
+        vec!["dup".to_string(), "other".to_string(), "dup".to_string()]
+    );
+    assert!(graph.block_occurrences("@notes:Missing.md").is_empty());
 }
 
 #[test]

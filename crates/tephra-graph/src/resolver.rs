@@ -117,11 +117,11 @@ pub(crate) enum ResolveOutcome {
     NotFound,
 }
 
-/// File extensions [`strip_markdown_extension`] strips, matching
-/// `tephrad::scan`'s own `MARKDOWN_EXTENSIONS` — every unit this
-/// graph ever holds came from a markdown file (PR-4's scan pipeline
-/// never writes a non-markdown `units` row), so every `rel_path`
-/// ends in one of these, case-insensitively.
+/// File extensions [`strip_markdown_extension`] strips. Only Markdown
+/// names are matched without their extension: a bare `[[Foo]]` finds
+/// `Foo.md`. The graph also holds units of other file types (a `.txt`,
+/// `.org`, a `.py`), which are matched by their full name; making a
+/// bare name reach those is PR-13's job, not this module's.
 const MARKDOWN_EXTENSIONS: [&str; 2] = [".md", ".markdown"];
 
 /// Strips a trailing `.md`/`.markdown` (case-insensitive) from

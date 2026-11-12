@@ -182,7 +182,7 @@ fn seed_units_with_rows(cache: &Cache, source_id: i64, count: usize, label: &str
             .insert_block(&NewBlock {
                 end_line: None,
                 unit_id,
-                block_id: "^blk",
+                block_id: Some("^blk"),
                 line: 1,
             })
             .expect("insert_block");
