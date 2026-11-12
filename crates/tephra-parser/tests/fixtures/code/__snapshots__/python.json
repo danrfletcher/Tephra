@@ -1,0 +1,37 @@
+{
+  "path": "tests/fixtures/code/python/sample.py",
+  "content_hash": "70fec97cb11a6688454e0c5d84e4cf98c2516b493cbac5271ead19ca9bdb276a",
+  "frontmatter": null,
+  "headings": [],
+  "wikilinks": [
+    {
+      "source_prefix": null,
+      "target": "Doc",
+      "anchor": null,
+      "alias": null,
+      "raw": "Doc",
+      "line": 1,
+      "span": [
+        20,
+        27
+      ]
+    },
+    {
+      "source_prefix": null,
+      "target": "Line",
+      "anchor": null,
+      "alias": null,
+      "raw": "Line",
+      "line": 2,
+      "span": [
+        46,
+        54
+      ]
+    }
+  ],
+  "markdown_links": [],
+  "tags": [],
+  "blocks": [],
+  "paragraphs": [],
+  "diagnostics": []
+}

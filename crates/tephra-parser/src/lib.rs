@@ -13,6 +13,13 @@
 //! link/anchor code, headings by their own native rules (none for
 //! `.txt`), no frontmatter and no tags. See the [`prose`] module.
 //!
+//! [`parse_code_unit`] is the code-file counterpart (G4): it parses a
+//! file in one of the 14 bundled tree-sitter grammars ([`Language`])
+//! and reads `[[wikilinks]]` and `[text](target)` links only inside
+//! comments and docstrings, through the same wikilink and Markdown
+//! scanners. It records no headings, tags, blocks or symbols. See the
+//! [`code`] module.
+//!
 //! This crate does no I/O, owns no watcher, and never opens SQLite or
 //! resolves a link against a registry (those are PR-4/PR-5). Its row
 //! types — [`tephra_cache::NewTag`], [`tephra_cache::NewLink`],
@@ -28,6 +35,7 @@
 //! crate's `tests/integration/parse_unit_fixtures.rs`.
 
 mod blocks;
+mod code;
 mod diagnostics;
 mod fences;
 mod frontmatter;
@@ -43,6 +51,10 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 pub use blocks::{BlockAnchor, Paragraph};
+pub use code::{
+    parse_code_unit, parse_code_unit_within, Language, CODE_PARSE_BUDGET, EXTENSIONS,
+    MAX_CODE_PARSE_BYTES,
+};
 pub use diagnostics::{Diagnostic, DiagnosticKind};
 pub use frontmatter::Frontmatter;
 pub use markdown_pass::{Heading, MarkdownLink};
@@ -128,8 +140,9 @@ impl ParsedUnit {
             rel_path,
             mtime,
             frontmatter_json: self.frontmatter.as_ref().and_then(|f| f.json.as_deref()),
-            // Only prose files go through this crate. The caller
-            // overwrites `size` with the file's real length.
+            // `prose` for a unit from `parse_unit`. The caller
+            // overwrites `size` with the file's real length, and
+            // `kind` with `code` for a unit from `parse_code_unit`.
             kind: "prose",
             size: None,
             too_large: false,

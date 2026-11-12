@@ -334,7 +334,7 @@ fn unit_summary(
 }
 
 #[test]
-fn every_non_ignored_file_is_a_unit_with_its_kind_and_only_prose_has_rows() {
+fn every_non_ignored_file_is_a_unit_with_its_kind_and_only_prose_and_code_have_rows() {
     // G2/G6/G15 through the real register -> scan path, a real temp
     // dir and a real cache.
     let fixture = fixtures::kinds_fixture();
@@ -370,10 +370,16 @@ fn every_non_ignored_file_is_a_unit_with_its_kind_and_only_prose_has_rows() {
         let (got_kind, links, tags, blocks) = &summary[path];
         assert_eq!(got_kind, kind, "{path}");
         if got_kind != "prose" {
+            // G4: a code unit has its comment links; no other
+            // non-prose unit has links, and none has tags or blocks.
+            let code_links = fixtures::KINDS_CODE_LINKS
+                .iter()
+                .find(|(p, _)| *p == path)
+                .map_or(0, |(_, n)| *n);
             assert_eq!(
                 (*links, *tags, *blocks),
-                (0, 0, 0),
-                "{path}: a non-prose unit has no links/tags/blocks"
+                (code_links, 0, 0),
+                "{path}: a non-prose unit has no tags/blocks, and links only from code comments"
             );
         }
     }
@@ -476,8 +482,26 @@ fn a_real_scan_of_a_mixed_format_tree_gives_the_expected_rows_and_writes_nothing
         .expect("register");
     assert_eq!(
         stats.units_written,
-        fixtures::PROSE_EXPECTED.len() + fixtures::PROSE_NO_ROWS.len()
+        fixtures::PROSE_EXPECTED.len()
+            + fixtures::CODE_EXPECTED.len()
+            + fixtures::PROSE_NO_ROWS.len()
     );
+
+    // G4: a code file gives its one comment link and no other row.
+    for path in fixtures::CODE_EXPECTED {
+        let got = fixtures::unit_rows(&cache_path, "prose", path)
+            .unwrap_or_else(|| panic!("{path} is not a unit"));
+        assert_eq!(got.kind, "code", "{path}");
+        assert_eq!(
+            got.links,
+            vec![("wikilink".to_string(), "Real".to_string())],
+            "{path}"
+        );
+        assert!(
+            got.headings.is_empty() && got.tags.is_empty() && got.blocks.is_empty(),
+            "{path}: {got:?}"
+        );
+    }
 
     // Every prose file: its headings, links, tags and blocks, exactly.
     for expected in &fixtures::PROSE_EXPECTED {

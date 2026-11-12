@@ -1,0 +1,49 @@
+{
+  "path": "tests/fixtures/code/cpp/sample.cpp",
+  "content_hash": "c3ead1bdedb4fd6e370bcd925c36925ff4109a5d0d2ea15597b18d6cbc334d29",
+  "frontmatter": null,
+  "headings": [],
+  "wikilinks": [
+    {
+      "source_prefix": null,
+      "target": "Line",
+      "anchor": null,
+      "alias": null,
+      "raw": "Line",
+      "line": 1,
+      "span": [
+        16,
+        24
+      ]
+    },
+    {
+      "source_prefix": null,
+      "target": "Block",
+      "anchor": null,
+      "alias": null,
+      "raw": "Block",
+      "line": 2,
+      "span": [
+        42,
+        51
+      ]
+    },
+    {
+      "source_prefix": null,
+      "target": "Doc",
+      "anchor": null,
+      "alias": null,
+      "raw": "Doc",
+      "line": 3,
+      "span": [
+        71,
+        78
+      ]
+    }
+  ],
+  "markdown_links": [],
+  "tags": [],
+  "blocks": [],
+  "paragraphs": [],
+  "diagnostics": []
+}

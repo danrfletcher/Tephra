@@ -1,0 +1,49 @@
+{
+  "path": "tests/fixtures/code/rust/sample.rs",
+  "content_hash": "74d6238f1f26d9d4f24c6a090cc03402da90ddc5e4cc9a5b6faf9b22de3140ba",
+  "frontmatter": null,
+  "headings": [],
+  "wikilinks": [
+    {
+      "source_prefix": null,
+      "target": "Line",
+      "anchor": null,
+      "alias": null,
+      "raw": "Line",
+      "line": 1,
+      "span": [
+        16,
+        24
+      ]
+    },
+    {
+      "source_prefix": null,
+      "target": "Block",
+      "anchor": null,
+      "alias": null,
+      "raw": "Block",
+      "line": 2,
+      "span": [
+        42,
+        51
+      ]
+    },
+    {
+      "source_prefix": null,
+      "target": "Doc",
+      "anchor": null,
+      "alias": null,
+      "raw": "Doc",
+      "line": 3,
+      "span": [
+        71,
+        78
+      ]
+    }
+  ],
+  "markdown_links": [],
+  "tags": [],
+  "blocks": [],
+  "paragraphs": [],
+  "diagnostics": []
+}

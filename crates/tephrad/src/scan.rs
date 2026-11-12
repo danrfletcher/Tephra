@@ -2,8 +2,10 @@
 //! (GP2/GP3), a forced rescan (`source.rescan`), and the batched
 //! change-apply path used by the debounced watcher (GP6/E5).
 //!
-//! Both entry points go through `tephra_parser::parse_unit_bytes` for
-//! extraction and write through `tephra_cache`'s typed row shapes
+//! Both entry points dispatch on the file's kind: prose goes through
+//! `tephra_parser::parse_unit` (or `parse_unit_bytes`), code through
+//! `tephra_parser::parse_code_unit` (see [`parse_file`], the one
+//! dispatch). Both write through `tephra_cache`'s typed row shapes
 //! (`NewUnit`/`NewLink`/`NewTag`/`NewBlock`), so a unit's cache row
 //! shape here is always in sync with what the parser crate produces
 //! — there is no separate re-description of that schema in this
@@ -14,14 +16,20 @@
 //! `code`, `document`, `text-other` or `binary` from its name and its
 //! first 8 KB. Every file that classifies as `prose` (`.md`,
 //! `.markdown`, `.txt`, `.org`, `.rst`, `.adoc`, any case) is fed
-//! through the parser (G3), which picks its rules from the extension:
-//! links, `^id` blocks, paragraphs and — for Markdown only — tags,
-//! plus headings for Markdown, org, rst and adoc. Every other file is
+//! through the prose parser (G3), which picks its rules from the
+//! extension: links, `^id` blocks, paragraphs and — for Markdown only
+//! — tags, plus headings for Markdown, org, rst and adoc. Every file
+//! that classifies as `code` (an extension with a bundled tree-sitter
+//! grammar, or a recognised shebang) is fed through the code parser
+//! (G4), which reads links only inside comments and docstrings: a
+//! `[[wikilink]]` in a string literal, a heredoc or code is never a
+//! link, and the code parse records no symbols (that is a later PR).
+//! Every other file — `document`, `text-other`, `binary`, and so a
+//! `.kt`, `.rb`, `.json` or `.ini` file, which has no grammar — is
 //! written as a unit carrying name, kind, size and mtime and nothing
-//! else — no links, headings or blocks — so a code repository never
-//! ends up with false wikilinks derived from its source files, and a
-//! `.txt` with a NUL byte (which classifies as `binary`) is never
-//! parsed. Parsing never writes to the file (F4). The
+//! else — no links, headings or blocks. A `.txt` or `.py` with a NUL
+//! byte (which classifies as `binary`) is never parsed. Parsing never
+//! writes to the file (F4). The
 //! walk ([`walk_and_write`]), the directory-upsert path and the
 //! debounced batch-apply path ([`apply_change_batch`]) all go through
 //! the same [`write_unit`], so they classify identically.
@@ -331,8 +339,9 @@ fn passes_through_symlink(root: &Path, abs: &Path) -> bool {
     false
 }
 
-/// Classifies one file and writes its unit row (and, for a prose file,
-/// its link/tag/block/heading rows) under the given `source_id`. Returns
+/// Classifies one file and writes its unit row (and, for a prose or
+/// code file, its link/tag/block/heading rows) under the given
+/// `source_id`. Returns
 /// `Ok(None)` (not an error) for a file whose metadata or leading
 /// bytes couldn't be read at all (permission denied, deleted
 /// mid-walk) — a single unreadable file must not abort the rest of the
@@ -349,11 +358,14 @@ fn passes_through_symlink(root: &Path, abs: &Path) -> bool {
 /// its real kind. Over [`MAX_INDEXED_BYTES`] that is all that is read:
 /// the file is stored by name only, with that kind and `too_large = 1`,
 /// and is never parsed. Otherwise only a file that classifies
-/// as `prose` is read in full and parsed (a UTF-16 prose file with a
-/// BOM is decoded first). A prose file whose later bytes turn out
-/// not to be valid UTF-8 is stored as `binary`, by name only, with a
-/// warning — it is still a file in the source. Every other kind is
-/// stored with name, kind, size and mtime only.
+/// as `prose` or `code` is read in full and parsed (a UTF-16 prose
+/// file with a BOM is decoded first; a code file goes to the code
+/// parser, which has its own time budget — a file it gives up on is
+/// kept as a `code` unit with no links, and the timeout is logged).
+/// A prose or code file whose later bytes turn out not to be valid
+/// UTF-8 is stored as `binary`, by name only, with a warning — it is
+/// still a file in the source. Every other kind is stored with name,
+/// kind, size and mtime only.
 ///
 /// Always an upsert, never a blind insert (R15 review finding): any
 /// existing row at this `(source_id, rel_path)` is deleted first.
@@ -424,7 +436,7 @@ fn write_unit(
     };
     let mut kind = file_kind::classify(file_name, &head);
     let mut parsed = None;
-    if !too_large && kind == FileKind::Prose {
+    if !too_large && matches!(kind, FileKind::Prose | FileKind::Code) {
         let bytes = match read_capped(abs_path) {
             Ok(b) => b,
             Err(e) => {
@@ -437,14 +449,10 @@ fn write_unit(
             // Grew past the cap between the stat and the read.
             too_large = true;
         } else {
-            let result = match file_kind::decode_utf16_with_bom(&bytes) {
-                Some(text) => Ok(tephra_parser::parse_unit(abs_path, &text)),
-                None => tephra_parser::parse_unit_bytes(abs_path, &bytes),
-            };
-            match result {
-                Ok(p) => parsed = Some(p),
+            match parse_file(kind, abs_path, file_name, &head, &bytes) {
+                Ok(p) => parsed = p,
                 Err(e) => {
-                    tracing::warn!(path = %abs_path.display(), error = %e, "prose file is not valid UTF-8; indexed by name only as binary");
+                    tracing::warn!(path = %abs_path.display(), error = %e, kind = kind.as_str(), "file is not valid UTF-8; indexed by name only as binary");
                     kind = FileKind::Binary;
                 }
             }
@@ -486,19 +494,30 @@ fn write_unit(
     };
 
     // E7: an ID that appears twice is stored twice (below) and
-    // reported here. The file itself is never touched by a scan.
+    // reported here. E12: so is a code parse that was given up on.
+    // The file itself is never touched by a scan.
     for diag in &parsed.diagnostics {
-        if diag.kind == tephra_parser::DiagnosticKind::DuplicateBlockId {
-            tracing::warn!(
+        match diag.kind {
+            tephra_parser::DiagnosticKind::DuplicateBlockId => tracing::warn!(
                 path = %abs_path.display(),
                 line = diag.line,
                 "{}",
                 diag.message
-            );
+            ),
+            tephra_parser::DiagnosticKind::ParseTimeout
+            | tephra_parser::DiagnosticKind::ParseSkippedTooLarge
+            | tephra_parser::DiagnosticKind::ParseFailed => tracing::warn!(
+                path = %abs_path.display(),
+                "{}",
+                diag.message
+            ),
+            _ => {}
         }
     }
 
     let mut new_unit = parsed.to_new_unit(source_id, &rel_path, mtime);
+    // `to_new_unit` says `prose`; a code unit says `code`.
+    new_unit.kind = kind.as_str();
     new_unit.size = Some(size as i64);
     let unit_id = cache.insert_unit(&new_unit)?;
 
@@ -523,6 +542,46 @@ fn write_unit(
     Ok(Some(stats))
 }
 
+/// The one dispatch from a file's kind to its parser. `bytes` is the
+/// whole file, `head` its first bytes (what [`file_kind::classify`]
+/// saw). `Ok(None)` is a kind this does not parse (or a code file with
+/// no grammar, which `classify` never produces). `Err` carries the
+/// reason the bytes are not text; the caller then stores the file as
+/// `binary`.
+///
+/// - `Prose`: `parse_unit`, after decoding a UTF-16 file with a BOM,
+///   else `parse_unit_bytes` (strict UTF-8).
+/// - `Code`: `parse_code_unit` in the language the name or shebang
+///   gives ([`file_kind::language_for`]), on strict UTF-8.
+///
+/// Used by every write path ([`write_unit`] is the only caller), so a
+/// file is parsed the same way in a full scan, a rescan and the
+/// watcher's batch.
+fn parse_file(
+    kind: FileKind,
+    abs_path: &Path,
+    file_name: &str,
+    head: &[u8],
+    bytes: &[u8],
+) -> Result<Option<tephra_parser::ParsedUnit>, String> {
+    match kind {
+        FileKind::Prose => match file_kind::decode_utf16_with_bom(bytes) {
+            Some(text) => Ok(Some(tephra_parser::parse_unit(abs_path, &text))),
+            None => tephra_parser::parse_unit_bytes(abs_path, bytes)
+                .map(Some)
+                .map_err(|e| e.to_string()),
+        },
+        FileKind::Code => {
+            let Some(lang) = file_kind::language_for(file_name, head) else {
+                return Ok(None);
+            };
+            let text = std::str::from_utf8(bytes).map_err(|e| e.to_string())?;
+            Ok(Some(tephra_parser::parse_code_unit(abs_path, lang, text)))
+        }
+        FileKind::Document | FileKind::TextOther | FileKind::Binary => Ok(None),
+    }
+}
+
 /// Deletes the one unit row at `source_id`/`rel_path` (if any) and
 /// its cascading links/tags/blocks, via `cache`'s typed helpers.
 /// Returns whether a row actually existed to delete.
@@ -539,8 +598,9 @@ fn delete_existing_unit(cache: &Cache, source_id: i64, rel_path: &str) -> Result
 /// `root` (streaming — see the module doc and E1), applying `ignore`
 /// before descending into any directory so an ignored subtree's files
 /// are never even listed, let alone parsed. Every non-ignored
-/// file is classified and written via `cache`; only prose files are
-/// parsed for links, tags and blocks (G2).
+/// file is classified and written via `cache`; only prose files
+/// (links, tags, blocks) and code files (comment/docstring links) are
+/// parsed (G2, G4).
 ///
 /// A single unreadable directory entry (e.g. a permission-denied
 /// subdirectory) is logged and skipped rather than aborting the whole
@@ -911,7 +971,8 @@ fn upsert_directory(
 /// rename the project can tell apart (R4, a team lesson from the
 /// Obsidian side of this project too):
 /// - An existing regular file: its old row (if any) is replaced by a
-///   freshly classified one (and, for a prose file, a fresh parse), so a
+///   freshly classified one (and, for a prose or code file, a fresh
+///   parse, through the same [`parse_file`] as a full scan), so a
 ///   file that changed kind leaves no stale rows of its old kind. A
 ///   file that can't be read is removed and skipped with a warning.
 /// - An existing directory (a create or a move-in): walked and every

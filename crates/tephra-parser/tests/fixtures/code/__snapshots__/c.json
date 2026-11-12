@@ -1,0 +1,49 @@
+{
+  "path": "tests/fixtures/code/c/sample.c",
+  "content_hash": "e356ca3ff4f22cbdef17460a2dd87c4f3c3134f30abfb5939f401fb8218321b1",
+  "frontmatter": null,
+  "headings": [],
+  "wikilinks": [
+    {
+      "source_prefix": null,
+      "target": "Line",
+      "anchor": null,
+      "alias": null,
+      "raw": "Line",
+      "line": 1,
+      "span": [
+        16,
+        24
+      ]
+    },
+    {
+      "source_prefix": null,
+      "target": "Block",
+      "anchor": null,
+      "alias": null,
+      "raw": "Block",
+      "line": 2,
+      "span": [
+        42,
+        51
+      ]
+    },
+    {
+      "source_prefix": null,
+      "target": "Doc",
+      "anchor": null,
+      "alias": null,
+      "raw": "Doc",
+      "line": 3,
+      "span": [
+        71,
+        78
+      ]
+    }
+  ],
+  "markdown_links": [],
+  "tags": [],
+  "blocks": [],
+  "paragraphs": [],
+  "diagnostics": []
+}

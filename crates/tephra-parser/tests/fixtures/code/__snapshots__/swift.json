@@ -1,0 +1,49 @@
+{
+  "path": "tests/fixtures/code/swift/sample.swift",
+  "content_hash": "2aa597bbff5d94710a9ac9d903117e625b59a4792982bf74cb02aa4aa6170dd9",
+  "frontmatter": null,
+  "headings": [],
+  "wikilinks": [
+    {
+      "source_prefix": null,
+      "target": "Line",
+      "anchor": null,
+      "alias": null,
+      "raw": "Line",
+      "line": 1,
+      "span": [
+        16,
+        24
+      ]
+    },
+    {
+      "source_prefix": null,
+      "target": "Block",
+      "anchor": null,
+      "alias": null,
+      "raw": "Block",
+      "line": 2,
+      "span": [
+        42,
+        51
+      ]
+    },
+    {
+      "source_prefix": null,
+      "target": "Doc",
+      "anchor": null,
+      "alias": null,
+      "raw": "Doc",
+      "line": 3,
+      "span": [
+        71,
+        78
+      ]
+    }
+  ],
+  "markdown_links": [],
+  "tags": [],
+  "blocks": [],
+  "paragraphs": [],
+  "diagnostics": []
+}

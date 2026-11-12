@@ -1,0 +1,49 @@
+{
+  "path": "tests/fixtures/code/typescript/sample.ts",
+  "content_hash": "3862034256e41dcb6fdce0022d5e228242770accde952ae194d77a633d14cac4",
+  "frontmatter": null,
+  "headings": [],
+  "wikilinks": [
+    {
+      "source_prefix": null,
+      "target": "Line",
+      "anchor": null,
+      "alias": null,
+      "raw": "Line",
+      "line": 1,
+      "span": [
+        16,
+        24
+      ]
+    },
+    {
+      "source_prefix": null,
+      "target": "Block",
+      "anchor": null,
+      "alias": null,
+      "raw": "Block",
+      "line": 2,
+      "span": [
+        42,
+        51
+      ]
+    },
+    {
+      "source_prefix": null,
+      "target": "Doc",
+      "anchor": null,
+      "alias": null,
+      "raw": "Doc",
+      "line": 3,
+      "span": [
+        73,
+        80
+      ]
+    }
+  ],
+  "markdown_links": [],
+  "tags": [],
+  "blocks": [],
+  "paragraphs": [],
+  "diagnostics": []
+}

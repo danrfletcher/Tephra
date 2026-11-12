@@ -821,9 +821,15 @@ fn the_watcher_path_classifies_every_kind_like_the_full_scan_and_flips_a_changed
 
     for (path, (kind, links, tags, blocks)) in &via_scan {
         if kind != "prose" {
-            assert_eq!((*links, *tags, *blocks), (0, 0, 0), "{path}");
+            // G4: only code comments give a non-prose unit a link.
+            let code_links = fixtures::KINDS_CODE_LINKS
+                .iter()
+                .find(|(p, _)| *p == path)
+                .map_or(0, |(_, n)| *n);
+            assert_eq!((*links, *tags, *blocks), (code_links, 0, 0), "{path}");
         }
     }
+    assert_eq!(via_scan["src/main.rs"], ("code".into(), 1, 0, 0));
     for ignored in fixtures::KINDS_IGNORED {
         assert!(!via_scan.contains_key(ignored), "{ignored}");
     }

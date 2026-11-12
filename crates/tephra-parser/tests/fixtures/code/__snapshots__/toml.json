@@ -1,0 +1,37 @@
+{
+  "path": "tests/fixtures/code/toml/sample.toml",
+  "content_hash": "b873c0a6a6708dc307893d470714d1e88ab45ee1f681283c395f06c6e4cc66cb",
+  "frontmatter": null,
+  "headings": [],
+  "wikilinks": [
+    {
+      "source_prefix": null,
+      "target": "Line",
+      "anchor": null,
+      "alias": null,
+      "raw": "Line",
+      "line": 1,
+      "span": [
+        15,
+        23
+      ]
+    },
+    {
+      "source_prefix": null,
+      "target": "Doc",
+      "anchor": null,
+      "alias": null,
+      "raw": "Doc",
+      "line": 2,
+      "span": [
+        62,
+        69
+      ]
+    }
+  ],
+  "markdown_links": [],
+  "tags": [],
+  "blocks": [],
+  "paragraphs": [],
+  "diagnostics": []
+}

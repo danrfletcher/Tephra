@@ -3,3 +3,6 @@
 
 #[path = "integration/parse_unit_fixtures.rs"]
 mod parse_unit_fixtures;
+
+#[path = "integration/code_fixtures.rs"]
+mod code_fixtures;

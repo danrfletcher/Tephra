@@ -5,9 +5,10 @@
 //!
 //! - `prose`: extension `md`, `markdown`, `txt`, `org`, `rst`, `adoc`.
 //! - `code`: an extension with a bundled tree-sitter grammar (the G4
-//!   list, [`CODE_EXTENSIONS`]; the grammars themselves arrive in a
-//!   later PR, this is only the static extension table), or, for a file
-//!   with *no* extension, a recognised shebang interpreter.
+//!   list), or, for a file with *no* extension, a recognised shebang
+//!   interpreter. The one extension/shebang -> grammar table is
+//!   `tephra_parser::Language`; this module only asks it, so "has a
+//!   grammar" and "is `code`" cannot disagree.
 //! - `document`: `pdf`, `docx`, `pptx`.
 //! - `text-other`: anything else whose first [`SNIFF_BYTES`] bytes have
 //!   no NUL byte and decode as UTF-8.
@@ -35,6 +36,8 @@
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::Path;
+
+pub use tephra_parser::Language;
 
 /// How many leading bytes the NUL / UTF-8 / shebang checks look at.
 pub const SNIFF_BYTES: usize = 8 * 1024;
@@ -66,57 +69,8 @@ impl FileKind {
     }
 }
 
-/// A language with a bundled grammar (G4). Only the extension and
-/// shebang tables exist in this PR; nothing parses with them yet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Language {
-    Python,
-    TypeScript,
-    Tsx,
-    JavaScript,
-    Jsx,
-    Rust,
-    Go,
-    Shell,
-    Yaml,
-    Toml,
-    C,
-    Cpp,
-    Java,
-    Swift,
-    Lua,
-}
-
 const PROSE_EXTENSIONS: [&str; 6] = ["md", "markdown", "txt", "org", "rst", "adoc"];
 const DOCUMENT_EXTENSIONS: [&str; 3] = ["pdf", "docx", "pptx"];
-
-/// The static extension table for `code` (lower-case, no dot).
-pub const CODE_EXTENSIONS: [(&str, Language); 24] = [
-    ("py", Language::Python),
-    ("ts", Language::TypeScript),
-    ("tsx", Language::Tsx),
-    ("js", Language::JavaScript),
-    ("mjs", Language::JavaScript),
-    ("cjs", Language::JavaScript),
-    ("jsx", Language::Jsx),
-    ("rs", Language::Rust),
-    ("go", Language::Go),
-    ("sh", Language::Shell),
-    ("bash", Language::Shell),
-    ("zsh", Language::Shell),
-    ("yml", Language::Yaml),
-    ("yaml", Language::Yaml),
-    ("toml", Language::Toml),
-    ("c", Language::C),
-    ("h", Language::C),
-    ("cpp", Language::Cpp),
-    ("cc", Language::Cpp),
-    ("cxx", Language::Cpp),
-    ("hpp", Language::Cpp),
-    ("java", Language::Java),
-    ("swift", Language::Swift),
-    ("lua", Language::Lua),
-];
 
 /// The extension of `file_name` (text after the last `.`, lower-cased),
 /// or `None` when there is none. A leading dot alone (`.bashrc`) and a
@@ -129,52 +83,21 @@ fn extension_of(file_name: &str) -> Option<String> {
         .map(|e| e.to_ascii_lowercase())
 }
 
-/// The language the extension table assigns to `file_name`, if any.
-pub fn language_for_extension(file_name: &str) -> Option<Language> {
-    let ext = extension_of(file_name)?;
-    CODE_EXTENSIONS
-        .iter()
-        .find(|(e, _)| *e == ext)
-        .map(|(_, l)| *l)
+/// The bundled-grammar language of the file `file_name` whose leading
+/// bytes are `head`, if any: by extension (any case), or, for a file
+/// with no extension, by its `#!` line. Asks
+/// [`tephra_parser::Language::from_path`], the one table.
+pub fn language_for(file_name: &str, head: &[u8]) -> Option<Language> {
+    Language::from_path(Path::new(file_name), first_line(head))
 }
 
-/// The language a `#!` line names, if its interpreter has a bundled
-/// grammar: `sh`/`bash`/`zsh`/`dash`/`ksh` -> Shell, `python*` ->
-/// Python, `node`/`nodejs` -> JavaScript, `lua*` -> Lua. Handles
-/// `#!/usr/bin/env python3` and `env -S VAR=1 python3 -u`. An
-/// interpreter with no grammar (`perl`, `ruby`) is `None`.
-pub fn language_for_shebang(head: &[u8]) -> Option<Language> {
-    let rest = head.strip_prefix(b"#!")?;
-    let line_end = rest
+/// The first line of `head` (up to `\n` or `\r`), when it is UTF-8.
+fn first_line(head: &[u8]) -> Option<&str> {
+    let end = head
         .iter()
         .position(|&b| b == b'\n' || b == b'\r')
-        .unwrap_or(rest.len());
-    let line = std::str::from_utf8(&rest[..line_end]).ok()?;
-    let mut tokens = line.split_whitespace();
-    let program = tokens.next()?;
-    let base = |s: &str| s.rsplit('/').next().unwrap_or(s).to_string();
-    let mut interpreter = base(program);
-    if interpreter == "env" {
-        // Skip env's own flags and `NAME=value` assignments.
-        interpreter = tokens
-            .find(|t| !t.starts_with('-') && !t.contains('='))
-            .map(base)?;
-    }
-    match interpreter.as_str() {
-        "sh" | "bash" | "zsh" | "dash" | "ksh" => Some(Language::Shell),
-        "node" | "nodejs" => Some(Language::JavaScript),
-        s if s == "python" || s.starts_with("python") && s[6..].chars().all(is_version_char) => {
-            Some(Language::Python)
-        }
-        s if s == "lua" || s.starts_with("lua") && s[3..].chars().all(is_version_char) => {
-            Some(Language::Lua)
-        }
-        _ => None,
-    }
-}
-
-fn is_version_char(c: char) -> bool {
-    c.is_ascii_digit() || c == '.'
+        .unwrap_or(head.len());
+    std::str::from_utf8(&head[..end]).ok()
 }
 
 /// Classifies one file from its name and its leading bytes. `head` is
@@ -207,7 +130,7 @@ pub fn classify(file_name: &str, head: &[u8]) -> FileKind {
                 FileKind::Binary
             };
         }
-        if CODE_EXTENSIONS.iter().any(|(e, _)| *e == ext) {
+        if Language::from_extension(ext).is_some() {
             return if is_text(window, truncated) {
                 FileKind::Code
             } else {
@@ -220,7 +143,9 @@ pub fn classify(file_name: &str, head: &[u8]) -> FileKind {
     if !is_text(window, truncated) {
         return FileKind::Binary;
     }
-    if ext.is_none() && language_for_shebang(window).is_some() {
+    if language_for(file_name, window).is_some() {
+        // Only a file with no extension gets here with a language: an
+        // extension decides by itself (a `.xyz` script is text-other).
         return FileKind::Code;
     }
     FileKind::TextOther
@@ -235,7 +160,7 @@ pub fn infer_kind_from_path(rel_path: &str) -> &'static str {
     match extension_of(file_name).as_deref() {
         Some(e) if DOCUMENT_EXTENSIONS.contains(&e) => FileKind::Document,
         Some(e) if PROSE_EXTENSIONS.contains(&e) => FileKind::Prose,
-        Some(e) if CODE_EXTENSIONS.iter().any(|(c, _)| *c == e) => FileKind::Code,
+        Some(e) if Language::from_extension(e).is_some() => FileKind::Code,
         _ => FileKind::TextOther,
     }
     .as_str()
@@ -361,7 +286,7 @@ mod tests {
             cases.push((format!("n.{ext}"), Document));
             cases.push((format!("n.{}", ext.to_uppercase()), Document));
         }
-        for (ext, _) in CODE_EXTENSIONS {
+        for (ext, _) in tephra_parser::EXTENSIONS {
             cases.push((format!("n.{ext}"), Code));
             cases.push((format!("n.{}", ext.to_uppercase()), Code));
         }
@@ -377,40 +302,27 @@ mod tests {
     }
 
     #[test]
-    fn the_alias_table_maps_to_the_documented_languages() {
-        let cases = [
-            ("a.h", Language::C),
-            ("a.c", Language::C),
-            ("a.hpp", Language::Cpp),
-            ("a.cc", Language::Cpp),
-            ("a.cpp", Language::Cpp),
-            ("a.cxx", Language::Cpp),
-            ("a.yml", Language::Yaml),
-            ("a.yaml", Language::Yaml),
-            ("a.mjs", Language::JavaScript),
-            ("a.cjs", Language::JavaScript),
-            ("a.js", Language::JavaScript),
-            ("a.zsh", Language::Shell),
-            ("a.bash", Language::Shell),
-            ("a.sh", Language::Shell),
-            ("a.tsx", Language::Tsx),
-            ("a.jsx", Language::Jsx),
-            ("a.ts", Language::TypeScript),
-            ("a.py", Language::Python),
-            ("a.rs", Language::Rust),
-            ("a.go", Language::Go),
-            ("a.toml", Language::Toml),
-            ("a.java", Language::Java),
-            ("a.swift", Language::Swift),
-            ("a.lua", Language::Lua),
-            ("A.CPP", Language::Cpp),
-        ];
-        for (name, lang) in cases {
-            assert_eq!(language_for_extension(name), Some(lang), "{name}");
+    fn language_for_asks_the_parser_table_by_extension_then_shebang() {
+        let text = b"hello\n".as_slice();
+        assert_eq!(language_for("a.h", text), Some(Language::C));
+        assert_eq!(language_for("A.CPP", text), Some(Language::Cpp));
+        assert_eq!(language_for("a.yml", text), Some(Language::Yaml));
+        assert_eq!(language_for("a.mjs", text), Some(Language::JavaScript));
+        assert_eq!(language_for("a.zsh", text), Some(Language::Shell));
+        assert_eq!(language_for("a.tsx", text), Some(Language::Tsx));
+        for name in ["a.txt", "a.md", "Makefile", "a.png", ".bashrc", "a."] {
+            assert_eq!(language_for(name, text), None, "{name}");
         }
-        for name in ["a.txt", "a.md", "Makefile", "a.png", ".bashrc"] {
-            assert_eq!(language_for_extension(name), None, "{name}");
-        }
+        // No extension: the shebang decides; an extension never asks it.
+        assert_eq!(
+            language_for("run", b"#!/usr/bin/env python3\nprint(1)\n"),
+            Some(Language::Python)
+        );
+        assert_eq!(
+            language_for(".bashrc", b"#!/bin/bash\r\nls\r\n"),
+            Some(Language::Shell)
+        );
+        assert_eq!(language_for("run.txt", b"#!/bin/bash\n"), None);
     }
 
     #[test]
@@ -523,14 +435,11 @@ mod tests {
         assert_eq!(classify("run.xyz", b"#!/bin/bash\n"), TextOther);
         // And the language lookup agrees.
         assert_eq!(
-            language_for_shebang(b"#!/usr/bin/env python3\n"),
+            language_for("run", b"#!/usr/bin/env python3\n"),
             Some(Language::Python)
         );
-        assert_eq!(
-            language_for_shebang(b"#!/bin/bash\n"),
-            Some(Language::Shell)
-        );
-        assert_eq!(language_for_shebang(b"no shebang"), None);
+        assert_eq!(language_for("run", b"#!/bin/bash\n"), Some(Language::Shell));
+        assert_eq!(language_for("run", b"no shebang"), None);
     }
 
     #[test]

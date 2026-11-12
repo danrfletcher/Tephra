@@ -90,7 +90,9 @@ fn build_large_fixture() -> fixtures::TempSourceHandle {
     for i in 0..CODE_FILE_COUNT {
         fixture.write(
             &format!("src/mod-{}/file-{i}.rs", i % 10),
-            &format!("// [[not-a-link-{i}]] #not-a-tag\nfn f{i}() {{}}\n"),
+            &format!(
+                "// [[link-{i}]] #not-a-tag\nfn f{i}() {{}}\nconst S: &str = \"[[decoy-{i}]]\";\n"
+            ),
         );
     }
     for i in 0..TEXT_FILE_COUNT {
@@ -169,8 +171,9 @@ fn a_100k_plus_ignored_subtree_is_pruned_before_the_walk_descends_into_it() {
     );
     assert_eq!(stats.units_written, MIXED_UNIT_COUNT);
     assert_eq!(
-        stats.links_written, 0,
-        "no Markdown file here has a link, and no code file may produce one"
+        stats.links_written, CODE_FILE_COUNT,
+        "no Markdown file here has a link; each code file gives its one \
+         comment link and never the one in its string literal"
     );
     assert_eq!(
         stats.tags_written, VALID_FILE_COUNT,
@@ -216,11 +219,13 @@ fn a_100k_plus_ignored_subtree_is_pruned_before_the_walk_descends_into_it() {
         let non_prose_rows: i64 = cache
             .connection()
             .query_row(
-                // Only prose units are parsed (G3): code, text-other,
-                // document and binary units carry no extracted rows.
+                // Only prose and code units are parsed (G3, G4), and
+                // code gives links only: text-other, document and
+                // binary units carry no extracted rows, and a code
+                // unit no blocks or headings.
                 "SELECT \
                    (SELECT COUNT(*) FROM links l JOIN units u ON u.id = l.from_unit_id \
-                      WHERE u.kind <> 'prose') \
+                      WHERE u.kind NOT IN ('prose', 'code')) \
                  + (SELECT COUNT(*) FROM blocks b JOIN units u ON u.id = b.unit_id \
                       WHERE u.kind <> 'prose') \
                  + (SELECT COUNT(*) FROM headings h JOIN units u ON u.id = h.unit_id \

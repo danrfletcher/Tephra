@@ -1,0 +1,37 @@
+{
+  "path": "tests/fixtures/code/yaml/sample.yaml",
+  "content_hash": "fab5307bbd9681ceca7ff07f3118aed2d9379006c7594d1036aabe2d8acb1052",
+  "frontmatter": null,
+  "headings": [],
+  "wikilinks": [
+    {
+      "source_prefix": null,
+      "target": "Line",
+      "anchor": null,
+      "alias": null,
+      "raw": "Line",
+      "line": 1,
+      "span": [
+        15,
+        23
+      ]
+    },
+    {
+      "source_prefix": null,
+      "target": "Doc",
+      "anchor": null,
+      "alias": null,
+      "raw": "Doc",
+      "line": 2,
+      "span": [
+        60,
+        67
+      ]
+    }
+  ],
+  "markdown_links": [],
+  "tags": [],
+  "blocks": [],
+  "paragraphs": [],
+  "diagnostics": []
+}

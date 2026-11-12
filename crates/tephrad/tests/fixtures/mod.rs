@@ -80,10 +80,10 @@ pub fn vault_fixture() -> TempSource {
 /// are also populated, each with a `.md` file that must never reach
 /// the parser (G2). `Cargo.toml` and `src/main.rs` are real,
 /// non-ignored source files a code repository would contain: each
-/// becomes a `code` unit (G2), but only `README.md` is parsed, so a
-/// code-repo source never ends up with a false wikilink parsed out of
-/// `Cargo.toml`'s `[[bin]]` table or a false tag out of a `main.rs`
-/// comment.
+/// becomes a `code` unit (G2). Code is parsed for links in comments
+/// only (G4), so a code-repo source never ends up with a false
+/// wikilink parsed out of `Cargo.toml`'s `[[bin]]` table, and never a
+/// tag out of a `main.rs` comment (code has no tags).
 pub fn repo_fixture() -> TempSource {
     let dir = tempfile::tempdir().expect("tempdir");
     let src = TempSource { dir };
@@ -144,6 +144,12 @@ pub const KINDS_EXPECTED: [(&str, &str); 17] = [
     ("Notes.MD", "prose"),
 ];
 
+/// The links the code files of [`kinds_fixture`] give, by path (G4):
+/// `src/main.rs` has one `[[Target]]` in a comment. `Cargo.toml`'s
+/// `[[bin]]` table and `bin/run`'s `'[[Target]] #tag'` string literal
+/// give none, and no code file ever gives a tag or a block.
+pub const KINDS_CODE_LINKS: [(&str, i64); 1] = [("src/main.rs", 1)];
+
 /// Paths [`kinds_fixture`] writes that must never become units.
 pub const KINDS_IGNORED: [&str; 6] = [
     ".venv/lib/site.py",
@@ -156,9 +162,10 @@ pub const KINDS_IGNORED: [&str; 6] = [
 
 /// One file of every kind plus ignored files (G2/G15). Only prose
 /// files (`notes/one.md`, `Notes.MD` and the two `.txt` files) are
-/// parsed (G3); every other file carries text that *looks* like a
-/// wikilink, tag and block ID, so any accidental parse shows up as a
-/// stray row.
+/// parsed in full (G3), and code files for comment links only (G4,
+/// see [`KINDS_CODE_LINKS`]); every other file carries text that
+/// *looks* like a wikilink, tag and block ID, so any accidental parse
+/// shows up as a stray row.
 pub fn kinds_fixture() -> TempSource {
     let dir = tempfile::tempdir().expect("tempdir");
     let src = TempSource { dir };
@@ -207,9 +214,10 @@ pub fn kinds_fixture() -> TempSource {
 
 /// G3: one prose file of every format (extensions in mixed case, a
 /// non-ASCII path, a UTF-16 file with a BOM), a duplicated `^id`, a
-/// native literal region and native link syntax, plus files that must
-/// give no rows (`.py`, `.rs`, `.pdf`, `.png`, `.json`, and a `.txt`
-/// and `.org` with a NUL byte). See [`PROSE_EXPECTED`].
+/// native literal region and native link syntax, plus two code files
+/// that give only their comment link ([`CODE_EXPECTED`]) and files that
+/// must give no rows (`.pdf`, `.png`, `.json`, and a `.txt` and `.org`
+/// with a NUL byte). See [`PROSE_EXPECTED`].
 pub fn prose_fixture() -> TempSource {
     let dir = tempfile::tempdir().expect("tempdir");
     let src = TempSource { dir };
@@ -245,9 +253,14 @@ pub fn prose_fixture() -> TempSource {
     // E2: a NUL in the first 8 KB makes these `binary`: no rows.
     src.write_bytes("nul.txt", b"[[Nope]] ^x\0\n");
     src.write_bytes("nul.org", b"* Head\0 [[Nope]]\n");
-    // F5/F6: code, documents and binaries give no rows.
-    src.write("main.py", "# [[Nope]] #nope ^x\nx = 1\n");
-    src.write("lib.rs", "// [[Nope]]\n// = Not a heading\nfn f() {}\n");
+    // F5/F6/G4: code gives its comment link and nothing else (no
+    // tag, no `^x` block, no heading); documents and binaries give no
+    // rows. The `"[[Nope]]"` string literal is never a link.
+    src.write("main.py", "# [[Real]] #nope ^x\ns = \"[[Nope]]\"\nx = 1\n");
+    src.write(
+        "lib.rs",
+        "// [[Real]]\n// = Not a heading\nfn f() {}\nconst S: &str = \"[[Nope]]\";\n",
+    );
     src.write_bytes("doc.pdf", b"%PDF-1.4\n\0[[Nope]]\0");
     src.write_bytes(
         "img.png",
@@ -328,16 +341,13 @@ pub const PROSE_EXPECTED: [ProseExpect; 8] = [
     ),
 ];
 
+/// The code files of [`prose_fixture`]: each gives exactly one
+/// `wikilink` row, `Real`, from its comment, and no heading, tag or
+/// block row.
+pub const CODE_EXPECTED: [&str; 2] = ["main.py", "lib.rs"];
+
 /// Files of [`prose_fixture`] that are units but give no rows at all.
-pub const PROSE_NO_ROWS: [&str; 7] = [
-    "nul.txt",
-    "nul.org",
-    "main.py",
-    "lib.rs",
-    "doc.pdf",
-    "img.png",
-    "data.json",
-];
+pub const PROSE_NO_ROWS: [&str; 5] = ["nul.txt", "nul.org", "doc.pdf", "img.png", "data.json"];
 
 /// Every file under `root` as `rel_path -> (bytes, mtime)`: the F4
 /// snapshot ("indexing prose never writes").

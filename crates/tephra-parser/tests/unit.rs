@@ -5,6 +5,12 @@
 
 #[path = "unit/blocks.rs"]
 mod blocks;
+#[path = "unit/code_comments.rs"]
+mod code_comments;
+#[path = "unit/code_languages.rs"]
+mod code_languages;
+#[path = "unit/code_robustness.rs"]
+mod code_robustness;
 #[path = "unit/determinism.rs"]
 mod determinism;
 #[path = "unit/frontmatter.rs"]
