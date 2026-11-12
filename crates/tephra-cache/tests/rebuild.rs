@@ -90,8 +90,8 @@ fn injected_failure_mid_rebuild_leaves_every_v2_table_and_row_intact() {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO symbols (unit_id, kind, name, parent, start_line, end_line) \
-             VALUES (?1, 'fn', 'main', NULL, 1, 9)",
+            "INSERT INTO symbols (unit_id, kind, name, parent, line, start_line, end_line) \
+             VALUES (?1, 'fn', 'main', NULL, 1, 1, 9)",
             [unit],
         )
         .unwrap();

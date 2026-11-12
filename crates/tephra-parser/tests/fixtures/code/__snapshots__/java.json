@@ -45,5 +45,15 @@
   "tags": [],
   "blocks": [],
   "paragraphs": [],
+  "symbols": [
+    {
+      "kind": "class",
+      "name": "Sample",
+      "parent": null,
+      "line": 4,
+      "start_line": 3,
+      "end_line": 9
+    }
+  ],
   "diagnostics": []
 }

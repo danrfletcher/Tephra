@@ -33,5 +33,23 @@
   "tags": [],
   "blocks": [],
   "paragraphs": [],
+  "symbols": [
+    {
+      "kind": "key",
+      "name": "name",
+      "parent": null,
+      "line": 2,
+      "start_line": 2,
+      "end_line": 2
+    },
+    {
+      "kind": "key",
+      "name": "list",
+      "parent": null,
+      "line": 3,
+      "start_line": 3,
+      "end_line": 3
+    }
+  ],
   "diagnostics": []
 }

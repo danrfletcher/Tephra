@@ -370,16 +370,21 @@ fn every_non_ignored_file_is_a_unit_with_its_kind_and_only_prose_and_code_have_r
         let (got_kind, links, tags, blocks) = &summary[path];
         assert_eq!(got_kind, kind, "{path}");
         if got_kind != "prose" {
-            // G4: a code unit has its comment links; no other
-            // non-prose unit has links, and none has tags or blocks.
+            // G4/G13: a code unit has its comment links and its `^id`
+            // comment blocks; no other non-prose unit has links or
+            // blocks, and none has tags.
             let code_links = fixtures::KINDS_CODE_LINKS
+                .iter()
+                .find(|(p, _)| *p == path)
+                .map_or(0, |(_, n)| *n);
+            let code_blocks = fixtures::KINDS_CODE_BLOCKS
                 .iter()
                 .find(|(p, _)| *p == path)
                 .map_or(0, |(_, n)| *n);
             assert_eq!(
                 (*links, *tags, *blocks),
-                (code_links, 0, 0),
-                "{path}: a non-prose unit has no tags/blocks, and links only from code comments"
+                (code_links, 0, code_blocks),
+                "{path}: a non-prose unit has no tags, links only from code comments and blocks only from code ID comments"
             );
         }
     }
@@ -487,7 +492,9 @@ fn a_real_scan_of_a_mixed_format_tree_gives_the_expected_rows_and_writes_nothing
             + fixtures::PROSE_NO_ROWS.len()
     );
 
-    // G4: a code file gives its one comment link and no other row.
+    // G4/G13: a code file gives its one comment link, and a block for
+    // each `^id` comment (only `main.py` has one: `# ... ^x` owned by
+    // the assignment below it); no heading or tag.
     for path in fixtures::CODE_EXPECTED {
         let got = fixtures::unit_rows(&cache_path, "prose", path)
             .unwrap_or_else(|| panic!("{path} is not a unit"));
@@ -497,8 +504,13 @@ fn a_real_scan_of_a_mixed_format_tree_gives_the_expected_rows_and_writes_nothing
             vec![("wikilink".to_string(), "Real".to_string())],
             "{path}"
         );
+        let want_blocks: Vec<(Option<String>, i64, i64)> = if path == "main.py" {
+            vec![(Some("x".to_string()), 2, 2)]
+        } else {
+            Vec::new()
+        };
         assert!(
-            got.headings.is_empty() && got.tags.is_empty() && got.blocks.is_empty(),
+            got.headings.is_empty() && got.tags.is_empty() && got.blocks == want_blocks,
             "{path}: {got:?}"
         );
     }
@@ -655,4 +667,165 @@ fn malformed_prose_never_fails_the_scan() {
     assert_eq!(stats.units_written, 8);
     assert!(fixtures::unit_rows(&cache_path, "m", "ok.txt").is_some());
     registry.unregister("m").expect("unregister");
+}
+
+// ------------------------------------------------------------ E8 / G4
+
+fn blocks_with_id_rows(cache_path: &std::path::Path, source: &str, id: &str) -> Vec<(String, i64)> {
+    let cache = Cache::open(cache_path).expect("open cache");
+    let source_id = cache.get_source(source).unwrap().unwrap().id;
+    cache
+        .blocks_with_id(source_id, id)
+        .unwrap()
+        .into_iter()
+        .map(|h| (h.rel_path, h.line))
+        .collect()
+}
+
+#[test]
+fn the_same_id_in_two_files_of_one_source_gives_two_rows_and_a_third_source_is_not_mixed_in() {
+    // E8 through a real scan: `conflict.rs` and `registry_copy.rs` both
+    // carry `// ^k3f9a2` on a symbol; a different source has the same
+    // ID too. `blocks_with_id` for the first source lists exactly its
+    // two files, sorted by path.
+    let body =
+        |name: &str| format!("use std::fmt;\n\n/// Docs.\n// ^k3f9a2\npub enum {name} {{ A }}\n");
+    let repo = fixtures::empty_source();
+    repo.write(
+        "crates/tephrad/src/registry_copy.rs",
+        &body("ConflictReason"),
+    );
+    repo.write("crates/tephrad/src/conflict.rs", &body("ConflictReason"));
+    repo.write(
+        "crates/tephrad/src/unrelated.rs",
+        "// ^other-id\nfn f() {}\n",
+    );
+    let other = fixtures::empty_source();
+    other.write("conflict.rs", &body("ConflictReason"));
+
+    let cache_dir = tempfile::tempdir().expect("cache tempdir");
+    let cache_path = cache_dir.path().join("cache.db");
+    let registry =
+        SourceRegistry::new(Cache::open(&cache_path).expect("open cache")).expect("registry");
+    registry.register("repo", repo.root()).expect("register");
+    registry.register("third", other.root()).expect("register");
+
+    assert_eq!(
+        blocks_with_id_rows(&cache_path, "repo", "k3f9a2"),
+        [
+            ("crates/tephrad/src/conflict.rs".to_string(), 5),
+            ("crates/tephrad/src/registry_copy.rs".to_string(), 5),
+        ]
+    );
+    assert_eq!(
+        blocks_with_id_rows(&cache_path, "third", "k3f9a2"),
+        [("conflict.rs".to_string(), 5)]
+    );
+    assert_eq!(
+        blocks_with_id_rows(&cache_path, "repo", "other-id"),
+        [("crates/tephrad/src/unrelated.rs".to_string(), 2)]
+    );
+
+    // Each block row names its enum symbol.
+    let cache = Cache::open(&cache_path).unwrap();
+    let linked: i64 = cache
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM blocks b JOIN symbols s ON s.id = b.symbol_id \
+             WHERE b.block_id = 'k3f9a2' AND s.name = 'ConflictReason' AND s.kind = 'enum' AND s.line = b.line",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(linked, 3);
+    registry.unregister("repo").unwrap();
+    registry.unregister("third").unwrap();
+}
+
+#[test]
+fn two_ids_the_same_in_one_file_are_two_rows_and_a_rescan_does_not_double_them() {
+    let repo = fixtures::empty_source();
+    repo.write("a.rs", "// ^k3f9a2\nfn one() {}\n// ^k3f9a2\nfn two() {}\n");
+    let cache_dir = tempfile::tempdir().expect("cache tempdir");
+    let cache_path = cache_dir.path().join("cache.db");
+    let registry =
+        SourceRegistry::new(Cache::open(&cache_path).expect("open cache")).expect("registry");
+    registry.register("repo", repo.root()).expect("register");
+    let want = [("a.rs".to_string(), 2), ("a.rs".to_string(), 4)];
+    assert_eq!(blocks_with_id_rows(&cache_path, "repo", "k3f9a2"), want);
+    registry.rescan("repo").expect("rescan");
+    assert_eq!(blocks_with_id_rows(&cache_path, "repo", "k3f9a2"), want);
+    registry.unregister("repo").unwrap();
+}
+
+#[test]
+fn a_language_without_a_grammar_and_a_non_code_kind_get_no_symbols() {
+    // F5: `.rb` and `.kt` are `text-other`, never parsed for symbols.
+    let repo = fixtures::empty_source();
+    repo.write("a.rb", "def hello\n  1\nend\n");
+    repo.write("b.kt", "fun main() {}\n");
+    repo.write("notes.md", "# Heading\n\nfn main() {}\n");
+    repo.write("c.rs", "fn real() {}\n");
+    let cache_dir = tempfile::tempdir().expect("cache tempdir");
+    let cache_path = cache_dir.path().join("cache.db");
+    let registry =
+        SourceRegistry::new(Cache::open(&cache_path).expect("open cache")).expect("registry");
+    registry.register("repo", repo.root()).expect("register");
+    let cache = Cache::open(&cache_path).unwrap();
+    let source_id = cache.get_source("repo").unwrap().unwrap().id;
+    for (rel, kind, symbols) in [
+        ("a.rb", "text-other", 0),
+        ("b.kt", "text-other", 0),
+        ("notes.md", "prose", 0),
+        ("c.rs", "code", 1),
+    ] {
+        let unit = cache.get_unit_by_rel_path(source_id, rel).unwrap().unwrap();
+        assert_eq!(unit.kind, kind, "{rel}");
+        assert_eq!(
+            cache.symbols_for_unit(unit.id).unwrap().len(),
+            symbols,
+            "{rel}"
+        );
+    }
+    registry.unregister("repo").unwrap();
+}
+
+#[test]
+fn a_half_written_code_file_never_fails_the_scan_and_keeps_the_symbols_before_the_error() {
+    // E12: an unclosed `{` after `fn walk_and_write` and a Python def
+    // with a broken parameter list. The scan finishes, the other
+    // files are unaffected, and the symbols before the error are
+    // stored.
+    let repo = fixtures::empty_source();
+    repo.write(
+        "broken.rs",
+        "fn before() {}\n\nstruct Mid;\n\nfn walk_and_write() {\n    let x = 1;\n",
+    );
+    repo.write("broken.py", "def ok():\n    pass\n\ndef bad(:\n    pass\n");
+    repo.write("fine.rs", "fn fine() {}\n");
+    let cache_dir = tempfile::tempdir().expect("cache tempdir");
+    let cache_path = cache_dir.path().join("cache.db");
+    let registry =
+        SourceRegistry::new(Cache::open(&cache_path).expect("open cache")).expect("registry");
+    let stats = registry.register("repo", repo.root()).expect("register");
+    assert_eq!(stats.units_written, 3);
+    let cache = Cache::open(&cache_path).unwrap();
+    let source_id = cache.get_source("repo").unwrap().unwrap().id;
+    let names = |rel: &str| -> Vec<String> {
+        let unit = cache.get_unit_by_rel_path(source_id, rel).unwrap().unwrap();
+        cache
+            .symbols_for_unit(unit.id)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.name)
+            .collect()
+    };
+    let rs = names("broken.rs");
+    assert!(
+        rs.contains(&"before".to_string()) && rs.contains(&"Mid".to_string()),
+        "{rs:?}"
+    );
+    assert!(names("broken.py").contains(&"ok".to_string()));
+    assert_eq!(names("fine.rs"), ["fine"]);
+    registry.unregister("repo").unwrap();
 }

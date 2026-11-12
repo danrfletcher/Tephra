@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use tephra_parser::{parse_code_unit, Language, ParsedUnit};
+use tephra_parser::{parse_code_unit, DiagnosticKind, Language, ParsedUnit};
 
 fn parse(lang: Language, src: &str) -> ParsedUnit {
     let name = format!("sample.{}", lang.name());
@@ -171,7 +171,9 @@ fn every_fixture_gives_exactly_its_expected_links_and_lines() {
             unit.wikilinks.iter().all(|w| !w.raw.contains("Decoy")),
             "{dir}/{file}: a decoy leaked"
         );
-        // A code unit records nothing but links.
+        // These fixtures have no `^id` comment, so a code unit here
+        // records links and symbols only: no heading, tag, block or
+        // paragraph.
         assert!(unit.headings.is_empty() && unit.tags.is_empty());
         assert!(unit.blocks.is_empty() && unit.paragraphs.is_empty());
         assert!(unit.frontmatter.is_none());
@@ -331,7 +333,15 @@ fn lua_block_comment_opener_is_not_a_link_and_only_the_inner_link_is_recorded() 
     assert_eq!(wikilinks(&unit), pairs(&[("@notes:A", 1)]));
     assert_eq!(unit.wikilinks[0].source_prefix.as_deref(), Some("notes"));
     assert_eq!(unit.wikilinks[0].target, "A");
-    assert!(unit.diagnostics.is_empty(), "{:?}", unit.diagnostics);
+    // The first `]]` closes the long comment, so the trailing ` ]]` is
+    // real invalid Lua: the only diagnostic is that syntax error (E12).
+    assert!(
+        unit.diagnostics
+            .iter()
+            .all(|d| d.kind == DiagnosticKind::SyntaxErrors),
+        "{:?}",
+        unit.diagnostics
+    );
 
     // The same with a level-1 long bracket, where nesting is legal.
     let unit = parse(Language::Lua, "--[=[ see [[B]] ]=]\n");

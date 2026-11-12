@@ -75,7 +75,7 @@ pub(crate) fn find_ranges(lang: Language, tree: &Tree, src: &str) -> Vec<ByteRan
 /// line as a comment, but the shell would read it as heredoc text,
 /// which is a string and never gives a link. A comment that follows a
 /// `heredoc_body` inside its `heredoc_redirect` can only be that.
-fn is_unterminated_heredoc_text(lang: Language, comment: Node<'_>) -> bool {
+pub(super) fn is_unterminated_heredoc_text(lang: Language, comment: Node<'_>) -> bool {
     if lang != Language::Shell || comment.parent().map(|p| p.kind()) != Some("heredoc_redirect") {
         return false;
     }

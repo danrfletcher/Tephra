@@ -118,13 +118,21 @@ const CREATE_TAGS: &str = "\
 /// line, `end_line` its last) or a bare `^id` occurrence. `block_id`
 /// is NULL for a paragraph with no `^id`. There is no uniqueness on
 /// `(unit_id, block_id)`: every occurrence of an ID is stored.
+///
+/// A block ID in a code file (G13) is attached to the symbol that owns
+/// it: `symbol_id` points at that `symbols` row and `line` is the
+/// symbol's first line. An ID comment with no symbol to own it is a
+/// block on its own line with `symbol_id` NULL. Prose rows have no
+/// symbol. `blocks` references `symbols`, so `symbols` is created
+/// first and dropped last of the two.
 const CREATE_BLOCKS: &str = "\
     CREATE TABLE blocks (\
         id INTEGER PRIMARY KEY AUTOINCREMENT, \
         unit_id INTEGER NOT NULL REFERENCES units(id), \
         block_id TEXT, \
         line INTEGER NOT NULL, \
-        end_line INTEGER \
+        end_line INTEGER, \
+        symbol_id INTEGER REFERENCES symbols(id) \
     )";
 
 const CREATE_HEADINGS: &str = "\
@@ -136,6 +144,14 @@ const CREATE_HEADINGS: &str = "\
         line INTEGER NOT NULL \
     )";
 
+/// One row per symbol of a `code` unit (G4): `kind`, `name`, the
+/// enclosing symbol's name (`parent`, NULL at the top level), the
+/// definition's first line (`line`, the line that carries a block ID)
+/// and the symbol's whole line range `start_line..=end_line`, which
+/// also takes in the attributes, decorators and doc comments directly
+/// above the definition (so `start_line <= line <= end_line`). All
+/// lines are 1-based. There is no uniqueness on `(unit_id, name)`: an
+/// `enum X` and an `impl X`, or overloaded methods, each keep a row.
 const CREATE_SYMBOLS: &str = "\
     CREATE TABLE symbols (\
         id INTEGER PRIMARY KEY AUTOINCREMENT, \
@@ -143,6 +159,7 @@ const CREATE_SYMBOLS: &str = "\
         kind TEXT NOT NULL, \
         name TEXT NOT NULL, \
         parent TEXT, \
+        line INTEGER NOT NULL, \
         start_line INTEGER NOT NULL, \
         end_line INTEGER NOT NULL \
     )";
@@ -197,6 +214,9 @@ const CREATE_IDX_HEADINGS_UNIT_ID: &str =
     "CREATE INDEX IF NOT EXISTS idx_headings_unit_id ON headings(unit_id)";
 const CREATE_IDX_SYMBOLS_UNIT_ID: &str =
     "CREATE INDEX IF NOT EXISTS idx_symbols_unit_id ON symbols(unit_id)";
+/// Backs `blocks_with_id` (E8): every occurrence of one block ID.
+const CREATE_IDX_BLOCKS_BLOCK_ID: &str =
+    "CREATE INDEX IF NOT EXISTS idx_blocks_block_id ON blocks(block_id)";
 
 /// Creates (or confirms, if already present) every index in this
 /// module. Idempotent: safe to call on every open, whether or not the
@@ -208,6 +228,7 @@ pub(crate) fn create_core_indexes(conn: &Connection) -> Result<(), CacheError> {
     conn.execute(CREATE_IDX_BLOCKS_UNIT_ID, [])?;
     conn.execute(CREATE_IDX_HEADINGS_UNIT_ID, [])?;
     conn.execute(CREATE_IDX_SYMBOLS_UNIT_ID, [])?;
+    conn.execute(CREATE_IDX_BLOCKS_BLOCK_ID, [])?;
     Ok(())
 }
 
@@ -237,9 +258,9 @@ fn core_table_ddls_if_not_exists() -> [String; 7] {
         CREATE_UNITS.replacen("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1),
         CREATE_LINKS.replacen("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1),
         CREATE_TAGS.replacen("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1),
+        CREATE_SYMBOLS.replacen("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1),
         CREATE_BLOCKS.replacen("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1),
         CREATE_HEADINGS.replacen("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1),
-        CREATE_SYMBOLS.replacen("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1),
         CREATE_BLOCK_FTS.replacen(
             "CREATE VIRTUAL TABLE",
             "CREATE VIRTUAL TABLE IF NOT EXISTS",
@@ -253,9 +274,10 @@ fn core_table_ddls_if_not_exists() -> [String; 7] {
 /// Never touches `sources`, `schema_version` or `scan_state`.
 pub(crate) fn drop_core_tables(conn: &Connection) -> Result<(), CacheError> {
     conn.execute("DROP TABLE IF EXISTS block_fts", [])?;
+    // `blocks` references `symbols`: drop the referencing table first.
+    conn.execute("DROP TABLE IF EXISTS blocks", [])?;
     conn.execute("DROP TABLE IF EXISTS symbols", [])?;
     conn.execute("DROP TABLE IF EXISTS headings", [])?;
-    conn.execute("DROP TABLE IF EXISTS blocks", [])?;
     conn.execute("DROP TABLE IF EXISTS tags", [])?;
     conn.execute("DROP TABLE IF EXISTS links", [])?;
     conn.execute("DROP TABLE IF EXISTS units", [])?;
@@ -269,9 +291,9 @@ pub(crate) fn create_core_tables(conn: &Connection) -> Result<(), CacheError> {
     conn.execute(CREATE_UNITS, [])?;
     conn.execute(CREATE_LINKS, [])?;
     conn.execute(CREATE_TAGS, [])?;
+    conn.execute(CREATE_SYMBOLS, [])?;
     conn.execute(CREATE_BLOCKS, [])?;
     conn.execute(CREATE_HEADINGS, [])?;
-    conn.execute(CREATE_SYMBOLS, [])?;
     conn.execute(CREATE_BLOCK_FTS, [])?;
     create_core_indexes(conn)?;
     Ok(())
@@ -381,16 +403,26 @@ fn table_has_columns(conn: &Connection, table: &str, columns: &[&str]) -> Result
     Ok(columns.iter().all(|c| existing.contains(*c)))
 }
 
+/// Whether `table` exists and has no column named `column`. `false`
+/// for a table that does not exist at all (the matching-version
+/// `CREATE ... IF NOT EXISTS` makes it).
+fn table_lacks_column(conn: &Connection, table: &str, column: &str) -> Result<bool, CacheError> {
+    let sql = format!("PRAGMA table_info({table})");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    let mut any = false;
+    while let Some(row) = rows.next()? {
+        any = true;
+        if row.get::<_, String>(1)? == column {
+            return Ok(false);
+        }
+    }
+    Ok(any)
+}
+
 /// Whether the existing `blocks.block_id` column is declared
-/// `NOT NULL`. The first build of schema v2 declared it so; G3 made it
-/// nullable (a paragraph with no `^id` is a row with a NULL
-/// `block_id`). SQLite can't relax a constraint in place, and the
-/// version number did not change, so [`crate::cache`]'s open path uses
-/// this to spot a cache file written by that first v2 build and sends
-/// it through the one rebuild path. `false` if the table or column is
-/// missing (the matching-version `CREATE ... IF NOT EXISTS` then makes
-/// it).
-pub(crate) fn blocks_block_id_is_not_null(conn: &Connection) -> Result<bool, CacheError> {
+/// `NOT NULL`. `false` if the table or column is missing.
+fn blocks_block_id_is_not_null(conn: &Connection) -> Result<bool, CacheError> {
     let mut stmt = conn.prepare("PRAGMA table_info(blocks)")?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
@@ -401,6 +433,29 @@ pub(crate) fn blocks_block_id_is_not_null(conn: &Connection) -> Result<bool, Cac
         }
     }
     Ok(false)
+}
+
+/// Whether a cache file at the *current* `schema_version` was written
+/// by an earlier build of that version, whose core tables had a shape
+/// the current one does not. SQLite can't relax or add a constrained
+/// column in place and the version number did not change, so
+/// [`crate::cache`]'s open path uses this to send such a file through
+/// the one rebuild path, as a version mismatch is. Two earlier shapes
+/// are recognised:
+///
+/// - the first build of v2 declared `blocks.block_id` `NOT NULL`,
+///   where a paragraph with no `^id` is a row with a NULL `block_id`
+///   (G3);
+/// - the build before code symbols (G4) had no `symbols.line` (the
+///   definition's first line) and no `blocks.symbol_id` (the symbol
+///   that owns a code block ID, G13).
+///
+/// A missing table is not stale (the matching-version `CREATE ... IF
+/// NOT EXISTS` makes it).
+pub(crate) fn core_shape_is_stale(conn: &Connection) -> Result<bool, CacheError> {
+    Ok(blocks_block_id_is_not_null(conn)?
+        || table_lacks_column(conn, "symbols", "line")?
+        || table_lacks_column(conn, "blocks", "symbol_id")?)
 }
 
 /// Gate for [`snapshot_offline_rows`]: `true` only if the *current*
@@ -490,6 +545,7 @@ pub(crate) fn snapshot_offline_rows(conn: &Connection) -> Result<OfflineRows, Ca
             block_id: row.get(2)?,
             line: row.get(3)?,
             end_line: None,
+            symbol_id: None,
         });
     }
 

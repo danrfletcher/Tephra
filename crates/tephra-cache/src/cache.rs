@@ -11,8 +11,8 @@ use rusqlite::Connection;
 use crate::schema::{self, KindInferrer};
 use crate::sources::{self, SourceRow, SourceStatus};
 use crate::units::{
-    self, BlockRow, HeadingRow, LinkRow, NewBlock, NewHeading, NewLink, NewTag, NewUnit, TagRow,
-    UnitRow, UnitWithSourceStatus,
+    self, BlockOccurrence, BlockRow, HeadingRow, LinkRow, NewBlock, NewHeading, NewLink, NewSymbol,
+    NewTag, NewUnit, SymbolRow, TagRow, UnitRow, UnitWithSourceStatus,
 };
 use crate::{CacheError, CURRENT_SCHEMA_VERSION};
 
@@ -382,6 +382,12 @@ impl Cache {
         units::insert_heading(&self.conn, new)
     }
 
+    /// Inserts one code symbol and returns its row id, which a
+    /// `blocks` row can then name as its `symbol_id`.
+    pub fn insert_symbol(&self, new: &NewSymbol) -> Result<i64, CacheError> {
+        units::insert_symbol(&self.conn, new)
+    }
+
     pub fn get_unit(&self, id: i64) -> Result<Option<UnitRow>, CacheError> {
         units::get_unit(&self.conn, id)
     }
@@ -486,6 +492,24 @@ impl Cache {
     /// Every `headings` row belonging to `unit_id`, in file order.
     pub fn headings_for_unit(&self, unit_id: i64) -> Result<Vec<HeadingRow>, CacheError> {
         units::headings_for_unit(&self.conn, unit_id)
+    }
+
+    /// Every `symbols` row belonging to `unit_id`, in file order.
+    pub fn symbols_for_unit(&self, unit_id: i64) -> Result<Vec<SymbolRow>, CacheError> {
+        units::symbols_for_unit(&self.conn, unit_id)
+    }
+
+    /// Every occurrence of the block ID `block_id` in the files of
+    /// `source_id`, sorted by path then line, each with its unit and
+    /// line (E8). The same ID in two files gives two entries, and an ID
+    /// of another source is never returned. This is what the ambiguity
+    /// error for a moved ID (G13) is built from.
+    pub fn blocks_with_id(
+        &self,
+        source_id: i64,
+        block_id: &str,
+    ) -> Result<Vec<BlockOccurrence>, CacheError> {
+        units::blocks_with_id(&self.conn, source_id, block_id)
     }
 
     /// Every `links` row authored by `from_unit_id`. Read counterpart
@@ -617,12 +641,12 @@ fn ensure_schema(
             schema::create_core_tables_if_not_exists(conn)?;
             schema::write_schema_version(conn, CURRENT_SCHEMA_VERSION)?;
         }
-        Some(v) if v == CURRENT_SCHEMA_VERSION && !schema::blocks_block_id_is_not_null(conn)? => {
-            // Version matches (and this is not a file from the first
-            // v2 build, which declared `blocks.block_id` NOT NULL
-            // where the current v2 allows NULL for a paragraph with
-            // no `^id`: that one falls through to the rebuild arm
-            // below, same as a version mismatch). Proceed without
+        Some(v) if v == CURRENT_SCHEMA_VERSION && !schema::core_shape_is_stale(conn)? => {
+            // Version matches (and this is not a file from an earlier
+            // build of v2 whose core tables had another shape, see
+            // `schema::core_shape_is_stale`: that one falls through to
+            // the rebuild arm below, same as a version mismatch).
+            // Proceed without
             // touching existing tables' data. `IF NOT EXISTS` here is purely defensive
             // against a prior partial failure; against a healthy
             // database it is a guaranteed no-op.

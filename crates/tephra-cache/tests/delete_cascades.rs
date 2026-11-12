@@ -339,3 +339,51 @@ fn delete_unit_removes_the_units_headings_too() {
         "the other unit's heading survives"
     );
 }
+
+#[test]
+fn delete_unit_removes_the_units_symbols_and_the_blocks_that_name_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = open_temp_cache(&dir);
+    let seeded = seed_source_with_units(&cache, "repo", "/repo", SourceStatus::Active);
+    let unit_id = seeded.unit_ids[0];
+    let other = seeded.unit_ids[1];
+    for unit in [unit_id, other] {
+        let symbol_id = cache
+            .insert_symbol(&tephra_cache::NewSymbol {
+                unit_id: unit,
+                kind: "function",
+                name: "f",
+                parent: None,
+                line: 2,
+                start_line: 1,
+                end_line: 3,
+            })
+            .unwrap();
+        cache
+            .insert_block(&tephra_cache::NewBlock {
+                unit_id: unit,
+                block_id: Some("k3f9a2"),
+                line: 2,
+                end_line: Some(3),
+                symbol_id: Some(symbol_id),
+            })
+            .unwrap();
+    }
+
+    cache.delete_unit(unit_id).expect("delete_unit");
+
+    let count = |table: &str, unit: i64| -> i64 {
+        cache
+            .connection()
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE unit_id = ?1"),
+                [unit],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(count("symbols", unit_id), 0, "no orphaned symbol rows");
+    assert_eq!(count("blocks", unit_id), 0);
+    assert_eq!(count("symbols", other), 1);
+    assert_eq!(count("blocks", other), 2, "seeded block plus the code one");
+}

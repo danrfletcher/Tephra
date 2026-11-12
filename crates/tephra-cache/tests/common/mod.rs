@@ -72,6 +72,7 @@ pub fn seed_source_with_units(
                 unit_id,
                 block_id: Some("abcd1234"),
                 line: 1,
+                symbol_id: None,
             })
             .expect("insert_block");
 

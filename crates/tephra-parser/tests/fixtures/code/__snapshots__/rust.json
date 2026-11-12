@@ -45,5 +45,31 @@
   "tags": [],
   "blocks": [],
   "paragraphs": [],
+  "symbols": [
+    {
+      "kind": "function",
+      "name": "f",
+      "parent": null,
+      "line": 4,
+      "start_line": 3,
+      "end_line": 4
+    },
+    {
+      "kind": "const",
+      "name": "S",
+      "parent": null,
+      "line": 5,
+      "start_line": 5,
+      "end_line": 5
+    },
+    {
+      "kind": "const",
+      "name": "R",
+      "parent": null,
+      "line": 6,
+      "start_line": 6,
+      "end_line": 6
+    }
+  ],
   "diagnostics": []
 }

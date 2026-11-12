@@ -33,6 +33,12 @@ pub enum DiagnosticKind {
     /// A code file's grammar produced no syntax tree at all, so the
     /// unit carries no links (E12).
     ParseFailed,
+    /// A code file has syntax errors. The tree-sitter parse recovered
+    /// what it could, so the symbols and links around the error are
+    /// still recorded, but the symbol list may be missing the
+    /// definition that contains the error (E12). The line is the first
+    /// error.
+    SyntaxErrors,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

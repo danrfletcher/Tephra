@@ -1,0 +1,15 @@
+# manifest
+name = "tephra"
+version = "0.1"
+
+[package]
+edition = "2021"
+
+[dependencies.serde]
+version = "1"
+
+[[bin]]
+name = "tephrad"
+
+[[bin]]
+name = "tephractl"

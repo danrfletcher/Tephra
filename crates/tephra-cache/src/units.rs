@@ -106,6 +106,10 @@ pub struct BlockRow {
     pub line: i64,
     /// Last line of the block, when known.
     pub end_line: Option<i64>,
+    /// The `symbols` row that owns this block ID (G13), for a block ID
+    /// in a code file. `None` for a prose block, and for a code ID
+    /// comment that has no symbol to own it.
+    pub symbol_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -115,6 +119,58 @@ pub struct NewBlock<'a> {
     pub block_id: Option<&'a str>,
     pub line: i64,
     pub end_line: Option<i64>,
+    /// The owning `symbols` row (a code block ID, G13); `None` for a
+    /// prose block or an ID comment with no symbol. Must be a row that
+    /// already exists (foreign key), so a caller inserts the unit's
+    /// symbols first.
+    pub symbol_id: Option<i64>,
+}
+
+/// One `blocks` row with the unit it belongs to: one occurrence of a
+/// block ID, as [`crate::Cache::blocks_with_id`] returns it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockOccurrence {
+    pub block_id: String,
+    pub unit_id: i64,
+    /// The unit's path relative to its source root.
+    pub rel_path: String,
+    /// 1-based line the block is stored on (a symbol's first line, for
+    /// a code symbol).
+    pub line: i64,
+    pub end_line: Option<i64>,
+    pub symbol_id: Option<i64>,
+}
+
+/// One `symbols` row read back: see [`NewSymbol`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolRow {
+    pub id: i64,
+    pub unit_id: i64,
+    pub kind: String,
+    pub name: String,
+    pub parent: Option<String>,
+    /// The definition's first line (the line that carries a block ID).
+    pub line: i64,
+    /// First line of the symbol's range, which takes in the
+    /// attributes, decorators and doc comments directly above it.
+    pub start_line: i64,
+    /// Last line of the symbol's range.
+    pub end_line: i64,
+}
+
+/// One `symbols` row to insert: a function, class, struct, enum,
+/// trait, interface, impl, mod, method or top-level variable, const,
+/// static or key of a code unit (G4). Lines are 1-based.
+#[derive(Debug, Clone, Copy)]
+pub struct NewSymbol<'a> {
+    pub unit_id: i64,
+    pub kind: &'a str,
+    pub name: &'a str,
+    /// The enclosing symbol's name; `None` at the top level.
+    pub parent: Option<&'a str>,
+    pub line: i64,
+    pub start_line: i64,
+    pub end_line: i64,
 }
 
 /// One `headings` row read back: see [`NewHeading`].
@@ -183,8 +239,32 @@ pub(crate) fn insert_tag(conn: &Connection, new: &NewTag) -> Result<i64, CacheEr
 
 pub(crate) fn insert_block(conn: &Connection, new: &NewBlock) -> Result<i64, CacheError> {
     conn.execute(
-        "INSERT INTO blocks (unit_id, block_id, line, end_line) VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![new.unit_id, new.block_id, new.line, new.end_line],
+        "INSERT INTO blocks (unit_id, block_id, line, end_line, symbol_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![
+            new.unit_id,
+            new.block_id,
+            new.line,
+            new.end_line,
+            new.symbol_id
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub(crate) fn insert_symbol(conn: &Connection, new: &NewSymbol) -> Result<i64, CacheError> {
+    conn.execute(
+        "INSERT INTO symbols (unit_id, kind, name, parent, line, start_line, end_line) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            new.unit_id,
+            new.kind,
+            new.name,
+            new.parent,
+            new.line,
+            new.start_line,
+            new.end_line
+        ],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -418,7 +498,8 @@ pub(crate) fn blocks_for_unit(
     unit_id: i64,
 ) -> Result<Vec<BlockRow>, CacheError> {
     let mut stmt = conn.prepare(
-        "SELECT id, unit_id, block_id, line, end_line FROM blocks WHERE unit_id = ?1 ORDER BY id",
+        "SELECT id, unit_id, block_id, line, end_line, symbol_id \
+         FROM blocks WHERE unit_id = ?1 ORDER BY id",
     )?;
     let mut rows = stmt.query([unit_id])?;
     let mut out = Vec::new();
@@ -429,6 +510,65 @@ pub(crate) fn blocks_for_unit(
             block_id: row.get(2)?,
             line: row.get(3)?,
             end_line: row.get(4)?,
+            symbol_id: row.get(5)?,
+        });
+    }
+    Ok(out)
+}
+
+/// Every `symbols` row belonging to `unit_id`, in file order (first
+/// line, then insertion). Read counterpart to [`insert_symbol`].
+pub(crate) fn symbols_for_unit(
+    conn: &Connection,
+    unit_id: i64,
+) -> Result<Vec<SymbolRow>, CacheError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, unit_id, kind, name, parent, line, start_line, end_line \
+         FROM symbols WHERE unit_id = ?1 ORDER BY line, id",
+    )?;
+    let mut rows = stmt.query([unit_id])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(SymbolRow {
+            id: row.get(0)?,
+            unit_id: row.get(1)?,
+            kind: row.get(2)?,
+            name: row.get(3)?,
+            parent: row.get(4)?,
+            line: row.get(5)?,
+            start_line: row.get(6)?,
+            end_line: row.get(7)?,
+        });
+    }
+    Ok(out)
+}
+
+/// Every occurrence of `block_id` in the units of `source_id`, sorted
+/// by path, then line (E8). One `blocks` row is one occurrence, so the
+/// same ID in two files (or twice in one) gives that many entries.
+/// Scoped to the one source: the same ID in another source's files is
+/// never returned. Matches the ID exactly (case-sensitive).
+pub(crate) fn blocks_with_id(
+    conn: &Connection,
+    source_id: i64,
+    block_id: &str,
+) -> Result<Vec<BlockOccurrence>, CacheError> {
+    let mut stmt = conn.prepare(
+        "SELECT b.block_id, b.unit_id, u.rel_path, b.line, b.end_line, b.symbol_id \
+         FROM blocks b JOIN units u ON u.id = b.unit_id \
+         WHERE u.source_id = ?1 AND b.block_id = ?2 \
+         ORDER BY u.rel_path, b.line, b.id",
+    )?;
+    let mut rows = stmt.query(rusqlite::params![source_id, block_id])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(BlockOccurrence {
+            block_id: row.get(0)?,
+            unit_id: row.get(1)?,
+            rel_path: row.get(2)?,
+            line: row.get(3)?,
+            end_line: row.get(4)?,
+            symbol_id: row.get(5)?,
         });
     }
     Ok(out)

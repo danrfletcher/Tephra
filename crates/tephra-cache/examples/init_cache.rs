@@ -76,6 +76,7 @@ fn main() {
                 unit_id,
                 block_id: Some("demo-block"),
                 line: 1,
+                symbol_id: None,
             })
             .expect("insert_block");
         cache

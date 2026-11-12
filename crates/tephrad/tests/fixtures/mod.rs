@@ -83,7 +83,8 @@ pub fn vault_fixture() -> TempSource {
 /// becomes a `code` unit (G2). Code is parsed for links in comments
 /// only (G4), so a code-repo source never ends up with a false
 /// wikilink parsed out of `Cargo.toml`'s `[[bin]]` table, and never a
-/// tag out of a `main.rs` comment (code has no tags).
+/// tag out of a `main.rs` comment (code has no tags). It does have
+/// symbols (G4) and `^id` blocks (G13).
 pub fn repo_fixture() -> TempSource {
     let dir = tempfile::tempdir().expect("tempdir");
     let src = TempSource { dir };
@@ -147,8 +148,15 @@ pub const KINDS_EXPECTED: [(&str, &str); 17] = [
 /// The links the code files of [`kinds_fixture`] give, by path (G4):
 /// `src/main.rs` has one `[[Target]]` in a comment. `Cargo.toml`'s
 /// `[[bin]]` table and `bin/run`'s `'[[Target]] #tag'` string literal
-/// give none, and no code file ever gives a tag or a block.
+/// give none, and no code file ever gives a tag.
 pub const KINDS_CODE_LINKS: [(&str, i64); 1] = [("src/main.rs", 1)];
+
+/// The `blocks` rows the code files of [`kinds_fixture`] give, by path
+/// (G13): the `^blk123` that ends `src/main.rs`'s first comment line
+/// is a block (owned by `fn main`, stored on its line). No other code
+/// file has an ID comment; the `^blk123` in a prose or text file is
+/// not a code block.
+pub const KINDS_CODE_BLOCKS: [(&str, i64); 1] = [("src/main.rs", 1)];
 
 /// Paths [`kinds_fixture`] writes that must never become units.
 pub const KINDS_IGNORED: [&str; 6] = [
@@ -253,9 +261,9 @@ pub fn prose_fixture() -> TempSource {
     // E2: a NUL in the first 8 KB makes these `binary`: no rows.
     src.write_bytes("nul.txt", b"[[Nope]] ^x\0\n");
     src.write_bytes("nul.org", b"* Head\0 [[Nope]]\n");
-    // F5/F6/G4: code gives its comment link and nothing else (no
-    // tag, no `^x` block, no heading); documents and binaries give no
-    // rows. The `"[[Nope]]"` string literal is never a link.
+    // F5/F6/G4/G13: code gives its comment link, its symbols and the
+    // `^x` ID comment as a block, and no tag or heading; documents
+    // and binaries give no rows. The `"[[Nope]]"` string literal is never a link.
     src.write("main.py", "# [[Real]] #nope ^x\ns = \"[[Nope]]\"\nx = 1\n");
     src.write(
         "lib.rs",

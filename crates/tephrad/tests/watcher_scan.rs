@@ -821,15 +821,24 @@ fn the_watcher_path_classifies_every_kind_like_the_full_scan_and_flips_a_changed
 
     for (path, (kind, links, tags, blocks)) in &via_scan {
         if kind != "prose" {
-            // G4: only code comments give a non-prose unit a link.
+            // G4/G13: only code comments give a non-prose unit a link
+            // or a block.
             let code_links = fixtures::KINDS_CODE_LINKS
                 .iter()
                 .find(|(p, _)| *p == path)
                 .map_or(0, |(_, n)| *n);
-            assert_eq!((*links, *tags, *blocks), (code_links, 0, 0), "{path}");
+            let code_blocks = fixtures::KINDS_CODE_BLOCKS
+                .iter()
+                .find(|(p, _)| *p == path)
+                .map_or(0, |(_, n)| *n);
+            assert_eq!(
+                (*links, *tags, *blocks),
+                (code_links, 0, code_blocks),
+                "{path}"
+            );
         }
     }
-    assert_eq!(via_scan["src/main.rs"], ("code".into(), 1, 0, 0));
+    assert_eq!(via_scan["src/main.rs"], ("code".into(), 1, 0, 1));
     for ignored in fixtures::KINDS_IGNORED {
         assert!(!via_scan.contains_key(ignored), "{ignored}");
     }
@@ -1015,4 +1024,117 @@ fn a_txt_that_gains_a_nul_byte_through_the_watcher_loses_its_rows() {
     let r = fixtures::unit_rows(&cache_path, "n", "n.txt").unwrap();
     assert_eq!((r.links.len(), r.blocks.len(), r.headings.len()), (0, 0, 0));
     registry.unregister("n").expect("unregister");
+}
+
+/// `(kind, name, line)` of every symbol of one unit, in file order.
+fn symbols_in_cache(
+    cache_path: &std::path::Path,
+    source: &str,
+    rel: &str,
+) -> Option<Vec<(String, String, i64)>> {
+    let cache = Cache::open(cache_path).expect("reopen cache");
+    let source_id = cache.get_source(source).unwrap()?.id;
+    let unit = cache.get_unit_by_rel_path(source_id, rel).unwrap()?;
+    Some(
+        cache
+            .symbols_for_unit(unit.id)
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.kind, s.name, s.line))
+            .collect(),
+    )
+}
+
+fn count_rows(cache_path: &std::path::Path, sql: &str) -> i64 {
+    let cache = Cache::open(cache_path).expect("reopen cache");
+    let n = cache.connection().query_row(sql, [], |r| r.get(0)).unwrap();
+    n
+}
+
+#[test]
+fn editing_and_deleting_a_rs_file_through_the_watcher_replaces_then_removes_its_symbols() {
+    // G4 / E7: the real watcher over a temp source. An edit replaces
+    // the unit's symbol rows and block rows (no leftovers), a delete
+    // removes them, and nothing is orphaned.
+    let fixture = fixtures::empty_source();
+    fixture.write(
+        "src/lib.rs",
+        "// ^k3f9a2\nfn old_one() {}\n\nstruct OldTwo;\n",
+    );
+    fixture.write("src/other.rs", "fn other() {}\n");
+    let cache_dir = tempfile::tempdir().expect("cache tempdir");
+    let cache_path = cache_dir.path().join("cache.db");
+    let registry =
+        SourceRegistry::new(Cache::open(&cache_path).expect("open cache")).expect("registry");
+    registry.register("repo", fixture.root()).expect("register");
+    let symbols = |rel: &str| symbols_in_cache(&cache_path, "repo", rel);
+    let names = |rel: &str| {
+        symbols(rel)
+            .map(|v| v.into_iter().map(|(_, n, _)| n).collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+
+    assert_eq!(names("src/lib.rs"), ["old_one", "OldTwo"]);
+    let rows = fixtures::unit_rows(&cache_path, "repo", "src/lib.rs").unwrap();
+    assert_eq!(rows.blocks, [(Some("k3f9a2".to_string()), 2, 2)]);
+    let before = fixtures::tree_snapshot(fixture.root());
+
+    // Edit: different symbols, the ID moves to another symbol.
+    fixture.write(
+        "src/lib.rs",
+        "fn new_one() {}\n\n/// Docs.\n// ^m4n5o6\npub enum NewTwo { A }\n",
+    );
+    let settled = wait_until(Duration::from_secs(20), || {
+        names("src/lib.rs") == ["new_one", "NewTwo"]
+    });
+    assert!(
+        settled,
+        "symbols never updated: {:?}",
+        symbols("src/lib.rs")
+    );
+    assert_eq!(
+        symbols("src/lib.rs").unwrap(),
+        [
+            ("function".to_string(), "new_one".to_string(), 1),
+            ("enum".to_string(), "NewTwo".to_string(), 5),
+        ]
+    );
+    let rows = fixtures::unit_rows(&cache_path, "repo", "src/lib.rs").unwrap();
+    assert_eq!(
+        rows.blocks,
+        [(Some("m4n5o6".to_string()), 5, 5)],
+        "the old ID's block is gone, not accumulated"
+    );
+    assert_eq!(names("src/other.rs"), ["other"], "other units untouched");
+    assert_eq!(
+        count_rows(&cache_path, "SELECT COUNT(*) FROM symbols"),
+        3,
+        "exactly the new rows: no leftovers from the old parse"
+    );
+
+    // Delete: the rows go with the unit.
+    fixture.remove("src/lib.rs");
+    let gone = wait_until(Duration::from_secs(20), || symbols("src/lib.rs").is_none());
+    assert!(gone, "unit never removed");
+    assert_eq!(count_rows(&cache_path, "SELECT COUNT(*) FROM symbols"), 1);
+    for sql in [
+        "SELECT COUNT(*) FROM symbols WHERE unit_id NOT IN (SELECT id FROM units)",
+        "SELECT COUNT(*) FROM blocks WHERE unit_id NOT IN (SELECT id FROM units)",
+        "SELECT COUNT(*) FROM blocks WHERE symbol_id IS NOT NULL AND symbol_id NOT IN (SELECT id FROM symbols)",
+    ] {
+        assert_eq!(count_rows(&cache_path, sql), 0, "{sql}");
+    }
+
+    // F4: indexing wrote nothing but the test's own edits.
+    let after = fixtures::tree_snapshot(fixture.root());
+    let changed: std::collections::BTreeSet<&String> = before
+        .keys()
+        .chain(after.keys())
+        .filter(|k| before.get(*k) != after.get(*k))
+        .collect();
+    assert_eq!(
+        changed.into_iter().cloned().collect::<Vec<_>>(),
+        ["src/lib.rs".to_string()]
+    );
+    registry.unregister("repo").expect("unregister");
 }

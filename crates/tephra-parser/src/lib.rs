@@ -17,8 +17,9 @@
 //! file in one of the 14 bundled tree-sitter grammars ([`Language`])
 //! and reads `[[wikilinks]]` and `[text](target)` links only inside
 //! comments and docstrings, through the same wikilink and Markdown
-//! scanners. It records no headings, tags, blocks or symbols. See the
-//! [`code`] module.
+//! scanners. It also records the file's symbols (G4) and the `^id`
+//! comments attached to them (G13), and no headings, tags or
+//! paragraphs. See the [`code`] module.
 //!
 //! This crate does no I/O, owns no watcher, and never opens SQLite or
 //! resolves a link against a registry (those are PR-4/PR-5). Its row
@@ -52,7 +53,7 @@ use serde::Serialize;
 
 pub use blocks::{BlockAnchor, Paragraph};
 pub use code::{
-    parse_code_unit, parse_code_unit_within, Language, CODE_PARSE_BUDGET, EXTENSIONS,
+    parse_code_unit, parse_code_unit_within, Language, Symbol, CODE_PARSE_BUDGET, EXTENSIONS,
     MAX_CODE_PARSE_BYTES,
 };
 pub use diagnostics::{Diagnostic, DiagnosticKind};
@@ -62,7 +63,7 @@ pub use prose::ProseFormat;
 pub use tags::Tag;
 pub use wikilinks::WikiLink;
 
-pub use tephra_cache::{NewBlock, NewHeading, NewLink, NewTag, NewUnit};
+pub use tephra_cache::{NewBlock, NewHeading, NewLink, NewSymbol, NewTag, NewUnit};
 
 /// `LinkRow`/`NewLink`'s `kind` value for a row derived from a
 /// `[[wikilink]]`.
@@ -118,6 +119,10 @@ pub struct ParsedUnit {
     /// Every paragraph block, in file order, with its line range and
     /// the `^id` ending its last line, if any.
     pub paragraphs: Vec<Paragraph>,
+    /// The symbols of a code file (G4), in file order, parents before
+    /// their children. Always empty for prose.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub symbols: Vec<Symbol>,
     /// Structured, non-fatal problems found while parsing (malformed
     /// frontmatter, empty/unterminated links, duplicate block ids).
     /// Diagnostics never replace or suppress whatever else could
@@ -169,7 +174,27 @@ impl ParsedUnit {
     /// occurrence of a repeated ID is its own row, never merged.
     /// `to_unit_id` resolution is out of scope for this crate — every
     /// row here only ever describes *this* unit's own blocks.
+    ///
+    /// Every row has `symbol_id: None`. For a code unit use
+    /// [`ParsedUnit::to_new_blocks_with_symbols`], which can name the
+    /// owning symbol row.
     pub fn to_new_blocks(&self, unit_id: i64) -> Vec<NewBlock<'_>> {
+        self.to_new_blocks_with_symbols(unit_id, &[])
+    }
+
+    /// [`ParsedUnit::to_new_blocks`] for a unit whose symbols have
+    /// been inserted: `symbol_ids[i]` is the `symbols` row id of
+    /// `self.symbols[i]` (see [`ParsedUnit::to_new_symbols`]). A code
+    /// `^id` that belongs to symbol `i` (G13) becomes a row on that
+    /// symbol's first line, spanning the symbol's range, with
+    /// `symbol_id` set. An ID with no symbol is a one-line row with
+    /// `symbol_id` `None`. An index `symbol_ids` has no entry for also
+    /// gives `None`.
+    pub fn to_new_blocks_with_symbols(
+        &self,
+        unit_id: i64,
+        symbol_ids: &[i64],
+    ) -> Vec<NewBlock<'_>> {
         let attached: std::collections::HashSet<(&str, usize)> = self
             .paragraphs
             .iter()
@@ -183,22 +208,45 @@ impl ParsedUnit {
                 block_id: p.block_id.as_deref(),
                 line: p.start_line as i64,
                 end_line: Some(p.end_line as i64),
+                symbol_id: None,
             })
             .collect();
         rows.extend(
             self.blocks
                 .iter()
                 .filter(|b| !attached.contains(&(b.block_id.as_str(), b.line)))
-                .map(|b| NewBlock {
-                    unit_id,
-                    block_id: Some(&b.block_id),
-                    line: b.line as i64,
-                    end_line: Some(b.line as i64),
+                .map(|b| {
+                    let owner = b.symbol.and_then(|i| Some((self.symbols.get(i)?, i)));
+                    NewBlock {
+                        unit_id,
+                        block_id: Some(&b.block_id),
+                        line: b.line as i64,
+                        end_line: Some(owner.map_or(b.line, |(s, _)| s.end_line) as i64),
+                        symbol_id: owner.and_then(|(_, i)| symbol_ids.get(i).copied()),
+                    }
                 }),
         );
         // Stable: paragraphs and loose anchors interleave by line.
         rows.sort_by_key(|r| r.line);
         rows
+    }
+
+    /// One `tephra-cache` `NewSymbol` per symbol of a code file, in
+    /// file order (`symbols[i]` is `self.symbols[i]`), once the caller
+    /// knows this unit's row id. Empty for prose.
+    pub fn to_new_symbols(&self, unit_id: i64) -> Vec<NewSymbol<'_>> {
+        self.symbols
+            .iter()
+            .map(|s| NewSymbol {
+                unit_id,
+                kind: s.kind,
+                name: &s.name,
+                parent: s.parent.as_deref(),
+                line: s.line as i64,
+                start_line: s.start_line as i64,
+                end_line: s.end_line as i64,
+            })
+            .collect()
     }
 
     /// One `tephra-cache` `NewHeading` per heading, in document
@@ -328,6 +376,7 @@ fn parse_markdown(path: &Path, content: &str) -> ParsedUnit {
         tags,
         blocks,
         paragraphs,
+        symbols: Vec::new(),
         diagnostics,
     }
 }
@@ -437,6 +486,7 @@ fn parse_native(path: &Path, content: &str, format: ProseFormat) -> ParsedUnit {
         tags: Vec::new(),
         blocks,
         paragraphs,
+        symbols: Vec::new(),
         diagnostics,
     }
 }

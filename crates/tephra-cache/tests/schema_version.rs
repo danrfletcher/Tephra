@@ -170,13 +170,14 @@ fn v2_ddl_has_every_table_and_column() {
             "kind",
             "name",
             "parent",
+            "line",
             "start_line",
             "end_line"
         ]
     );
     assert_eq!(
         names(&columns(conn, "blocks")),
-        ["id", "unit_id", "block_id", "line", "end_line"]
+        ["id", "unit_id", "block_id", "line", "end_line", "symbol_id"]
     );
     assert_eq!(
         names(&columns(conn, "block_fts")),
@@ -205,6 +206,7 @@ fn v2_ddl_has_every_table_and_column() {
         "idx_headings_unit_id",
         "idx_symbols_unit_id",
         "idx_blocks_unit_id",
+        "idx_blocks_block_id",
     ] {
         let n: i64 = conn
             .query_row(
@@ -278,6 +280,7 @@ fn two_blocks_with_the_same_unit_and_block_id_both_persist() {
             block_id: Some("abcd1234"),
             line: 40,
             end_line: Some(44),
+            symbol_id: None,
         })
         .expect("a duplicate (unit_id, block_id) must be storable");
 
@@ -309,8 +312,8 @@ fn deleting_a_unit_removes_its_headings_symbols_and_fts_rows() {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO symbols (unit_id, kind, name, parent, start_line, end_line) \
-             VALUES (?1, 'fn', 'f', NULL, 1, 2)",
+            "INSERT INTO symbols (unit_id, kind, name, parent, line, start_line, end_line) \
+             VALUES (?1, 'fn', 'f', NULL, 1, 1, 2)",
             [unit],
         )
         .unwrap();

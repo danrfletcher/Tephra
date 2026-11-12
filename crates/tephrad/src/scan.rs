@@ -23,7 +23,11 @@
 //! grammar, or a recognised shebang) is fed through the code parser
 //! (G4), which reads links only inside comments and docstrings: a
 //! `[[wikilink]]` in a string literal, a heredoc or code is never a
-//! link, and the code parse records no symbols (that is a later PR).
+//! link. The code parse also records the file's symbols (G4) in the
+//! `symbols` table and each `^id` comment as a `blocks` row owned by
+//! its symbol (G13), written in the same chunk transaction as the
+//! unit row. Nothing here writes to the file (F4) or resolves a
+//! `#name` anchor to a symbol (F3).
 //! Every other file — `document`, `text-other`, `binary`, and so a
 //! `.kt`, `.rb`, `.json` or `.ini` file, which has no grammar — is
 //! written as a unit carrying name, kind, size and mtime and nothing
@@ -506,7 +510,8 @@ fn write_unit(
             ),
             tephra_parser::DiagnosticKind::ParseTimeout
             | tephra_parser::DiagnosticKind::ParseSkippedTooLarge
-            | tephra_parser::DiagnosticKind::ParseFailed => tracing::warn!(
+            | tephra_parser::DiagnosticKind::ParseFailed
+            | tephra_parser::DiagnosticKind::SyntaxErrors => tracing::warn!(
                 path = %abs_path.display(),
                 "{}",
                 diag.message
@@ -529,7 +534,13 @@ fn write_unit(
         cache.insert_tag(&tag)?;
         stats.tags_written += 1;
     }
-    for block in parsed.to_new_blocks(unit_id) {
+    // A code file's symbols go in first: its `^id` block rows name the
+    // symbol that owns them (G13). Prose has none.
+    let mut symbol_ids = Vec::with_capacity(parsed.symbols.len());
+    for symbol in parsed.to_new_symbols(unit_id) {
+        symbol_ids.push(cache.insert_symbol(&symbol)?);
+    }
+    for block in parsed.to_new_blocks_with_symbols(unit_id, &symbol_ids) {
         cache.insert_block(&block)?;
         stats.blocks_written += 1;
     }

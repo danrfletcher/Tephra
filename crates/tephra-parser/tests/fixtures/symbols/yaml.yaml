@@ -1,0 +1,11 @@
+# config
+name: tephra
+version: 1
+dependencies:
+  - serde
+  - rusty
+nested:
+  key: value
+"quoted": true
+---
+second: doc

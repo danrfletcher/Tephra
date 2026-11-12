@@ -45,5 +45,23 @@
   "tags": [],
   "blocks": [],
   "paragraphs": [],
+  "symbols": [
+    {
+      "kind": "const",
+      "name": "s",
+      "parent": null,
+      "line": 4,
+      "start_line": 3,
+      "end_line": 4
+    },
+    {
+      "kind": "const",
+      "name": "r",
+      "parent": null,
+      "line": 5,
+      "start_line": 5,
+      "end_line": 7
+    }
+  ],
   "diagnostics": []
 }

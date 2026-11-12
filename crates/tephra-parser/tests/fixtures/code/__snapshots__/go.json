@@ -45,5 +45,31 @@
   "tags": [],
   "blocks": [],
   "paragraphs": [],
+  "symbols": [
+    {
+      "kind": "function",
+      "name": "Doc",
+      "parent": null,
+      "line": 6,
+      "start_line": 3,
+      "end_line": 6
+    },
+    {
+      "kind": "variable",
+      "name": "s",
+      "parent": null,
+      "line": 8,
+      "start_line": 8,
+      "end_line": 8
+    },
+    {
+      "kind": "variable",
+      "name": "r",
+      "parent": null,
+      "line": 9,
+      "start_line": 9,
+      "end_line": 9
+    }
+  ],
   "diagnostics": []
 }

@@ -17,31 +17,43 @@
 //! on a line such as `/* [[a */ b]]` that `]]` is code, outside the
 //! comment. A per-range scan cannot cross a comment boundary.
 //!
+//! The same parse gives the file's **symbols** and **block IDs**
+//! ([`symbols`]): functions, classes, methods and the like with their
+//! kind, name, parent, first line and line range, and every `^id`
+//! comment attached to the symbol that owns it (G13). They come out as
+//! [`ParsedUnit::symbols`] and [`ParsedUnit::blocks`].
+//!
 //! What is *not* done here, on purpose: no Markdown fence exclusion
 //! around a wikilink (the comment boundary is the only filter), no
-//! `^id` blocks, headings, tags or paragraphs (PR-12.F1 and later),
-//! no symbols (PR-6.F1), and no I/O.
+//! headings, tags or paragraphs, no name-based `#anchor` resolution to
+//! a symbol (F3), no writing of an ID into a file (PR-12.F1) and no
+//! I/O.
 //!
 //! A half-written file still gives what parses (E12), and a parse is
 //! bounded in time and in memory:
 //!
+//! - a file with syntax errors still gives every symbol and link
+//!   tree-sitter recovered, plus a [`DiagnosticKind::SyntaxErrors`]
+//!   diagnostic;
 //! - past [`CODE_PARSE_BUDGET`] the parse is abandoned and the unit
-//!   carries no links and a [`DiagnosticKind::ParseTimeout`]
+//!   carries no links or symbols and a [`DiagnosticKind::ParseTimeout`]
 //!   diagnostic for the caller to log;
 //! - a file larger than [`MAX_CODE_PARSE_BYTES`] is never handed to
 //!   tree-sitter at all (its tree costs roughly 100 times the file's
 //!   size in memory, which a time budget does not bound), and the unit
-//!   carries no links and a [`DiagnosticKind::ParseSkippedTooLarge`]
-//!   diagnostic.
+//!   carries no links or symbols and a
+//!   [`DiagnosticKind::ParseSkippedTooLarge`] diagnostic.
 
 mod comments;
 mod languages;
+mod symbols;
 
 use std::ops::ControlFlow;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 pub use languages::{Language, EXTENSIONS};
+pub use symbols::Symbol;
 
 use crate::diagnostics::{Diagnostic, DiagnosticKind};
 use crate::line_index::LineIndex;
@@ -61,7 +73,8 @@ pub const CODE_PARSE_BUDGET: Duration = Duration::from_secs(5);
 pub const MAX_CODE_PARSE_BYTES: usize = 2 * 1024 * 1024;
 
 /// Parses the code file `content` at `path`, written in `lang`, into a
-/// [`ParsedUnit`] holding only its comment/docstring links. Pure,
+/// [`ParsedUnit`] holding its comment/docstring links, symbols and
+/// block IDs. Pure,
 /// `Send + Sync`, never panics on malformed input.
 pub fn parse_code_unit(path: &Path, lang: Language, content: &str) -> ParsedUnit {
     parse_code_unit_within(path, lang, content, CODE_PARSE_BUDGET)
@@ -79,6 +92,8 @@ pub fn parse_code_unit_within(
     let mut diagnostics = Vec::new();
     let mut wikilinks_out = Vec::new();
     let mut markdown_links = Vec::new();
+    let mut symbols = Vec::new();
+    let mut blocks = Vec::new();
 
     let parsed = if content.len() > MAX_CODE_PARSE_BYTES {
         Err(ParseFailure::TooLarge)
@@ -87,6 +102,9 @@ pub fn parse_code_unit_within(
     };
     match parsed {
         Ok(tree) => {
+            let found = symbols::extract(lang, &tree, content, &mut diagnostics);
+            symbols = found.symbols;
+            blocks = found.blocks;
             let ranges = comments::find_ranges(lang, &tree, content);
             let lines = LineIndex::new(content);
             for (start, end) in ranges {
@@ -140,8 +158,9 @@ pub fn parse_code_unit_within(
         wikilinks: wikilinks_out,
         markdown_links,
         tags: Vec::new(),
-        blocks: Vec::new(),
+        blocks,
         paragraphs: Vec::new(),
+        symbols,
         diagnostics,
     }
 }

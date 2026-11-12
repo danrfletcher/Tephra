@@ -97,6 +97,7 @@ fn blocks_keep_ranges_null_ids_and_every_occurrence_of_a_repeated_id() {
                 block_id,
                 line,
                 end_line,
+                symbol_id: None,
             })
             .expect("a NULL block_id and a repeated (unit, block_id) are both storable");
     }
@@ -227,6 +228,7 @@ fn a_cache_from_the_first_v2_build_with_a_not_null_block_id_is_rebuilt_on_open()
             block_id: None,
             line: 1,
             end_line: Some(1),
+            symbol_id: None,
         })
         .expect("nullable block_id after the rebuild");
 
@@ -254,6 +256,7 @@ fn an_offline_sources_id_less_paragraph_rows_survive_a_rebuild() {
                 block_id,
                 line,
                 end_line: Some(line),
+                symbol_id: None,
             })
             .unwrap();
     }

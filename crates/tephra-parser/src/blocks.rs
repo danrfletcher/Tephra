@@ -24,8 +24,15 @@ use crate::fences::FenceCursor;
 pub struct BlockAnchor {
     /// Without the leading `^`.
     pub block_id: String,
-    /// 1-indexed line number, absolute within the original file.
+    /// 1-indexed line number, absolute within the original file. For a
+    /// `^id` in a code file that belongs to a symbol (G13) this is the
+    /// symbol's first line, whichever line the comment sits on.
     pub line: usize,
+    /// For a code file: the index in [`crate::ParsedUnit::symbols`] of
+    /// the symbol that owns this ID. `None` for prose, and for an ID
+    /// comment with no symbol to own it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<usize>,
 }
 
 /// One block of prose: a paragraph, or one list item's own text, with
@@ -59,7 +66,10 @@ pub(crate) fn attach_ids(paragraphs: &mut [Paragraph], anchors: &[BlockAnchor]) 
     }
 }
 
-fn is_block_id_char(c: char) -> bool {
+/// The one character rule for a block ID (G12): ASCII letters, digits
+/// and hyphens. Prose and code files share it, so `k3f9a2` and
+/// `summary-v2` read the same everywhere.
+pub(crate) fn is_block_id_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '-'
 }
 
@@ -107,6 +117,7 @@ pub(crate) fn scan(
                 out.push(BlockAnchor {
                     block_id: id.to_string(),
                     line: absolute_line,
+                    symbol: None,
                 });
             }
         }

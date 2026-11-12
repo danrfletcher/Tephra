@@ -104,6 +104,22 @@ impl World {
     }
 }
 
+/// `(kind, name, line)` of every symbol of one unit, in file order.
+fn symbol_rows(cache_path: &Path, source: &str, rel_path: &str) -> Vec<(String, String, i64)> {
+    let cache = Cache::open(cache_path).unwrap();
+    let source_id = cache.get_source(source).unwrap().unwrap().id;
+    let unit = cache
+        .get_unit_by_rel_path(source_id, rel_path)
+        .unwrap()
+        .unwrap();
+    cache
+        .symbols_for_unit(unit.id)
+        .unwrap()
+        .into_iter()
+        .map(|s| (s.kind, s.name, s.line))
+        .collect()
+}
+
 fn scan_unit() -> String {
     format!("@tephra:{SCAN_RS}")
 }
@@ -143,8 +159,8 @@ fn gp8_a_comment_link_in_a_code_file_is_a_backlink_and_a_string_decoy_is_not() {
         EdgeTarget::Resolved("@notes:Tephra test.md".into())
     );
 
-    // The unit itself is `code`, with that one link row and no tag,
-    // block, heading or symbol row (F3: no symbols writer).
+    // The unit itself is `code`, with that one link row, its three
+    // symbols (G4), and no tag, block or heading row.
     let rows = fixtures::unit_rows(&w.cache_path, "tephra", SCAN_RS).expect("scan.rs is a unit");
     assert_eq!(rows.kind, "code");
     assert_eq!(
@@ -152,12 +168,15 @@ fn gp8_a_comment_link_in_a_code_file_is_a_backlink_and_a_string_decoy_is_not() {
         vec![("wikilink".to_string(), "@notes:Tephra test".to_string())]
     );
     assert!(rows.tags.is_empty() && rows.blocks.is_empty() && rows.headings.is_empty());
-    let cache = Cache::open(&w.cache_path).unwrap();
-    let symbols: i64 = cache
-        .connection()
-        .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(symbols, 0, "this PR records no symbols");
+    assert_eq!(
+        symbol_rows(&w.cache_path, "tephra", SCAN_RS),
+        vec![
+            ("function".to_string(), "walk_and_write".to_string(), 2),
+            ("const".to_string(), "DECOY".to_string(), 3),
+            ("const".to_string(), "OTHER".to_string(), 4),
+        ],
+        "the string decoys are no links but the consts are symbols"
+    );
     w.finish();
 }
 
@@ -264,17 +283,27 @@ fn f3_a_symbol_style_anchor_is_stored_as_an_anchor_link_with_no_symbol_resolutio
             "@tephra:crates/tephrad/src/scan.rs#walk_and_write".to_string()
         )]
     );
+    // F3: the resolver reads headings for `#name`, never symbols. The
+    // symbol is recorded (G4) but the link stays what it was: a
+    // `wikilink` row with the raw anchor text (asserted above), with
+    // no column or table that could name a symbol.
+    assert_eq!(
+        symbol_rows(&w.cache_path, "tephra", SCAN_RS),
+        vec![("function".to_string(), "walk_and_write".to_string(), 2)]
+    );
     let cache = Cache::open(&w.cache_path).unwrap();
-    let symbols: i64 = cache
+    let link_columns: Vec<String> = cache
         .connection()
-        .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(symbols, 0);
-    // `scan.rs` has no symbols writer.
-    let scan_source = include_str!("../src/scan.rs");
-    for needle in ["INSERT INTO symbols", "insert_symbol", "NewSymbol"] {
-        assert!(!scan_source.contains(needle), "scan.rs mentions {needle}");
-    }
+        .prepare("SELECT name FROM pragma_table_info('links')")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert!(
+        link_columns.iter().all(|c| !c.contains("symbol")),
+        "{link_columns:?}"
+    );
     w.finish();
 }
 

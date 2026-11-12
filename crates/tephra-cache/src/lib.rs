@@ -27,8 +27,8 @@ pub use listing::{
 pub use schema::KindInferrer;
 pub use sources::{validate_transition, InvalidTransition, SourceRow, SourceStatus};
 pub use units::{
-    BlockRow, HeadingRow, LinkRow, NewBlock, NewHeading, NewLink, NewTag, NewUnit, TagRow, UnitRow,
-    UnitWithSourceStatus,
+    BlockOccurrence, BlockRow, HeadingRow, LinkRow, NewBlock, NewHeading, NewLink, NewSymbol,
+    NewTag, NewUnit, SymbolRow, TagRow, UnitRow, UnitWithSourceStatus,
 };
 
 /// The schema version this build of the crate expects. Bumping this
@@ -41,8 +41,12 @@ pub use units::{
 /// (F2).
 ///
 /// Version 2 added `units.kind`/`size`/`too_large`/`needs_rescan`,
-/// the `headings` and `symbols` tables, `blocks.end_line` and the
-/// `block_fts` trigram FTS5 index.
+/// the `headings` and `symbols` tables (a symbol's first line in
+/// `symbols.line`), `blocks.end_line` and `blocks.symbol_id` (the
+/// symbol that owns a code block ID) and the `block_fts` trigram FTS5
+/// index. Builds of v2 before the last two have another table shape
+/// at the same version number; the open path spots that and rebuilds
+/// (see `schema::core_shape_is_stale`).
 pub const CURRENT_SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug)]

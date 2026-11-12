@@ -94,8 +94,12 @@ fn a_half_written_file_still_gives_the_comments_before_and_after_the_error() {
         let unit = parse(*lang, src);
         let found: Vec<&str> = unit.wikilinks.iter().map(|w| w.raw.as_str()).collect();
         assert_eq!(found, ["Before", "After"], "{lang:?}: {src:?}");
-        assert!(
-            unit.diagnostics.is_empty(),
+        // E12: the recovery is reported, once, as `SyntaxErrors`, and
+        // nothing else.
+        let kinds: Vec<_> = unit.diagnostics.iter().map(|d| d.kind).collect();
+        assert_eq!(
+            kinds,
+            [DiagnosticKind::SyntaxErrors],
             "{lang:?}: {:?}",
             unit.diagnostics
         );
@@ -442,4 +446,107 @@ fn a_shell_heredoc_cut_off_before_its_terminator_gives_no_link_from_its_text() {
     // A comment on the heredoc's own start line is a comment.
     let same_line = "cat <<EOF # [[Start]]\nbody\nEOF\n";
     assert_eq!(raws(&parse(Language::Shell, same_line)), [("Start", 1)]);
+}
+
+// ------------------------------------------------- E12: symbols half
+
+fn symbol_names(unit: &ParsedUnit) -> Vec<&str> {
+    unit.symbols.iter().map(|s| s.name.as_str()).collect()
+}
+
+#[test]
+fn an_unclosed_brace_after_a_fn_keeps_every_symbol_before_it_and_logs_a_diagnostic() {
+    let src = "fn before() {}\n\nstruct Mid;\n\nfn walk_and_write() {\n    let x = 1;\n";
+    let unit = parse(Language::Rust, src);
+    // The definition being typed is inside the error node and may be
+    // missing; everything before it must be there.
+    let names = symbol_names(&unit);
+    for want in ["before", "Mid"] {
+        assert!(names.contains(&want), "{names:?}");
+    }
+    let kinds: Vec<_> = unit.diagnostics.iter().map(|d| d.kind).collect();
+    assert_eq!(kinds, [DiagnosticKind::SyntaxErrors]);
+    assert!(unit.diagnostics[0].line >= 1);
+}
+
+#[test]
+fn symbols_after_the_error_are_taken_when_tree_sitter_recovers() {
+    let rust = "fn a() {}\nfn broken( {\nfn c() {}\n\nstruct After;\n";
+    let unit = parse(Language::Rust, rust);
+    let names = symbol_names(&unit);
+    assert!(names.contains(&"a"), "{names:?}");
+    assert!(names.contains(&"After"), "{names:?}");
+
+    let py = "def a():\n    pass\n\ndef broken(:\n    pass\n\nclass After:\n    pass\n";
+    let unit = parse(Language::Python, py);
+    let names = symbol_names(&unit);
+    assert!(names.contains(&"a"), "{names:?}");
+    assert!(names.contains(&"After"), "{names:?}");
+    assert!(unit
+        .diagnostics
+        .iter()
+        .any(|d| d.kind == DiagnosticKind::SyntaxErrors));
+
+    let ts = "function a() {}\nfunction broken( {\nclass After {}\n";
+    let unit = parse(Language::TypeScript, ts);
+    let names = symbol_names(&unit);
+    assert!(names.contains(&"a"), "{names:?}");
+    assert!(unit
+        .diagnostics
+        .iter()
+        .any(|d| d.kind == DiagnosticKind::SyntaxErrors));
+}
+
+#[test]
+fn the_diagnostic_line_points_at_the_fault_not_at_a_leading_comment() {
+    let src = "// one\n// two\n// three\nfn ok() {}\nfn broken( {\n";
+    let unit = parse(Language::Rust, src);
+    let d = unit
+        .diagnostics
+        .iter()
+        .find(|d| d.kind == DiagnosticKind::SyntaxErrors)
+        .expect("a diagnostic");
+    assert!(d.line >= 4, "line {}", d.line);
+}
+
+#[test]
+fn clean_code_has_no_syntax_diagnostic() {
+    for (lang, src) in [
+        (Language::Rust, "fn a() {}\n"),
+        (Language::Python, "def a():\n    pass\n"),
+        (Language::TypeScript, "function a() {}\n"),
+    ] {
+        let unit = parse(lang, src);
+        assert!(unit.diagnostics.is_empty(), "{lang:?}");
+    }
+}
+
+#[test]
+fn deeply_nested_code_does_not_overflow_the_symbol_walk() {
+    // 3000 nested blocks: an explicit stack, not recursion.
+    let mut src = String::from("fn f() {\n");
+    for _ in 0..3000 {
+        src.push_str("{\n");
+    }
+    for _ in 0..3000 {
+        src.push_str("}\n");
+    }
+    src.push_str("}\nfn after() {}\n");
+    let unit = std::thread::Builder::new()
+        .stack_size(512 * 1024)
+        .spawn(move || parse(Language::Rust, &src))
+        .unwrap()
+        .join()
+        .expect("no overflow");
+    let names: Vec<&str> = unit.symbols.iter().map(|s| s.name.as_str()).collect();
+    assert!(names.contains(&"f"), "{names:?}");
+}
+
+#[test]
+fn block_ids_before_a_syntax_error_are_still_stored() {
+    let src = "// ^k3f9a2\nfn a() {}\nfn broken( {\n";
+    let unit = parse(Language::Rust, src);
+    assert_eq!(unit.blocks.len(), 1);
+    assert_eq!(unit.blocks[0].block_id, "k3f9a2");
+    assert_eq!(unit.blocks[0].symbol, Some(0));
 }

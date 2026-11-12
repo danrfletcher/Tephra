@@ -105,6 +105,7 @@ fn inserting_a_block_with_nonexistent_unit_id_is_rejected() {
         unit_id: 999_999,
         block_id: Some("ghost"),
         line: 1,
+        symbol_id: None,
     });
     assert!(
         result.is_err(),
@@ -146,6 +147,7 @@ fn valid_rows_against_real_parents_insert_cleanly() {
             unit_id,
             block_id: Some("real-block"),
             line: 5,
+            symbol_id: None,
         })
         .is_ok());
 }

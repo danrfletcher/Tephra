@@ -5,6 +5,8 @@
 
 #[path = "unit/blocks.rs"]
 mod blocks;
+#[path = "unit/code_block_ids.rs"]
+mod code_block_ids;
 #[path = "unit/code_comments.rs"]
 mod code_comments;
 #[path = "unit/code_languages.rs"]
@@ -27,6 +29,10 @@ mod prose_formats;
 mod prose_headings;
 #[path = "unit/robustness.rs"]
 mod robustness;
+#[path = "unit/symbol_ranges.rs"]
+mod symbol_ranges;
+#[path = "unit/symbols.rs"]
+mod symbols;
 #[path = "unit/tags.rs"]
 mod tags;
 #[path = "unit/wikilinks.rs"]
