@@ -15,6 +15,16 @@ mod code_languages;
 mod code_robustness;
 #[path = "unit/determinism.rs"]
 mod determinism;
+#[path = "unit/documents_docx.rs"]
+mod documents_docx;
+#[path = "unit/documents_links.rs"]
+mod documents_links;
+#[path = "unit/documents_pdf.rs"]
+mod documents_pdf;
+#[path = "unit/documents_pptx.rs"]
+mod documents_pptx;
+#[path = "unit/documents_support.rs"]
+mod documents_support;
 #[path = "unit/frontmatter.rs"]
 mod frontmatter;
 #[path = "unit/headings.rs"]

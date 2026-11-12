@@ -38,6 +38,7 @@
 mod blocks;
 mod code;
 mod diagnostics;
+mod documents;
 mod fences;
 mod frontmatter;
 mod hash;
@@ -57,6 +58,10 @@ pub use code::{
     MAX_CODE_PARSE_BYTES,
 };
 pub use diagnostics::{Diagnostic, DiagnosticKind};
+pub use documents::{
+    parse_document_bytes, DocHeading, DocLocation, DocMarkdownLink, DocParagraph, DocWikiLink,
+    DocumentError, DocumentFormat, ParsedDocument, MAX_PART_BYTES,
+};
 pub use frontmatter::Frontmatter;
 pub use markdown_pass::{Heading, MarkdownLink};
 pub use prose::ProseFormat;

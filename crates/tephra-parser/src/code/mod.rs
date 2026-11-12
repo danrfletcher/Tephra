@@ -170,7 +170,7 @@ pub fn parse_code_unit_within(
 /// each run of consecutive non-blank lines, starting at its first
 /// non-blank character so the comment's own indentation never reads
 /// as an indented code block.
-fn scan_markdown_links(
+pub(crate) fn scan_markdown_links(
     text: &str,
     first_line: usize,
     start_byte: usize,

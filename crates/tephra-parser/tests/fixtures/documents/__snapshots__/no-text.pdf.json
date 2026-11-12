@@ -1,0 +1,16 @@
+{
+  "content_hash": "d7e131be7adb242695d0ab1bbe01e5b538229c550f6bc90acd602d104d0e3234",
+  "diagnostics": [
+    {
+      "kind": "no_text_layer",
+      "line": 1,
+      "message": "PDF has 1 page(s) but no text layer (scanned or image-only); indexed by name only, no OCR"
+    }
+  ],
+  "format": "pdf",
+  "headings": [],
+  "markdown_links": [],
+  "paragraphs": [],
+  "path": "tests/fixtures/documents/no-text.pdf",
+  "wikilinks": []
+}

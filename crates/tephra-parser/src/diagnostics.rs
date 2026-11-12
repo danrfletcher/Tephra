@@ -39,6 +39,9 @@ pub enum DiagnosticKind {
     /// definition that contains the error (E12). The line is the first
     /// error.
     SyntaxErrors,
+    /// A PDF has pages but no text layer (scanned or image-only). No
+    /// OCR is done, so the unit carries no text and no links (E4, F6).
+    NoTextLayer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

@@ -1,0 +1,5 @@
+{
+  "error": {
+    "corrupt": "not a readable zip: invalid Zip archive: Could not find EOCD"
+  }
+}

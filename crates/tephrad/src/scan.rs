@@ -28,7 +28,16 @@
 //! its symbol (G13), written in the same chunk transaction as the
 //! unit row. Nothing here writes to the file (F4) or resolves a
 //! `#name` anchor to a symbol (F3).
-//! Every other file — `document`, `text-other`, `binary`, and so a
+//! Every file that classifies as `document` (`.docx`, `.pptx`, `.pdf`)
+//! is fed through the document parser (G5), which reads its text and
+//! links, its headings (docx heading styles, pptx slide titles, the
+//! PDF outline) and its paragraphs with their page, slide or paragraph
+//! number (stored as `blocks` rows with no `block_id`). A document that
+//! cannot be read (corrupt, encrypted) or a PDF with no text layer is
+//! kept as a `document` unit by name only, with one warning naming the
+//! path and the reason; the scan carries on. Documents are never
+//! written (F4) and never OCRed (F6).
+//! Every other file — `text-other`, `binary`, and so a
 //! `.kt`, `.rb`, `.json` or `.ini` file, which has no grammar — is
 //! written as a unit carrying name, kind, size and mtime and nothing
 //! else — no links, headings or blocks. A `.txt` or `.py` with a NUL
@@ -440,6 +449,27 @@ fn write_unit(
     };
     let mut kind = file_kind::classify(file_name, &head);
     let mut parsed = None;
+    let mut parsed_doc = None;
+    if !too_large && kind == FileKind::Document {
+        // G5: a docx, pptx or PDF is read whole (bounded by the cap) and
+        // handed to the document parser. One that cannot be read stays
+        // a `document` unit by name only, with one warning (E4); it
+        // never fails the scan.
+        let bytes = match read_capped(abs_path) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(path = %abs_path.display(), error = %e, "failed to read file during scan; skipping");
+                return Ok(None);
+            }
+        };
+        size = bytes.len() as u64;
+        if size > MAX_INDEXED_BYTES {
+            // Grew past the cap between the stat and the read.
+            too_large = true;
+        } else {
+            parsed_doc = parse_document(abs_path, &bytes);
+        }
+    }
     if !too_large && matches!(kind, FileKind::Prose | FileKind::Code) {
         let bytes = match read_capped(abs_path) {
             Ok(b) => b,
@@ -483,6 +513,10 @@ fn write_unit(
         tags_written: 0,
         blocks_written: 0,
     };
+
+    if let Some(doc) = &parsed_doc {
+        return write_document(cache, source_id, &rel_path, mtime, size, doc, stats).map(Some);
+    }
 
     let Some(parsed) = parsed else {
         cache.insert_unit(&NewUnit {
@@ -553,6 +587,71 @@ fn write_unit(
     Ok(Some(stats))
 }
 
+/// Parses a `document` file's bytes. `None` means the unit is kept by
+/// name only: the document could not be read (corrupt, encrypted) or
+/// has no text layer, and one warning names the path and the reason
+/// (E4). Never fails the scan and never panics.
+fn parse_document(abs_path: &Path, bytes: &[u8]) -> Option<tephra_parser::ParsedDocument> {
+    match tephra_parser::parse_document_bytes(abs_path, bytes) {
+        Ok(doc) => {
+            if let Some(diag) = doc
+                .diagnostics
+                .iter()
+                .find(|d| d.kind == tephra_parser::DiagnosticKind::NoTextLayer)
+            {
+                tracing::warn!(
+                    path = %abs_path.display(),
+                    reason = "no text layer",
+                    "{}",
+                    diag.message
+                );
+                return None;
+            }
+            Some(doc)
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %abs_path.display(),
+                reason = %e,
+                "document could not be read; indexed by name only"
+            );
+            None
+        }
+    }
+}
+
+/// Writes a parsed document's unit row with its links, headings and
+/// paragraph rows (G5), in the same transaction as every other write of
+/// the chunk. The paragraphs go into `blocks` with no `block_id`; their
+/// `line` is the page, slide or paragraph number. Nothing is written to
+/// the document itself (F4).
+fn write_document(
+    cache: &Cache,
+    source_id: i64,
+    rel_path: &str,
+    mtime: Option<i64>,
+    size: u64,
+    doc: &tephra_parser::ParsedDocument,
+    mut stats: ScanStats,
+) -> Result<ScanStats, ScanError> {
+    let mut new_unit = doc.to_new_unit(source_id, rel_path, mtime);
+    new_unit.kind = FileKind::Document.as_str();
+    new_unit.size = Some(size as i64);
+    let unit_id = cache.insert_unit(&new_unit)?;
+    for link in doc.to_new_links(unit_id) {
+        cache.insert_link(&link)?;
+        stats.links_written += 1;
+    }
+    for heading in doc.to_new_headings(unit_id) {
+        cache.insert_heading(&heading)?;
+    }
+    for block in doc.to_new_blocks(unit_id) {
+        cache.insert_block(&block)?;
+        stats.blocks_written += 1;
+    }
+    Ok(stats)
+}
+
 /// The one dispatch from a file's kind to its parser. `bytes` is the
 /// whole file, `head` its first bytes (what [`file_kind::classify`]
 /// saw). `Ok(None)` is a kind this does not parse (or a code file with
@@ -589,6 +688,8 @@ fn parse_file(
             let text = std::str::from_utf8(bytes).map_err(|e| e.to_string())?;
             Ok(Some(tephra_parser::parse_code_unit(abs_path, lang, text)))
         }
+        // A document goes through `parse_document` instead: its bytes
+        // are not text, so it has no `ParsedUnit`.
         FileKind::Document | FileKind::TextOther | FileKind::Binary => Ok(None),
     }
 }

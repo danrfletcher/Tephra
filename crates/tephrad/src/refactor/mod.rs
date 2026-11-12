@@ -932,6 +932,11 @@ struct StoredPreview {
     mtimes: HashMap<String, SystemTime>,
 }
 
+/// Why a referring docx, pptx or PDF is left out of a refactor: Tephra
+/// never writes to a document (F4), so a link inside one stays as it is.
+pub const DOCUMENT_READ_ONLY: &str =
+    "read-only document: links inside a docx, pptx or pdf are never rewritten";
+
 /// One referring file [`RefactorEngine::preview`] could not read or
 /// stat, and therefore could not scan for incoming links at all.
 ///
@@ -1049,6 +1054,19 @@ impl RefactorEngine {
                 let Some(abs) = self.resolve_abs_path(&edge.from, &roots) else {
                     continue;
                 };
+                // G5/F4: a docx, pptx or PDF is read-only. A link inside
+                // one is never rewritten, so the file is reported as
+                // skipped and never read as text.
+                // A document holds many links, so one entry per file.
+                if tephra_parser::DocumentFormat::from_path(&abs).is_some() {
+                    if !skipped.iter().any(|s: &SkippedFile| s.file == edge.from) {
+                        skipped.push(SkippedFile {
+                            file: edge.from.clone(),
+                            error: DOCUMENT_READ_ONLY.to_string(),
+                        });
+                    }
+                    continue;
+                }
                 let content = match fs::read_to_string(&abs) {
                     Ok(c) => c,
                     Err(e) => {

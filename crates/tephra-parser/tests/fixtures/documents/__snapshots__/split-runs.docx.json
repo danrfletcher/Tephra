@@ -1,0 +1,37 @@
+{
+  "content_hash": "af275824c8f1cae2fb36ba3965fc4ce86a45a73c4e0e2e589afc4442f0a9f3b0",
+  "diagnostics": [],
+  "format": "docx",
+  "headings": [],
+  "markdown_links": [],
+  "paragraphs": [
+    {
+      "index": 1,
+      "location": {
+        "paragraph": 1
+      },
+      "text": "see [[@notes:Tephra test]] done"
+    }
+  ],
+  "path": "tests/fixtures/documents/split-runs.docx",
+  "wikilinks": [
+    {
+      "index": 1,
+      "link": {
+        "alias": null,
+        "anchor": null,
+        "line": 1,
+        "raw": "@notes:Tephra test",
+        "source_prefix": "notes",
+        "span": [
+          4,
+          26
+        ],
+        "target": "Tephra test"
+      },
+      "location": {
+        "paragraph": 1
+      }
+    }
+  ]
+}
