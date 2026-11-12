@@ -14,7 +14,7 @@
 use serde_json::Value;
 
 use crate::rpc::auth::Authenticated;
-use crate::rpc::backend::{GraphBackend, RefactorBackend, SourceBackend};
+use crate::rpc::backend::{GraphBackend, RefactorBackend, SourceBackend, UnitListError};
 use crate::rpc::protocol::{
     INVALID_PARAMS, METHOD_NOT_FOUND, REFACTOR_ERROR, RESOLVE_ERROR, SOURCE_ERROR,
 };
@@ -36,6 +36,7 @@ pub const METHOD_NAMES: &[&str] = &[
     "source.rescan",
     "link.preview_refactor",
     "link.apply_refactor",
+    "unit.list",
 ];
 
 /// The three backends one `dispatch` call reads through, bundled so
@@ -91,6 +92,7 @@ pub fn dispatch(
         "source.rescan" => source_rescan(params, backends.sources),
         "link.preview_refactor" => link_preview_refactor(params, backends.refactor),
         "link.apply_refactor" => link_apply_refactor(params, backends.refactor),
+        "unit.list" => unit_list(params, backends.sources),
         other => Err((
             METHOD_NOT_FOUND,
             format!("unknown method \"{other}\""),
@@ -157,6 +159,33 @@ fn source_rescan(params: &Value, sources: &dyn SourceBackend) -> DispatchResult 
         .map_err(|e| (SOURCE_ERROR, e, None))
 }
 
+/// `unit.list {source, folder?, recursive?}` (G1). `source` is a
+/// non-empty string; `folder` (default: the root) a string; `recursive`
+/// (default false) a boolean; `null` counts as absent for the two
+/// optional ones. `folder` is normalized here, so a `..` or absolute
+/// path is refused with `INVALID_PARAMS` before any backend runs.
+fn unit_list(params: &Value, sources: &dyn SourceBackend) -> DispatchResult {
+    let source = require_str(params, "source")?;
+    let folder = match params.get("folder") {
+        None | Some(Value::Null) => "",
+        Some(Value::String(s)) => s.as_str(),
+        Some(_) => return Err(invalid_params("\"folder\" must be a string")),
+    };
+    let recursive = match params.get("recursive") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err(invalid_params("\"recursive\" must be a boolean")),
+    };
+    let folder = crate::unit_list::normalize_folder(folder).map_err(invalid_params)?;
+    sources
+        .list_units(source, &folder, recursive)
+        .map(|wire| serde_json::to_value(wire).expect("UnitListWire always serializes"))
+        .map_err(|e| match e {
+            UnitListError::InvalidParams(message) => invalid_params(message),
+            UnitListError::Source(message) => (SOURCE_ERROR, message, None),
+        })
+}
+
 fn link_preview_refactor(params: &Value, refactor: &dyn RefactorBackend) -> DispatchResult {
     let source = require_str(params, "source")?;
     let old_path = require_str(params, "old_path")?;
@@ -204,7 +233,200 @@ mod tests {
                 "source.rescan",
                 "link.preview_refactor",
                 "link.apply_refactor",
+                "unit.list",
             ]
+        );
+    }
+
+    use std::sync::Mutex;
+
+    use serde_json::json;
+
+    use crate::rpc::backend::{ScanStatsWire, SourceRowWire, UnitListWire};
+    use crate::rpc::protocol::SOURCE_ERROR;
+
+    /// A `SourceBackend` whose only live verb is `list_units`: it
+    /// records the arguments it receives and answers a canned result.
+    /// Nothing else in the dispatch path is faked.
+    struct ListStub {
+        calls: Mutex<Vec<(String, String, bool)>>,
+        reply: Result<UnitListWire, UnitListError>,
+    }
+
+    impl ListStub {
+        fn answering(reply: Result<UnitListWire, UnitListError>) -> Self {
+            ListStub {
+                calls: Mutex::new(Vec::new()),
+                reply,
+            }
+        }
+        fn empty_ok() -> Self {
+            Self::answering(Ok(UnitListWire {
+                source: "s".into(),
+                folder: String::new(),
+                recursive: false,
+                offline: false,
+                needs_rescan: false,
+                entries: Vec::new(),
+            }))
+        }
+        fn calls(&self) -> Vec<(String, String, bool)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl SourceBackend for ListStub {
+        fn register(&self, _: &str, _: &str) -> Result<ScanStatsWire, String> {
+            unreachable!("unit.list never registers")
+        }
+        fn unregister(&self, _: &str) -> Result<(), String> {
+            unreachable!("unit.list never unregisters")
+        }
+        fn list(&self) -> Result<Vec<SourceRowWire>, String> {
+            unreachable!("unit.list never lists sources")
+        }
+        fn rescan(&self, _: &str) -> Result<ScanStatsWire, String> {
+            unreachable!("unit.list never rescans")
+        }
+        fn list_units(
+            &self,
+            source: &str,
+            folder: &str,
+            recursive: bool,
+        ) -> Result<UnitListWire, UnitListError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((source.to_string(), folder.to_string(), recursive));
+            self.reply.clone()
+        }
+    }
+
+    fn invalid(params: Value) -> String {
+        let stub = ListStub::empty_ok();
+        let err = unit_list(&params, &stub).expect_err("should be rejected");
+        assert_eq!(err.0, INVALID_PARAMS, "{params}: {}", err.1);
+        assert!(stub.calls().is_empty(), "{params} reached the backend");
+        err.1
+    }
+
+    #[test]
+    fn unit_list_rejects_bad_params_before_the_backend_runs() {
+        invalid(json!({}));
+        invalid(json!({"source": ""}));
+        invalid(json!({"source": 7}));
+        invalid(json!({"source": null}));
+        invalid(json!({"source": "s", "folder": 1}));
+        invalid(json!({"source": "s", "folder": ["a"]}));
+        invalid(json!({"source": "s", "recursive": 1}));
+        invalid(json!({"source": "s", "recursive": "true"}));
+        invalid(json!({"source": "s", "folder": "a\u{0}b"}));
+    }
+
+    #[test]
+    fn unit_list_rejects_dot_dot_and_absolute_folders() {
+        for folder in ["..", "../x", "a/../b", "a/..", "/etc", "/etc/passwd", "//x"] {
+            let message = invalid(json!({"source": "s", "folder": folder}));
+            assert!(
+                message.contains("folder"),
+                "message should name the param: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn unit_list_passes_normalized_arguments_to_the_backend() {
+        let cases = [
+            (json!({"source": "s"}), ("", false)),
+            (json!({"source": "s", "folder": ""}), ("", false)),
+            (json!({"source": "s", "folder": "/"}), ("", false)),
+            (json!({"source": "s", "folder": "."}), ("", false)),
+            (
+                json!({"source": "s", "folder": null, "recursive": null}),
+                ("", false),
+            ),
+            (
+                json!({"source": "s", "folder": "Attachments/"}),
+                ("Attachments", false),
+            ),
+            (
+                json!({"source": "s", "folder": "a//b/./c", "recursive": true}),
+                ("a/b/c", true),
+            ),
+            (
+                json!({"source": "s", "folder": "caf\u{e9} notes"}),
+                ("caf\u{e9} notes", false),
+            ),
+        ];
+        for (params, (folder, recursive)) in cases {
+            let stub = ListStub::empty_ok();
+            unit_list(&params, &stub).expect("accepted");
+            assert_eq!(
+                stub.calls(),
+                vec![("s".to_string(), folder.to_string(), recursive)],
+                "{params}"
+            );
+        }
+    }
+
+    #[test]
+    fn unit_list_maps_backend_errors_to_the_right_codes() {
+        let stub = ListStub::answering(Err(UnitListError::Source("no such folder: x".into())));
+        let err = unit_list(&json!({"source": "s", "folder": "x"}), &stub).unwrap_err();
+        assert_eq!((err.0, err.1.as_str()), (SOURCE_ERROR, "no such folder: x"));
+
+        let stub = ListStub::answering(Err(UnitListError::InvalidParams("escapes".into())));
+        let err = unit_list(&json!({"source": "s", "folder": "link"}), &stub).unwrap_err();
+        assert_eq!((err.0, err.1.as_str()), (INVALID_PARAMS, "escapes"));
+    }
+
+    #[test]
+    fn unit_list_serializes_the_backend_result_as_the_response() {
+        use crate::rpc::backend::UnitEntryWire;
+        let stub = ListStub::answering(Ok(UnitListWire {
+            source: "s".into(),
+            folder: "d".into(),
+            recursive: true,
+            offline: true,
+            needs_rescan: true,
+            entries: vec![
+                UnitEntryWire {
+                    id: "@s:d/a.md".into(),
+                    name: "a.md".into(),
+                    rel_path: "d/a.md".into(),
+                    kind: "prose".into(),
+                    size: None,
+                    mtime: Some(5),
+                    title: Some("A".into()),
+                },
+                UnitEntryWire {
+                    id: "@s:d/b.bin".into(),
+                    name: "b.bin".into(),
+                    rel_path: "d/b.bin".into(),
+                    kind: "binary".into(),
+                    size: Some(3),
+                    mtime: None,
+                    title: None,
+                },
+            ],
+        }));
+        let value = unit_list(
+            &json!({"source": "s", "folder": "d", "recursive": true}),
+            &stub,
+        )
+        .expect("ok");
+        assert_eq!(
+            value,
+            json!({
+                "source": "s", "folder": "d", "recursive": true,
+                "offline": true, "needs_rescan": true,
+                "entries": [
+                    {"id": "@s:d/a.md", "name": "a.md", "rel_path": "d/a.md",
+                     "kind": "prose", "size": null, "mtime": 5, "title": "A"},
+                    {"id": "@s:d/b.bin", "name": "b.bin", "rel_path": "d/b.bin",
+                     "kind": "binary", "size": 3, "mtime": null},
+                ]
+            })
         );
     }
 }

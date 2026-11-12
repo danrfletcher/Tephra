@@ -822,6 +822,19 @@ impl SourceRegistry {
             .collect())
     }
 
+    /// `unit.list` (G1): one folder of `source`, from a fresh read-only
+    /// cache connection — it never takes the shared `self.cache` lock or
+    /// the writer gate, so a listing can't stall a scan or a register,
+    /// nor they it. See [`crate::unit_list`].
+    pub fn list_units(
+        &self,
+        source: &str,
+        folder: &str,
+        recursive: bool,
+    ) -> Result<crate::unit_list::UnitListWire, crate::unit_list::UnitListError> {
+        crate::unit_list::list_units(&self.cache_path, source, folder, recursive)
+    }
+
     /// Whether `name` is currently marked `permission_denied`.
     pub fn is_permission_denied(&self, name: &str) -> bool {
         self.permission_denied.lock().unwrap().contains(name)

@@ -44,6 +44,7 @@ JSON-RPC 2.0 over HTTP (`POST /rpc`) and WebSocket (`GET /rpc`) on `127.0.0.1:48
 
 - `source.register`, `source.unregister`, `source.list`, `source.rescan`
 - `unit.resolve_link`, `graph.get_backlinks`, `graph.get_forward_links`, `graph.get_edges`
+- `unit.list`: one folder of a source (`{source, folder?, recursive?}`), each entry `{id, name, rel_path, kind, size, mtime, title?}`, folders first then by name. Files come from the cache through a read-only connection; folders of an online source come from the disk (so empty folders show), and an offline source is listed from the cache alone with `offline: true`. `tephractl ls <source> [folder] [-r]` prints it.
 
 ## Not built yet
 

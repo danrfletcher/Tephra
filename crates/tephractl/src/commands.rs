@@ -92,6 +92,11 @@ pub fn execute_with_prompt_writer<R: BufRead, W: Write>(
         Command::SourceRemove { name } => source_remove(name, json, client),
         Command::SourceList => source_list(json, client),
         Command::Status => status(json, client),
+        Command::Ls {
+            source,
+            folder,
+            recursive,
+        } => ls(source, folder, *recursive, json, client),
         Command::LinkResolve {
             target,
             default_source,
@@ -199,6 +204,26 @@ fn source_list(json: bool, client: &RpcClient) -> CommandOutcome {
                 || render::render_source_table(&rows),
                 json,
             ))
+        }
+        Err(e) => CommandOutcome::err(describe_error(&e)),
+    }
+}
+
+/// `ls` (G1): one `unit.list` call. The daemon's `no such source:
+/// <name>` is the message a user sees, with a non-zero exit; every
+/// other failure (including a missing folder) is the daemon's own
+/// message.
+fn ls(
+    source: &str,
+    folder: &str,
+    recursive: bool,
+    json: bool,
+    client: &RpcClient,
+) -> CommandOutcome {
+    let params = json!({"source": source, "folder": folder, "recursive": recursive});
+    match client.call("unit.list", params) {
+        Ok(result) => {
+            CommandOutcome::ok(json_or(&result, || render::render_unit_list(&result), json))
         }
         Err(e) => CommandOutcome::err(describe_error(&e)),
     }

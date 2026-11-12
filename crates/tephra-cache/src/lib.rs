@@ -13,6 +13,7 @@
 //! typed helpers exposed here.
 
 mod cache;
+mod listing;
 mod schema;
 mod sources;
 mod units;
@@ -20,10 +21,14 @@ mod units;
 use std::fmt;
 
 pub use cache::{Cache, FaultInjector};
+pub use listing::{
+    compare_entries, compare_names, FolderEntry, FolderListing, FolderState, FOLDER_KIND,
+};
 pub use schema::KindInferrer;
 pub use sources::{validate_transition, InvalidTransition, SourceRow, SourceStatus};
 pub use units::{
-    BlockRow, LinkRow, NewBlock, NewLink, NewTag, NewUnit, TagRow, UnitRow, UnitWithSourceStatus,
+    BlockRow, LinkRow, NewBlock, NewHeading, NewLink, NewTag, NewUnit, TagRow, UnitRow,
+    UnitWithSourceStatus,
 };
 
 /// The schema version this build of the crate expects. Bumping this

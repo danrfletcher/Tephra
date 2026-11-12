@@ -15,5 +15,6 @@ pub mod refactor;
 pub mod registry;
 pub mod rpc;
 pub mod scan;
+pub mod unit_list;
 pub mod watcher;
 mod writer_gate;

@@ -609,3 +609,257 @@ fn a_too_large_file_logs_one_info_line_and_a_nul_file_logs_nothing() {
     let big = unit(&env, "big.md").unwrap();
     assert_eq!((big.kind.as_str(), big.too_large), ("prose", true));
 }
+
+fn headings_of(env: &Env, rel: &str) -> Vec<(i64, String, i64)> {
+    let id = unit(env, rel).expect("unit").id;
+    let conn = env.cache.connection();
+    let mut stmt = conn
+        .prepare("SELECT level, text, line FROM headings WHERE unit_id = ?1 ORDER BY line, id")
+        .unwrap();
+    stmt.query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+fn listed_title(env: &Env, rel: &str) -> Option<String> {
+    let listing = env.cache.list_folder("s", "", true).expect("list_folder");
+    listing
+        .entries
+        .into_iter()
+        .find(|e| e.rel_path == rel)
+        .unwrap_or_else(|| panic!("{rel} is listed"))
+        .title
+}
+
+#[test]
+fn a_scan_and_a_change_batch_cache_headings_and_the_listing_title_falls_back_to_the_first() {
+    let fixture = fixtures::empty_source();
+    fixture.write("h.md", "intro\n\n# First\n\ntext\n\n## Second\n");
+    fixture.write("front.md", "---\ntitle: From Frontmatter\n---\n# Ignored\n");
+    fixture.write("none.md", "no headings here\n");
+    fixture.write("code.rs", "// # not a heading\nfn main() {}\n");
+    let env = env_for(&fixture);
+    let rules = IgnoreRules::default();
+    scan::scan_source(&env.cache, env.source_id, &env.root, &rules).unwrap();
+
+    assert_eq!(
+        headings_of(&env, "h.md"),
+        [(1, "First".to_string(), 3), (2, "Second".to_string(), 7)]
+    );
+    assert_eq!(listed_title(&env, "h.md").as_deref(), Some("First"));
+    assert_eq!(
+        listed_title(&env, "front.md").as_deref(),
+        Some("From Frontmatter")
+    );
+    assert_eq!(listed_title(&env, "none.md"), None);
+    assert_eq!(env.cache.table_row_count("headings").unwrap(), 3);
+
+    // An edit through the change batch replaces the old headings
+    // rather than adding to them.
+    fixture.write("h.md", "# Renamed\n");
+    scan::apply_change_batch(
+        &env.cache,
+        env.source_id,
+        &env.root,
+        &HashSet::from([env.root.join("h.md")]),
+        &rules,
+    )
+    .unwrap();
+    assert_eq!(headings_of(&env, "h.md"), [(1, "Renamed".to_string(), 1)]);
+    assert_eq!(listed_title(&env, "h.md").as_deref(), Some("Renamed"));
+    assert_eq!(env.cache.table_row_count("headings").unwrap(), 2);
+
+    // A file that stops being prose keeps no headings or title.
+    fixture.write_bytes("h.md", &[0, 1, 2, 0]);
+    scan::apply_change_batch(
+        &env.cache,
+        env.source_id,
+        &env.root,
+        &HashSet::from([env.root.join("h.md")]),
+        &rules,
+    )
+    .unwrap();
+    assert_eq!(env.cache.table_row_count("headings").unwrap(), 1);
+
+    // A forced rescan rebuilds the same rows, with no duplicates.
+    scan::rescan_source(&env.cache, env.source_id, &env.root, &rules).unwrap();
+    assert_eq!(env.cache.table_row_count("headings").unwrap(), 1);
+}
+
+#[cfg(unix)]
+mod symlinks {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    fn outside() -> fixtures::TempSource {
+        let outside = fixtures::empty_source();
+        outside.write("secret.md", "# Secret\n\n[[x]] #leak\n");
+        outside.write("deeper/more.txt", "more\n");
+        outside
+    }
+
+    fn rel_paths(env: &Env) -> Vec<String> {
+        let mut paths: Vec<String> = env
+            .cache
+            .connection()
+            .prepare("SELECT rel_path FROM units ORDER BY rel_path")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    #[test]
+    fn a_scan_never_reads_through_a_symlinked_file_or_folder() {
+        let outside = outside();
+        let fixture = fixtures::empty_source();
+        fixture.write("real.md", "# Real\n");
+        symlink(outside.root(), fixture.root().join("link_dir")).unwrap();
+        symlink(
+            outside.root().join("secret.md"),
+            fixture.root().join("link_file.md"),
+        )
+        .unwrap();
+        // A link to a file inside the root is not a unit either.
+        symlink(
+            fixture.root().join("real.md"),
+            fixture.root().join("alias.md"),
+        )
+        .unwrap();
+        let env = env_for(&fixture);
+
+        scan::scan_source(
+            &env.cache,
+            env.source_id,
+            &env.root,
+            &IgnoreRules::default(),
+        )
+        .unwrap();
+
+        assert_eq!(rel_paths(&env), ["real.md"]);
+        assert_eq!(env.cache.table_row_count("headings").unwrap(), 1);
+        assert_eq!(env.cache.table_row_count("tags").unwrap(), 0);
+        assert_eq!(env.cache.table_row_count("links").unwrap(), 0);
+    }
+
+    /// The reported leak: a link to another tree made while the daemon
+    /// is already watching arrives as a change batch naming the link
+    /// and, on some platforms, paths below it.
+    #[test]
+    fn a_change_batch_never_indexes_a_late_symlink_or_anything_below_it() {
+        let outside = outside();
+        let fixture = fixtures::empty_source();
+        fixture.write("real.md", "# Real\n");
+        let env = env_for(&fixture);
+        let rules = IgnoreRules::default();
+        scan::scan_source(&env.cache, env.source_id, &env.root, &rules).unwrap();
+
+        symlink(outside.root(), fixture.root().join("late_link")).unwrap();
+        symlink(
+            outside.root().join("secret.md"),
+            fixture.root().join("late_file.md"),
+        )
+        .unwrap();
+        let batch: HashSet<PathBuf> = [
+            "late_link",
+            "late_link/secret.md",
+            "late_link/deeper",
+            "late_link/deeper/more.txt",
+            "late_file.md",
+        ]
+        .iter()
+        .map(|p| env.root.join(p))
+        .collect();
+        let outcome =
+            scan::apply_change_batch(&env.cache, env.source_id, &env.root, &batch, &rules).unwrap();
+
+        assert_eq!(rel_paths(&env), ["real.md"]);
+        assert!(
+            outcome.changed_paths.is_empty(),
+            "{:?}",
+            outcome.changed_paths
+        );
+        assert_eq!(env.cache.table_row_count("tags").unwrap(), 0);
+    }
+
+    /// A directory that arrives whole (a create or a move-in) is walked;
+    /// a link inside it is not followed, and the walk's own root being
+    /// a link is refused too.
+    #[test]
+    fn a_walked_directory_skips_links_inside_it_and_a_linked_directory_root() {
+        let outside = outside();
+        let fixture = fixtures::empty_source();
+        fixture.write("real.md", "# Real\n");
+        let env = env_for(&fixture);
+        let rules = IgnoreRules::default();
+        scan::scan_source(&env.cache, env.source_id, &env.root, &rules).unwrap();
+
+        fixture.write("moved/in.md", "# In\n");
+        symlink(outside.root(), fixture.root().join("moved/escape")).unwrap();
+        symlink(outside.root(), fixture.root().join("as_dir")).unwrap();
+        let batch: HashSet<PathBuf> = ["moved", "as_dir"]
+            .iter()
+            .map(|p| env.root.join(p))
+            .collect();
+        scan::apply_change_batch(&env.cache, env.source_id, &env.root, &batch, &rules).unwrap();
+
+        assert_eq!(rel_paths(&env), ["moved/in.md", "real.md"]);
+    }
+
+    /// Rows indexed through a link before the check existed (or by a
+    /// bug) are dropped the next time the link shows up in a batch.
+    #[test]
+    fn rows_cached_below_a_symlink_are_dropped_when_it_next_changes() {
+        let outside = outside();
+        let fixture = fixtures::empty_source();
+        fixture.write("real.md", "# Real\n");
+        let env = env_for(&fixture);
+        let rules = IgnoreRules::default();
+        scan::scan_source(&env.cache, env.source_id, &env.root, &rules).unwrap();
+
+        for rel in [
+            "late_link/secret.md",
+            "late_link/deeper/more.txt",
+            "late_link",
+        ] {
+            env.cache
+                .insert_unit(&tephra_cache::NewUnit {
+                    source_id: env.source_id,
+                    rel_path: rel,
+                    mtime: None,
+                    frontmatter_json: None,
+                    kind: "text-other",
+                    size: Some(1),
+                    too_large: false,
+                })
+                .unwrap();
+        }
+        // A sibling that merely shares the name prefix must survive.
+        fixture.write("late_link_notes.md", "# Mine\n");
+        scan::apply_change_batch(
+            &env.cache,
+            env.source_id,
+            &env.root,
+            &HashSet::from([env.root.join("late_link_notes.md")]),
+            &rules,
+        )
+        .unwrap();
+        symlink(outside.root(), fixture.root().join("late_link")).unwrap();
+
+        let outcome = scan::apply_change_batch(
+            &env.cache,
+            env.source_id,
+            &env.root,
+            &HashSet::from([env.root.join("late_link")]),
+            &rules,
+        )
+        .unwrap();
+
+        assert_eq!(rel_paths(&env), ["late_link_notes.md", "real.md"]);
+        assert_eq!(outcome.changed_paths, [env.root.join("late_link")]);
+    }
+}

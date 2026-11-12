@@ -15,6 +15,9 @@ mod auth;
 #[path = "cli/source_commands.rs"]
 mod source_commands;
 
+#[path = "cli/ls_commands.rs"]
+mod ls_commands;
+
 #[path = "cli/link_commands.rs"]
 mod link_commands;
 

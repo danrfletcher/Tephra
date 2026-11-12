@@ -19,12 +19,19 @@ USAGE:
     tephractl source remove <name> [--json]
     tephractl source list [--json]
     tephractl status [--json]
+    tephractl ls <source> [folder] [-r] [--json]
     tephractl link resolve [--source <name>] <target> [--json]
     tephractl link refactor --source <name> --old <path> --new <path> [--apply] [--yes] [--json]
     tephractl daemon install [--from <path>] [--json]
     tephractl daemon uninstall
     tephractl daemon status [--json]
     tephractl -h | --help
+
+LS:
+    ls <source> [folder]  List one folder of a source: kind, size, modified time and name.
+                          <folder> is relative to the source root (default: the root).
+                          Works for an offline source too, from the cache.
+    -r, --recursive       Also list everything below <folder>, indented by depth
 
 DAEMON (macOS only; need no token and no running daemon):
     daemon install    Copy tephrad to ~/Library/Application Support/tephra/bin, sign it
@@ -50,6 +57,13 @@ pub enum Command {
     },
     SourceList,
     Status,
+    /// `ls <source> [folder] [-r]`: `folder` is `""` for the source
+    /// root.
+    Ls {
+        source: String,
+        folder: String,
+        recursive: bool,
+    },
     LinkResolve {
         target: String,
         default_source: Option<String>,
@@ -182,6 +196,7 @@ where
     let (command, trailing_json, trailing_addr) = match head {
         "source" => parse_source(&mut iter)?,
         "status" => parse_status(&mut iter)?,
+        "ls" => parse_ls(&mut iter)?,
         "link" => parse_link(&mut iter)?,
         "daemon" => parse_daemon(&mut iter)?,
         other => return Err(ArgsError(format!("unrecognized command: {other}"))),
@@ -257,6 +272,47 @@ fn parse_status<'a>(
 ) -> Result<(Command, bool, Option<String>), ArgsError> {
     let (json, addr) = parse_trailing_flags(iter)?;
     Ok((Command::Status, json, addr))
+}
+
+/// `ls <source> [folder] [-r|--recursive] [--json] [--addr <addr>]`.
+/// Flags may sit anywhere after `ls`, including between the two
+/// positionals; the first positional is the source, the second the
+/// folder. A folder that starts with `-` can't be given (it would
+/// read as a flag), which no real source-relative path needs.
+fn parse_ls<'a>(
+    iter: &mut impl Iterator<Item = &'a str>,
+) -> Result<(Command, bool, Option<String>), ArgsError> {
+    let mut source: Option<String> = None;
+    let mut folder: Option<String> = None;
+    let mut recursive = false;
+    let mut json = false;
+    let mut addr = None;
+
+    while let Some(arg) = iter.next() {
+        match arg {
+            "-r" | "--recursive" => recursive = true,
+            "--json" => json = true,
+            "--addr" => addr = Some(take_value(iter, "--addr")?),
+            other if other.starts_with('-') && other.len() > 1 => {
+                return Err(ArgsError(format!("unrecognized argument: {other}")))
+            }
+            other if source.is_none() => source = Some(other.to_string()),
+            other if folder.is_none() => folder = Some(other.to_string()),
+            other => return Err(ArgsError(format!("unrecognized argument: {other}"))),
+        }
+    }
+
+    let source = source.ok_or_else(|| ArgsError("ls requires <source> [folder]".to_string()))?;
+    validate_source_name(&source)?;
+    Ok((
+        Command::Ls {
+            source,
+            folder: folder.unwrap_or_default(),
+            recursive,
+        },
+        json,
+        addr,
+    ))
 }
 
 fn parse_daemon<'a>(
@@ -691,5 +747,95 @@ mod tests {
     fn unrecognized_trailing_flag_errors() {
         let err = parse_args(["source", "list", "--bogus"]).unwrap_err();
         assert!(err.0.contains("unrecognized argument"));
+    }
+
+    fn ls(source: &str, folder: &str, recursive: bool) -> Command {
+        Command::Ls {
+            source: source.to_string(),
+            folder: folder.to_string(),
+            recursive,
+        }
+    }
+
+    #[test]
+    fn ls_parses_source_alone_with_the_root_as_folder() {
+        let parsed = run(&["ls", "notes"]).unwrap();
+        assert_eq!(parsed.command, ls("notes", "", false));
+        assert!(!parsed.json);
+        assert_eq!(parsed.addr, None);
+    }
+
+    #[test]
+    fn ls_parses_source_and_folder() {
+        let parsed = run(&["ls", "tephra", "crates/tephrad/src"]).unwrap();
+        assert_eq!(parsed.command, ls("tephra", "crates/tephrad/src", false));
+    }
+
+    #[test]
+    fn ls_recursive_flag_before_or_after_the_folder() {
+        for args in [
+            ["ls", "src", "folder", "-r"],
+            ["ls", "src", "-r", "folder"],
+            ["ls", "-r", "src", "folder"],
+        ] {
+            assert_eq!(
+                run(&args).unwrap().command,
+                ls("src", "folder", true),
+                "{args:?}"
+            );
+        }
+        assert_eq!(
+            run(&["ls", "src", "--recursive"]).unwrap().command,
+            ls("src", "", true)
+        );
+    }
+
+    #[test]
+    fn ls_accepts_an_explicit_empty_folder_as_the_root() {
+        assert_eq!(
+            run(&["ls", "src", ""]).unwrap().command,
+            ls("src", "", false)
+        );
+    }
+
+    #[test]
+    fn ls_json_and_addr_flags_work_before_or_after_the_command() {
+        let leading = run(&["--json", "--addr", "127.0.0.1:1", "ls", "src", "-r"]).unwrap();
+        assert!(leading.json);
+        assert_eq!(leading.addr.as_deref(), Some("127.0.0.1:1"));
+        assert_eq!(leading.command, ls("src", "", true));
+
+        let trailing = run(&["ls", "src", "docs", "--json", "--addr", "127.0.0.1:2"]).unwrap();
+        assert!(trailing.json);
+        assert_eq!(trailing.addr.as_deref(), Some("127.0.0.1:2"));
+        assert_eq!(trailing.command, ls("src", "docs", false));
+
+        let between = run(&["ls", "src", "--addr", "127.0.0.1:3", "docs", "-r", "--json"]).unwrap();
+        assert_eq!(between.addr.as_deref(), Some("127.0.0.1:3"));
+        assert_eq!(between.command, ls("src", "docs", true));
+    }
+
+    #[test]
+    fn ls_without_a_source_is_an_args_error() {
+        let err = run(&["ls"]).unwrap_err();
+        assert!(err.0.contains("ls requires <source>"), "{err}");
+        assert!(run(&["ls", "-r"]).is_err());
+        assert!(run(&["ls", "--json"]).is_err());
+    }
+
+    #[test]
+    fn ls_rejects_a_source_name_with_a_space_slash_or_at_sign() {
+        for bad in ["my notes", "a/b", "@notes", "no\ttab"] {
+            let err = run(&["ls", bad]).unwrap_err();
+            assert!(err.0.contains("invalid source name"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn ls_rejects_extra_positionals_and_unknown_flags() {
+        assert!(run(&["ls", "src", "a", "b"]).is_err());
+        assert!(run(&["ls", "src", "--all"]).is_err());
+        assert!(run(&["ls", "src", "-x"]).is_err());
+        assert!(run(&["ls", "src", "--addr"]).is_err());
     }
 }

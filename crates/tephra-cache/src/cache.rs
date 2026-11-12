@@ -11,7 +11,7 @@ use rusqlite::Connection;
 use crate::schema::{self, KindInferrer};
 use crate::sources::{self, SourceRow, SourceStatus};
 use crate::units::{
-    self, BlockRow, LinkRow, NewBlock, NewLink, NewTag, NewUnit, TagRow, UnitRow,
+    self, BlockRow, LinkRow, NewBlock, NewHeading, NewLink, NewTag, NewUnit, TagRow, UnitRow,
     UnitWithSourceStatus,
 };
 use crate::{CacheError, CURRENT_SCHEMA_VERSION};
@@ -114,6 +114,30 @@ impl Cache {
             path,
             infer_kind,
             rebuilt_from,
+        })
+    }
+
+    /// Opens an existing `cache.db` read-only, for a caller that only
+    /// queries (`unit.list`): the connection cannot write, whatever SQL
+    /// runs on it, and under WAL it never blocks the scan's writer. It
+    /// runs no schema check or rebuild, so the file must already have
+    /// been opened by [`Cache::open`] at [`CURRENT_SCHEMA_VERSION`]
+    /// (the daemon does that at start); a file that doesn't exist is an
+    /// error rather than being created.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, CacheError> {
+        let path = path.as_ref().to_path_buf();
+        let conn = Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        Ok(Cache {
+            conn,
+            path,
+            infer_kind: schema::default_kind_inferrer,
+            rebuilt_from: None,
         })
     }
 
@@ -354,6 +378,10 @@ impl Cache {
         units::insert_block(&self.conn, new)
     }
 
+    pub fn insert_heading(&self, new: &NewHeading) -> Result<i64, CacheError> {
+        units::insert_heading(&self.conn, new)
+    }
+
     pub fn get_unit(&self, id: i64) -> Result<Option<UnitRow>, CacheError> {
         units::get_unit(&self.conn, id)
     }
@@ -421,6 +449,23 @@ impl Cache {
         source_name: &str,
     ) -> Result<Vec<UnitWithSourceStatus>, CacheError> {
         units::units_with_status_for_source(&self.conn, source_name)
+    }
+
+    /// One folder of the named source, from the cached rows alone
+    /// (`unit.list`, G1): see [`crate::FolderListing`]. `folder` is a
+    /// source-relative path with no leading or trailing slash; `""` is
+    /// the source root. With `recursive`, every level below it is
+    /// included depth-first, each folder entry directly before its
+    /// contents. Folders are derived from the units' `rel_path`
+    /// prefixes. Returns [`CacheError::SourceNotFound`] for an unknown
+    /// source. Read-only.
+    pub fn list_folder(
+        &self,
+        source_name: &str,
+        folder: &str,
+        recursive: bool,
+    ) -> Result<crate::FolderListing, CacheError> {
+        crate::listing::list_folder(&self.conn, source_name, folder, recursive)
     }
 
     /// Every `tags` row belonging to `unit_id`. Read counterpart to

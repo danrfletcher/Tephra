@@ -113,6 +113,17 @@ pub struct NewBlock<'a> {
     pub end_line: Option<i64>,
 }
 
+/// One `headings` row to insert: a Markdown heading of a prose unit.
+#[derive(Debug, Clone, Copy)]
+pub struct NewHeading<'a> {
+    pub unit_id: i64,
+    /// 1 through 6.
+    pub level: i64,
+    pub text: &'a str,
+    /// 1-indexed line within the file.
+    pub line: i64,
+}
+
 /// A `units` row paired with its owning source's current status, so a
 /// caller querying across an offline source can tell the rows are
 /// cached-but-stale (E2) rather than current.
@@ -159,6 +170,14 @@ pub(crate) fn insert_block(conn: &Connection, new: &NewBlock) -> Result<i64, Cac
     conn.execute(
         "INSERT INTO blocks (unit_id, block_id, line, end_line) VALUES (?1, ?2, ?3, ?4)",
         rusqlite::params![new.unit_id, new.block_id, new.line, new.end_line],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub(crate) fn insert_heading(conn: &Connection, new: &NewHeading) -> Result<i64, CacheError> {
+    conn.execute(
+        "INSERT INTO headings (unit_id, level, text, line) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![new.unit_id, new.level, new.text, new.line],
     )?;
     Ok(conn.last_insert_rowid())
 }

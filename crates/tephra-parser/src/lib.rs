@@ -41,7 +41,7 @@ pub use markdown_pass::{Heading, MarkdownLink};
 pub use tags::Tag;
 pub use wikilinks::WikiLink;
 
-pub use tephra_cache::{NewBlock, NewLink, NewTag, NewUnit};
+pub use tephra_cache::{NewBlock, NewHeading, NewLink, NewTag, NewUnit};
 
 /// `LinkRow`/`NewLink`'s `kind` value for a row derived from a
 /// `[[wikilink]]`.
@@ -144,6 +144,20 @@ impl ParsedUnit {
                 block_id: &b.block_id,
                 line: b.line as i64,
                 end_line: None,
+            })
+            .collect()
+    }
+
+    /// One `tephra-cache` `NewHeading` per heading, in document
+    /// order. The listing's prose title falls back to the first one.
+    pub fn to_new_headings(&self, unit_id: i64) -> Vec<NewHeading<'_>> {
+        self.headings
+            .iter()
+            .map(|h| NewHeading {
+                unit_id,
+                level: i64::from(h.level),
+                text: &h.text,
+                line: h.line as i64,
             })
             .collect()
     }

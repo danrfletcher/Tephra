@@ -208,8 +208,8 @@ fn unknown_method_returns_method_not_found() {
 }
 
 #[test]
-fn method_table_is_exactly_the_ten_named_verbs() {
-    assert_eq!(METHOD_NAMES.len(), 10);
+fn method_table_is_exactly_the_eleven_named_verbs() {
+    assert_eq!(METHOD_NAMES.len(), 11);
     for name in [
         "unit.resolve_link",
         "graph.get_backlinks",
@@ -221,9 +221,40 @@ fn method_table_is_exactly_the_ten_named_verbs() {
         "source.rescan",
         "link.preview_refactor",
         "link.apply_refactor",
+        "unit.list",
     ] {
         assert!(METHOD_NAMES.contains(&name), "missing method {name}");
     }
+}
+
+/// `unit.list` is routed (it reaches the sources backend, which here
+/// is the default that refuses), while a one-letter typo is not a
+/// method at all.
+#[test]
+fn unit_list_is_accepted_and_a_misspelling_is_method_not_found() {
+    let graph = NullGraph;
+    let sources = NullSources;
+    let p = proof();
+
+    let accepted = dispatch(
+        &p,
+        "unit.list",
+        &json!({"source": "notes"}),
+        &backends(&graph, &sources),
+    );
+    match accepted {
+        Ok(_) => {}
+        Err((code, _, _)) => assert_ne!(code, METHOD_NOT_FOUND, "unit.list must be routed"),
+    }
+
+    let err = dispatch(
+        &p,
+        "unit.lst",
+        &json!({"source": "notes"}),
+        &backends(&graph, &sources),
+    )
+    .unwrap_err();
+    assert_eq!(err.0, METHOD_NOT_FOUND);
 }
 
 #[test]

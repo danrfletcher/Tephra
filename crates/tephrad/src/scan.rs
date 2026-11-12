@@ -322,14 +322,41 @@ fn read_capped(path: &Path) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Whether `abs`, or any directory between `root` and it, is a symlink.
+/// Checked component by component with `symlink_metadata`, so nothing
+/// is followed. A component that doesn't exist (a path that was just
+/// deleted, or lies below a deleted symlink) is not a symlink: there is
+/// nothing there to read, and the caller treats it as a removal.
+///
+/// The root itself is not checked: it is whatever path the user
+/// registered, and may legitimately be reached through a link.
+fn passes_through_symlink(root: &Path, abs: &Path) -> bool {
+    let Ok(rel) = abs.strip_prefix(root) else {
+        return false;
+    };
+    let mut current = root.to_path_buf();
+    for component in rel.components() {
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => return true,
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
 /// Classifies one file and writes its unit row (and, for Markdown, its
-/// link/tag/block rows) under the given `source_id`. Returns
+/// link/tag/block/heading rows) under the given `source_id`. Returns
 /// `Ok(None)` (not an error) for a file whose metadata or leading
 /// bytes couldn't be read at all (permission denied, deleted
 /// mid-walk) — a single unreadable file must not abort the rest of the
 /// scan or the whole rescan transaction (E1/E5: the walk and the
 /// change-apply batch both keep going past one bad file), and is
-/// skipped with a warning whatever its kind.
+/// skipped with a warning whatever its kind. A symlink is skipped the
+/// same way, without a warning and without being read: a unit is a
+/// regular file inside the source, so a link can never pull in content
+/// from outside the root.
 ///
 /// Order of operations (G7): `metadata().len()` first, before any read.
 /// The first 8 KB are then read (one bounded read, whatever the size)
@@ -378,7 +405,17 @@ fn write_unit(
         .and_then(|n| n.to_str())
         .unwrap_or(&rel_path);
 
-    // G7: the size comes from metadata, before any read.
+    // G7: the size comes from metadata, before any read. A symlink is
+    // never indexed (see the doc comment above), so look at the entry
+    // itself first: `fs::metadata` would follow it.
+    match fs::symlink_metadata(abs_path) {
+        Ok(m) if m.file_type().is_symlink() => return Ok(None),
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(path = %abs_path.display(), error = %e, "failed to stat file during scan; skipping");
+            return Ok(None);
+        }
+    }
     let metadata = match fs::metadata(abs_path) {
         Ok(m) => m,
         Err(e) => {
@@ -478,6 +515,11 @@ fn write_unit(
     for block in parsed.to_new_blocks(unit_id) {
         cache.insert_block(&block)?;
         stats.blocks_written += 1;
+    }
+    // Headings feed the listing's prose title (first heading when the
+    // frontmatter has none). `delete_unit` removes them with the row.
+    for heading in parsed.to_new_headings(unit_id) {
+        cache.insert_heading(&heading)?;
     }
 
     Ok(Some(stats))
@@ -946,6 +988,21 @@ fn apply_change_batch_once(
         let rel = Path::new(&rel_path);
         if ignore.is_ignored(rel) {
             stats.files_ignored += 1;
+            continue;
+        }
+
+        // T2: never read through a symlink. A changed path that is a
+        // symlink, or lies below one, is not content of this source: a
+        // link made inside the root to /etc must not pull /etc in
+        // (`fs::metadata` and a walk's root both follow links). Drop
+        // any rows already cached for it instead, so a link that was
+        // indexed before this check existed is cleaned up too.
+        if passes_through_symlink(root, abs_path) {
+            let had_existing = delete_existing_unit(cache, source_id, &rel_path)?;
+            let nested_deleted = cache.delete_units_under_prefix(source_id, &rel_path)?;
+            if had_existing || nested_deleted > 0 {
+                touched_paths.push(abs_path.clone());
+            }
             continue;
         }
 

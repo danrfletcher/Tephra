@@ -24,6 +24,7 @@ use tephra_graph::{Edge, ResolveError, ResolveResult, UnitGraph};
 
 use crate::registry::{RegistryError, SourceListing, SourceRegistry};
 use crate::scan::ScanStats;
+pub use crate::unit_list::{UnitEntryWire, UnitListError, UnitListWire};
 
 /// `unit.resolve_link` / `graph.get_*` (G4), behind a trait so tests
 /// substitute a canned in-memory fixture for PR-5's real
@@ -286,6 +287,21 @@ pub trait SourceBackend: Send + Sync {
     fn unregister(&self, name: &str) -> Result<(), String>;
     fn list(&self) -> Result<Vec<SourceRowWire>, String>;
     fn rescan(&self, name: &str) -> Result<ScanStatsWire, String>;
+    /// `unit.list` (G1): one folder of `source` (`folder` already
+    /// normalized by the dispatcher; `""` is the root). The default
+    /// refuses, so a test double that only exercises the other four
+    /// verbs needn't implement it; the real [`SourceRegistry`] does,
+    /// and tests of `unit.list` itself substitute a stub.
+    fn list_units(
+        &self,
+        _source: &str,
+        _folder: &str,
+        _recursive: bool,
+    ) -> Result<UnitListWire, UnitListError> {
+        Err(UnitListError::Source(
+            "unit.list is not supported by this source backend".to_string(),
+        ))
+    }
 }
 
 impl SourceBackend for SourceRegistry {
@@ -306,6 +322,14 @@ impl SourceBackend for SourceRegistry {
         SourceRegistry::rescan(self, name)
             .map(ScanStatsWire::from)
             .map_err(registry_err_to_string)
+    }
+    fn list_units(
+        &self,
+        source: &str,
+        folder: &str,
+        recursive: bool,
+    ) -> Result<UnitListWire, UnitListError> {
+        SourceRegistry::list_units(self, source, folder, recursive)
     }
 }
 
