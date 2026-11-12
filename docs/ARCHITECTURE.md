@@ -19,15 +19,15 @@ This page describes the code on the branch `vector/atlas-3/pr-7` (pull requests 
 |---|---|
 | `tephrad` | The daemon: config and auth token, source registry, filesystem watcher, JSON-RPC server. Headless by design: no UI of any kind. |
 | `tephra-parser` | Pure Markdown parsing (`pulldown-cmark`). Extracts frontmatter, headings, `[[wikilinks]]` (including `[[@source:path]]`), `[markdown](links)`, `#tags` and `^block` ids. No I/O, no resolving. |
-| `tephra-cache` | The SQLite database (WAL mode): sources, units, links, tags, blocks. Versioned: on a schema change it drops and rebuilds rather than migrating, and tries to keep the rows of offline sources. |
+| `tephra-cache` | The SQLite database (WAL mode): sources, units (each with a kind, size and `too_large` flag), links, tags, blocks, headings, symbols, a trigram full-text table and per-source scan state. Schema version 2. Versioned: on a schema change it drops and rebuilds rather than migrating, and tries to keep the rows of offline sources. |
 | `tephra-graph` | The in-memory link graph built from the cache: forward links, backlinks, tags, and the link resolver. |
 | `tephractl` | The CLI client: `source add/remove/list`, `status`, `link resolve`. Holds no state and never touches your files itself. |
 
 ## How a source plugs in
 
 1. `tephractl source add notes /path/to/notes` calls `source.register`. The name becomes a namespace: every note in it is addressed as `@notes:path/to/note`.
-2. `tephrad` walks the folder. Ignored directories (`.git`, `node_modules`, `target`, plus anything listed in a `.tephraignore` at the source root) are pruned before the walk descends into them, and the walk streams rather than collecting every path first. Only Markdown files (`.md`, `.markdown`) are parsed and indexed; other files are seen but skipped.
-3. Each Markdown file is parsed to a unit and written to the cache. A `notify` watcher keeps it current: filesystem events are debounced (250 ms) and coalesced, the file is re-parsed, and the graph is updated. Connected WebSocket clients get a `graph:changed` notification.
+2. `tephrad` walks the folder. Ignored names (`.git`, `node_modules`, `target`, `.venv`, `__pycache__`, `.DS_Store`, `Library` and `.Trash` directly under `$HOME`, plus anything listed in a `.tephraignore` at the source root) are pruned before the walk descends into them, and the walk streams rather than collecting every path first. Every other file becomes a unit with a kind: `prose`, `code`, `document`, `text-other` or `binary`. Files over 20 MiB are indexed by name only.
+3. Each Markdown file is parsed to a unit and written to the cache; every other file is written as a unit with its name, kind, size and mtime and no links, tags or blocks. A scan records when it starts and finishes, and the daemon rescans any source whose scan never finished (for example after a `kill -9`) on its next start. A `notify` watcher keeps it current: filesystem events are debounced (250 ms) and coalesced, the file is re-parsed, and the graph is updated. Connected WebSocket clients get a `graph:changed` notification.
 4. If a source's folder goes missing (an unmounted drive), the source is marked offline. Its cached index is kept, and links into it resolve with an `(offline)` marker until it returns.
 
 Sources are independent: a missing or broken source does not corrupt another.

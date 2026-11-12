@@ -1,7 +1,8 @@
 //! `tephra-cache`: the SQLite persistent cache layer for `tephrad`.
 //!
 //! Owns `cache.db` (WAL mode), its schema (`sources`, `units`, `links`,
-//! `tags`, `blocks`, `schema_version`), the single drop-and-rebuild
+//! `tags`, `blocks`, `headings`, `symbols`, the `block_fts` FTS5 index,
+//! `scan_state`, `schema_version`), the single drop-and-rebuild
 //! path triggered by a schema-version mismatch (F2 — no migration
 //! scripts), and per-source status bookkeeping
 //! (`active`/`stale`/`offline`) so an unmounted or offline source's
@@ -19,6 +20,7 @@ mod units;
 use std::fmt;
 
 pub use cache::{Cache, FaultInjector};
+pub use schema::KindInferrer;
 pub use sources::{validate_transition, InvalidTransition, SourceRow, SourceStatus};
 pub use units::{
     BlockRow, LinkRow, NewBlock, NewLink, NewTag, NewUnit, TagRow, UnitRow, UnitWithSourceStatus,
@@ -28,10 +30,15 @@ pub use units::{
 /// constant is the *only* way the on-disk schema ever changes shape:
 /// on next open, [`Cache::open`] compares the stored `schema_version`
 /// row against this value and, on mismatch, drops and recreates
-/// `units`/`links`/`tags`/`blocks` (never `sources`) — see
-/// [`Cache::rebuild`]. There is no migration-file mechanism or
-/// version-ladder anywhere in this crate (F2).
-pub const CURRENT_SCHEMA_VERSION: i64 = 1;
+/// every core table (never `sources`, `schema_version` or
+/// `scan_state`) — see [`Cache::rebuild`]. There is no
+/// migration-file mechanism or version-ladder anywhere in this crate
+/// (F2).
+///
+/// Version 2 added `units.kind`/`size`/`too_large`/`needs_rescan`,
+/// the `headings` and `symbols` tables, `blocks.end_line` and the
+/// `block_fts` trigram FTS5 index.
+pub const CURRENT_SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug)]
 pub enum CacheError {

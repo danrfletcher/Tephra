@@ -21,6 +21,9 @@ fn a_reader_can_read_while_a_writer_holds_a_transaction_open() {
         .expect("register_source");
     writer
         .insert_unit(&NewUnit {
+            kind: "prose",
+            size: None,
+            too_large: false,
             source_id,
             rel_path: "committed.md",
             mtime: None,
@@ -42,7 +45,7 @@ fn a_reader_can_read_while_a_writer_holds_a_transaction_open() {
         .expect("begin writer tx");
     writer_conn
         .execute(
-            "INSERT INTO units (source_id, rel_path, mtime, frontmatter_json) VALUES (?1, ?2, NULL, NULL)",
+            "INSERT INTO units (source_id, rel_path, mtime, frontmatter_json, kind) VALUES (?1, ?2, NULL, NULL, 'prose')",
             rusqlite::params![source_id, "in-flight.md"],
         )
         .expect("insert inside open writer tx");
@@ -97,6 +100,9 @@ fn a_writer_with_a_short_busy_timeout_does_not_get_sqlite_busy_against_a_concurr
         .busy_timeout(Duration::from_millis(200))
         .expect("set short busy_timeout");
     let result = cache.insert_unit(&NewUnit {
+        kind: "prose",
+        size: None,
+        too_large: false,
         source_id,
         rel_path: "written-while-reader-open.md",
         mtime: None,

@@ -1,13 +1,14 @@
 //! `Cache`: the connection wrapper that opens `cache.db`, applies WAL
 //! pragmas, runs the schema-version check/rebuild, and exposes typed
-//! read/write helpers over `sources`/`units`/`links`/`tags`/`blocks`.
+//! read/write helpers over `sources`/`units`/`links`/`tags`/`blocks`
+//! (and the v2 `headings`/`symbols`/`block_fts`/`scan_state` tables).
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
-use crate::schema;
+use crate::schema::{self, KindInferrer};
 use crate::sources::{self, SourceRow, SourceStatus};
 use crate::units::{
     self, BlockRow, LinkRow, NewBlock, NewLink, NewTag, NewUnit, TagRow, UnitRow,
@@ -19,6 +20,14 @@ use crate::{CacheError, CURRENT_SCHEMA_VERSION};
 pub struct Cache {
     conn: Connection,
     path: PathBuf,
+    /// Used only by [`Cache::rebuild`]'s offline-row carry-over; see
+    /// [`Cache::open_with_kind_inferrer`].
+    infer_kind: KindInferrer,
+    /// `Some(old_version)` when this open found a stored `schema_version`
+    /// different from [`CURRENT_SCHEMA_VERSION`] and rebuilt the core
+    /// tables; `None` for a fresh file or an up-to-date one. See
+    /// [`Cache::rebuilt_from_version`].
+    rebuilt_from: Option<i64>,
 }
 
 /// Test-only seam for forcing [`Cache::rebuild`] to fail partway
@@ -52,6 +61,43 @@ impl Cache {
     /// `XDG_DATA_HOME`, falling back to `~/.local/share/tephra`); tests
     /// in this crate pass a temp directory instead.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, CacheError> {
+        Self::open_with_kind_inferrer(path, schema::default_kind_inferrer)
+    }
+
+    /// [`Cache::open`], with the function a schema rebuild uses to
+    /// give each carried-over offline `units` row a `kind` (E10). An
+    /// offline source's files can't be read, so the kind can only be
+    /// inferred from the path; this crate knows no extensions, so the
+    /// plain [`Cache::open`] marks every such row `text-other`, and
+    /// `tephrad` passes its real extension table here. The inferrer
+    /// must return one of the five `units.kind` values. It only
+    /// matters on a version-mismatch open or an explicit
+    /// [`Cache::rebuild`]; every restored row has `needs_rescan = 1`
+    /// either way.
+    pub fn open_with_kind_inferrer(
+        path: impl AsRef<Path>,
+        infer_kind: KindInferrer,
+    ) -> Result<Self, CacheError> {
+        Self::open_inner(path, infer_kind, &FaultInjector::none())
+    }
+
+    /// Test-only seam, like [`FaultInjector`] itself: [`Cache::open`]
+    /// with `injector` applied to the version-mismatch rebuild that
+    /// open may trigger, so a test can prove that a failed v1 -> v2
+    /// rebuild-on-open leaves the old file exactly as it was. The
+    /// failed rebuild's error is returned as `Err`.
+    pub fn open_with_fault_injector(
+        path: impl AsRef<Path>,
+        injector: &FaultInjector,
+    ) -> Result<Self, CacheError> {
+        Self::open_inner(path, schema::default_kind_inferrer, injector)
+    }
+
+    fn open_inner(
+        path: impl AsRef<Path>,
+        infer_kind: KindInferrer,
+        injector: &FaultInjector,
+    ) -> Result<Self, CacheError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -61,9 +107,24 @@ impl Cache {
 
         let conn = Connection::open(&path)?;
         apply_pragmas(&conn)?;
-        ensure_schema(&conn)?;
+        let rebuilt_from = ensure_schema(&conn, infer_kind, injector)?;
 
-        Ok(Cache { conn, path })
+        Ok(Cache {
+            conn,
+            path,
+            infer_kind,
+            rebuilt_from,
+        })
+    }
+
+    /// The `schema_version` this file held before [`Cache::open`] rebuilt
+    /// it to [`CURRENT_SCHEMA_VERSION`], or `None` if the open did not
+    /// rebuild (a new file, or one already at the current version). The
+    /// caller owns logging: this crate has no logger, so `tephrad`
+    /// reads this at startup and logs the old and new version. An
+    /// explicit [`Cache::rebuild`] does not change it.
+    pub fn rebuilt_from_version(&self) -> Option<i64> {
+        self.rebuilt_from
     }
 
     /// The path this cache was opened against.
@@ -104,7 +165,7 @@ impl Cache {
     }
 
     /// F2's single drop-and-recreate rebuild path: drops and recreates
-    /// `units`/`links`/`tags`/`blocks` inside one transaction, then
+    /// every core table inside one transaction, then
     /// rewrites `schema_version` to [`CURRENT_SCHEMA_VERSION`]. Never
     /// touches `sources` — row count and contents are preserved across
     /// a rebuild, including a source's `offline`/`stale`/`active`
@@ -121,7 +182,7 @@ impl Cache {
     /// test calls go through this same function.
     pub fn rebuild(&mut self, injector: &FaultInjector) -> Result<(), CacheError> {
         let mut tx = self.conn.transaction()?;
-        perform_rebuild(&mut tx, injector)?;
+        perform_rebuild(&mut tx, injector, self.infer_kind)?;
         tx.commit()?;
         Ok(())
     }
@@ -208,12 +269,64 @@ impl Cache {
         Ok(())
     }
 
+    /// Records that a scan of `source_id` has started and not yet
+    /// finished (E11). Replaces any earlier record, so a source is
+    /// "interrupted" exactly when its most recent started scan has no
+    /// matching [`Cache::mark_scan_finished`].
+    pub fn mark_scan_started(&self, source_id: i64) -> Result<(), CacheError> {
+        self.conn.execute(
+            "INSERT INTO scan_state (source_id, started_at, finished_at) \
+             VALUES (?1, CAST(strftime('%s','now') AS INTEGER), NULL) \
+             ON CONFLICT(source_id) DO UPDATE SET \
+                 started_at = excluded.started_at, finished_at = NULL",
+            [source_id],
+        )?;
+        Ok(())
+    }
+
+    /// Records that the scan [`Cache::mark_scan_started`] opened for
+    /// `source_id` ran to completion. A no-op if none was started.
+    pub fn mark_scan_finished(&self, source_id: i64) -> Result<(), CacheError> {
+        self.conn.execute(
+            "UPDATE scan_state SET finished_at = CAST(strftime('%s','now') AS INTEGER) \
+             WHERE source_id = ?1",
+            [source_id],
+        )?;
+        Ok(())
+    }
+
+    /// Every source with a scan that started and never finished (E11),
+    /// in registration order: a daemon killed mid-scan, or a source
+    /// whose rows a schema rebuild emptied. `tephrad` rescans each of
+    /// these from the top on start; there is no resume logic.
+    pub fn sources_with_unfinished_scan(&self) -> Result<Vec<SourceRow>, CacheError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, s.name, s.path, s.status, s.last_scanned_at \
+             FROM sources s JOIN scan_state c ON c.source_id = s.id \
+             WHERE c.finished_at IS NULL ORDER BY s.id",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let status_raw: String = row.get(3)?;
+            out.push(sources::row_from_query(
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                status_raw,
+                row.get(4)?,
+            )?);
+        }
+        Ok(out)
+    }
+
     pub fn source_row_count(&self) -> Result<i64, CacheError> {
         units::count_rows(&self.conn, "sources")
     }
 
     /// Row count for one of the fixed internal table names (`sources`,
-    /// `units`, `links`, `tags`, `blocks`, `schema_version`). `table`
+    /// `units`, `links`, `tags`, `blocks`, `schema_version`,
+    /// `headings`, `symbols`, `block_fts`, `scan_state`). `table`
     /// is checked against that closed allow-list and rejected with
     /// [`CacheError::InvalidTableName`] for anything else — this
     /// method is `pub` (tests and a future RPC layer call it), so the
@@ -283,14 +396,16 @@ impl Cache {
         units::delete_units_under_prefix(&self.conn, source_id, rel_prefix)
     }
 
-    /// Deletes the named source's row and every `units`/`links`/
-    /// `tags`/`blocks` row that belonged to it. Idempotent: a no-op
+    /// Deletes the named source's row, its scan record, and every
+    /// core-table row that belonged to it. Idempotent: a no-op
     /// (not an error) if no source with this name exists, so
     /// `source.unregister` can be called twice on an already-removed
     /// source without erroring.
     pub fn delete_source(&self, name: &str) -> Result<(), CacheError> {
         if let Some(row) = self.get_source(name)? {
             units::delete_units_for_source(&self.conn, row.id)?;
+            self.conn
+                .execute("DELETE FROM scan_state WHERE source_id = ?1", [row.id])?;
             self.conn
                 .execute("DELETE FROM sources WHERE id = ?1", [row.id])?;
         }
@@ -358,7 +473,9 @@ fn apply_pragmas(conn: &Connection) -> Result<(), CacheError> {
 
 /// Drops and recreates the core tables, preserving any row that
 /// belongs to a currently-`offline` source across the drop/recreate
-/// (E2), then rewrites `schema_version`. Shared by [`Cache::rebuild`]
+/// (E2) — as provisional rows with `needs_rescan = 1`, see
+/// [`schema::restore_offline_rows`] — flags every online source's
+/// scan as unfinished, then rewrites `schema_version`. Shared by [`Cache::rebuild`]
 /// and [`ensure_schema`]'s automatic version-mismatch branch so there
 /// is exactly one rebuild code path in the crate (F2). `injector` is
 /// the test-only fault-injection seam; every production call site
@@ -396,6 +513,7 @@ fn apply_pragmas(conn: &Connection) -> Result<(), CacheError> {
 fn perform_rebuild(
     tx: &mut rusqlite::Transaction,
     injector: &FaultInjector,
+    infer_kind: KindInferrer,
 ) -> Result<(), CacheError> {
     let preserved = if schema::offline_rows_are_carryable(tx)? {
         // `.ok()`, not `?`: a column-compatible old table can still
@@ -413,11 +531,14 @@ fn perform_rebuild(
     schema::create_core_tables(tx)?;
     if let Some(preserved) = preserved {
         let mut savepoint = tx.savepoint()?;
-        match schema::restore_offline_rows(&savepoint, &preserved) {
+        match schema::restore_offline_rows(&savepoint, &preserved, infer_kind) {
             Ok(()) => savepoint.commit()?,
             Err(_) => savepoint.rollback()?,
         }
     }
+    // E11/E10: every online source's rows were just wiped, so mark each
+    // one's scan as unfinished; the daemon rescans them on start.
+    schema::flag_online_sources_for_rescan(tx)?;
     schema::write_schema_version(tx, CURRENT_SCHEMA_VERSION)?;
     Ok(())
 }
@@ -427,7 +548,14 @@ fn perform_rebuild(
 /// a brand-new database, or rebuilds core tables on a version mismatch
 /// (F2) — via [`perform_rebuild`], the same function [`Cache::rebuild`]
 /// uses, so there is exactly one rebuild code path in the crate.
-fn ensure_schema(conn: &Connection) -> Result<(), CacheError> {
+///
+/// Returns `Some(old_version)` when it rebuilt, else `None`, so the
+/// caller can report the rebuild (see [`Cache::rebuilt_from_version`]).
+fn ensure_schema(
+    conn: &Connection,
+    infer_kind: KindInferrer,
+    injector: &FaultInjector,
+) -> Result<Option<i64>, CacheError> {
     schema::create_bootstrap_tables(conn)?;
 
     match schema::read_schema_version(conn)? {
@@ -446,12 +574,13 @@ fn ensure_schema(conn: &Connection) -> Result<(), CacheError> {
             // database it is a guaranteed no-op.
             schema::create_core_tables_if_not_exists(conn)?;
         }
-        Some(_) => {
+        Some(old) => {
             let mut tx = conn.unchecked_transaction()?;
-            perform_rebuild(&mut tx, &FaultInjector::none())?;
+            perform_rebuild(&mut tx, injector, infer_kind)?;
             tx.commit()?;
+            return Ok(Some(old));
         }
     }
 
-    Ok(())
+    Ok(None)
 }

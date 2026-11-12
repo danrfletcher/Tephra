@@ -373,6 +373,77 @@ fn startup_log_lines_are_in_the_documented_order() {
     );
 }
 
+/// C27/T1: a cache.db stamped with an older schema_version is rebuilt on
+/// start, and the log names the rebuild with the old and new version
+/// (not just the later "scan did not finish" line, which reads as a crash).
+#[test]
+fn older_schema_cache_logs_the_rebuild_with_both_versions() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let config_path = home.path().join(".config/tephra/config.toml");
+    let data_dir = home.path().join(".local/share/tephra");
+    write_config(&config_path, &data_dir, EPHEMERAL_ADDR);
+
+    // A real cache file, then downgrade its version row to v1.
+    let db_path = data_dir.join("cache.db");
+    {
+        let _ = tephra_cache::Cache::open(&db_path).expect("seed cache");
+    }
+    {
+        let conn = rusqlite::Connection::open(&db_path).expect("raw open");
+        conn.execute("UPDATE schema_version SET version = 1", [])
+            .expect("downgrade version row");
+    }
+
+    let mut process = TephradProcess::spawn(home.path(), &config_path);
+    let found = process.wait_for_line("listening on 127.0.0.1:", Duration::from_secs(10));
+    assert!(
+        found,
+        "expected the listening line, got stderr: {:?}",
+        process.captured_stderr_lines()
+    );
+    process.terminate_and_wait(Duration::from_secs(5));
+
+    let lines = process.captured_stderr_lines();
+    let rebuild_idx = lines
+        .iter()
+        .position(|l| l.contains("schema rebuilt from v1 to v2"))
+        .unwrap_or_else(|| panic!("no rebuild log line in: {lines:?}"));
+    let ready_idx = lines
+        .iter()
+        .position(|l| l.contains("cache ready"))
+        .expect("cache ready line");
+    assert!(
+        rebuild_idx < ready_idx,
+        "rebuild line must precede 'cache ready'"
+    );
+
+    let conn = rusqlite::Connection::open(&db_path).expect("raw reopen");
+    let v: i64 = conn
+        .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, 2);
+}
+
+/// A current-version cache logs no rebuild line.
+#[test]
+fn current_schema_cache_logs_no_rebuild() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let config_path = home.path().join(".config/tephra/config.toml");
+    let data_dir = home.path().join(".local/share/tephra");
+    write_config(&config_path, &data_dir, EPHEMERAL_ADDR);
+
+    let mut process = TephradProcess::spawn(home.path(), &config_path);
+    assert!(process.wait_for_line("listening on 127.0.0.1:", Duration::from_secs(10)));
+    process.terminate_and_wait(Duration::from_secs(5));
+    assert!(
+        !process
+            .captured_stderr_lines()
+            .iter()
+            .any(|l| l.contains("schema rebuilt")),
+        "a fresh cache must not log a rebuild"
+    );
+}
+
 /// G5: `cache.db` is created at `<data_dir>/cache.db` on first daemon
 /// start, with the six documented tables (`sources`, `units`, `links`,
 /// `tags`, `blocks`, `schema_version`) present.
@@ -1059,4 +1130,176 @@ fn invalid_log_level_fails_startup_with_clear_error_not_silence() {
         !stderr.is_empty(),
         "stderr must not be silently empty on an invalid log_level"
     );
+}
+
+/// E11, end to end with real processes: a daemon that is `kill -9`ed
+/// after a large scan's first chunk committed leaves the source
+/// "started, never finished"; the next start rescans it from the top,
+/// with no duplicate `(source_id, rel_path)` rows and the same unit
+/// count as a clean scan.
+///
+/// The kill is triggered by what the cache shows, not by a sleep: this
+/// test polls the cache (a read-only connection, WAL, so it never
+/// blocks the scan) until at least one chunk's rows
+/// (`SCAN_COMMIT_CHUNK_SIZE` = 500) are visible, then SIGKILLs the
+/// child. The fixture is sixteen chunks long, so the scan is still running
+/// at that point by a wide margin; if it somehow isn't, the test says
+/// so rather than passing vacuously.
+#[test]
+fn a_kill_mid_scan_is_redone_from_the_top_on_the_next_start() {
+    const FILE_COUNT: i64 = 8_000;
+
+    let home = tempfile::tempdir().expect("tempdir");
+    let config_path = home.path().join(".config/tephra/config.toml");
+    let data_dir = home.path().join(".local/share/tephra");
+    write_config(&config_path, &data_dir, EPHEMERAL_ADDR);
+    let cache_path = data_dir.join("cache.db");
+
+    let vault = tempfile::tempdir().expect("vault tempdir");
+    for i in 0..FILE_COUNT {
+        let rel = format!("notes/n-{i:05}.md");
+        let full = vault.path().join(&rel);
+        fs::create_dir_all(full.parent().unwrap()).unwrap();
+        fs::write(
+            &full,
+            format!("# Note {i}\n\nLinks to [[n-{:05}]] #t\n", i + 1),
+        )
+        .unwrap();
+    }
+
+    // ---- first run: start registering, kill it after chunk 1 ------------
+    let mut first = TephradProcess::spawn(home.path(), &config_path);
+    assert!(
+        first.wait_for_line("listening on 127.0.0.1:", Duration::from_secs(10)),
+        "no listening line: {:?}",
+        first.captured_stderr_lines()
+    );
+    let listening_line = first
+        .captured_stderr_lines()
+        .into_iter()
+        .find(|l| l.contains("listening on 127.0.0.1:"))
+        .unwrap();
+    let port = port_from_listening_line(&listening_line);
+    let token = fs::read_to_string(data_dir.join("token"))
+        .expect("read token")
+        .trim()
+        .to_string();
+
+    // `source.register` answers only when the scan is done, so it runs
+    // on its own thread; the thread's request just fails when we kill
+    // the daemon under it.
+    let register_body = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"source.register\",\"params\":{{\"name\":\"big\",\"root\":\"{}\"}}}}",
+        vault.path().display()
+    );
+    let register_port = port.clone();
+    let register_token = token.clone();
+    let register_thread = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let request = format!(
+            "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1:{register_port}\r\n\
+             Authorization: Bearer {register_token}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{register_body}",
+            register_body.len()
+        );
+        if let Ok(mut stream) = std::net::TcpStream::connect(format!("127.0.0.1:{register_port}")) {
+            let _ = stream.write_all(request.as_bytes());
+            let mut sink = String::new();
+            let _ = stream.read_to_string(&mut sink);
+        }
+    });
+
+    let count_units = || -> i64 {
+        let conn = rusqlite::Connection::open_with_flags(
+            &cache_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("read-only cache connection");
+        conn.busy_timeout(Duration::from_secs(5)).unwrap();
+        conn.query_row("SELECT COUNT(*) FROM units", [], |r| r.get(0))
+            .unwrap_or(0)
+    };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut seen = 0;
+    while Instant::now() < deadline {
+        seen = if cache_path.exists() {
+            count_units()
+        } else {
+            0
+        };
+        if seen > 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    // SIGKILL our own child: no chance to finish anything.
+    first.child.kill().expect("kill -9 the first daemon");
+    first.child.wait().expect("reap the first daemon");
+    register_thread.join().expect("register thread");
+    assert!(
+        seen > 0 && seen < FILE_COUNT,
+        "the kill must land mid-scan: saw {seen} of {FILE_COUNT} units at kill time"
+    );
+    let at_kill = count_units();
+    assert!(
+        at_kill < FILE_COUNT,
+        "the scan finished before the kill landed ({at_kill} units)"
+    );
+    // The cache says: started, not finished.
+    {
+        let conn = rusqlite::Connection::open_with_flags(
+            &cache_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let unfinished: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM scan_state WHERE finished_at IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            unfinished, 1,
+            "the killed scan must be recorded as unfinished"
+        );
+    }
+
+    // ---- second run: restart, expect a rescan from the top -------------
+    let mut second = TephradProcess::spawn(home.path(), &config_path);
+    assert!(
+        second.wait_for_line("scan did not finish last time", Duration::from_secs(30)),
+        "the restart must announce the rescan: {:?}",
+        second.captured_stderr_lines()
+    );
+    assert!(
+        second.wait_for_line("interrupted scan redone", Duration::from_secs(120)),
+        "the rescan must complete: {:?}",
+        second.captured_stderr_lines()
+    );
+    let code = second.terminate_and_wait(Duration::from_secs(10));
+    assert_eq!(code, Some(0), "clean exit after SIGTERM");
+
+    let conn = rusqlite::Connection::open(&cache_path).unwrap();
+    let (total, distinct): (i64, i64) = conn
+        .query_row(
+            "SELECT COUNT(*), COUNT(DISTINCT source_id || '/' || rel_path) FROM units",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(total, FILE_COUNT, "same unit count as a clean scan");
+    assert_eq!(
+        distinct, FILE_COUNT,
+        "no duplicate (source_id, rel_path) rows"
+    );
+    let unfinished: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM scan_state WHERE finished_at IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(unfinished, 0, "the redone scan is recorded as finished");
 }

@@ -1,10 +1,11 @@
 //! SQL DDL and the single drop-and-recreate rebuild path (F2).
 //!
 //! Two groups of tables:
-//! - Bootstrap tables (`sources`, `schema_version`) are created once
-//!   with `CREATE TABLE IF NOT EXISTS` and are never dropped, not even
-//!   by a schema-version rebuild.
-//! - Core tables (`units`, `links`, `tags`, `blocks`) hold derived,
+//! - Bootstrap tables (`sources`, `schema_version`, `scan_state`) are
+//!   created once with `CREATE TABLE IF NOT EXISTS` and are never
+//!   dropped, not even by a schema-version rebuild.
+//! - Core tables (`units`, `links`, `tags`, `blocks`, `headings`,
+//!   `symbols`, and the `block_fts` FTS5 index) hold derived,
 //!   re-parseable data. On a schema-version mismatch they are
 //!   unconditionally dropped and recreated — this crate has no
 //!   migration-file mechanism, version ladder, or incremental
@@ -20,6 +21,16 @@
 //! wiped (E2) — the tables are still genuinely dropped and recreated
 //! (satisfying F2's "no incremental migration path"), the offline
 //! rows are just carried across that drop/recreate rather than lost.
+//!
+//! The snapshot reads only the column set every schema version has
+//! had (the v1 columns): anything a newer schema added (`kind`,
+//! `size`, `too_large`, `needs_rescan`, `blocks.end_line`, the
+//! `headings`/`symbols`/`block_fts` tables) is not read, because an
+//! offline source cannot be re-read from disk. Restored `units` rows
+//! get a `kind` inferred from the extension alone (via the
+//! [`KindInferrer`] the [`crate::Cache`] was opened with), a `NULL`
+//! `size`, and `needs_rescan = 1`, so the next online rescan knows to
+//! fill them in (E10).
 //!
 //! That carry-over is itself gated by [`offline_rows_are_carryable`]:
 //! an older cache file, opened by a newer build after the schema
@@ -44,7 +55,7 @@
 
 use rusqlite::Connection;
 
-use crate::units::{BlockRow, LinkRow, TagRow, UnitRow};
+use crate::units::{BlockRow, LinkRow, TagRow};
 use crate::CacheError;
 
 const CREATE_SOURCES: &str = "\
@@ -61,6 +72,18 @@ const CREATE_SCHEMA_VERSION: &str = "\
         version INTEGER NOT NULL \
     )";
 
+/// Per-source scan bookkeeping (E11). Bootstrap table like `sources`:
+/// created `IF NOT EXISTS` and never dropped. A row with a NULL
+/// `finished_at` is a scan that started and never finished, which
+/// `tephrad` rescans from the top on its next start. There is no
+/// resume logic.
+const CREATE_SCAN_STATE: &str = "\
+    CREATE TABLE IF NOT EXISTS scan_state (\
+        source_id INTEGER PRIMARY KEY REFERENCES sources(id), \
+        started_at INTEGER NOT NULL, \
+        finished_at INTEGER \
+    )";
+
 const CREATE_UNITS: &str = "\
     CREATE TABLE units (\
         id INTEGER PRIMARY KEY AUTOINCREMENT, \
@@ -68,6 +91,10 @@ const CREATE_UNITS: &str = "\
         rel_path TEXT NOT NULL, \
         mtime INTEGER, \
         frontmatter_json TEXT, \
+        kind TEXT NOT NULL CHECK (kind IN ('prose','code','document','text-other','binary')), \
+        size INTEGER, \
+        too_large INTEGER NOT NULL DEFAULT 0, \
+        needs_rescan INTEGER NOT NULL DEFAULT 0, \
         UNIQUE(source_id, rel_path) \
     )";
 
@@ -92,7 +119,42 @@ const CREATE_BLOCKS: &str = "\
         id INTEGER PRIMARY KEY AUTOINCREMENT, \
         unit_id INTEGER NOT NULL REFERENCES units(id), \
         block_id TEXT NOT NULL, \
+        line INTEGER NOT NULL, \
+        end_line INTEGER \
+    )";
+
+const CREATE_HEADINGS: &str = "\
+    CREATE TABLE headings (\
+        id INTEGER PRIMARY KEY AUTOINCREMENT, \
+        unit_id INTEGER NOT NULL REFERENCES units(id), \
+        level INTEGER NOT NULL, \
+        text TEXT NOT NULL, \
         line INTEGER NOT NULL \
+    )";
+
+const CREATE_SYMBOLS: &str = "\
+    CREATE TABLE symbols (\
+        id INTEGER PRIMARY KEY AUTOINCREMENT, \
+        unit_id INTEGER NOT NULL REFERENCES units(id), \
+        kind TEXT NOT NULL, \
+        name TEXT NOT NULL, \
+        parent TEXT, \
+        start_line INTEGER NOT NULL, \
+        end_line INTEGER NOT NULL \
+    )";
+
+/// Trigram FTS5 index over paragraph/comment/symbol text (`^^`
+/// search). `unit_id` and `line` are stored but not tokenized. A
+/// virtual table cannot carry a foreign key or a regular index, so
+/// rows are removed by the explicit `DELETE ... WHERE unit_id` in the
+/// delete helpers in `units.rs`, like the other child tables. Nothing
+/// populates it yet; the search PR does.
+const CREATE_BLOCK_FTS: &str = "\
+    CREATE VIRTUAL TABLE block_fts USING fts5(\
+        unit_id UNINDEXED, \
+        line UNINDEXED, \
+        text, \
+        tokenize = 'trigram'\
     )";
 
 /// Indexes backing the per-unit cascading deletes in `units.rs`
@@ -127,6 +189,10 @@ const CREATE_IDX_TAGS_UNIT_ID: &str =
     "CREATE INDEX IF NOT EXISTS idx_tags_unit_id ON tags(unit_id)";
 const CREATE_IDX_BLOCKS_UNIT_ID: &str =
     "CREATE INDEX IF NOT EXISTS idx_blocks_unit_id ON blocks(unit_id)";
+const CREATE_IDX_HEADINGS_UNIT_ID: &str =
+    "CREATE INDEX IF NOT EXISTS idx_headings_unit_id ON headings(unit_id)";
+const CREATE_IDX_SYMBOLS_UNIT_ID: &str =
+    "CREATE INDEX IF NOT EXISTS idx_symbols_unit_id ON symbols(unit_id)";
 
 /// Creates (or confirms, if already present) every index in this
 /// module. Idempotent: safe to call on every open, whether or not the
@@ -136,19 +202,22 @@ pub(crate) fn create_core_indexes(conn: &Connection) -> Result<(), CacheError> {
     conn.execute(CREATE_IDX_LINKS_TO_UNIT_ID, [])?;
     conn.execute(CREATE_IDX_TAGS_UNIT_ID, [])?;
     conn.execute(CREATE_IDX_BLOCKS_UNIT_ID, [])?;
+    conn.execute(CREATE_IDX_HEADINGS_UNIT_ID, [])?;
+    conn.execute(CREATE_IDX_SYMBOLS_UNIT_ID, [])?;
     Ok(())
 }
 
-/// Creates `sources` and `schema_version` if absent. Idempotent and
-/// safe to call on every open: never drops or truncates either table.
+/// Creates `sources`, `schema_version` and `scan_state` if absent.
+/// Idempotent and safe to call on every open: never drops or
+/// truncates any of them.
 pub(crate) fn create_bootstrap_tables(conn: &Connection) -> Result<(), CacheError> {
     conn.execute(CREATE_SOURCES, [])?;
     conn.execute(CREATE_SCHEMA_VERSION, [])?;
+    conn.execute(CREATE_SCAN_STATE, [])?;
     Ok(())
 }
 
-/// Creates `units`/`links`/`tags`/`blocks` only if they don't already
-/// exist. Used on first run (after a fresh `schema_version` insert) and
+/// Creates every core table only if it doesn't already exist. Used on first run (after a fresh `schema_version` insert) and
 /// defensively on a version-match open, where it is a guaranteed no-op
 /// against an already-populated schema.
 pub(crate) fn create_core_tables_if_not_exists(conn: &Connection) -> Result<(), CacheError> {
@@ -159,19 +228,29 @@ pub(crate) fn create_core_tables_if_not_exists(conn: &Connection) -> Result<(), 
     Ok(())
 }
 
-fn core_table_ddls_if_not_exists() -> [String; 4] {
+fn core_table_ddls_if_not_exists() -> [String; 7] {
     [
         CREATE_UNITS.replacen("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1),
         CREATE_LINKS.replacen("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1),
         CREATE_TAGS.replacen("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1),
         CREATE_BLOCKS.replacen("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1),
+        CREATE_HEADINGS.replacen("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1),
+        CREATE_SYMBOLS.replacen("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1),
+        CREATE_BLOCK_FTS.replacen(
+            "CREATE VIRTUAL TABLE",
+            "CREATE VIRTUAL TABLE IF NOT EXISTS",
+            1,
+        ),
     ]
 }
 
-/// Drops `units`/`links`/`tags`/`blocks` (children first, parents
-/// last, though `DROP TABLE` in SQLite does not itself enforce foreign
-/// keys). Never touches `sources` or `schema_version`.
+/// Drops every core table (children first, parents last, though
+/// `DROP TABLE` in SQLite does not itself enforce foreign keys).
+/// Never touches `sources`, `schema_version` or `scan_state`.
 pub(crate) fn drop_core_tables(conn: &Connection) -> Result<(), CacheError> {
+    conn.execute("DROP TABLE IF EXISTS block_fts", [])?;
+    conn.execute("DROP TABLE IF EXISTS symbols", [])?;
+    conn.execute("DROP TABLE IF EXISTS headings", [])?;
     conn.execute("DROP TABLE IF EXISTS blocks", [])?;
     conn.execute("DROP TABLE IF EXISTS tags", [])?;
     conn.execute("DROP TABLE IF EXISTS links", [])?;
@@ -179,7 +258,7 @@ pub(crate) fn drop_core_tables(conn: &Connection) -> Result<(), CacheError> {
     Ok(())
 }
 
-/// Recreates `units`/`links`/`tags`/`blocks` from the current schema,
+/// Recreates every core table from the current schema,
 /// unconditionally. Only ever called immediately after
 /// [`drop_core_tables`] within the same transaction.
 pub(crate) fn create_core_tables(conn: &Connection) -> Result<(), CacheError> {
@@ -187,6 +266,9 @@ pub(crate) fn create_core_tables(conn: &Connection) -> Result<(), CacheError> {
     conn.execute(CREATE_LINKS, [])?;
     conn.execute(CREATE_TAGS, [])?;
     conn.execute(CREATE_BLOCKS, [])?;
+    conn.execute(CREATE_HEADINGS, [])?;
+    conn.execute(CREATE_SYMBOLS, [])?;
+    conn.execute(CREATE_BLOCK_FTS, [])?;
     create_core_indexes(conn)?;
     Ok(())
 }
@@ -203,9 +285,9 @@ pub(crate) fn create_core_tables(conn: &Connection) -> Result<(), CacheError> {
 ///
 /// Callers must first confirm [`offline_rows_are_carryable`] returns
 /// `true` for the connection's *current* (pre-drop) table shapes.
-/// This function's `SELECT`s name every column the current schema
-/// expects (e.g. `u.frontmatter_json`); against an older cache opened
-/// by a newer build, one of those columns may not exist yet, and a
+/// This function's `SELECT`s name every column in the v1 set (e.g.
+/// `u.frontmatter_json`); against a cache older than that, one of
+/// those columns may not exist, and a
 /// statement naming a nonexistent column fails to even *prepare* —
 /// before the `WHERE status = 'offline'` filter could matter, even
 /// when nothing is offline. [`offline_rows_are_carryable`] checks
@@ -221,17 +303,52 @@ pub(crate) fn create_core_tables(conn: &Connection) -> Result<(), CacheError> {
 /// empty core tables for the affected source rather than failing.
 #[derive(Debug, Default)]
 pub(crate) struct OfflineRows {
-    units: Vec<UnitRow>,
+    units: Vec<OfflineUnit>,
     links: Vec<LinkRow>,
     tags: Vec<TagRow>,
     blocks: Vec<BlockRow>,
 }
 
-/// The exact column names [`snapshot_offline_rows`]'s `SELECT`s and
-/// [`restore_offline_rows`]'s `INSERT`s reference, by table, in the
-/// current schema (see the `CREATE_*` constants above). Checked via
-/// `PRAGMA table_info` against the *old*, pre-rebuild table shapes
-/// before a rebuild ever attempts to snapshot offline rows.
+/// A `units` row as the snapshot reads it: only the columns every
+/// schema version has had. The newer columns (`kind`, `size`,
+/// `too_large`, `needs_rescan`) are filled in by
+/// [`restore_offline_rows`].
+#[derive(Debug)]
+pub(crate) struct OfflineUnit {
+    id: i64,
+    source_id: i64,
+    rel_path: String,
+    mtime: Option<i64>,
+    frontmatter_json: Option<String>,
+}
+
+/// Infers a `units.kind` value from a `rel_path` alone, with no file
+/// read. An offline source's files cannot be opened, so a restored
+/// row's kind can only come from its name. Must return one of the
+/// five values the `units.kind` CHECK allows (`prose`, `code`,
+/// `document`, `text-other`, `binary`); the restore runs inside a
+/// savepoint, so a value the CHECK rejects discards the whole
+/// carry-over rather than failing the rebuild.
+pub type KindInferrer = fn(&str) -> &'static str;
+
+/// The [`KindInferrer`] a plain [`crate::Cache::open`] uses: knows no
+/// extensions, so every restored offline row is `text-other`. The
+/// `tephrad` daemon opens its cache with
+/// [`crate::Cache::open_with_kind_inferrer`] and its real extension
+/// table; either way `needs_rescan = 1` marks the guess as provisional.
+pub(crate) fn default_kind_inferrer(_rel_path: &str) -> &'static str {
+    "text-other"
+}
+
+/// The exact column names [`snapshot_offline_rows`]'s `SELECT`s read,
+/// by table. This is the v1 column set, which every later schema
+/// version still contains, so it is what a rebuild can rely on finding
+/// in any old cache. It deliberately omits the v2 columns (`units.kind`
+/// and friends, `blocks.end_line`): a v1 cache doesn't have them, and
+/// requiring them would make the gate below refuse every v1 cache and
+/// drop its offline rows (E10). Checked via `PRAGMA table_info`
+/// against the *old*, pre-rebuild table shapes before a rebuild ever
+/// attempts to snapshot offline rows.
 const UNITS_SNAPSHOT_COLUMNS: [&str; 5] =
     ["id", "source_id", "rel_path", "mtime", "frontmatter_json"];
 const LINKS_SNAPSHOT_COLUMNS: [&str; 5] = ["id", "from_unit_id", "to_raw", "to_unit_id", "kind"];
@@ -262,10 +379,9 @@ fn table_has_columns(conn: &Connection, table: &str, columns: &[&str]) -> Result
 
 /// Gate for [`snapshot_offline_rows`]: `true` only if the *current*
 /// (pre-drop) `units`/`links`/`tags`/`blocks` tables already have
-/// every column this crate's current schema expects. `false` means an
-/// older cache file (opened by a newer build after the schema grew a
-/// column, as in the R1 review repro: a `units` table with no
-/// `frontmatter_json`) is being rebuilt — in that case the rebuild
+/// every column the snapshot reads (the v1 set above). `false` means
+/// an older cache file than that (as in the R1 review repro: a
+/// `units` table with no `frontmatter_json`) is being rebuilt — in that case the rebuild
 /// still proceeds (drop, recreate, rewrite `schema_version`; F2's
 /// single code path is unaffected), it just skips the offline-row
 /// carry-over rather than failing outright. A source's `sources` row
@@ -290,7 +406,7 @@ pub(crate) fn snapshot_offline_rows(conn: &Connection) -> Result<OfflineRows, Ca
     )?;
     let mut rows = units_stmt.query([])?;
     while let Some(row) = rows.next()? {
-        out.units.push(UnitRow {
+        out.units.push(OfflineUnit {
             id: row.get(0)?,
             source_id: row.get(1)?,
             rel_path: row.get(2)?,
@@ -347,6 +463,7 @@ pub(crate) fn snapshot_offline_rows(conn: &Connection) -> Result<OfflineRows, Ca
             unit_id: row.get(1)?,
             block_id: row.get(2)?,
             line: row.get(3)?,
+            end_line: None,
         });
     }
 
@@ -375,12 +492,24 @@ pub(crate) fn snapshot_offline_rows(conn: &Connection) -> Result<OfflineRows, Ca
 pub(crate) fn restore_offline_rows(
     conn: &Connection,
     rows: &OfflineRows,
+    infer_kind: KindInferrer,
 ) -> Result<(), CacheError> {
     for u in &rows.units {
+        // `size` is NULL (the file can't be stat'ed while the source is
+        // offline) and `needs_rescan` is 1, so the next online rescan
+        // of this source knows the row is provisional (E10).
         conn.execute(
-            "INSERT INTO units (id, source_id, rel_path, mtime, frontmatter_json) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![u.id, u.source_id, u.rel_path, u.mtime, u.frontmatter_json],
+            "INSERT INTO units \
+             (id, source_id, rel_path, mtime, frontmatter_json, kind, size, too_large, needs_rescan) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 0, 1)",
+            rusqlite::params![
+                u.id,
+                u.source_id,
+                u.rel_path,
+                u.mtime,
+                u.frontmatter_json,
+                infer_kind(&u.rel_path)
+            ],
         )?;
     }
 
@@ -405,11 +534,29 @@ pub(crate) fn restore_offline_rows(
 
     for b in &rows.blocks {
         conn.execute(
-            "INSERT INTO blocks (id, unit_id, block_id, line) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![b.id, b.unit_id, b.block_id, b.line],
+            "INSERT INTO blocks (id, unit_id, block_id, line, end_line) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![b.id, b.unit_id, b.block_id, b.line, b.end_line],
         )?;
     }
 
+    Ok(())
+}
+
+/// Marks every non-offline source as "scan started, never finished"
+/// (E11), so the daemon rescans it from the top on its next start. A
+/// rebuild empties every online source's core rows, and `scan_state`
+/// is never dropped, so without this an online source would keep its
+/// old "finished" record and silently stay empty. Offline sources are
+/// skipped: their rows were carried across and they can't be scanned.
+pub(crate) fn flag_online_sources_for_rescan(conn: &Connection) -> Result<(), CacheError> {
+    conn.execute(
+        "INSERT INTO scan_state (source_id, started_at, finished_at) \
+         SELECT id, CAST(strftime('%s','now') AS INTEGER), NULL FROM sources \
+         WHERE status != 'offline' \
+         ON CONFLICT(source_id) DO UPDATE SET \
+             started_at = excluded.started_at, finished_at = NULL",
+        [],
+    )?;
     Ok(())
 }
 

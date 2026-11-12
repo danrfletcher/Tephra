@@ -703,3 +703,150 @@ fn moving_a_directory_out_of_a_tracked_source_removes_its_files_rows() {
 
     registry.unregister("notes").expect("unregister");
 }
+
+/// `(kind, links, tags, blocks)` per `rel_path` for the whole cache's
+/// one source `name`.
+fn kinds_in_cache(
+    cache_path: &std::path::Path,
+    name: &str,
+) -> std::collections::BTreeMap<String, (String, i64, i64, i64)> {
+    let cache = Cache::open(cache_path).expect("reopen cache");
+    let source_id = cache.get_source(name).unwrap().unwrap().id;
+    let conn = cache.connection();
+    let mut stmt = conn
+        .prepare(
+            "SELECT u.rel_path, u.kind, \
+                (SELECT COUNT(*) FROM links l WHERE l.from_unit_id = u.id), \
+                (SELECT COUNT(*) FROM tags t WHERE t.unit_id = u.id), \
+                (SELECT COUNT(*) FROM blocks b WHERE b.unit_id = u.id) \
+             FROM units u WHERE u.source_id = ?1",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([source_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                (r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?),
+            ))
+        })
+        .unwrap();
+    rows.map(Result::unwrap).collect()
+}
+
+/// Every file under `root` as `(rel_path, bytes)`.
+fn read_tree(root: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                out.push((rel, std::fs::read(&path).unwrap()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+#[test]
+fn the_watcher_path_classifies_every_kind_like_the_full_scan_and_flips_a_changed_kind() {
+    // G2/G6/G15 + "a file changing kind": a source that starts empty
+    // gets the whole kinds fixture written into it while the real
+    // watcher runs, so every unit below came from the debounced batch
+    // path, never from the initial walk.
+    let template = fixtures::kinds_fixture();
+    let tree = read_tree(template.root());
+
+    let target = fixtures::empty_source();
+    let cache_dir = tempfile::tempdir().expect("cache tempdir");
+    let cache_path = cache_dir.path().join("cache.db");
+    let registry =
+        SourceRegistry::new(Cache::open(&cache_path).expect("open cache")).expect("registry");
+    registry
+        .register("kinds", target.root())
+        .expect("register empty");
+
+    let expected: std::collections::BTreeMap<&str, &str> =
+        fixtures::KINDS_EXPECTED.iter().copied().collect();
+    let settled = |cache_path: &std::path::Path| {
+        let got = kinds_in_cache(cache_path, "kinds");
+        got.len() == expected.len()
+            && got
+                .iter()
+                .all(|(p, v)| expected.get(p.as_str()) == Some(&v.0.as_str()))
+    };
+
+    for (rel, bytes) in &tree {
+        target.write_bytes(rel, bytes);
+    }
+    assert!(
+        wait_until(Duration::from_secs(20), || settled(&cache_path)),
+        "the watcher never produced the expected units: {:?}",
+        kinds_in_cache(&cache_path, "kinds")
+    );
+
+    // Same result as a full scan of the same tree, row for row.
+    let scan_dir = tempfile::tempdir().expect("scan cache tempdir");
+    let scan_path = scan_dir.path().join("cache.db");
+    let scan_registry =
+        SourceRegistry::new(Cache::open(&scan_path).expect("open")).expect("registry");
+    scan_registry
+        .register("kinds", template.root())
+        .expect("register full");
+    let via_scan = kinds_in_cache(&scan_path, "kinds");
+    assert_eq!(kinds_in_cache(&cache_path, "kinds"), via_scan);
+
+    for (path, (_, links, tags, blocks)) in &via_scan {
+        if !path.to_ascii_lowercase().ends_with(".md") {
+            assert_eq!((*links, *tags, *blocks), (0, 0, 0), "{path}");
+        }
+    }
+    for ignored in fixtures::KINDS_IGNORED {
+        assert!(!via_scan.contains_key(ignored), "{ignored}");
+    }
+
+    // Touch every file (rewrite the same bytes): nothing changes.
+    for (rel, bytes) in &tree {
+        target.write_bytes(rel, bytes);
+    }
+    std::thread::sleep(Duration::from_millis(800)); // > debounce, then verify
+    assert!(
+        wait_until(Duration::from_secs(10), || settled(&cache_path)),
+        "touching every file must leave the same units"
+    );
+    assert_eq!(kinds_in_cache(&cache_path, "kinds"), via_scan);
+
+    // A Markdown file overwritten with binary bytes flips to `binary`
+    // and loses its link/tag/block rows.
+    assert_eq!(via_scan["notes/one.md"], ("prose".into(), 1, 1, 1));
+    target.write_bytes("notes/one.md", &[0, 1, 2, 3, 0]);
+    let flipped = wait_until(Duration::from_secs(20), || {
+        kinds_in_cache(&cache_path, "kinds").get("notes/one.md")
+            == Some(&("binary".into(), 0, 0, 0))
+    });
+    assert!(
+        flipped,
+        "one.md must flip to binary with no stale rows: {:?}",
+        kinds_in_cache(&cache_path, "kinds").get("notes/one.md")
+    );
+    // And an extensionless file given a shebang becomes code.
+    target.write("bin/plain", "#!/bin/sh\necho hi\n");
+    let to_code = wait_until(Duration::from_secs(20), || {
+        kinds_in_cache(&cache_path, "kinds")
+            .get("bin/plain")
+            .map(|v| v.0.as_str())
+            == Some("code")
+    });
+    assert!(to_code, "bin/plain gained a shebang and must become code");
+
+    registry.unregister("kinds").expect("unregister");
+    scan_registry.unregister("kinds").expect("unregister");
+}

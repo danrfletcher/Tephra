@@ -47,6 +47,9 @@ fn main() {
         };
         let unit_id = cache
             .insert_unit(&NewUnit {
+                kind: "prose",
+                size: None,
+                too_large: false,
                 source_id,
                 rel_path: "demo-note.md",
                 mtime: Some(0),
@@ -69,6 +72,7 @@ fn main() {
             .expect("insert_tag");
         cache
             .insert_block(&NewBlock {
+                end_line: None,
                 unit_id,
                 block_id: "demo-block",
                 line: 1,

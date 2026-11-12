@@ -152,8 +152,22 @@ fn main() -> ExitCode {
     // A failure here is a hard startup failure, same as every other
     // stage; the daemon has nothing useful to do without its cache.
     let cache_path = cfg.data_dir.join("cache.db");
-    match tephra_cache::Cache::open(&cache_path) {
+    // `infer_kind_from_path` gives any offline source's rows carried
+    // across a v1 -> v2 rebuild their provisional `kind` (E10).
+    match tephra_cache::Cache::open_with_kind_inferrer(
+        &cache_path,
+        tephrad::file_kind::infer_kind_from_path,
+    ) {
         Ok(cache) => {
+            if let Some(old) = cache.rebuilt_from_version() {
+                tracing::info!(
+                    from_version = old,
+                    to_version = tephra_cache::CURRENT_SCHEMA_VERSION,
+                    path = %cache.path().display(),
+                    "schema rebuilt from v{old} to v{}; cached rows will be rescanned",
+                    tephra_cache::CURRENT_SCHEMA_VERSION
+                );
+            }
             tracing::info!(path = %cache.path().display(), "cache ready");
         }
         Err(e) => return fail(stage::CACHE, e),
@@ -473,6 +487,24 @@ fn run_server(
             }
         });
 
+        // E11: redo, from the top, every scan that started and never
+        // finished (a kill mid-scan, or a source emptied by a schema
+        // rebuild). Runs in the background so the daemon answers
+        // requests meanwhile, one source at a time; each success sends
+        // a `source_changed` event, which the forwarder above turns
+        // into a graph refresh. Joined at shutdown below, so no scan
+        // thread outlives the registry. A scan already running when a
+        // shutdown arrives is not interrupted, but no further source
+        // is started; whatever is left stays unfinished and is redone
+        // on the next start.
+        let rescan_registry = registry.clone();
+        let rescan_shutdown_rx = shutdown_rx.clone();
+        let rescan_handle = tokio::task::spawn_blocking(move || {
+            let outcomes = rescan_registry.rescan_unfinished(|| *rescan_shutdown_rx.borrow());
+            drop(rescan_registry);
+            outcomes.len()
+        });
+
         let socket_tasks = state.socket_tasks.clone();
         let app = build_router(state);
 
@@ -497,6 +529,9 @@ fn run_server(
         // after the same signal fired) so `forward_state` is guaranteed
         // dropped before `registry` is handed back out below.
         let _ = forwarder_handle.await;
+        if let Err(e) = rescan_handle.await {
+            tracing::warn!(error = %e, "startup rescan task panicked");
+        }
 
         // R10: `axum::serve`'s own graceful shutdown above only waits
         // on in-flight plain HTTP requests — it has no idea an

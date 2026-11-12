@@ -26,6 +26,9 @@ fn inserting_a_unit_with_nonexistent_source_id_is_rejected() {
     let cache = common::open_temp_cache(&dir);
 
     let result = cache.insert_unit(&NewUnit {
+        kind: "prose",
+        size: None,
+        too_large: false,
         source_id: 999_999,
         rel_path: "ghost.md",
         mtime: None,
@@ -98,6 +101,7 @@ fn inserting_a_block_with_nonexistent_unit_id_is_rejected() {
     let cache = common::open_temp_cache(&dir);
 
     let result = cache.insert_block(&NewBlock {
+        end_line: None,
         unit_id: 999_999,
         block_id: "ghost",
         line: 1,
@@ -138,6 +142,7 @@ fn valid_rows_against_real_parents_insert_cleanly() {
         .is_ok());
     assert!(cache
         .insert_block(&NewBlock {
+            end_line: None,
             unit_id,
             block_id: "real-block",
             line: 5,

@@ -139,6 +139,9 @@ fn delete_units_under_prefix_clears_only_the_nested_rel_paths() {
     // component boundary) and must survive; `top.md` is unrelated.
     let dir_a = cache
         .insert_unit(&NewUnit {
+            kind: "prose",
+            size: None,
+            too_large: false,
             source_id,
             rel_path: "dir/a.md",
             mtime: None,
@@ -155,6 +158,9 @@ fn delete_units_under_prefix_clears_only_the_nested_rel_paths() {
         .expect("insert link for dir/a.md");
     let dir_sub_b = cache
         .insert_unit(&NewUnit {
+            kind: "prose",
+            size: None,
+            too_large: false,
             source_id,
             rel_path: "dir/sub/b.md",
             mtime: None,
@@ -163,6 +169,9 @@ fn delete_units_under_prefix_clears_only_the_nested_rel_paths() {
         .expect("insert dir/sub/b.md");
     let dir2_c = cache
         .insert_unit(&NewUnit {
+            kind: "prose",
+            size: None,
+            too_large: false,
             source_id,
             rel_path: "dir2/c.md",
             mtime: None,
@@ -171,6 +180,9 @@ fn delete_units_under_prefix_clears_only_the_nested_rel_paths() {
         .expect("insert dir2/c.md");
     let top = cache
         .insert_unit(&NewUnit {
+            kind: "prose",
+            size: None,
+            too_large: false,
             source_id,
             rel_path: "top.md",
             mtime: None,
@@ -218,6 +230,9 @@ fn delete_units_under_prefix_does_not_match_on_underscore_percent_or_case() {
     let insert = |rel_path: &str| {
         cache
             .insert_unit(&NewUnit {
+                kind: "prose",
+                size: None,
+                too_large: false,
                 source_id,
                 rel_path,
                 mtime: None,

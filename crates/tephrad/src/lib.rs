@@ -8,6 +8,7 @@
 //! binary-only (`src/main.rs`'s own module tree), since they're
 //! startup-sequence concerns with no API surface a later crate or
 //! test needs to call directly.
+pub mod file_kind;
 pub mod ignore;
 pub mod refactor;
 pub mod registry;

@@ -42,13 +42,20 @@ fn two_sources_register_and_scan_fully_independently() {
     // Each source's own scan sees only its own files — no shared
     // mutable state leaking file counts across sources (GP4).
     assert_eq!(notes_stats.files_seen, 2);
-    // README.md, Cargo.toml, and src/main.rs are all walked and
-    // counted, but only README.md's `.md` extension qualifies it to
-    // actually be parsed (R3).
+    // README.md, Cargo.toml, and src/main.rs are all walked and each
+    // becomes a unit (G2): README.md prose, the other two code.
     assert_eq!(repo_stats.files_seen, 3);
     assert_eq!(
-        repo_stats.units_written, 1,
-        "only README.md becomes a unit; Cargo.toml and main.rs must not"
+        repo_stats.units_written, 3,
+        "README.md, Cargo.toml and src/main.rs are all units"
+    );
+    assert_eq!(
+        repo_stats.links_written, 1,
+        "only README.md's [[one]] is a link; Cargo.toml's [[bin]] is not"
+    );
+    assert_eq!(
+        repo_stats.tags_written, 0,
+        "main.rs's comment tag is not a tag"
     );
 
     let sources = registry.list().expect("list");
@@ -60,26 +67,46 @@ fn two_sources_register_and_scan_fully_independently() {
     // source_registered log lines with different source ids").
     assert_ne!(sources[0].id, sources[1].id);
 
-    // R3: Cargo.toml and main.rs must never have become unit rows.
+    // G2/R3: Cargo.toml and main.rs are `code` units with no extracted rows.
     let repo_row = sources
         .iter()
         .find(|s| s.name == "atlas-repo")
         .expect("atlas-repo row");
     let verify_cache = Cache::open(cache_dir.path().join("cache.db")).expect("reopen cache");
-    assert!(
-        verify_cache
-            .get_unit_by_rel_path(repo_row.id, "Cargo.toml")
+    for (path, kind) in [
+        ("README.md", "prose"),
+        ("Cargo.toml", "code"),
+        ("src/main.rs", "code"),
+    ] {
+        let unit = verify_cache
+            .get_unit_by_rel_path(repo_row.id, path)
             .expect("get_unit_by_rel_path")
-            .is_none(),
-        "Cargo.toml must never be parsed as a unit"
-    );
-    assert!(
-        verify_cache
-            .get_unit_by_rel_path(repo_row.id, "src/main.rs")
-            .expect("get_unit_by_rel_path")
-            .is_none(),
-        "src/main.rs must never be parsed as a unit"
-    );
+            .unwrap_or_else(|| panic!("{path} must be a unit"));
+        assert_eq!(unit.kind, kind, "{path}");
+        assert!(unit.size.is_some() && !unit.too_large && !unit.needs_rescan);
+    }
+    for path in ["Cargo.toml", "src/main.rs"] {
+        let unit = verify_cache
+            .get_unit_by_rel_path(repo_row.id, path)
+            .unwrap()
+            .unwrap();
+        for table in ["links", "tags", "blocks"] {
+            let col = if table == "links" {
+                "from_unit_id"
+            } else {
+                "unit_id"
+            };
+            let n: i64 = verify_cache
+                .connection()
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE {col} = ?1"),
+                    [unit.id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 0, "{path} must have no {table} rows");
+        }
+    }
 
     registry.unregister("notes").expect("unregister notes");
     registry
@@ -277,4 +304,149 @@ fn removing_one_source_leaves_the_others_watcher_and_rows_untouched() {
     registry
         .unregister("atlas-repo")
         .expect("unregister atlas-repo");
+}
+
+/// `(kind, links, tags, blocks)` for every unit of `source_id`, keyed by
+/// `rel_path`.
+fn unit_summary(
+    cache: &Cache,
+    source_id: i64,
+) -> std::collections::BTreeMap<String, (String, i64, i64, i64)> {
+    let conn = cache.connection();
+    let mut stmt = conn
+        .prepare(
+            "SELECT u.rel_path, u.kind, \
+                (SELECT COUNT(*) FROM links l WHERE l.from_unit_id = u.id), \
+                (SELECT COUNT(*) FROM tags t WHERE t.unit_id = u.id), \
+                (SELECT COUNT(*) FROM blocks b WHERE b.unit_id = u.id) \
+             FROM units u WHERE u.source_id = ?1",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([source_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                (r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?),
+            ))
+        })
+        .unwrap();
+    rows.map(Result::unwrap).collect()
+}
+
+#[test]
+fn every_non_ignored_file_is_a_unit_with_its_kind_and_only_markdown_has_rows() {
+    // G2/G6/G15 through the real register -> scan path, a real temp
+    // dir and a real cache.
+    let fixture = fixtures::kinds_fixture();
+    let cache_dir = tempfile::tempdir().expect("cache tempdir");
+    let cache_path = cache_dir.path().join("cache.db");
+    let registry =
+        SourceRegistry::new(Cache::open(&cache_path).expect("open cache")).expect("registry");
+
+    let stats = registry
+        .register("kinds", fixture.root())
+        .expect("register");
+    assert_eq!(stats.units_written, fixtures::KINDS_EXPECTED.len());
+    // Files under an ignored *directory* (`.venv`, `__pycache__`) are
+    // pruned before the walk lists them; the two ignored `.DS_Store`
+    // *files* are listed, counted as seen, and skipped.
+    assert_eq!(stats.files_ignored, 2);
+    assert_eq!(stats.files_seen, fixtures::KINDS_EXPECTED.len() + 2);
+
+    let cache = Cache::open(&cache_path).expect("reopen cache");
+    let source_id = cache.get_source("kinds").unwrap().unwrap().id;
+    let summary = unit_summary(&cache, source_id);
+
+    let expected_paths: std::collections::BTreeSet<&str> =
+        fixtures::KINDS_EXPECTED.iter().map(|(p, _)| *p).collect();
+    let actual_paths: std::collections::BTreeSet<&str> =
+        summary.keys().map(String::as_str).collect();
+    assert_eq!(
+        actual_paths, expected_paths,
+        "exact set of units, exact rel_paths"
+    );
+
+    for (path, kind) in fixtures::KINDS_EXPECTED {
+        let (got_kind, links, tags, blocks) = &summary[path];
+        assert_eq!(got_kind, kind, "{path}");
+        let is_markdown = path.to_ascii_lowercase().ends_with(".md");
+        if !is_markdown {
+            assert_eq!(
+                (*links, *tags, *blocks),
+                (0, 0, 0),
+                "{path}: a non-Markdown unit has no links/tags/blocks"
+            );
+        }
+    }
+    // The Markdown file with content still goes through the parser.
+    assert_eq!(summary["notes/one.md"], ("prose".to_string(), 1, 1, 1));
+    assert_eq!(summary["Notes.MD"], ("prose".to_string(), 1, 0, 0));
+
+    for ignored in fixtures::KINDS_IGNORED {
+        assert!(
+            !summary.contains_key(ignored),
+            "{ignored} is under an ignored name and must not be a unit"
+        );
+    }
+    for path in ["docs/a b.PDF", "img/logo.png"] {
+        let row = cache
+            .get_unit_by_rel_path(source_id, path)
+            .unwrap()
+            .unwrap();
+        let on_disk = std::fs::metadata(fixture.root().join(path)).unwrap().len();
+        assert_eq!(
+            row.size,
+            Some(on_disk as i64),
+            "{path}: size is the file length"
+        );
+        assert!(row.mtime.is_some());
+    }
+
+    registry.unregister("kinds").expect("unregister");
+}
+
+#[test]
+fn a_scan_never_writes_into_a_source_file() {
+    // F2: byte-compare the whole fixture tree (names, contents,
+    // mtimes) before and after a register-scan and a forced rescan.
+    fn snapshot(root: &std::path::Path) -> Vec<(String, Vec<u8>, std::time::SystemTime)> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    out.push((
+                        path.strip_prefix(root)
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned(),
+                        std::fs::read(&path).unwrap(),
+                        std::fs::metadata(&path).unwrap().modified().unwrap(),
+                    ));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    let fixture = fixtures::kinds_fixture();
+    let before = snapshot(fixture.root());
+    let cache_dir = tempfile::tempdir().expect("cache tempdir");
+    let registry =
+        SourceRegistry::new(Cache::open(cache_dir.path().join("cache.db")).expect("open cache"))
+            .expect("registry");
+    registry
+        .register("kinds", fixture.root())
+        .expect("register");
+    registry.rescan("kinds").expect("rescan");
+    let after = snapshot(fixture.root());
+    assert_eq!(
+        before, after,
+        "the scan must not create, change or delete any source file"
+    );
+    registry.unregister("kinds").expect("unregister");
 }

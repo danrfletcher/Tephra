@@ -9,15 +9,34 @@
 //! — there is no separate re-description of that schema in this
 //! module.
 //!
-//! Only markdown files (`.md`/`.markdown`, case-insensitive) are ever
-//! fed through the parser (GP3: "feeds every markdown file through
-//! the PR-3 parser", R3 review finding): a non-ignored non-markdown
-//! file (a `Cargo.toml`, a `main.rs`, in a code-repository source)
-//! is still walked and counted in `files_seen`, but never parsed or
-//! written as a unit row — the walk and the debounced batch-apply
-//! path both apply this filter identically, so a code-repo source
-//! never ends up with false wikilinks/tags derived from its source
-//! files.
+//! Every non-ignored file becomes a unit (G2), not just Markdown. Each
+//! file is classified by [`crate::file_kind::classify`] into `prose`,
+//! `code`, `document`, `text-other` or `binary` from its name and its
+//! first 8 KB. Only `.md`/`.markdown` files (case-insensitive) that
+//! classify as `prose` are fed through the parser; every other file is
+//! written as a unit carrying name, kind, size and mtime and nothing
+//! else — no links, tags or blocks — so a code repository never ends
+//! up with false wikilinks/tags derived from its source files. The
+//! walk ([`walk_and_write`]), the directory-upsert path and the
+//! debounced batch-apply path ([`apply_change_batch`]) all go through
+//! the same [`write_unit`], so they classify identically.
+//!
+//! Size cap (G7): a file over [`crate::file_kind::MAX_INDEXED_BYTES`]
+//! (20 MiB) is indexed by name only. Its size comes from `metadata()`
+//! before any read of the file. It keeps its real kind: the kind comes
+//! from the same name-plus-first-8-KB classification as any other file
+//! (one bounded `read_head`, never more than the sniff window), so an
+//! unknown-extension file with a NUL in its head is `binary`, not
+//! `text-other`. It is never parsed (no links, tags or blocks), gets
+//! `too_large = 1`, and one `info` line names the path and size. A
+//! file of exactly the cap is parsed normally.
+//!
+//! Interrupted scans (E11): [`scan_source`] and [`rescan_source`]
+//! record "started" in the cache's `scan_state` table before they
+//! touch any row, and "finished" only after the walk completes. A
+//! process killed in between leaves the source "started, never
+//! finished"; `tephrad` rescans such a source from the top on its next
+//! start (see `main.rs`), with no resume logic.
 //!
 //! Transaction strategy (R11 review finding): a full scan or forced
 //! rescan commits its writes in bounded chunks ([`SCAN_COMMIT_CHUNK_SIZE`])
@@ -56,8 +75,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rusqlite::{Transaction, TransactionBehavior};
-use tephra_cache::Cache;
+use tephra_cache::{Cache, NewUnit};
 
+use crate::file_kind::{self, FileKind, MAX_INDEXED_BYTES};
 use crate::ignore::IgnoreRules;
 use crate::refactor;
 use crate::writer_gate::{self, WriterGate, WriterGateGuard};
@@ -237,17 +257,15 @@ fn open_chunk<'c, 'g>(
     Ok((permit, tx))
 }
 
-/// File extensions (case-insensitive, no leading dot) treated as
-/// markdown (R3/GP3): only these are ever parsed and written as a
-/// unit row. No per-source override in v1, matching G2's "no
-/// per-source override" precedent for the ignore rules.
+/// File extensions (case-insensitive, no leading dot) whose files are
+/// parsed for links, tags and blocks. Every other kind is stored
+/// without extraction (G2). No per-source override in v1, matching
+/// G2's "no per-source override" precedent for the ignore rules.
 const MARKDOWN_EXTENSIONS: [&str; 2] = ["md", "markdown"];
 
-/// Whether `path`'s extension marks it as a markdown file this scan
-/// should actually parse. A non-ignored file with any other
-/// extension (or none) is still walked and counted as "seen", but is
-/// never handed to [`tephra_parser::parse_unit_bytes`] or written as
-/// a unit row.
+/// Whether `path`'s extension marks it as Markdown, i.e. as a file
+/// [`write_unit`] hands to the parser. This no longer decides whether
+/// a unit is created: every non-ignored file is one.
 fn is_markdown_path(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
@@ -275,22 +293,45 @@ fn to_rel_string(root: &Path, abs: &Path) -> Option<String> {
     }
 }
 
-fn file_mtime(path: &Path) -> Option<i64> {
-    let metadata = fs::metadata(path).ok()?;
+/// Seconds since the epoch of `metadata`'s modification time.
+fn metadata_mtime(metadata: &fs::Metadata) -> Option<i64> {
     let modified = metadata.modified().ok()?;
     let since_epoch = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
     Some(since_epoch.as_secs() as i64)
 }
 
-/// Parses one markdown file and writes its unit/link/tag/block rows,
-/// under the given `source_id`. Returns `Ok(None)` (not an error) for
-/// a file that can't be read as UTF-8 text or whose bytes couldn't be
-/// read at all — a single unreadable file must not abort the rest of
-/// the scan or the whole rescan transaction (E1/E5: the walk and the
-/// change-apply batch both keep going past one bad file). Callers are
-/// responsible for only calling this on a path that has already
-/// passed [`is_markdown_path`]; this function itself does not
-/// re-check the extension.
+/// Reads at most `MAX_INDEXED_BYTES + 1` bytes of `path`: enough to
+/// tell a file that grew past the cap after its `metadata()` check
+/// without ever holding more than the cap in memory.
+fn read_capped(path: &Path) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    fs::File::open(path)?
+        .take(MAX_INDEXED_BYTES + 1)
+        .read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+/// Classifies one file and writes its unit row (and, for Markdown, its
+/// link/tag/block rows) under the given `source_id`. Returns
+/// `Ok(None)` (not an error) for a file whose metadata or leading
+/// bytes couldn't be read at all (permission denied, deleted
+/// mid-walk) — a single unreadable file must not abort the rest of the
+/// scan or the whole rescan transaction (E1/E5: the walk and the
+/// change-apply batch both keep going past one bad file), and is
+/// skipped with a warning whatever its kind.
+///
+/// Order of operations (G7): `metadata().len()` first, before any read.
+/// The first 8 KB are then read (one bounded read, whatever the size)
+/// and classified ([`file_kind::classify`]), so a too-large file keeps
+/// its real kind. Over [`MAX_INDEXED_BYTES`] that is all that is read:
+/// the file is stored by name only, with that kind and `too_large = 1`,
+/// and is never parsed. Otherwise only a Markdown file that classifies
+/// as `prose` is read in full and parsed (a UTF-16 Markdown file with a
+/// BOM is decoded first). A Markdown file whose later bytes turn out
+/// not to be valid UTF-8 is stored as `binary`, by name only, with a
+/// warning — it is still a file in the source. Every other kind is
+/// stored with name, kind, size and mtime only.
 ///
 /// Always an upsert, never a blind insert (R15 review finding): any
 /// existing row at this `(source_id, rel_path)` is deleted first.
@@ -308,7 +349,10 @@ fn file_mtime(path: &Path) -> Option<i64> {
 /// after the clear committed but before this walk gets there,
 /// upserting a fresh row for it. Deleting any existing row here first
 /// makes every write-path in this module idempotent with respect to a
-/// pre-existing row, regardless of how it got there.
+/// pre-existing row, regardless of how it got there. (That also
+/// flips a file's kind cleanly: the old row's links/tags/blocks go
+/// with it, so a Markdown file overwritten with binary bytes keeps no
+/// stale link rows.)
 fn write_unit(
     cache: &Cache,
     source_id: i64,
@@ -319,29 +363,73 @@ fn write_unit(
         Some(r) => r,
         None => return Ok(None),
     };
+    let file_name = abs_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(&rel_path);
 
-    let bytes = match fs::read(abs_path) {
-        Ok(b) => b,
+    // G7: the size comes from metadata, before any read.
+    let metadata = match fs::metadata(abs_path) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(path = %abs_path.display(), error = %e, "failed to stat file during scan; skipping");
+            return Ok(None);
+        }
+    };
+    let mtime = metadata_mtime(&metadata);
+    let mut size = metadata.len();
+    let mut too_large = size > MAX_INDEXED_BYTES;
+
+    // The kind comes from the name and the first 8 KB, for a too-large
+    // file too (G7: it keeps its real kind). `read_head` is bounded, so
+    // this never reads past the sniff window whatever the file's size.
+    let head = match file_kind::read_head(abs_path) {
+        Ok(h) => h,
         Err(e) => {
             tracing::warn!(path = %abs_path.display(), error = %e, "failed to read file during scan; skipping");
             return Ok(None);
         }
     };
-
-    let parsed = match tephra_parser::parse_unit_bytes(abs_path, &bytes) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(path = %abs_path.display(), error = %e, "file is not valid UTF-8; skipping");
-            return Ok(None);
+    let mut kind = file_kind::classify(file_name, &head);
+    let mut parsed = None;
+    if !too_large && kind == FileKind::Prose && is_markdown_path(abs_path) {
+        let bytes = match read_capped(abs_path) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(path = %abs_path.display(), error = %e, "failed to read file during scan; skipping");
+                return Ok(None);
+            }
+        };
+        size = bytes.len() as u64;
+        if size > MAX_INDEXED_BYTES {
+            // Grew past the cap between the stat and the read.
+            too_large = true;
+        } else {
+            let result = match file_kind::decode_utf16_with_bom(&bytes) {
+                Some(text) => Ok(tephra_parser::parse_unit(abs_path, &text)),
+                None => tephra_parser::parse_unit_bytes(abs_path, &bytes),
+            };
+            match result {
+                Ok(p) => parsed = Some(p),
+                Err(e) => {
+                    tracing::warn!(path = %abs_path.display(), error = %e, "markdown file is not valid UTF-8; indexed by name only as binary");
+                    kind = FileKind::Binary;
+                }
+            }
         }
-    };
+    }
+    if too_large {
+        tracing::info!(
+            path = %abs_path.display(),
+            size_bytes = size,
+            limit_bytes = MAX_INDEXED_BYTES,
+            "file is over the size limit; indexed by name only"
+        );
+    }
 
     // R15: delete any existing row for this path before inserting the
-    // freshly parsed one, so this is always an upsert.
+    // freshly built one, so this is always an upsert.
     delete_existing_unit(cache, source_id, &rel_path)?;
-
-    let mtime = file_mtime(abs_path);
-    let unit_id = cache.insert_unit(&parsed.to_new_unit(source_id, &rel_path, mtime))?;
 
     let mut stats = ScanStats {
         files_seen: 0,
@@ -351,6 +439,23 @@ fn write_unit(
         tags_written: 0,
         blocks_written: 0,
     };
+
+    let Some(parsed) = parsed else {
+        cache.insert_unit(&NewUnit {
+            source_id,
+            rel_path: &rel_path,
+            mtime,
+            frontmatter_json: None,
+            kind: kind.as_str(),
+            size: Some(size as i64),
+            too_large,
+        })?;
+        return Ok(Some(stats));
+    };
+
+    let mut new_unit = parsed.to_new_unit(source_id, &rel_path, mtime);
+    new_unit.size = Some(size as i64);
+    let unit_id = cache.insert_unit(&new_unit)?;
 
     for link in parsed.to_new_links(unit_id) {
         cache.insert_link(&link)?;
@@ -384,8 +489,8 @@ fn delete_existing_unit(cache: &Cache, source_id: i64, rel_path: &str) -> Result
 /// `root` (streaming — see the module doc and E1), applying `ignore`
 /// before descending into any directory so an ignored subtree's files
 /// are never even listed, let alone parsed. Every non-ignored
-/// markdown file is parsed and its rows written via `cache`;
-/// non-markdown files are counted as seen but never parsed (R3).
+/// file is classified and written via `cache`; only Markdown is
+/// parsed for links, tags and blocks (G2).
 ///
 /// A single unreadable directory entry (e.g. a permission-denied
 /// subdirectory) is logged and skipped rather than aborting the whole
@@ -480,10 +585,6 @@ fn walk_and_write(
             stats.files_ignored += 1;
             continue;
         }
-        if !is_markdown_path(entry.path()) {
-            continue;
-        }
-
         if let Some(file_stats) = write_unit(cache, source_id, root, entry.path())? {
             stats.accumulate(file_stats);
         }
@@ -592,6 +693,28 @@ pub fn sweep_stale_temp_files(root: &Path) -> io::Result<usize> {
     Ok(removed)
 }
 
+/// Records "scan started" for `source_id` (E11) in its own committed
+/// write, *before* the scan's first chunk opens — so a process killed
+/// at any point from here on, even before that first chunk commits,
+/// leaves the source marked unfinished. Takes the writer gate like
+/// every other write so it never races an in-process chunk.
+fn record_scan_started(cache: &Cache, gate: &WriterGate, source_id: i64) -> Result<(), ScanError> {
+    retry_on_busy(|| {
+        let _permit = gate.acquire();
+        cache.mark_scan_started(source_id).map_err(ScanError::from)
+    })
+}
+
+/// Records "scan finished" for `source_id`, only reached once the walk
+/// returned `Ok`. A failed or killed scan never gets here, which is
+/// what leaves it unfinished.
+fn record_scan_finished(cache: &Cache, gate: &WriterGate, source_id: i64) -> Result<(), ScanError> {
+    retry_on_busy(|| {
+        let _permit = gate.acquire();
+        cache.mark_scan_finished(source_id).map_err(ScanError::from)
+    })
+}
+
 /// `source.register`'s initial full scan (GP2/GP3), against a source
 /// with no pre-existing rows. Commits in bounded chunks rather than
 /// one transaction for the whole walk (R11 — see the module doc
@@ -603,8 +726,11 @@ pub fn scan_source(
     ignore: &IgnoreRules,
 ) -> Result<ScanStats, ScanError> {
     let gate = writer_gate::for_path(cache.path());
+    record_scan_started(cache, &gate, source_id)?;
     let first_chunk = open_chunk(cache, &gate)?;
-    walk_and_write(cache, source_id, root, ignore, &gate, first_chunk)
+    let stats = walk_and_write(cache, source_id, root, ignore, &gate, first_chunk)?;
+    record_scan_finished(cache, &gate, source_id)?;
+    Ok(stats)
 }
 
 /// `source.rescan`'s forced full re-walk: clears this source's
@@ -625,13 +751,16 @@ pub fn rescan_source(
     ignore: &IgnoreRules,
 ) -> Result<ScanStats, ScanError> {
     let gate = writer_gate::for_path(cache.path());
+    record_scan_started(cache, &gate, source_id)?;
     let first_chunk = open_chunk(cache, &gate)?;
     cache.delete_units_for_source(source_id)?;
-    walk_and_write(cache, source_id, root, ignore, &gate, first_chunk)
+    let stats = walk_and_write(cache, source_id, root, ignore, &gate, first_chunk)?;
+    record_scan_finished(cache, &gate, source_id)?;
+    Ok(stats)
 }
 
 /// Walks an existing directory that arrived as one changed path (a
-/// create or a move-in: R4) and upserts every non-ignored markdown
+/// create or a move-in: R4) and upserts every non-ignored
 /// file under it, the same way [`walk_and_write`] does for a full
 /// scan — except scoped to this one subtree instead of the whole
 /// source, and recording every touched absolute path into
@@ -687,11 +816,9 @@ fn upsert_directory(
         let had_existing = delete_existing_unit(cache, source_id, &rel_path)?;
         stats.files_seen += 1;
         let mut wrote_unit = false;
-        if is_markdown_path(entry.path()) {
-            if let Some(file_stats) = write_unit(cache, source_id, root, entry.path())? {
-                stats.accumulate(file_stats);
-                wrote_unit = true;
-            }
+        if let Some(file_stats) = write_unit(cache, source_id, root, entry.path())? {
+            stats.accumulate(file_stats);
+            wrote_unit = true;
         }
         if had_existing || wrote_unit {
             touched_paths.push(entry.path().to_path_buf());
@@ -712,10 +839,11 @@ fn upsert_directory(
 /// rename the project can tell apart (R4, a team lesson from the
 /// Obsidian side of this project too):
 /// - An existing regular file: its old row (if any) is replaced by a
-///   fresh parse — unless it's non-markdown, in which case any old
-///   row is still removed (R3) but nothing is reinserted.
+///   freshly classified one (and, for Markdown, a fresh parse), so a
+///   file that changed kind leaves no stale rows of its old kind. A
+///   file that can't be read is removed and skipped with a warning.
 /// - An existing directory (a create or a move-in): walked and every
-///   markdown file under it is upserted ([`upsert_directory`]) — a
+///   non-ignored file under it is upserted ([`upsert_directory`]) — a
 ///   directory arriving as a single changed path is otherwise never
 ///   reconciled at all.
 /// - A path that no longer exists (a delete or a move-out): its own
@@ -805,11 +933,9 @@ fn apply_change_batch_once(
                 let had_existing = delete_existing_unit(cache, source_id, &rel_path)?;
                 stats.files_seen += 1;
                 let mut wrote_unit = false;
-                if is_markdown_path(abs_path) {
-                    if let Some(file_stats) = write_unit(cache, source_id, root, abs_path)? {
-                        stats.accumulate(file_stats);
-                        wrote_unit = true;
-                    }
+                if let Some(file_stats) = write_unit(cache, source_id, root, abs_path)? {
+                    stats.accumulate(file_stats);
+                    wrote_unit = true;
                 }
                 if had_existing || wrote_unit {
                     touched_paths.push(abs_path.clone());

@@ -723,6 +723,73 @@ impl SourceRegistry {
         Ok(cache.list_sources()?)
     }
 
+    /// E11: rescans from the top every source whose last scan started
+    /// and never finished (the daemon was killed mid-scan, or a schema
+    /// rebuild emptied it). Called once at startup. There is no resume
+    /// logic: [`SourceRegistry::rescan`] clears the source's rows and
+    /// re-walks it, so the result has no duplicate `(source_id,
+    /// rel_path)` rows and the same unit count as a clean scan.
+    ///
+    /// Each source is rescanned in turn; `should_stop` is checked
+    /// before each one so a shutdown doesn't wait for sources that
+    /// haven't started (their scan stays unfinished and is redone next
+    /// start). A scan already running is not interrupted. A source
+    /// whose root is missing is handled by `rescan` (it goes
+    /// `offline`) and stays unfinished until a real scan completes.
+    /// One failed source never stops the others; every outcome is
+    /// returned. Each successful rescan also emits a `source_changed`
+    /// event so the in-memory graph is refreshed and clients are told.
+    pub fn rescan_unfinished(
+        &self,
+        should_stop: impl Fn() -> bool,
+    ) -> Vec<(String, Result<ScanStats, RegistryError>)> {
+        let unfinished = {
+            let cache = self.cache.lock().unwrap();
+            match cache.sources_with_unfinished_scan() {
+                Ok(rows) => rows,
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to list sources with an unfinished scan");
+                    return Vec::new();
+                }
+            }
+        };
+
+        let mut outcomes = Vec::new();
+        for row in unfinished {
+            if should_stop() {
+                tracing::info!(
+                    "shutdown requested; leaving the remaining unfinished scans for the next start"
+                );
+                break;
+            }
+            tracing::info!(
+                source = %row.name,
+                source_id = row.id,
+                root = %row.path,
+                "scan did not finish last time; rescanning from the top"
+            );
+            let result = self.rescan(&row.name);
+            match &result {
+                Ok(stats) => {
+                    tracing::info!(
+                        source = %row.name,
+                        units_written = stats.units_written,
+                        "interrupted scan redone"
+                    );
+                    let _ = self.events_tx.send(DaemonEvent::SourceChanged {
+                        source: row.name.clone(),
+                        paths: Vec::new(),
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(source = %row.name, error = %e, "failed to redo an interrupted scan");
+                }
+            }
+            outcomes.push((row.name, result));
+        }
+        outcomes
+    }
+
     /// `source.rescan` (G1): forces a full re-walk of one source,
     /// re-evaluating its `.tephraignore` fresh from disk (so an edit
     /// to it takes effect on the next rescan rather than reusing a

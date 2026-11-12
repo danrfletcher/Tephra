@@ -113,6 +113,11 @@ impl ParsedUnit {
             rel_path,
             mtime,
             frontmatter_json: self.frontmatter.as_ref().and_then(|f| f.json.as_deref()),
+            // Only Markdown goes through this crate. The caller
+            // overwrites `size` with the file's real length.
+            kind: "prose",
+            size: None,
+            too_large: false,
         }
     }
 
@@ -138,6 +143,7 @@ impl ParsedUnit {
                 unit_id,
                 block_id: &b.block_id,
                 line: b.line as i64,
+                end_line: None,
             })
             .collect()
     }

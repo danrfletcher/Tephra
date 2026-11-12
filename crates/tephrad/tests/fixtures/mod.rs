@@ -34,6 +34,15 @@ impl TempSource {
         fs::write(full, contents).expect("write fixture file");
     }
 
+    /// Like [`TempSource::write`], for bytes that aren't UTF-8 text.
+    pub fn write_bytes(&self, rel_path: &str, contents: &[u8]) {
+        let full = self.root().join(rel_path);
+        if let Some(parent) = full.parent() {
+            fs::create_dir_all(parent).expect("create_dir_all");
+        }
+        fs::write(full, contents).expect("write fixture file");
+    }
+
     pub fn remove(&self, rel_path: &str) {
         fs::remove_file(self.root().join(rel_path)).expect("remove fixture file");
     }
@@ -70,10 +79,8 @@ pub fn vault_fixture() -> TempSource {
 /// (`[[one]]`); a `.git` directory and a `target/` build directory
 /// are also populated, each with a `.md` file that must never reach
 /// the parser (G2). `Cargo.toml` and `src/main.rs` are real,
-/// non-ignored source files a code repository would contain — they
-/// are walked and counted in `files_seen` like any other non-ignored
-/// file, but (R3) must never be fed through the parser: only
-/// `README.md`'s `.md` extension qualifies it to become a unit, so a
+/// non-ignored source files a code repository would contain: each
+/// becomes a `code` unit (G2), but only `README.md` is parsed, so a
 /// code-repo source never ends up with a false wikilink parsed out of
 /// `Cargo.toml`'s `[[bin]]` table or a false tag out of a `main.rs`
 /// comment.
@@ -114,3 +121,85 @@ pub fn empty_source() -> TempSource {
 /// handle type returned by every `*_fixture`/`*_source` function in
 /// this module.
 pub type TempSourceHandle = TempSource;
+
+/// Every file in [`kinds_fixture`] with the kind its unit must have
+/// (G2). The ignored files are listed in [`KINDS_IGNORED`].
+pub const KINDS_EXPECTED: [(&str, &str); 17] = [
+    ("notes/one.md", "prose"),
+    ("notes/two.txt", "prose"),
+    ("notes/café notes.txt", "prose"),
+    ("src/main.rs", "code"),
+    ("Cargo.toml", "code"),
+    ("Cargo.lock", "text-other"),
+    ("docs/a b.PDF", "document"),
+    ("img/logo.png", "binary"),
+    ("scripts/bad.py", "binary"),
+    ("bin/run", "code"),
+    ("bin/plain", "text-other"),
+    ("data/blob.xyz", "binary"),
+    ("empty", "text-other"),
+    ("empty.png", "text-other"),
+    ("empty.md", "prose"),
+    ("empty.pdf", "document"),
+    ("Notes.MD", "prose"),
+];
+
+/// Paths [`kinds_fixture`] writes that must never become units.
+pub const KINDS_IGNORED: [&str; 6] = [
+    ".venv/lib/site.py",
+    ".venv/pyvenv.cfg",
+    "src/__pycache__/main.cpython-312.pyc",
+    "pkg/deep/er/__pycache__/m.py",
+    ".DS_Store",
+    "notes/.DS_Store",
+];
+
+/// One file of every kind plus ignored files (G2/G15). `notes/one.md`
+/// is the only file with links/tags/blocks to extract; every other
+/// file carries text that *looks* like a wikilink, tag and block ID,
+/// so any accidental parse shows up as a stray row.
+pub fn kinds_fixture() -> TempSource {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let src = TempSource { dir };
+    let looks_like_markdown = "[[Target]] and #tag and a block ^blk123\n";
+
+    src.write(
+        "notes/one.md",
+        "# One\n\nLinks to [[Two]] and has a #project tag.\n\nSome text. ^block1\n",
+    );
+    src.write("notes/two.txt", looks_like_markdown);
+    src.write("notes/café notes.txt", looks_like_markdown);
+    src.write(
+        "src/main.rs",
+        &format!("// {looks_like_markdown}fn main() {{}}\n"),
+    );
+    src.write(
+        "Cargo.toml",
+        "[package]\nname = \"x\"\n\n[[bin]]\nname = \"x\"\n",
+    );
+    src.write("Cargo.lock", "# generated\nversion = 3\n");
+    src.write_bytes("docs/a b.PDF", b"%PDF-1.4\n\0\x01\x02 binary container\0");
+    src.write_bytes(
+        "img/logo.png",
+        &[
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0x0D,
+        ],
+    );
+    src.write_bytes("scripts/bad.py", b"print('hi')\n\0\0 [[Target]]\n");
+    src.write(
+        "bin/run",
+        "#!/usr/bin/env python3\nprint('[[Target]] #tag')\n",
+    );
+    src.write("bin/plain", looks_like_markdown);
+    src.write_bytes("data/blob.xyz", &[0xFF, 0xFE, 0x00, 0x01, 0x02]);
+    src.write_bytes("empty", b"");
+    src.write_bytes("empty.png", b"");
+    src.write_bytes("empty.md", b"");
+    src.write_bytes("empty.pdf", b"");
+    src.write("Notes.MD", "# Upper-case extension\n\n[[Two]]\n");
+
+    for ignored in KINDS_IGNORED {
+        src.write(ignored, looks_like_markdown);
+    }
+    src
+}
