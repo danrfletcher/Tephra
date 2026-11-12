@@ -78,14 +78,22 @@ pub fn error_means_not_found(message: &str) -> bool {
 
 /// `source list` / `status`'s shared table renderer. Rows are
 /// `SourceRowWire`-shaped JSON (`name`, `path`, `status`,
-/// `last_scanned_at`). Zero rows renders the "no sources registered"
+/// `last_scanned_at`). `status` is `active`, `stale`, `offline` or
+/// `permission_denied` (macOS Full Disk Access not granted, E13).
+/// Zero rows renders the "no sources registered"
 /// line the spec requires instead of an empty table.
 pub fn render_source_table(rows: &[Value]) -> String {
     if rows.is_empty() {
         return "no sources registered\n".to_string();
     }
 
-    let mut out = String::from("NAME                 STATUS    PATH\n");
+    // `permission_denied` (E13) is longer than the other statuses;
+    // widen the column for it instead of breaking the alignment.
+    let status_width = rows
+        .iter()
+        .map(|row| str_field(row, "status").chars().count())
+        .fold(9, usize::max);
+    let mut out = format!("{:<20} {:<status_width$} PATH\n", "NAME", "STATUS");
     for row in rows {
         let name = str_field(row, "name");
         let path = str_field(row, "path");
@@ -95,7 +103,9 @@ pub fn render_source_table(rows: &[Value]) -> String {
         } else {
             ""
         };
-        out.push_str(&format!("{name:<20} {status:<9} {path}{offline_marker}\n"));
+        out.push_str(&format!(
+            "{name:<20} {status:<status_width$} {path}{offline_marker}\n"
+        ));
     }
     out
 }
@@ -372,6 +382,21 @@ mod tests {
         assert!(rendered.contains("active"));
         assert!(rendered.contains("old"));
         assert!(rendered.contains("(offline)"));
+    }
+
+    #[test]
+    fn source_table_shows_permission_denied_and_keeps_the_columns_aligned() {
+        let rows = vec![
+            json!({"name": "notes", "path": "/Users/dan/Documents/Notes", "status": "permission_denied", "last_scanned_at": 1}),
+            json!({"name": "work", "path": "/vault/work", "status": "active", "last_scanned_at": 1}),
+        ];
+        let rendered = render_source_table(&rows);
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert!(lines[0].starts_with("NAME                 STATUS            PATH"));
+        assert!(lines[1].contains("permission_denied /Users/dan/Documents/Notes"));
+        assert!(!lines[1].contains("(offline)"), "never reported as offline");
+        let path_col = |l: &str| l.find('/').unwrap();
+        assert_eq!(path_col(lines[1]), path_col(lines[2]));
     }
 
     #[test]

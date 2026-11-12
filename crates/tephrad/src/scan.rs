@@ -123,6 +123,13 @@ pub enum ScanError {
     Walk(walkdir::Error),
     Cache(tephra_cache::CacheError),
     Sqlite(rusqlite::Error),
+    /// The source's own root could not be listed because the OS
+    /// refused (E13: macOS Full Disk Access not granted, or a mode
+    /// that forbids it). The scan stops here and writes nothing: an
+    /// unreadable root is never "an empty folder", so the cached
+    /// rows must not be cleared. The caller marks the source
+    /// `permission_denied`.
+    PermissionDenied(PathBuf),
 }
 
 impl fmt::Display for ScanError {
@@ -132,6 +139,9 @@ impl fmt::Display for ScanError {
             ScanError::Walk(e) => write!(f, "{e}"),
             ScanError::Cache(e) => write!(f, "{e}"),
             ScanError::Sqlite(e) => write!(f, "{e}"),
+            ScanError::PermissionDenied(path) => {
+                write!(f, "permission denied reading {}", path.display())
+            }
         }
     }
 }
@@ -495,7 +505,11 @@ fn delete_existing_unit(cache: &Cache, source_id: i64, rel_path: &str) -> Result
 /// A single unreadable directory entry (e.g. a permission-denied
 /// subdirectory) is logged and skipped rather than aborting the whole
 /// walk (R2) — the same "log and keep going" treatment
-/// [`write_unit`] already gives one unreadable file.
+/// [`write_unit`] already gives one unreadable file. The one exception
+/// is the root itself: if it cannot be listed because of a permission
+/// error the walk returns [`ScanError::PermissionDenied`] instead of
+/// finishing "empty" (E13), so a forced rescan never wipes the cached
+/// rows of a source the OS merely refuses to show it.
 ///
 /// This never collects the full file list into memory at once: the
 /// `walkdir::WalkDir` iterator yields one entry at a time, and each
@@ -541,6 +555,14 @@ fn walk_and_write(
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
+                // E13: the root itself refusing to be listed must not
+                // read as "the folder is empty". Stop before anything
+                // is committed past what the caller already holds in
+                // its open first chunk (dropped, so rolled back, on
+                // this return): the cached rows stay as they were.
+                if walk_error_is_root_permission_denied(&e) {
+                    return Err(ScanError::PermissionDenied(root.to_path_buf()));
+                }
                 tracing::warn!(error = %e, "failed to walk a directory entry during scan; skipping");
                 continue;
             }
@@ -612,6 +634,16 @@ fn walk_and_write(
         tx.commit()?;
     }
     Ok(stats)
+}
+
+/// Whether a walk error is the walk's own root (depth 0) failing with a
+/// permission error, as opposed to one unreadable subdirectory or file
+/// further down (which is logged and skipped, E1/R2).
+fn walk_error_is_root_permission_denied(err: &walkdir::Error) -> bool {
+    err.depth() == 0
+        && err
+            .io_error()
+            .is_some_and(|io| io.kind() == io::ErrorKind::PermissionDenied)
 }
 
 /// Sweeps every stale `.{original-file-name}.tephra-tmp-{n}` leftover

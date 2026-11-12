@@ -1,0 +1,7 @@
+gui/501/com.danrfletcher.tephrad = {
+	active count = 0
+	state = not running
+
+	runs = 0
+	last exit code = (never exited)
+}

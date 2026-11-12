@@ -1303,3 +1303,165 @@ fn a_kill_mid_scan_is_redone_from_the_top_on_the_next_start() {
         .unwrap();
     assert_eq!(unfinished, 0, "the redone scan is recorded as finished");
 }
+
+/// Reads and parses `<data_dir>/access.json`.
+fn read_access_json(data_dir: &Path) -> serde_json::Value {
+    let raw = fs::read_to_string(data_dir.join("access.json")).expect("access.json written");
+    serde_json::from_str(&raw).expect("access.json is valid JSON")
+}
+
+/// Spawns tephrad with `home` as `$HOME` and waits for its listening
+/// line (the access probe runs before it), returning the process.
+fn start_and_wait_listening(home: &Path, config_path: &Path) -> TephradProcess {
+    let process = TephradProcess::spawn(home, config_path);
+    assert!(
+        process.wait_for_line("listening on 127.0.0.1:", Duration::from_secs(10)),
+        "expected a listening line, got: {:?}",
+        process.captured_stderr_lines()
+    );
+    process
+}
+
+/// G20: on start, tephrad lists `$HOME/Documents` and writes
+/// `<data_dir>/access.json` with its own pid.
+#[test]
+fn access_json_records_a_readable_documents_folder_with_the_daemons_own_pid() {
+    let home = tempfile::tempdir().expect("tempdir");
+    fs::create_dir(home.path().join("Documents")).unwrap();
+    let config_path = home.path().join(".config/tephra/config.toml");
+    let data_dir = home.path().join(".local/share/tephra");
+    write_config(&config_path, &data_dir, EPHEMERAL_ADDR);
+
+    let mut process = start_and_wait_listening(home.path(), &config_path);
+    let access = read_access_json(&data_dir);
+    assert_eq!(access["documents_readable"], true);
+    assert!(access["error_kind"].is_null(), "{access}");
+    assert_eq!(access["pid"], process.child.id());
+    assert!(access["checked_at"].as_i64().unwrap() > 0);
+
+    // Atomic write: no temp file is left behind.
+    let leftovers: Vec<String> = fs::read_dir(&data_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains("access.json.tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+
+    assert_eq!(process.terminate_and_wait(Duration::from_secs(5)), Some(0));
+}
+
+#[test]
+fn access_json_reports_not_found_when_documents_is_absent() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let config_path = home.path().join(".config/tephra/config.toml");
+    let data_dir = home.path().join(".local/share/tephra");
+    write_config(&config_path, &data_dir, EPHEMERAL_ADDR);
+
+    let mut process = start_and_wait_listening(home.path(), &config_path);
+    let access = read_access_json(&data_dir);
+    assert_eq!(access["documents_readable"], false);
+    assert_eq!(access["error_kind"], "not_found");
+    assert_eq!(access["pid"], process.child.id());
+
+    assert_eq!(process.terminate_and_wait(Duration::from_secs(5)), Some(0));
+}
+
+#[test]
+fn access_json_reports_permission_denied_when_documents_is_unreadable_and_a_restart_updates_it() {
+    if nix_root_can_bypass_permissions() {
+        eprintln!("skipped: running as root, file modes are ignored");
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().expect("tempdir");
+    let documents = home.path().join("Documents");
+    fs::create_dir(&documents).unwrap();
+    fs::set_permissions(&documents, fs::Permissions::from_mode(0o000)).unwrap();
+    let config_path = home.path().join(".config/tephra/config.toml");
+    let data_dir = home.path().join(".local/share/tephra");
+    write_config(&config_path, &data_dir, EPHEMERAL_ADDR);
+
+    let mut first = start_and_wait_listening(home.path(), &config_path);
+    let first_pid = first.child.id();
+    let access = read_access_json(&data_dir);
+    assert_eq!(access["documents_readable"], false);
+    assert_eq!(access["error_kind"], "permission_denied");
+    assert_eq!(access["pid"], first_pid);
+    assert_eq!(first.terminate_and_wait(Duration::from_secs(5)), Some(0));
+
+    // Access granted, daemon restarted: the file now carries the new
+    // pid and says readable (what `tephractl daemon install` waits for).
+    fs::set_permissions(&documents, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut second = start_and_wait_listening(home.path(), &config_path);
+    let access = read_access_json(&data_dir);
+    assert_eq!(access["documents_readable"], true);
+    assert_eq!(access["pid"], second.child.id());
+    assert_ne!(access["pid"], first_pid);
+    assert_eq!(second.terminate_and_wait(Duration::from_secs(5)), Some(0));
+}
+
+/// E13 end to end through the real binary: a registered source whose
+/// root the OS won't list is reported `permission_denied` by
+/// `source.list` from the first request after a restart, its cached
+/// rows are intact, and a rescan after access returns it to `active`.
+#[test]
+fn restart_with_an_unreadable_source_root_lists_it_as_permission_denied_and_keeps_its_rows() {
+    if nix_root_can_bypass_permissions() {
+        eprintln!("skipped: running as root, file modes are ignored");
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().expect("tempdir");
+    let config_path = home.path().join(".config/tephra/config.toml");
+    let data_dir = home.path().join(".local/share/tephra");
+    write_config(&config_path, &data_dir, EPHEMERAL_ADDR);
+
+    let vault = tempfile::tempdir().expect("vault tempdir");
+    fs::write(vault.path().join("a.md"), "# A\n\n[[B]]\n").unwrap();
+    fs::write(vault.path().join("b.md"), "# B\n").unwrap();
+
+    let rpc = |process: &TephradProcess, body: String| -> String {
+        let line = process
+            .captured_stderr_lines()
+            .into_iter()
+            .find(|l| l.contains("listening on 127.0.0.1:"))
+            .expect("listening line");
+        let token = fs::read_to_string(data_dir.join("token")).unwrap();
+        send_rpc_request(&port_from_listening_line(&line), token.trim(), &body)
+    };
+    let list_body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"source.list\",\"params\":{}}";
+
+    let mut first = start_and_wait_listening(home.path(), &config_path);
+    let register = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"source.register\",\"params\":{{\"name\":\"notes\",\"root\":\"{}\"}}}}",
+        vault.path().display()
+    );
+    assert!(rpc(&first, register).contains("units_written"));
+    assert!(rpc(&first, list_body.to_string()).contains("\"status\":\"active\""));
+    assert_eq!(first.terminate_and_wait(Duration::from_secs(5)), Some(0));
+
+    fs::set_permissions(vault.path(), fs::Permissions::from_mode(0o000)).unwrap();
+    let mut second = start_and_wait_listening(home.path(), &config_path);
+    let listed = rpc(&second, list_body.to_string());
+    assert!(
+        listed.contains("\"status\":\"permission_denied\""),
+        "expected permission_denied, got: {listed}"
+    );
+
+    // The denied start cleared nothing: both cached units are still
+    // there while the root is unreadable.
+    let conn = rusqlite::Connection::open(data_dir.join("cache.db")).unwrap();
+    let units: i64 = conn
+        .query_row("SELECT COUNT(*) FROM units", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(units, 2, "denied start must keep the cached rows");
+    drop(conn);
+
+    fs::set_permissions(vault.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    let rescan = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"source.rescan\",\"params\":{\"name\":\"notes\"}}";
+    let rescanned = rpc(&second, rescan.to_string());
+    assert!(rescanned.contains("\"units_written\":2"), "{rescanned}");
+    let listed = rpc(&second, list_body.to_string());
+    assert!(listed.contains("\"status\":\"active\""), "{listed}");
+    assert_eq!(second.terminate_and_wait(Duration::from_secs(5)), Some(0));
+}

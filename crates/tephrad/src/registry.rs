@@ -42,22 +42,53 @@ pub enum PathProbe {
     Ok,
     Missing,
     NotADirectory,
+    /// Exists but its contents can't be listed (e.g. `chmod 000`).
     NotReadable,
+    /// Exists but the OS refused with EPERM ("Operation not permitted")
+    /// on macOS: the signature of a missing Full Disk Access grant
+    /// (TCC), as opposed to ordinary file modes, which give EACCES.
+    /// Reported with the Full Disk Access fix line (E13).
+    NotReadablePrivacy,
+}
+
+impl PathProbe {
+    /// Whether the path exists but the OS won't list it: a permission
+    /// problem, not a missing or offline source (E13).
+    pub fn is_permission_denied(self) -> bool {
+        matches!(self, PathProbe::NotReadable | PathProbe::NotReadablePrivacy)
+    }
 }
 
 /// Real-filesystem [`PathProbe`]: does `path` exist, is it a
 /// directory, and can its contents actually be listed. Used by
 /// [`SourceRegistry::register`]; unit tests below use `PathProbe`
 /// values directly instead of calling this.
+///
+/// A listing that fails with EPERM on macOS is
+/// [`PathProbe::NotReadablePrivacy`] (TCC / Full Disk Access); any
+/// other failure to list is [`PathProbe::NotReadable`].
 pub fn probe_path(path: &Path) -> PathProbe {
     match std::fs::metadata(path) {
         Ok(meta) if !meta.is_dir() => PathProbe::NotADirectory,
         Ok(_) => match std::fs::read_dir(path) {
             Ok(_) => PathProbe::Ok,
+            Err(e) if is_privacy_block(&e) => PathProbe::NotReadablePrivacy,
             Err(_) => PathProbe::NotReadable,
         },
+        // A stat the OS refuses is a permission problem, not a missing
+        // path: a source under a protected folder must never be taken
+        // for offline just because it can't be looked at (E13).
+        Err(e) if is_privacy_block(&e) => PathProbe::NotReadablePrivacy,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => PathProbe::NotReadable,
         Err(_) => PathProbe::Missing,
     }
+}
+
+/// Whether `err` is macOS's privacy block: EPERM ("Operation not
+/// permitted"), which TCC returns for a protected folder, whereas an
+/// ordinary mode/ACL denial is EACCES.
+fn is_privacy_block(err: &std::io::Error) -> bool {
+    cfg!(target_os = "macos") && err.raw_os_error() == Some(1)
 }
 
 /// An in-memory record of one registered source's name and root, the
@@ -106,6 +137,19 @@ pub enum RegisterError {
 impl fmt::Display for RegisterError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            RegisterError::InvalidPath {
+                path,
+                reason: PathProbe::NotReadablePrivacy,
+            } => {
+                // Same text as the plain NotReadable case, plus the
+                // Full Disk Access fix line (E13).
+                write!(
+                    f,
+                    "path {path:?} is invalid: {:?}. {}",
+                    PathProbe::NotReadable,
+                    crate::access::fix_line(&path.display().to_string())
+                )
+            }
             RegisterError::InvalidPath { path, reason } => {
                 write!(f, "path {path:?} is invalid: {reason:?}")
             }
@@ -373,7 +417,41 @@ pub struct SourceRegistry {
     runtime: tokio::runtime::Runtime,
     running: Mutex<HashMap<String, RunningSource>>,
     events_tx: tokio::sync::broadcast::Sender<DaemonEvent>,
+    /// Sources whose root exists but the OS won't list (E13: macOS
+    /// Full Disk Access not granted). A runtime status only: it is
+    /// never written to the `sources` table (whose `status` CHECK
+    /// constraint stays `active|stale|offline`), it starts empty on
+    /// every start, and it is set by the startup access sweep
+    /// ([`SourceRegistry::refresh_access`]) and by [`SourceRegistry::rescan`].
+    /// [`SourceRegistry::list_with_runtime_status`] overlays it on the
+    /// stored status, so `source.list` reports `permission_denied`.
+    permission_denied: Mutex<HashSet<String>>,
 }
+
+/// One `source.list` row: the stored row plus the runtime
+/// `permission_denied` overlay.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceListing {
+    pub row: SourceRow,
+    pub permission_denied: bool,
+}
+
+impl SourceListing {
+    /// The status shown to clients: `permission_denied` wins over the
+    /// stored `active|stale|offline` (the source's rows are kept
+    /// either way).
+    pub fn status_str(&self) -> &'static str {
+        if self.permission_denied {
+            PERMISSION_DENIED_STATUS
+        } else {
+            self.row.status.as_str()
+        }
+    }
+}
+
+/// The runtime-only `source.list` status for a source the OS won't let
+/// `tephrad` read (E13).
+pub const PERMISSION_DENIED_STATUS: &str = "permission_denied";
 
 impl SourceRegistry {
     pub fn new(cache: Cache) -> std::io::Result<Self> {
@@ -391,6 +469,7 @@ impl SourceRegistry {
             runtime,
             running: Mutex::new(HashMap::new()),
             events_tx,
+            permission_denied: Mutex::new(HashSet::new()),
         })
     }
 
@@ -712,15 +791,77 @@ impl SourceRegistry {
         if let Some(running) = self.running.lock().unwrap().remove(name) {
             running.handle.stop();
         }
+        self.set_permission_denied(name, false);
         let cache = self.cache.lock().unwrap();
         retry_cache_on_busy(&self.gate, || cache.delete_source(name))?;
         Ok(())
     }
 
-    /// `source.list` (G1).
+    /// `source.list` (G1): the stored rows, with their stored status.
+    /// Clients use [`SourceRegistry::list_with_runtime_status`], which
+    /// adds the runtime `permission_denied` overlay.
     pub fn list(&self) -> Result<Vec<SourceRow>, RegistryError> {
         let cache = self.cache.lock().unwrap();
         Ok(cache.list_sources()?)
+    }
+
+    /// `source.list` as clients see it (E13): every stored row plus
+    /// whether it is currently `permission_denied`.
+    pub fn list_with_runtime_status(&self) -> Result<Vec<SourceListing>, RegistryError> {
+        let rows = self.list()?;
+        let denied = self.permission_denied.lock().unwrap();
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let permission_denied = denied.contains(&row.name);
+                SourceListing {
+                    row,
+                    permission_denied,
+                }
+            })
+            .collect())
+    }
+
+    /// Whether `name` is currently marked `permission_denied`.
+    pub fn is_permission_denied(&self, name: &str) -> bool {
+        self.permission_denied.lock().unwrap().contains(name)
+    }
+
+    fn set_permission_denied(&self, name: &str, denied: bool) {
+        let mut set = self.permission_denied.lock().unwrap();
+        if denied {
+            set.insert(name.to_string());
+        } else {
+            set.remove(name);
+        }
+    }
+
+    /// The startup access sweep (E13): checks each registered source's
+    /// root once and marks the ones the OS refuses to list as
+    /// `permission_denied` (clearing the mark on the ones that list
+    /// fine). It reads nothing else and changes no cached row. A
+    /// missing root is left alone: that is `offline`, handled by the
+    /// watcher and by [`SourceRegistry::rescan`]. Returns the names
+    /// newly marked.
+    pub fn refresh_access(&self) -> Result<Vec<String>, RegistryError> {
+        let mut marked = Vec::new();
+        for row in self.list()? {
+            let probe = probe_path(Path::new(&row.path));
+            if probe.is_permission_denied() {
+                if !self.is_permission_denied(&row.name) {
+                    tracing::warn!(
+                        source = %row.name,
+                        root = %row.path,
+                        "source root can't be read (permission denied); marked permission_denied"
+                    );
+                }
+                self.set_permission_denied(&row.name, true);
+                marked.push(row.name);
+            } else if probe == PathProbe::Ok {
+                self.set_permission_denied(&row.name, false);
+            }
+        }
+        Ok(marked)
     }
 
     /// E11: rescans from the top every source whose last scan started
@@ -810,6 +951,14 @@ impl SourceRegistry {
     /// watched root deleted out from under a running watcher"
     /// (handled live by the watcher itself) also holding for an
     /// explicit rescan of an already-offline source.
+    ///
+    /// If the root exists but the OS won't list it (E13: macOS Full
+    /// Disk Access not granted), the rescan changes no cached row and
+    /// no stored status; the source is marked `permission_denied` (a
+    /// runtime status, see [`SourceRegistry::list_with_runtime_status`])
+    /// and the call returns empty stats. Once access is granted, the
+    /// next rescan walks normally, lands on `active` and clears the
+    /// mark, with no restart needed.
     pub fn rescan(&self, name: &str) -> Result<ScanStats, RegistryError> {
         let (source_id, root, status) = {
             let cache = self.cache.lock().unwrap();
@@ -819,7 +968,22 @@ impl SourceRegistry {
             (row.id, PathBuf::from(row.path), row.status)
         };
 
-        if probe_path(&root) != PathProbe::Ok {
+        let probe = probe_path(&root);
+
+        // E13: a root that exists but can't be listed is not empty and
+        // not offline. Keep every cached row and the stored status,
+        // mark it `permission_denied`, and scan nothing.
+        if probe.is_permission_denied() {
+            tracing::warn!(
+                source = %name,
+                root = %root.display(),
+                "source root can't be read (permission denied); keeping its cached rows"
+            );
+            self.set_permission_denied(name, true);
+            return Ok(ScanStats::default());
+        }
+
+        if probe != PathProbe::Ok {
             let cache = self.cache.lock().unwrap();
             if status != SourceStatus::Offline {
                 retry_cache_on_busy(&self.gate, || {
@@ -852,8 +1016,32 @@ impl SourceRegistry {
         }
 
         let scan_cache = Cache::open(&self.cache_path)?;
-        let stats = scan::rescan_source(&scan_cache, source_id, &root, &ignore_rules)?;
+        let stats = match scan::rescan_source(&scan_cache, source_id, &root, &ignore_rules) {
+            Ok(stats) => stats,
+            Err(ScanError::PermissionDenied(path)) => {
+                // The root listed a moment ago (the probe above) but
+                // refused the walk: nothing was cleared or written
+                // (the first chunk rolled back). Put the stored status
+                // back to what it was, and report the denial.
+                drop(scan_cache);
+                tracing::warn!(
+                    source = %name,
+                    root = %path.display(),
+                    "source root can't be read (permission denied); keeping its cached rows"
+                );
+                self.set_permission_denied(name, true);
+                let cache = self.cache.lock().unwrap();
+                if status != SourceStatus::Stale {
+                    retry_cache_on_busy(&self.gate, || {
+                        cache.transition_source_status(name, status)
+                    })?;
+                }
+                return Ok(ScanStats::default());
+            }
+            Err(e) => return Err(e.into()),
+        };
         drop(scan_cache);
+        self.set_permission_denied(name, false);
 
         tracing::info!(
             source = %name,
@@ -1030,6 +1218,51 @@ mod tests {
             PathProbe::Ok,
         );
         assert_eq!(result, Ok(()));
+    }
+
+    // ---- E13: the Full Disk Access line on a privacy-blocked path -----
+
+    #[test]
+    fn register_error_for_a_privacy_blocked_path_carries_the_full_disk_access_line() {
+        let existing: Vec<Source> = vec![];
+        let err = validate_register(
+            &existing,
+            "notes",
+            Path::new("/Users/dan/Documents/Notes"),
+            PathProbe::NotReadablePrivacy,
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("NotReadable"), "{message}");
+        assert!(
+            message.contains(&crate::access::fix_line("/Users/dan/Documents/Notes")),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn register_error_for_other_unreadable_paths_keeps_the_plain_message() {
+        let existing: Vec<Source> = vec![];
+        let err = validate_register(
+            &existing,
+            "notes",
+            Path::new("/no/permission"),
+            PathProbe::NotReadable,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "path \"/no/permission\" is invalid: NotReadable"
+        );
+    }
+
+    #[test]
+    fn only_the_two_unreadable_probes_count_as_permission_denied() {
+        assert!(PathProbe::NotReadable.is_permission_denied());
+        assert!(PathProbe::NotReadablePrivacy.is_permission_denied());
+        assert!(!PathProbe::Ok.is_permission_denied());
+        assert!(!PathProbe::Missing.is_permission_denied());
+        assert!(!PathProbe::NotADirectory.is_permission_denied());
     }
 
     // ---- state transitions (reusing tephra-cache's validated edges) ---

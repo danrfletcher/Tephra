@@ -9,6 +9,7 @@ use std::process::ExitCode;
 
 use tephractl::cli::{self, Action};
 use tephractl::commands;
+use tephractl::daemon;
 use tephractl::token;
 use tephractl::transport::{RpcClient, DEFAULT_ADDR};
 
@@ -27,6 +28,25 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    // `daemon` commands manage the launchd agent itself: they need
+    // neither the token file nor a running daemon (and so work before
+    // the first start, when no token exists yet).
+    if daemon::is_daemon_command(&parsed.command) {
+        let code = daemon::run(
+            &parsed.command,
+            parsed.json,
+            &mut io::stdout(),
+            &mut io::stderr(),
+        );
+        let _ = io::stdout().flush();
+        let _ = io::stderr().flush();
+        return if code == 0 {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
 
     // Token loading happens before any network call: a missing
     // token file is reported with a single, clear message and a

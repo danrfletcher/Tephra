@@ -1,0 +1,26 @@
+gui/501/com.danrfletcher.tephrad = {
+	active count = 0
+	path = /Users/dan/Library/LaunchAgents/com.danrfletcher.tephrad.plist
+	type = LaunchAgent
+	state = not running
+
+	program = /Users/dan/Library/Application Support/tephra/bin/tephrad
+	arguments = {
+		/Users/dan/Library/Application Support/tephra/bin/tephrad
+	}
+
+	domain = gui/501 [100024]
+	asid = 100024
+	minimum runtime = 10
+	exit timeout = 5
+	runs = 4
+	last exit code = 78: EX_CONFIG
+
+	event triggers = {
+		com.danrfletcher.tephrad.268435472 => {
+			keepalive = 1
+			service = com.danrfletcher.tephrad
+			state = active
+		}
+	}
+}

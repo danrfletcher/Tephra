@@ -21,7 +21,17 @@ USAGE:
     tephractl status [--json]
     tephractl link resolve [--source <name>] <target> [--json]
     tephractl link refactor --source <name> --old <path> --new <path> [--apply] [--yes] [--json]
+    tephractl daemon install [--from <path>] [--json]
+    tephractl daemon uninstall
+    tephractl daemon status [--json]
     tephractl -h | --help
+
+DAEMON (macOS only; need no token and no running daemon):
+    daemon install    Copy tephrad to ~/Library/Application Support/tephra/bin, sign it
+                      with a local \"Tephra Local\" identity and load it as a launchd agent
+                      (--from <path> installs that tephrad instead of the one next to tephractl)
+    daemon uninstall  Unload the agent and remove the plist and the installed copy
+    daemon status     Show whether the agent is installed and running
 
 GLOBAL OPTIONS:
     --json          Print raw structured JSON instead of human-readable text
@@ -51,6 +61,14 @@ pub enum Command {
         apply: bool,
         yes: bool,
     },
+    /// `daemon install`. `keychain` is the hidden `--keychain <path>`
+    /// the live test uses so it never touches the login keychain.
+    DaemonInstall {
+        from: Option<String>,
+        keychain: Option<String>,
+    },
+    DaemonUninstall,
+    DaemonStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,6 +183,7 @@ where
         "source" => parse_source(&mut iter)?,
         "status" => parse_status(&mut iter)?,
         "link" => parse_link(&mut iter)?,
+        "daemon" => parse_daemon(&mut iter)?,
         other => return Err(ArgsError(format!("unrecognized command: {other}"))),
     };
 
@@ -238,6 +257,58 @@ fn parse_status<'a>(
 ) -> Result<(Command, bool, Option<String>), ArgsError> {
     let (json, addr) = parse_trailing_flags(iter)?;
     Ok((Command::Status, json, addr))
+}
+
+fn parse_daemon<'a>(
+    iter: &mut impl Iterator<Item = &'a str>,
+) -> Result<(Command, bool, Option<String>), ArgsError> {
+    let sub = iter.next().ok_or_else(|| {
+        ArgsError("expected a daemon subcommand: install, uninstall, or status".to_string())
+    })?;
+
+    match sub {
+        "install" => {
+            let mut from = None;
+            let mut keychain = None;
+            let mut json = false;
+            while let Some(arg) = iter.next() {
+                match arg {
+                    "--from" => from = Some(take_value(iter, "--from")?),
+                    "--keychain" => keychain = Some(take_value(iter, "--keychain")?),
+                    "--json" => json = true,
+                    other => return Err(ArgsError(format!("unrecognized argument: {other}"))),
+                }
+            }
+            Ok((Command::DaemonInstall { from, keychain }, json, None))
+        }
+        "uninstall" => {
+            let (json, _) = parse_daemon_trailing(iter, false)?;
+            Ok((Command::DaemonUninstall, json, None))
+        }
+        "status" => {
+            let (json, _) = parse_daemon_trailing(iter, true)?;
+            Ok((Command::DaemonStatus, json, None))
+        }
+        other => Err(ArgsError(format!(
+            "unrecognized daemon subcommand: {other} (expected install, uninstall, or status)"
+        ))),
+    }
+}
+
+/// Trailing flags for `daemon uninstall|status`: `--json` only where
+/// the verb has JSON output (`status`).
+fn parse_daemon_trailing<'a>(
+    iter: &mut impl Iterator<Item = &'a str>,
+    allow_json: bool,
+) -> Result<(bool, ()), ArgsError> {
+    let mut json = false;
+    for arg in iter {
+        match arg {
+            "--json" if allow_json => json = true,
+            other => return Err(ArgsError(format!("unrecognized argument: {other}"))),
+        }
+    }
+    Ok((json, ()))
 }
 
 fn parse_link<'a>(

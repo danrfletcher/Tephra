@@ -115,6 +115,19 @@ pub fn execute_with_prompt_writer<R: BufRead, W: Write>(
             stdin,
             prompt_out,
         ),
+        // `main.rs` runs these before it loads the token or builds a
+        // client and streams their output; this arm exists so
+        // `execute` still handles every `Command`, buffering the same
+        // output into an outcome.
+        Command::DaemonInstall { .. } | Command::DaemonUninstall | Command::DaemonStatus => {
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let exit_code = crate::daemon::run(command, json, &mut out, &mut err);
+            CommandOutcome {
+                exit_code,
+                stdout: String::from_utf8_lossy(&out).into_owned(),
+                stderr: String::from_utf8_lossy(&err).into_owned(),
+            }
+        }
     }
 }
 

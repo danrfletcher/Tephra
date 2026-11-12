@@ -22,7 +22,7 @@ use serde::Serialize;
 use tephra_cache::{Cache, SourceRow, SourceStatus};
 use tephra_graph::{Edge, ResolveError, ResolveResult, UnitGraph};
 
-use crate::registry::{RegistryError, SourceRegistry};
+use crate::registry::{RegistryError, SourceListing, SourceRegistry};
 use crate::scan::ScanStats;
 
 /// `unit.resolve_link` / `graph.get_*` (G4), behind a trait so tests
@@ -233,7 +233,9 @@ impl From<ScanStats> for ScanStatsWire {
     }
 }
 
-/// Wire shape for one `source.list` row.
+/// Wire shape for one `source.list` row. `status` is one of `active`,
+/// `stale`, `offline`, or the runtime-only `permission_denied` (E13:
+/// the root exists but the OS won't list it).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SourceRowWire {
     pub name: String,
@@ -250,6 +252,17 @@ impl From<SourceRow> for SourceRowWire {
             status: status_str(r.status).to_string(),
             last_scanned_at: r.last_scanned_at,
         }
+    }
+}
+
+impl From<SourceListing> for SourceRowWire {
+    /// `source.list`'s row: the stored row, with `status` overridden by
+    /// the runtime `permission_denied` value when it applies (E13).
+    fn from(l: SourceListing) -> Self {
+        let status = l.status_str().to_string();
+        let mut wire = SourceRowWire::from(l.row);
+        wire.status = status;
+        wire
     }
 }
 
@@ -285,7 +298,7 @@ impl SourceBackend for SourceRegistry {
         SourceRegistry::unregister(self, name).map_err(registry_err_to_string)
     }
     fn list(&self) -> Result<Vec<SourceRowWire>, String> {
-        SourceRegistry::list(self)
+        SourceRegistry::list_with_runtime_status(self)
             .map(|rows| rows.into_iter().map(SourceRowWire::from).collect())
             .map_err(registry_err_to_string)
     }
