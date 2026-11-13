@@ -13,6 +13,7 @@
 //! typed helpers exposed here.
 
 mod cache;
+mod fts;
 mod in_file;
 mod listing;
 mod schema;
@@ -23,6 +24,9 @@ mod units;
 use std::fmt;
 
 pub use cache::{Cache, FaultInjector};
+pub use fts::{
+    make_snippet, BlockHit, NewFtsRow, FTS_ROWS_PER_UNIT, MAX_RANK_CANDIDATES, MIN_TRIGRAM_CHARS,
+};
 pub use in_file::{InFileCandidate, InFileScope};
 pub use listing::{
     compare_entries, compare_names, FolderEntry, FolderListing, FolderState, FOLDER_KIND,
@@ -78,6 +82,9 @@ pub enum CacheError {
     /// as an error rather than letting the name reach SQL at all — see
     /// `units::count_rows`'s allow-list check.
     InvalidTableName(String),
+    /// This SQLite build has no FTS5 with the `trigram` tokenizer, which
+    /// the `^^` search needs. Carries a message saying what is missing.
+    Fts5Unavailable(String),
 }
 
 impl fmt::Display for CacheError {
@@ -104,6 +111,7 @@ impl fmt::Display for CacheError {
             CacheError::InvalidTableName(name) => {
                 write!(f, "\"{name}\" is not a recognized cache table name")
             }
+            CacheError::Fts5Unavailable(message) => write!(f, "{message}"),
         }
     }
 }

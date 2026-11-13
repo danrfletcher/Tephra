@@ -388,6 +388,33 @@ impl Cache {
         units::insert_symbol(&self.conn, new)
     }
 
+    /// Writes `rows` as the `^^` search index rows of `unit_id` (G10),
+    /// all in the caller's transaction, and returns how many were
+    /// written. Call it once per unit, right after inserting the unit:
+    /// [`Cache::delete_unit`] and the other delete helpers remove the
+    /// rows again.
+    pub fn insert_fts_rows(
+        &self,
+        unit_id: i64,
+        rows: &[crate::NewFtsRow<'_>],
+    ) -> Result<usize, CacheError> {
+        crate::fts::insert_fts_rows(&self.conn, unit_id, rows)
+    }
+
+    /// `unit.search` with `scope: "all_blocks"` (`^^`, G10): the best
+    /// `limit` indexed paragraphs, comment blocks, symbols, headings and
+    /// document paragraphs of every source for `query`, ranked; see
+    /// [`crate::BlockHit`] and the `fts` module for the matching and
+    /// ranking rules. A blank `query` runs no SQL and returns nothing.
+    /// Offline sources are included (flagged). Read-only.
+    pub fn search_all_blocks(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::BlockHit>, CacheError> {
+        crate::fts::search_all_blocks(&self.conn, query, limit)
+    }
+
     pub fn get_unit(&self, id: i64) -> Result<Option<UnitRow>, CacheError> {
         units::get_unit(&self.conn, id)
     }
@@ -656,6 +683,7 @@ fn ensure_schema(
     infer_kind: KindInferrer,
     injector: &FaultInjector,
 ) -> Result<Option<i64>, CacheError> {
+    schema::assert_fts5_available(conn)?;
     schema::create_bootstrap_tables(conn)?;
 
     match schema::read_schema_version(conn)? {
@@ -677,6 +705,12 @@ fn ensure_schema(
             // against a prior partial failure; against a healthy
             // database it is a guaranteed no-op.
             schema::create_core_tables_if_not_exists(conn)?;
+            // G17: files are cached but the `^^` index is empty (written
+            // by a build that did not fill it): rescan every online
+            // source on this start, so the index is filled.
+            if schema::fts_needs_backfill(conn)? {
+                schema::flag_online_sources_for_rescan(conn)?;
+            }
         }
         Some(old) => {
             let mut tx = conn.unchecked_transaction()?;

@@ -63,5 +63,22 @@
       "end_line": 7
     }
   ],
+  "comment_blocks": [
+    {
+      "start_line": 1,
+      "end_line": 1,
+      "text": "line comment [[Line]]"
+    },
+    {
+      "start_line": 2,
+      "end_line": 2,
+      "text": "block comment [[Block]]"
+    },
+    {
+      "start_line": 3,
+      "end_line": 3,
+      "text": "doc comment [[Doc]]"
+    }
+  ],
   "diagnostics": []
 }

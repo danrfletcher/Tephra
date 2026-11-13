@@ -323,7 +323,7 @@ pub(crate) fn delete_unit(conn: &Connection, unit_id: i64) -> Result<(), CacheEr
     conn.execute("DELETE FROM blocks WHERE unit_id = ?1", [unit_id])?;
     conn.execute("DELETE FROM headings WHERE unit_id = ?1", [unit_id])?;
     conn.execute("DELETE FROM symbols WHERE unit_id = ?1", [unit_id])?;
-    conn.execute("DELETE FROM block_fts WHERE unit_id = ?1", [unit_id])?;
+    crate::fts::delete_fts_for_unit(conn, unit_id)?;
     conn.execute("DELETE FROM units WHERE id = ?1", [unit_id])?;
     Ok(())
 }
@@ -359,10 +359,16 @@ pub(crate) fn delete_units_for_source(conn: &Connection, source_id: i64) -> Resu
         "DELETE FROM symbols WHERE unit_id IN (SELECT id FROM units WHERE source_id = ?1)",
         [source_id],
     )?;
-    conn.execute(
-        "DELETE FROM block_fts WHERE unit_id IN (SELECT id FROM units WHERE source_id = ?1)",
+    // A unit's rows are the rowids `unit_id << 24 ..` (see `crate::fts`),
+    // so each unit's rows go by a rowid range, never a scan of the index.
+    let ids = unit_ids(
+        conn,
+        "SELECT id FROM units WHERE source_id = ?1",
         [source_id],
     )?;
+    for id in ids {
+        crate::fts::delete_fts_for_unit(conn, id)?;
+    }
     conn.execute("DELETE FROM units WHERE source_id = ?1", [source_id])?;
     Ok(())
 }
@@ -426,7 +432,7 @@ pub(crate) fn delete_units_under_prefix(
          (SELECT id FROM units WHERE source_id = ?1 AND rel_path >= ?2 AND rel_path < ?3)",
         rusqlite::params![source_id, lower, upper],
     )?;
-    for child in ["headings", "symbols", "block_fts"] {
+    for child in ["headings", "symbols"] {
         conn.execute(
             &format!(
                 "DELETE FROM {child} WHERE unit_id IN \
@@ -434,6 +440,15 @@ pub(crate) fn delete_units_under_prefix(
             ),
             rusqlite::params![source_id, lower, upper],
         )?;
+    }
+    // The index rows are found by rowid, as in `delete_units_for_source`.
+    let ids = unit_ids(
+        conn,
+        "SELECT id FROM units WHERE source_id = ?1 AND rel_path >= ?2 AND rel_path < ?3",
+        rusqlite::params![source_id, lower, upper],
+    )?;
+    for id in ids {
+        crate::fts::delete_fts_for_unit(conn, id)?;
     }
     let deleted = conn.execute(
         "DELETE FROM units WHERE source_id = ?1 AND rel_path >= ?2 AND rel_path < ?3",
@@ -638,7 +653,7 @@ pub(crate) fn links_from_unit(
 /// [`crate::Cache::table_row_count`] is `pub` and reachable from a
 /// future RPC layer, so an unexpected value must be rejected rather
 /// than merely asserted against in debug builds.
-const ALLOWED_TABLE_NAMES: [&str; 10] = [
+const ALLOWED_TABLE_NAMES: [&str; 11] = [
     "sources",
     "units",
     "links",
@@ -648,6 +663,7 @@ const ALLOWED_TABLE_NAMES: [&str; 10] = [
     "headings",
     "symbols",
     "block_fts",
+    "block_names",
     "scan_state",
 ];
 
@@ -658,4 +674,17 @@ pub(crate) fn count_rows(conn: &Connection, table: &str) -> Result<i64, CacheErr
     let sql = format!("SELECT COUNT(*) FROM {table}");
     let count: i64 = conn.query_row(&sql, [], |row| row.get(0))?;
     Ok(count)
+}
+
+/// The ids a `SELECT id FROM units ...` statement gives.
+fn unit_ids(
+    conn: &Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+) -> Result<Vec<i64>, CacheError> {
+    let mut stmt = conn.prepare_cached(sql)?;
+    let ids = stmt
+        .query_map(params, |r| r.get(0))?
+        .collect::<Result<Vec<i64>, _>>()?;
+    Ok(ids)
 }

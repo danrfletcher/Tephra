@@ -432,9 +432,9 @@ async fn limit_gives_exactly_that_many_as_the_top_of_the_unlimited_list() {
 }
 
 #[tokio::test]
-async fn bad_params_are_refused_and_name_a_scope_that_is_not_built_yet() {
+async fn bad_params_are_refused_and_name_the_scope() {
     let (daemon, _notes, _tephra) = gp4().await;
-    for scope in ["headings", "blocks", "all_blocks", "nonsense"] {
+    for scope in ["headings", "blocks", "nonsense"] {
         let (code, message) = daemon
             .search_error(json!({"query": "atlas", "scope": scope}))
             .await;

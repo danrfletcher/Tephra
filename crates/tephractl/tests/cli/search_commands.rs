@@ -4,6 +4,8 @@
 //! `tests/fixtures/search_*.json`), the plain "no matches" line, the
 //! daemon's refusal of a blank query, and (through the real binary) the
 //! client-side "pick a file first" rejection with no RPC round-trip.
+//! The `^^q` search (G10, scope `all_blocks`) is tested at the end of
+//! this file, the same way.
 //! Argv parsing is tested here too, from a `Vec<&str>` to a `Command`.
 
 use serde_json::json;
@@ -19,6 +21,13 @@ fn client_for(server: &MockServer) -> RpcClient {
 
 fn search(query: &str, limit: Option<u64>) -> Command {
     Command::Search {
+        query: query.to_string(),
+        limit,
+    }
+}
+
+fn all_blocks(query: &str, limit: Option<u64>) -> Command {
+    Command::SearchAllBlocks {
         query: query.to_string(),
         limit,
     }
@@ -213,11 +222,12 @@ fn argv_hash_and_caret_queries_are_refused_before_any_rpc() {
         let err = parse(&["search", query]).unwrap_err();
         assert!(err.0.contains("pick a file first"), "{query}: {err}");
     }
-    for query in ["^^", "^^x"] {
-        let err = parse(&["search", query]).unwrap_err();
-        assert!(err.0.contains("^^"), "{query}: {err}");
-        assert!(!err.0.contains("pick a file first"), "{query}: {err}");
-    }
+    // `^^q` is the block search across every file (G10), not a refusal;
+    // a bare `^^` is refused as an empty query before any RPC.
+    let parsed = parse(&["search", "^^x"]).unwrap();
+    assert!(matches!(parsed.command, Command::SearchAllBlocks { .. }));
+    let err = parse(&["search", "^^"]).unwrap_err();
+    assert!(err.0.contains("empty query"), "{err}");
     // A hash or caret that does not lead is text.
     assert!(parse(&["search", "c#"]).is_ok());
 }
@@ -227,7 +237,7 @@ fn argv_hash_and_caret_queries_are_refused_before_any_rpc() {
 /// file even looked for: this runs with an empty `HOME`).
 #[test]
 fn the_binary_rejects_a_hash_query_with_no_round_trip() {
-    for query in ["#x", "^x", "^^x"] {
+    for query in ["#x", "^x"] {
         let server = MockServer::start(vec![Behavior::Respond {
             status: 200,
             body: load_fixture("search_gp4"),
@@ -244,11 +254,164 @@ fn the_binary_rejects_a_hash_query_with_no_round_trip() {
         assert_eq!(output.stdout, b"", "{query}");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.starts_with("tephractl: "), "{query}: {stderr}");
-        if query == "^^x" {
-            assert!(stderr.contains("^^"), "{stderr}");
-        } else {
-            assert!(stderr.contains("pick a file first"), "{query}: {stderr}");
-        }
+        assert!(stderr.contains("pick a file first"), "{query}: {stderr}");
         assert_eq!(server.call_count(), 0, "{query}: no RPC may be made");
     }
+}
+
+// ---- `^^q`: the all_blocks scope (G10) ---------------------------------
+//
+// `search "^^q"` sends `unit.search` with scope `all_blocks`, the `^^`
+// stripped, the query verbatim and no `in`; rendered and `--json` output
+// are compared byte for byte with `tests/fixtures/expected/
+// search_all_blocks_*.txt` (served from `tests/fixtures/
+// search_all_blocks.json`); a bare or blank `^^` is refused by the
+// binary itself, with no request sent. The binary tests run the real
+// `tephractl`, argv to stdout.
+
+#[test]
+fn it_sends_unit_search_with_scope_all_blocks_and_the_query_verbatim() {
+    let server = serve("search_all_blocks");
+    let outcome = run(&server, &all_blocks("conflict", None), false);
+    assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
+    let received = server.received();
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].body["method"], "unit.search");
+    assert_eq!(
+        received[0].body["params"],
+        json!({"query": "conflict", "scope": "all_blocks"})
+    );
+}
+
+#[test]
+fn it_sends_a_limit_only_when_one_was_given_and_odd_queries_untouched() {
+    let server = serve("search_all_blocks");
+    run(&server, &all_blocks("a", Some(7)), false);
+    assert_eq!(
+        server.received()[0].body["params"],
+        json!({"query": "a", "scope": "all_blocks", "limit": 7})
+    );
+    for query in ["café", "100%_done", "a\"b NEAR(c) *", "it's \\ x", "日本語"] {
+        let server = serve("search_all_blocks");
+        run(&server, &all_blocks(query, None), false);
+        assert_eq!(server.received()[0].body["params"]["query"], query);
+    }
+}
+
+#[test]
+fn it_prints_one_row_per_hit_in_rank_order_flagging_offline_ones() {
+    let server = serve("search_all_blocks");
+    let outcome = run(&server, &all_blocks("conflict", None), false);
+    assert_eq!(outcome.stdout, load_expected("search_all_blocks_rendered"));
+    assert_eq!(outcome.stderr, "");
+    assert_eq!(outcome.exit_code, 0);
+}
+
+#[test]
+fn json_prints_the_raw_result_array() {
+    let server = serve("search_all_blocks");
+    let outcome = run(&server, &all_blocks("conflict", None), true);
+    assert_eq!(outcome.stdout, load_expected("search_all_blocks_json"));
+    assert_eq!(outcome.exit_code, 0);
+}
+
+#[test]
+fn no_hits_is_the_plain_no_matches_line_and_exit_0() {
+    let server = serve("search_empty");
+    let outcome = run(&server, &all_blocks("zzz", None), false);
+    assert_eq!(outcome.stdout, "no matches\n");
+    assert_eq!(outcome.exit_code, 0);
+}
+
+/// The daemon's refusal of a blank query (a command built by hand: the
+/// parser never builds one) is printed with a non-zero exit.
+#[test]
+fn the_all_blocks_daemons_refusal_of_a_blank_query_is_printed_with_a_non_zero_exit() {
+    for query in ["", "   "] {
+        let server = serve("search_all_blocks_invalid_query");
+        let outcome = run(&server, &all_blocks(query, None), false);
+        assert_eq!(outcome.stdout, "");
+        assert_ne!(outcome.exit_code, 0);
+        assert!(
+            outcome.stderr.contains("empty query"),
+            "stderr: {}",
+            outcome.stderr
+        );
+        assert!(outcome.stderr.starts_with("tephractl: "));
+    }
+}
+
+#[test]
+fn a_hostile_snippet_cannot_inject_terminal_control_characters() {
+    let body = json!({"jsonrpc": "2.0", "id": 1, "result": [
+        {"unit": "@s:a\u{1b}[31m.md", "source": "s", "kind": "paragraph", "line": 1,
+         "snippet": "x\u{1b}]0;title\u{7}y\r\nz", "offline": false}
+    ]});
+    let server = MockServer::start(vec![Behavior::Respond { status: 200, body }]);
+    let outcome = run(&server, &all_blocks("x", None), false);
+    assert!(!outcome.stdout.contains('\u{1b}'), "{:?}", outcome.stdout);
+    assert!(!outcome.stdout.contains('\u{7}'), "{:?}", outcome.stdout);
+    assert_eq!(outcome.stdout.lines().count(), 1, "{:?}", outcome.stdout);
+}
+
+/// A bare or blank `^^` is refused by the binary itself: "empty query" on
+/// stderr, a non-zero exit, and not one request reaches the daemon.
+#[test]
+fn the_binary_refuses_a_blank_double_caret_without_a_request() {
+    for arg in ["^^", "^^  "] {
+        let server = serve("search_all_blocks");
+        let data = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(data.path().join("tephra")).unwrap();
+        std::fs::write(data.path().join("tephra/token"), "test-token\n").unwrap();
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_tephractl"))
+            .args(["search", arg, "--addr", &server.addr])
+            .env("HOME", data.path())
+            .env("XDG_DATA_HOME", data.path())
+            .output()
+            .expect("run tephractl");
+        assert!(!output.status.success(), "{arg:?} should fail");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "", "{arg:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("empty query"), "{arg:?}: {stderr}");
+        assert_eq!(server.call_count(), 0, "{arg:?} sent a request");
+    }
+}
+
+/// Through the real binary, argv to stdout: `search "^^conflict"` with a
+/// token file under a scratch `XDG_DATA_HOME` and the mock daemon on its
+/// own port.
+#[test]
+fn the_binary_sends_a_double_caret_query_as_all_blocks_and_prints_the_rows() {
+    let server = serve("search_all_blocks");
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(data.path().join("tephra")).unwrap();
+    std::fs::write(data.path().join("tephra/token"), "test-token\n").unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tephractl"))
+        .args([
+            "search",
+            "^^conflict",
+            "--limit",
+            "9",
+            "--addr",
+            &server.addr,
+        ])
+        .env("HOME", data.path())
+        .env("XDG_DATA_HOME", data.path())
+        .output()
+        .expect("run tephractl");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        load_expected("search_all_blocks_rendered")
+    );
+    let received = server.received();
+    assert_eq!(received.len(), 1);
+    assert_eq!(
+        received[0].body["params"],
+        json!({"query": "conflict", "scope": "all_blocks", "limit": 9})
+    );
 }

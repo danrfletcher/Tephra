@@ -131,14 +131,16 @@ fn in_with_a_query_that_has_no_sigil_is_refused_not_guessed() {
 }
 
 #[test]
-fn a_double_caret_stays_refused_with_or_without_in() {
+fn a_double_caret_takes_no_in() {
     for args in [
-        vec!["search", "^^x"],
         vec!["search", "--in", UNIT, "^^x"],
         vec!["search", "--in", UNIT, "^^"],
     ] {
         let err = parse(&args).unwrap_err();
-        assert!(err.0.contains("^^"), "{args:?}: {err}");
+        assert!(
+            err.0.contains("^^") && err.0.contains("no --in"),
+            "{args:?}: {err}"
+        );
         assert!(!err.0.contains("pick a file first"), "{args:?}: {err}");
     }
 }

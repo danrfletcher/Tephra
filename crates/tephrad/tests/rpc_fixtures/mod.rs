@@ -127,6 +127,7 @@ pub struct MockSources {
     rescan: Mutex<HashMap<String, Result<ScanStatsWire, String>>>,
     search: Mutex<Option<Result<Vec<SearchHitWire>, SearchError>>>,
     search_calls: Mutex<Vec<(String, usize)>>,
+    all_blocks_calls: Mutex<Vec<(String, usize)>>,
 }
 
 impl MockSources {
@@ -170,6 +171,12 @@ impl MockSources {
     /// An empty list after a rejected request proves nothing reached it.
     pub fn search_calls(&self) -> Vec<(String, usize)> {
         self.search_calls.lock().unwrap().clone()
+    }
+
+    /// Every `(query, limit)` the backend was asked to search with
+    /// `scope: "all_blocks"`, in order (it answers no hits).
+    pub fn all_blocks_calls(&self) -> Vec<(String, usize)> {
+        self.all_blocks_calls.lock().unwrap().clone()
     }
 }
 
@@ -219,6 +226,51 @@ impl SourceBackend for MockSources {
             .unwrap()
             .clone()
             .unwrap_or(Ok(Vec::new()))
+    }
+
+    fn search_all_blocks(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<tephrad::rpc::backend::AllBlocksHitWire>, SearchError> {
+        self.all_blocks_calls
+            .lock()
+            .unwrap()
+            .push((query.to_string(), limit));
+        Ok(Vec::new())
+    }
+}
+
+/// Lets a test keep a handle on the mock the server owns.
+pub struct SharedMock(pub std::sync::Arc<MockSources>);
+
+impl tephrad::rpc::backend::SourceBackend for SharedMock {
+    fn register(&self, n: &str, r: &str) -> Result<tephrad::rpc::backend::ScanStatsWire, String> {
+        self.0.register(n, r)
+    }
+    fn unregister(&self, n: &str) -> Result<(), String> {
+        self.0.unregister(n)
+    }
+    fn list(&self) -> Result<Vec<tephrad::rpc::backend::SourceRowWire>, String> {
+        self.0.list()
+    }
+    fn rescan(&self, n: &str) -> Result<tephrad::rpc::backend::ScanStatsWire, String> {
+        self.0.rescan(n)
+    }
+    fn search_names(
+        &self,
+        q: &str,
+        l: usize,
+    ) -> Result<Vec<SearchHitWire>, tephrad::rpc::backend::SearchError> {
+        self.0.search_names(q, l)
+    }
+    fn search_all_blocks(
+        &self,
+        q: &str,
+        l: usize,
+    ) -> Result<Vec<tephrad::rpc::backend::AllBlocksHitWire>, tephrad::rpc::backend::SearchError>
+    {
+        self.0.search_all_blocks(q, l)
     }
 }
 

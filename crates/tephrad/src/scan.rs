@@ -6,7 +6,7 @@
 //! `tephra_parser::parse_unit` (or `parse_unit_bytes`), code through
 //! `tephra_parser::parse_code_unit` (see [`parse_file`], the one
 //! dispatch). Both write through `tephra_cache`'s typed row shapes
-//! (`NewUnit`/`NewLink`/`NewTag`/`NewBlock`), so a unit's cache row
+//! (`NewUnit`/`NewLink`/`NewTag`/`NewBlock`/`NewFtsRow`), so a unit's cache row
 //! shape here is always in sync with what the parser crate produces
 //! — there is no separate re-description of that schema in this
 //! module.
@@ -42,7 +42,17 @@
 //! written as a unit carrying name, kind, size and mtime and nothing
 //! else — no links, headings or blocks. A `.txt` or `.py` with a NUL
 //! byte (which classifies as `binary`) is never parsed. Parsing never
-//! writes to the file (F4). The
+//! writes to the file (F4).
+//!
+//! `^^` index (G10): the same transaction that writes a unit also
+//! writes its `block_fts` rows ([`insert_index_rows`]): headings and
+//! paragraphs of prose, symbols and comment blocks of code, paragraphs
+//! of a document, and the blank-line-separated blocks of a `text-other`
+//! file (the one kind of unit with no other rows that is still read in
+//! full). A `binary` file, a `too_large` one and a document that could
+//! not be read get none. Replacing or deleting a unit removes its rows
+//! with it, so a watcher batch keeps the index in step with the unit
+//! rows. The
 //! walk ([`walk_and_write`]), the directory-upsert path and the
 //! debounced batch-apply path ([`apply_change_batch`]) all go through
 //! the same [`write_unit`], so they classify identically.
@@ -101,7 +111,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rusqlite::{Transaction, TransactionBehavior};
-use tephra_cache::{Cache, NewUnit};
+use tephra_cache::{Cache, NewFtsRow, NewUnit};
+use tephra_parser::IndexRow;
 
 use crate::file_kind::{self, FileKind, MAX_INDEXED_BYTES};
 use crate::ignore::IgnoreRules;
@@ -450,6 +461,11 @@ fn write_unit(
     let mut kind = file_kind::classify(file_name, &head);
     let mut parsed = None;
     let mut parsed_doc = None;
+    // G10: the rows this file adds to the `^^` index, built from the
+    // same parse (or the same text) as its other rows and written in
+    // the same transaction. Empty for a binary, a too-large or a
+    // name-only file.
+    let mut index_rows: Vec<IndexRow> = Vec::new();
     if !too_large && kind == FileKind::Document {
         // G5: a docx, pptx or PDF is read whole (bounded by the cap) and
         // handed to the document parser. One that cannot be read stays
@@ -484,11 +500,36 @@ fn write_unit(
             too_large = true;
         } else {
             match parse_file(kind, abs_path, file_name, &head, &bytes) {
-                Ok(p) => parsed = p,
+                Ok(Some((unit, rows))) => {
+                    parsed = Some(unit);
+                    index_rows = rows;
+                }
+                Ok(None) => {}
                 Err(e) => {
                     tracing::warn!(path = %abs_path.display(), error = %e, kind = kind.as_str(), "file is not valid UTF-8; indexed by name only as binary");
                     kind = FileKind::Binary;
                 }
+            }
+        }
+    }
+    if !too_large && kind == FileKind::TextOther {
+        // G6/G10: a text file of an unknown type is searched by its
+        // blocks of text, split on blank lines. It is still a
+        // `text-other` unit with no links, symbols or headings. Bytes
+        // that are not UTF-8 give no rows (the kind is the sniff's,
+        // and stays so).
+        match read_capped(abs_path) {
+            Ok(bytes) => {
+                size = bytes.len() as u64;
+                if size > MAX_INDEXED_BYTES {
+                    too_large = true;
+                } else if let Some(text) = text_of(&bytes) {
+                    index_rows = tephra_parser::text_other_rows(&text);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(path = %abs_path.display(), error = %e, "failed to read file during scan; skipping");
+                return Ok(None);
             }
         }
     }
@@ -519,7 +560,7 @@ fn write_unit(
     }
 
     let Some(parsed) = parsed else {
-        cache.insert_unit(&NewUnit {
+        let unit_id = cache.insert_unit(&NewUnit {
             source_id,
             rel_path: &rel_path,
             mtime,
@@ -528,6 +569,7 @@ fn write_unit(
             size: Some(size as i64),
             too_large,
         })?;
+        insert_index_rows(cache, unit_id, &index_rows)?;
         return Ok(Some(stats));
     };
 
@@ -583,8 +625,47 @@ fn write_unit(
     for heading in parsed.to_new_headings(unit_id) {
         cache.insert_heading(&heading)?;
     }
+    insert_index_rows(cache, unit_id, &index_rows)?;
 
     Ok(Some(stats))
+}
+
+/// The text of a file's `bytes`: UTF-16 with a BOM decoded, else strict
+/// UTF-8. `None` when it is neither.
+fn text_of(bytes: &[u8]) -> Option<std::borrow::Cow<'_, str>> {
+    match file_kind::decode_utf16_with_bom(bytes) {
+        Some(text) => Some(std::borrow::Cow::Owned(text)),
+        None => std::str::from_utf8(bytes)
+            .ok()
+            .map(std::borrow::Cow::Borrowed),
+    }
+}
+
+/// Writes `rows` as `unit_id`'s `^^` index rows (G10), in the caller's
+/// transaction: the same one that wrote the unit row, so a reader never
+/// sees a unit without its rows or rows without its unit, and
+/// `delete_existing_unit` (the next write of this path) removes them
+/// with the unit.
+fn insert_index_rows(cache: &Cache, unit_id: i64, rows: &[IndexRow]) -> Result<(), ScanError> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let new_rows: Vec<NewFtsRow<'_>> = rows
+        .iter()
+        .map(|r| NewFtsRow {
+            kind: r.kind,
+            line: r.line,
+            block_id: r.block_id.as_deref(),
+            name: r.name.as_deref(),
+            label: r.label.as_deref(),
+            place: r.place,
+            place_n: r.place_n,
+            idx: r.idx,
+            text: &r.text,
+        })
+        .collect();
+    cache.insert_fts_rows(unit_id, &new_rows)?;
+    Ok(())
 }
 
 /// Parses a `document` file's bytes. `None` means the unit is kept by
@@ -623,8 +704,9 @@ fn parse_document(abs_path: &Path, bytes: &[u8]) -> Option<tephra_parser::Parsed
 /// Writes a parsed document's unit row with its links, headings and
 /// paragraph rows (G5), in the same transaction as every other write of
 /// the chunk. The paragraphs go into `blocks` with no `block_id`; their
-/// `line` is the page, slide or paragraph number. Nothing is written to
-/// the document itself (F4).
+/// `line` is the page, slide or paragraph number. They also go into the
+/// `^^` index (G10) with that place and their position within it.
+/// Nothing is written to the document itself (F4).
 fn write_document(
     cache: &Cache,
     source_id: i64,
@@ -649,6 +731,7 @@ fn write_document(
         cache.insert_block(&block)?;
         stats.blocks_written += 1;
     }
+    insert_index_rows(cache, unit_id, &doc.index_rows())?;
     Ok(stats)
 }
 
@@ -657,10 +740,11 @@ fn write_document(
 /// saw). `Ok(None)` is a kind this does not parse (or a code file with
 /// no grammar, which `classify` never produces). `Err` carries the
 /// reason the bytes are not text; the caller then stores the file as
-/// `binary`.
+/// `binary`. `Ok(Some((unit, rows)))` is the parse and the `^^` index
+/// rows ([`IndexRow`]) built from it and the text it was parsed from.
 ///
 /// - `Prose`: `parse_unit`, after decoding a UTF-16 file with a BOM,
-///   else `parse_unit_bytes` (strict UTF-8).
+///   else on strict UTF-8.
 /// - `Code`: `parse_code_unit` in the language the name or shebang
 ///   gives ([`file_kind::language_for`]), on strict UTF-8.
 ///
@@ -673,23 +757,34 @@ fn parse_file(
     file_name: &str,
     head: &[u8],
     bytes: &[u8],
-) -> Result<Option<tephra_parser::ParsedUnit>, String> {
+) -> Result<Option<(tephra_parser::ParsedUnit, Vec<IndexRow>)>, String> {
     match kind {
-        FileKind::Prose => match file_kind::decode_utf16_with_bom(bytes) {
-            Some(text) => Ok(Some(tephra_parser::parse_unit(abs_path, &text))),
-            None => tephra_parser::parse_unit_bytes(abs_path, bytes)
-                .map(Some)
-                .map_err(|e| e.to_string()),
-        },
+        FileKind::Prose => {
+            let text = match file_kind::decode_utf16_with_bom(bytes) {
+                Some(text) => std::borrow::Cow::Owned(text),
+                None => std::borrow::Cow::Borrowed(std::str::from_utf8(bytes).map_err(|e| {
+                    tephra_parser::InvalidUtf8 {
+                        valid_up_to: e.valid_up_to(),
+                    }
+                    .to_string()
+                })?),
+            };
+            let unit = tephra_parser::parse_unit(abs_path, &text);
+            let rows = unit.index_rows(&text);
+            Ok(Some((unit, rows)))
+        }
         FileKind::Code => {
             let Some(lang) = file_kind::language_for(file_name, head) else {
                 return Ok(None);
             };
             let text = std::str::from_utf8(bytes).map_err(|e| e.to_string())?;
-            Ok(Some(tephra_parser::parse_code_unit(abs_path, lang, text)))
+            let unit = tephra_parser::parse_code_unit(abs_path, lang, text);
+            let rows = unit.index_rows(text);
+            Ok(Some((unit, rows)))
         }
         // A document goes through `parse_document` instead: its bytes
-        // are not text, so it has no `ParsedUnit`.
+        // are not text, so it has no `ParsedUnit`. A `text-other` file
+        // is read for its index rows in `write_unit`.
         FileKind::Document | FileKind::TextOther | FileKind::Binary => Ok(None),
     }
 }

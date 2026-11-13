@@ -12,7 +12,7 @@ use tephrad::rpc::backend::SearchHitWire;
 use tephrad::rpc::protocol::{INVALID_PARAMS, SOURCE_ERROR};
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::rpc_fixtures::{connect_ws, spawn, MockGraph, MockSources, TestServer};
+use crate::rpc_fixtures::{connect_ws, spawn, MockGraph, MockSources, SharedMock, TestServer};
 
 fn hit(id_path: &str, score: f64, offline: bool) -> SearchHitWire {
     SearchHitWire {
@@ -126,31 +126,6 @@ async fn the_default_limit_is_fifty_and_an_explicit_limit_and_scope_names_are_pa
     }
 }
 
-/// Lets a test keep a handle on the mock the server owns.
-struct SharedMock(std::sync::Arc<MockSources>);
-
-impl tephrad::rpc::backend::SourceBackend for SharedMock {
-    fn register(&self, n: &str, r: &str) -> Result<tephrad::rpc::backend::ScanStatsWire, String> {
-        self.0.register(n, r)
-    }
-    fn unregister(&self, n: &str) -> Result<(), String> {
-        self.0.unregister(n)
-    }
-    fn list(&self) -> Result<Vec<tephrad::rpc::backend::SourceRowWire>, String> {
-        self.0.list()
-    }
-    fn rescan(&self, n: &str) -> Result<tephrad::rpc::backend::ScanStatsWire, String> {
-        self.0.rescan(n)
-    }
-    fn search_names(
-        &self,
-        q: &str,
-        l: usize,
-    ) -> Result<Vec<SearchHitWire>, tephrad::rpc::backend::SearchError> {
-        self.0.search_names(q, l)
-    }
-}
-
 #[tokio::test]
 async fn bad_params_are_invalid_params_on_both_transports_and_never_reach_the_backend() {
     let sources = std::sync::Arc::new(MockSources::new());
@@ -169,7 +144,15 @@ async fn bad_params_are_invalid_params_on_both_transports_and_never_reach_the_ba
         (json!({"query": null}), "query"),
         (json!({"query": "a", "scope": "headings"}), "headings"),
         (json!({"query": "a", "scope": "blocks"}), "blocks"),
-        (json!({"query": "a", "scope": "all_blocks"}), "all_blocks"),
+        (json!({"query": "", "scope": "all_blocks"}), "empty query"),
+        (
+            json!({"query": " \t", "scope": "all_blocks"}),
+            "empty query",
+        ),
+        (
+            json!({"query": "a", "scope": "all_blocks", "in": "@s:a.md"}),
+            "all_blocks",
+        ),
         (json!({"query": "a", "scope": "bogus"}), "bogus"),
         (json!({"query": "a", "scope": 3}), "scope"),
         (json!({"query": "a", "limit": 0}), "limit"),
@@ -250,6 +233,63 @@ async fn a_search_with_no_or_a_wrong_token_is_401_and_reaches_nothing() {
         .await
         .is_err());
 
+    assert!(sources.search_calls().is_empty());
+}
+
+/// `unit.search` with `scope: "all_blocks"` (G10) is behind the same
+/// bearer-token gate as every other method: with no token or a wrong one
+/// it is refused before dispatch and the backend is never asked; with the
+/// right one the same request reaches it on both transports.
+#[tokio::test]
+async fn a_search_with_scope_all_blocks_needs_the_bearer_token() {
+    let sources = std::sync::Arc::new(MockSources::new());
+    let server = crate::rpc_fixtures::spawn_with_token_and_any_sources(
+        MockGraph::new(),
+        SharedMock(sources.clone()),
+        "t".repeat(64).as_str(),
+    )
+    .await;
+    let body = request(7, json!({"query": "conflict", "scope": "all_blocks"}));
+
+    let client = reqwest::Client::new();
+    let none = client
+        .post(server.http_url())
+        .json(&body)
+        .send()
+        .await
+        .expect("request completes");
+    assert_eq!(none.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let parsed: Value = none.json().await.expect("JSON-RPC error body");
+    assert!(parsed.get("error").is_some() && parsed.get("result").is_none());
+
+    let wrong = client
+        .post(server.http_url())
+        .bearer_auth("not-the-right-token")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert!(connect_ws(&server.ws_url(), "not-the-right-token")
+        .await
+        .is_err());
+    assert!(
+        sources.all_blocks_calls().is_empty(),
+        "a refused request reached the backend"
+    );
+
+    // With the token, the same body is dispatched (the default limit is 50).
+    for response in [
+        over_http(&server, &body).await,
+        over_ws(&server, &body).await,
+    ] {
+        assert_eq!(response["result"], json!([]), "{response}");
+    }
+    assert_eq!(
+        sources.all_blocks_calls(),
+        vec![("conflict".to_string(), 50), ("conflict".to_string(), 50)]
+    );
+    // It never went to the names search.
     assert!(sources.search_calls().is_empty());
 }
 

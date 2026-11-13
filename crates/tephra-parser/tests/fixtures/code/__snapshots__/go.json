@@ -71,5 +71,22 @@
       "end_line": 9
     }
   ],
+  "comment_blocks": [
+    {
+      "start_line": 3,
+      "end_line": 3,
+      "text": "line comment [[Line]]"
+    },
+    {
+      "start_line": 4,
+      "end_line": 4,
+      "text": "block comment [[Block]]"
+    },
+    {
+      "start_line": 5,
+      "end_line": 5,
+      "text": "Doc is documented [[Doc]]"
+    }
+  ],
   "diagnostics": []
 }

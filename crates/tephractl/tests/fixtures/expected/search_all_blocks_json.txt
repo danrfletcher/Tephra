@@ -1,0 +1,53 @@
+[
+  {
+    "kind": "symbol",
+    "line": 73,
+    "offline": false,
+    "snippet": "enum ConflictReason",
+    "source": "tephra",
+    "unit": "@tephra:crates/tephra-cache/src/schema.rs"
+  },
+  {
+    "block_id": "k3f9a2",
+    "kind": "paragraph",
+    "line": 7,
+    "offline": false,
+    "snippet": "...how a link conflict is shown\nto the user...",
+    "source": "notes",
+    "unit": "@notes:plans/links.md"
+  },
+  {
+    "index": 1,
+    "kind": "document paragraph",
+    "offline": false,
+    "slide": 2,
+    "snippet": "Conflict resolution",
+    "source": "notes",
+    "unit": "@notes:deck.pptx"
+  },
+  {
+    "index": 4,
+    "kind": "document paragraph",
+    "offline": false,
+    "paragraph": 4,
+    "snippet": "A conflict of interest",
+    "source": "notes",
+    "unit": "@notes:report.docx"
+  },
+  {
+    "kind": "comment",
+    "line": 3,
+    "offline": true,
+    "snippet": "a conflict\u0007note",
+    "source": "old",
+    "unit": "@old:b.md"
+  },
+  {
+    "kind": "heading",
+    "line": 1,
+    "offline": true,
+    "snippet": "",
+    "source": "old",
+    "unit": "@old:c.md"
+  }
+]

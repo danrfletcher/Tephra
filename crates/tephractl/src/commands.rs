@@ -104,6 +104,7 @@ pub fn execute_with_prompt_writer<R: BufRead, W: Write>(
             query,
             limit,
         } => search_in(unit, *scope, query, *limit, json, client),
+        Command::SearchAllBlocks { query, limit } => search_all_blocks(query, *limit, json, client),
         Command::LinkResolve {
             target,
             default_source,
@@ -276,6 +277,31 @@ fn search_in(
         Ok(result) => CommandOutcome::ok(json_or(
             &result,
             || render::render_in_file_results(&result),
+            json,
+        )),
+        Err(e) => CommandOutcome::err(describe_error(&e)),
+    }
+}
+
+/// `search "^^q"` (G10): one `unit.search` call with scope `all_blocks`,
+/// `query` being what followed the `^^`. The daemon's refusal of a blank
+/// or too-long query (INVALID_PARAMS) is printed as it comes, with a
+/// non-zero exit; no results is the plain line `no matches` and exit 0.
+/// `--json` is the raw result array.
+fn search_all_blocks(
+    query: &str,
+    limit: Option<u64>,
+    json: bool,
+    client: &RpcClient,
+) -> CommandOutcome {
+    let mut params = json!({"query": query, "scope": "all_blocks"});
+    if let Some(limit) = limit {
+        params["limit"] = json!(limit);
+    }
+    match client.call("unit.search", params) {
+        Ok(result) => CommandOutcome::ok(json_or(
+            &result,
+            || render::render_all_blocks_results(&result),
             json,
         )),
         Err(e) => CommandOutcome::err(describe_error(&e)),

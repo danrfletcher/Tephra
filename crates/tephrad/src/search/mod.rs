@@ -1,8 +1,9 @@
 //! `unit.search` (G8): `[[`-style search across every registered source
 //! (`scope: "names"`, here), plus G9's search inside one file
-//! (`scope: "headings"` and `"blocks"`, in [`in_file`]). `all_blocks` is
-//! not built yet: the dispatcher refuses it, never answering it as
-//! another scope.
+//! (`scope: "headings"` and `"blocks"`, in [`in_file`]) and G10's `^^`
+//! full-text search of every block of every source (`scope:
+//! "all_blocks"`, in [`all_blocks`]). The dispatcher never answers a
+//! scope as another one.
 //!
 //! A search is one read-only pass over the cache
 //! ([`tephra_cache::Cache::search_names`]) on a fresh
@@ -17,6 +18,7 @@
 //! The matching rule is [`fuzzy`]; this module adds the wire shape, the
 //! parameter limits and the `offline` flag.
 
+pub mod all_blocks;
 pub mod fuzzy;
 pub mod in_file;
 

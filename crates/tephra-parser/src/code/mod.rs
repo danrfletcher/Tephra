@@ -23,6 +23,11 @@
 //! comment attached to the symbol that owns it (G13). They come out as
 //! [`ParsedUnit::symbols`] and [`ParsedUnit::blocks`].
 //!
+//! The same comment ranges are grouped into **comment blocks**
+//! ([`CommentBlock`]: a run of consecutive line comments, or one block
+//! comment) for the `^^` full-text index (G10), and [`split_identifier`]
+//! gives a symbol name's words for it.
+//!
 //! What is *not* done here, on purpose: no Markdown fence exclusion
 //! around a wikilink (the comment boundary is the only filter), no
 //! headings, tags or paragraphs, no name-based `#anchor` resolution to
@@ -45,6 +50,7 @@
 //!   [`DiagnosticKind::ParseSkippedTooLarge`] diagnostic.
 
 mod comments;
+mod index;
 mod languages;
 mod symbols;
 
@@ -52,6 +58,7 @@ use std::ops::ControlFlow;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+pub use index::{split_identifier, CommentBlock};
 pub use languages::{Language, EXTENSIONS};
 pub use symbols::Symbol;
 
@@ -94,6 +101,7 @@ pub fn parse_code_unit_within(
     let mut markdown_links = Vec::new();
     let mut symbols = Vec::new();
     let mut blocks = Vec::new();
+    let mut comment_blocks = Vec::new();
 
     let parsed = if content.len() > MAX_CODE_PARSE_BYTES {
         Err(ParseFailure::TooLarge)
@@ -107,6 +115,7 @@ pub fn parse_code_unit_within(
             blocks = found.blocks;
             let ranges = comments::find_ranges(lang, &tree, content);
             let lines = LineIndex::new(content);
+            comment_blocks = index::group_comments(content, &ranges, &lines, &blocks);
             for (start, end) in ranges {
                 let Some(text) = content.get(start..end) else {
                     continue;
@@ -161,6 +170,7 @@ pub fn parse_code_unit_within(
         blocks,
         paragraphs: Vec::new(),
         symbols,
+        comment_blocks,
         diagnostics,
     }
 }

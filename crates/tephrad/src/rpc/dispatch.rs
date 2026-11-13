@@ -201,8 +201,9 @@ fn unit_list(params: &Value, sources: &dyn SourceBackend) -> DispatchResult {
 ///   (`@source:path`), which is required: without it the error is
 ///   "pick a file first". `query` may be empty or blank, which lists
 ///   everything in the file in file order.
-/// - `all_blocks` is not built yet and is refused naming the scope, and
-///   `in` is refused with it too.
+/// - `all_blocks` (G10, the `^^` search): a full-text search of every
+///   block of every source. `query` needs at least one non-blank
+///   character ("empty query" otherwise), and `in` is refused.
 ///
 /// Any other value is unknown. A search is never quietly run as another
 /// scope, and an `in` is never quietly ignored. `limit` (default
@@ -241,9 +242,7 @@ fn unit_search(params: &Value, sources: &dyn SourceBackend) -> DispatchResult {
             )))
         }
         ("all_blocks", _, None) => {
-            return Err(invalid_params(
-                "scope \"all_blocks\" is not supported yet; \"names\", \"headings\" and \"blocks\" are",
-            ))
+            crate::search::all_blocks::check_query(query).map_err(invalid_params)?;
         }
         (_, Some(_), None) => {
             return Err(invalid_params(format!(
@@ -260,7 +259,7 @@ fn unit_search(params: &Value, sources: &dyn SourceBackend) -> DispatchResult {
         }
         _ => {
             return Err(invalid_params(format!(
-                "unknown scope \"{scope}\"; \"names\", \"headings\" and \"blocks\" are supported"
+                "unknown scope \"{scope}\"; \"names\", \"headings\", \"blocks\" and \"all_blocks\" are supported"
             )))
         }
     }
@@ -293,6 +292,12 @@ fn unit_search(params: &Value, sources: &dyn SourceBackend) -> DispatchResult {
         (Some(scope), Some(unit)) => sources
             .search_in_file(unit, scope, query, limit)
             .map(|wire| serde_json::to_value(wire).expect("InFileSearchWire always serializes"))
+            .map_err(to_error),
+        _ if scope == "all_blocks" => sources
+            .search_all_blocks(query, limit)
+            .map(|hits| {
+                serde_json::to_value(hits).expect("Vec<AllBlocksHitWire> always serializes")
+            })
             .map_err(to_error),
         _ => sources
             .search_names(query, limit)
@@ -554,6 +559,9 @@ mod tests {
     /// records the arguments it receives and answers a canned result.
     struct SearchStub {
         calls: Mutex<Vec<(String, usize)>>,
+        /// The `search_all_blocks` calls (G10), kept apart from the
+        /// name searches so a test can tell which verb ran.
+        all_blocks_calls: Mutex<Vec<(String, usize)>>,
         reply: Result<Vec<SearchHitWire>, SearchError>,
     }
 
@@ -561,6 +569,7 @@ mod tests {
         fn answering(reply: Result<Vec<SearchHitWire>, SearchError>) -> Self {
             SearchStub {
                 calls: Mutex::new(Vec::new()),
+                all_blocks_calls: Mutex::new(Vec::new()),
                 reply,
             }
         }
@@ -593,6 +602,17 @@ mod tests {
             self.calls.lock().unwrap().push((query.to_string(), limit));
             self.reply.clone()
         }
+        fn search_all_blocks(
+            &self,
+            query: &str,
+            limit: usize,
+        ) -> Result<Vec<crate::rpc::backend::AllBlocksHitWire>, SearchError> {
+            self.all_blocks_calls
+                .lock()
+                .unwrap()
+                .push((query.to_string(), limit));
+            Ok(Vec::new())
+        }
     }
 
     fn search_invalid(params: Value) -> String {
@@ -624,11 +644,18 @@ mod tests {
     }
 
     #[test]
-    fn unit_search_refuses_every_unknown_or_unbuilt_scope_and_names_the_scope() {
+    fn unit_search_refuses_every_unknown_scope_and_bad_all_blocks_params_and_names_the_scope() {
         // `headings` and `blocks` need `in` (tests/unit/search_in_file.rs).
-        let message = search_invalid(json!({"query": "a", "scope": "all_blocks"}));
+        // `all_blocks` (G10) is built: it refuses a blank or too-long
+        // query and an `in`, before the backend runs.
+        let message = search_invalid(json!({"query": " ", "scope": "all_blocks"}));
+        assert!(message.contains("empty query"), "{message}");
+        let message = search_invalid(json!({"query": "", "scope": "all_blocks"}));
+        assert!(message.contains("empty query"), "{message}");
+        let too_long = "a".repeat(crate::search::fuzzy::MAX_QUERY_CHARS + 1);
+        search_invalid(json!({"query": too_long, "scope": "all_blocks"}));
+        let message = search_invalid(json!({"query": "a", "scope": "all_blocks", "in": "@s:a"}));
         assert!(message.contains("all_blocks"), "{message}");
-        assert!(message.contains("not supported yet"), "{message}");
         for scope in ["", "Names", "NAMES", "name", "files", "names "] {
             let message = search_invalid(json!({"query": "a", "scope": scope}));
             assert!(message.contains("unknown scope"), "{scope:?}: {message}");
@@ -688,6 +715,30 @@ mod tests {
             assert_eq!(value, json!([]));
             assert_eq!(stub.calls(), vec![(query.to_string(), limit)], "{params}");
         }
+    }
+
+    #[test]
+    fn unit_search_all_blocks_calls_its_own_verb_with_the_query_verbatim() {
+        let stub = SearchStub::empty_ok();
+        // FTS5 operators and quotes are the daemon's to escape, not the
+        // dispatcher's: it passes the text through unchanged.
+        let value = unit_search(
+            &json!({"query": " a\"b NEAR(c) ", "scope": "all_blocks"}),
+            &stub,
+        )
+        .expect("accepted");
+        assert_eq!(value, json!([]));
+        let value = unit_search(
+            &json!({"query": "x", "scope": "all_blocks", "limit": 7}),
+            &stub,
+        )
+        .expect("accepted");
+        assert_eq!(value, json!([]));
+        assert_eq!(
+            *stub.all_blocks_calls.lock().unwrap(),
+            [(" a\"b NEAR(c) ".to_string(), 50), ("x".to_string(), 7)]
+        );
+        assert!(stub.calls().is_empty(), "no name search ran");
     }
 
     #[test]

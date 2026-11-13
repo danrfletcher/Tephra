@@ -33,5 +33,12 @@
   "tags": [],
   "blocks": [],
   "paragraphs": [],
+  "comment_blocks": [
+    {
+      "start_line": 1,
+      "end_line": 3,
+      "text": "bin/bash\nline comment [[Line]]\ndoc comment [[Doc]]"
+    }
+  ],
   "diagnostics": []
 }

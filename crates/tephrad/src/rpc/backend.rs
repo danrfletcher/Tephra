@@ -24,6 +24,7 @@ use tephra_graph::{Edge, ResolveError, ResolveResult, UnitGraph};
 
 use crate::registry::{RegistryError, SourceListing, SourceRegistry};
 use crate::scan::ScanStats;
+pub use crate::search::all_blocks::AllBlocksHitWire;
 pub use crate::search::in_file::InFileSearchWire;
 pub use crate::search::{SearchError, SearchHitWire};
 pub use crate::unit_list::{UnitEntryWire, UnitListError, UnitListWire};
@@ -330,6 +331,19 @@ pub trait SourceBackend: Send + Sync {
             "unit.search is not supported by this source backend".to_string(),
         ))
     }
+    /// `unit.search` with `scope: "all_blocks"` (G10, `^^`): the best
+    /// `limit` indexed blocks of every source for `query`, ranked. The
+    /// dispatcher has already checked `query` and `limit`. The default
+    /// refuses, like [`SourceBackend::list_units`].
+    fn search_all_blocks(
+        &self,
+        _query: &str,
+        _limit: usize,
+    ) -> Result<Vec<AllBlocksHitWire>, SearchError> {
+        Err(SearchError::Source(
+            "unit.search is not supported by this source backend".to_string(),
+        ))
+    }
 }
 
 impl SourceBackend for SourceRegistry {
@@ -370,6 +384,13 @@ impl SourceBackend for SourceRegistry {
         limit: usize,
     ) -> Result<InFileSearchWire, SearchError> {
         SourceRegistry::search_in_file(self, unit, scope, query, limit)
+    }
+    fn search_all_blocks(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<AllBlocksHitWire>, SearchError> {
+        SourceRegistry::search_all_blocks(self, query, limit)
     }
 }
 

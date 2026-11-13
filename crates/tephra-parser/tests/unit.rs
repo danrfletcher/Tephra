@@ -29,6 +29,8 @@ mod documents_support;
 mod frontmatter;
 #[path = "unit/headings.rs"]
 mod headings;
+#[path = "unit/index_rows.rs"]
+mod index_rows;
 #[path = "unit/large_file.rs"]
 mod large_file;
 #[path = "unit/markdown_links.rs"]

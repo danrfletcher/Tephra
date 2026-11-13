@@ -1138,3 +1138,87 @@ fn editing_and_deleting_a_rs_file_through_the_watcher_replaces_then_removes_its_
     );
     registry.unregister("repo").expect("unregister");
 }
+
+/// `block_fts` rows of the unit at `rel` (0 if it has no unit).
+fn fts_rows_of(cache: &Cache, rel: &str) -> i64 {
+    cache
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM block_fts f JOIN units u ON u.id = f.unit_id \
+             WHERE u.rel_path = ?1",
+            [rel],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+/// G10 on the watcher path: an edit, a delete and a rename each leave the
+/// `^^` index in step within the debounce, checked by row count per unit:
+/// the old rows replaced, never added to; a deleted file's rows gone; a
+/// renamed file's old path with no rows and its new path with exactly one
+/// set. A renamed folder moves its files' rows the same way.
+#[test]
+fn the_watcher_keeps_the_block_index_in_step_with_an_edit_a_delete_and_a_rename() {
+    let fixture = fixtures::empty_source();
+    fixture.write("a.md", "# Title\n\nalpha one\n\nalpha two\n");
+    fixture.write("keep.md", "keep this\n");
+    fixture.write("gone.md", "bye text\n");
+    fixture.write("dir/x.md", "# X\n\nfolder text\n");
+    let cache_dir = tempfile::tempdir().expect("cache tempdir");
+    let cache_path = cache_dir.path().join("cache.db");
+    let registry =
+        SourceRegistry::new(Cache::open(&cache_path).expect("open cache")).expect("registry");
+    registry.register("n", fixture.root()).expect("register");
+    let cache = Cache::open(&cache_path).expect("reopen cache");
+    let wait = |what: &str, check: &dyn Fn() -> bool| {
+        assert!(wait_until(Duration::from_secs(20), check), "{what}");
+    };
+    let rel_paths = |query: &str| -> Vec<String> {
+        cache
+            .search_all_blocks(query, 50)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.rel_path)
+            .collect()
+    };
+
+    assert_eq!(fts_rows_of(&cache, "a.md"), 3, "heading and two paragraphs");
+    assert_eq!(fts_rows_of(&cache, "gone.md"), 1);
+    assert_eq!(fts_rows_of(&cache, "dir/x.md"), 2);
+    let total = cache.table_row_count("block_fts").unwrap();
+    assert_eq!(total, 3 + 1 + 1 + 2);
+
+    // Edit: the old rows are replaced by the new ones.
+    fixture.write("a.md", "# Title\n\nbeta only\n");
+    wait("an edit replaces the unit's rows", &|| {
+        fts_rows_of(&cache, "a.md") == 2
+    });
+    assert!(rel_paths("alpha").is_empty(), "no stale hit");
+    assert_eq!(rel_paths("beta"), ["a.md"]);
+
+    // Delete: the rows go with the unit.
+    fixture.remove("gone.md");
+    wait("a delete removes the unit's rows", &|| {
+        fts_rows_of(&cache, "gone.md") == 0
+    });
+    assert!(rel_paths("bye text").is_empty());
+    assert_eq!(cache.table_row_count("block_fts").unwrap(), 2 + 1 + 2);
+
+    // Rename a file: nothing under the old path, one set under the new.
+    std::fs::rename(fixture.root().join("a.md"), fixture.root().join("b.md")).expect("rename");
+    wait("a renamed file's rows move to its new path", &|| {
+        fts_rows_of(&cache, "b.md") == 2 && fts_rows_of(&cache, "a.md") == 0
+    });
+    assert_eq!(rel_paths("beta"), ["b.md"], "one hit, under the new path");
+    assert_eq!(cache.table_row_count("block_fts").unwrap(), 2 + 1 + 2);
+
+    // Rename a folder: its file's rows follow it.
+    std::fs::rename(fixture.root().join("dir"), fixture.root().join("dir2")).expect("rename dir");
+    wait("a renamed folder's files' rows move with it", &|| {
+        fts_rows_of(&cache, "dir2/x.md") == 2 && fts_rows_of(&cache, "dir/x.md") == 0
+    });
+    assert_eq!(rel_paths("folder text"), ["dir2/x.md"]);
+    assert_eq!(cache.table_row_count("block_fts").unwrap(), 2 + 1 + 2);
+
+    registry.unregister("n").expect("unregister");
+}

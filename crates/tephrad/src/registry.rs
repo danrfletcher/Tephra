@@ -862,6 +862,20 @@ impl SourceRegistry {
         crate::search::in_file::search_in_file(&self.cache_path, unit_id, scope, query, limit)
     }
 
+    /// `unit.search` with `scope: "all_blocks"` (G10, `^^`): the best
+    /// `limit` indexed paragraphs, comment blocks, symbols, headings and
+    /// document paragraphs of every source for `query`, from a fresh
+    /// read-only cache connection, like [`SourceRegistry::search_names`]:
+    /// it never takes the shared `self.cache` lock or the writer gate.
+    /// See [`crate::search::all_blocks`].
+    pub fn search_all_blocks(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::search::all_blocks::AllBlocksHitWire>, crate::search::SearchError> {
+        crate::search::all_blocks::search_all_blocks(&self.cache_path, query, limit)
+    }
+
     /// Whether `name` is currently marked `permission_denied`.
     pub fn is_permission_denied(&self, name: &str) -> bool {
         self.permission_denied.lock().unwrap().contains(name)

@@ -1,0 +1,6 @@
+@tephra:crates/tephra-cache/src/schema.rs:73  symbol  enum ConflictReason
+@notes:plans/links.md:7  paragraph  ...how a link conflict is shown to the user...  ^k3f9a2
+@notes:deck.pptx  document paragraph  slide 2 #1  Conflict resolution
+@notes:report.docx  document paragraph  paragraph 4  A conflict of interest
+@old:b.md:3  comment  a conflict?note  (offline)
+@old:c.md:1  heading  (offline)

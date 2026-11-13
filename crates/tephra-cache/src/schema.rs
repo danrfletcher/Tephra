@@ -5,7 +5,8 @@
 //!   created once with `CREATE TABLE IF NOT EXISTS` and are never
 //!   dropped, not even by a schema-version rebuild.
 //! - Core tables (`units`, `links`, `tags`, `blocks`, `headings`,
-//!   `symbols`, and the `block_fts` FTS5 index) hold derived,
+//!   `symbols`, the `block_fts` FTS5 index and its `block_names`
+//!   exact-name table) hold derived,
 //!   re-parseable data. On a schema-version mismatch they are
 //!   unconditionally dropped and recreated — this crate has no
 //!   migration-file mechanism, version ladder, or incremental
@@ -164,18 +165,51 @@ const CREATE_SYMBOLS: &str = "\
         end_line INTEGER NOT NULL \
     )";
 
-/// Trigram FTS5 index over paragraph/comment/symbol text (`^^`
-/// search). `unit_id` and `line` are stored but not tokenized. A
-/// virtual table cannot carry a foreign key or a regular index, so
-/// rows are removed by the explicit `DELETE ... WHERE unit_id` in the
-/// delete helpers in `units.rs`, like the other child tables. Nothing
-/// populates it yet; the search PR does.
+/// Trigram FTS5 index for the `^^` search (G10): one row per paragraph,
+/// comment block, symbol name, heading and document paragraph of a unit.
+///
+/// Only `text` is tokenized (the trigram tokenizer, so `conflict` finds
+/// `ConflictReason`; a symbol's text also carries its name split on
+/// camelCase/snake_case). Every other column is stored and never
+/// searched (`UNINDEXED`): `unit_id` and `line` place the row, `kind`
+/// is `paragraph`, `comment`, `symbol` or `heading`, `block_id` is the
+/// `^id` the block carries, `name` is the bare symbol or heading name
+/// (what an exact-name match boosts),
+/// `label` is the text a symbol is shown as (`enum ConflictReason`),
+/// and a document row has `place` (`page`, `slide` or `paragraph`),
+/// `place_n` and `idx` (its place within a page or slide) instead of a
+/// `line`.
+///
+/// A virtual table cannot carry a foreign key or a regular index, so a
+/// unit's rows are found by `rowid` instead: [`crate::fts`] gives a
+/// unit's rows the rowids `unit_id << 24 ..= (unit_id << 24) + 2^24 - 1`,
+/// and every delete helper in `units.rs` removes that range (a plain
+/// rowid range scan, where a `WHERE unit_id = ?` over an UNINDEXED
+/// column would read the whole table once per file).
 const CREATE_BLOCK_FTS: &str = "\
     CREATE VIRTUAL TABLE block_fts USING fts5(\
         unit_id UNINDEXED, \
         line UNINDEXED, \
+        kind UNINDEXED, \
+        block_id UNINDEXED, \
+        name UNINDEXED, \
+        label UNINDEXED, \
+        place UNINDEXED, \
+        place_n UNINDEXED, \
+        idx UNINDEXED, \
         text, \
         tokenize = 'trigram'\
+    )";
+
+/// The lower-cased (ASCII) name of every `block_fts` row that has one (a
+/// symbol or a heading), keyed by that row's rowid, so the `^^` search
+/// finds the rows named exactly like the query from an index instead of
+/// by scanning every match. Written and deleted with the `block_fts`
+/// rows, by the same functions.
+const CREATE_BLOCK_NAMES: &str = "\
+    CREATE TABLE block_names (\
+        fts_rowid INTEGER PRIMARY KEY, \
+        name_lower TEXT NOT NULL\
     )";
 
 /// Indexes backing the per-unit cascading deletes in `units.rs`
@@ -214,6 +248,9 @@ const CREATE_IDX_HEADINGS_UNIT_ID: &str =
     "CREATE INDEX IF NOT EXISTS idx_headings_unit_id ON headings(unit_id)";
 const CREATE_IDX_SYMBOLS_UNIT_ID: &str =
     "CREATE INDEX IF NOT EXISTS idx_symbols_unit_id ON symbols(unit_id)";
+/// Backs the exact-name lookup of the `^^` search.
+const CREATE_IDX_BLOCK_NAMES_NAME: &str =
+    "CREATE INDEX IF NOT EXISTS idx_block_names_name ON block_names(name_lower)";
 /// Backs `blocks_with_id` (E8): every occurrence of one block ID.
 const CREATE_IDX_BLOCKS_BLOCK_ID: &str =
     "CREATE INDEX IF NOT EXISTS idx_blocks_block_id ON blocks(block_id)";
@@ -229,6 +266,7 @@ pub(crate) fn create_core_indexes(conn: &Connection) -> Result<(), CacheError> {
     conn.execute(CREATE_IDX_HEADINGS_UNIT_ID, [])?;
     conn.execute(CREATE_IDX_SYMBOLS_UNIT_ID, [])?;
     conn.execute(CREATE_IDX_BLOCKS_BLOCK_ID, [])?;
+    conn.execute(CREATE_IDX_BLOCK_NAMES_NAME, [])?;
     Ok(())
 }
 
@@ -253,7 +291,7 @@ pub(crate) fn create_core_tables_if_not_exists(conn: &Connection) -> Result<(), 
     Ok(())
 }
 
-fn core_table_ddls_if_not_exists() -> [String; 7] {
+fn core_table_ddls_if_not_exists() -> [String; 8] {
     [
         CREATE_UNITS.replacen("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1),
         CREATE_LINKS.replacen("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1),
@@ -266,6 +304,7 @@ fn core_table_ddls_if_not_exists() -> [String; 7] {
             "CREATE VIRTUAL TABLE IF NOT EXISTS",
             1,
         ),
+        CREATE_BLOCK_NAMES.replacen("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1),
     ]
 }
 
@@ -274,6 +313,7 @@ fn core_table_ddls_if_not_exists() -> [String; 7] {
 /// Never touches `sources`, `schema_version` or `scan_state`.
 pub(crate) fn drop_core_tables(conn: &Connection) -> Result<(), CacheError> {
     conn.execute("DROP TABLE IF EXISTS block_fts", [])?;
+    conn.execute("DROP TABLE IF EXISTS block_names", [])?;
     // `blocks` references `symbols`: drop the referencing table first.
     conn.execute("DROP TABLE IF EXISTS blocks", [])?;
     conn.execute("DROP TABLE IF EXISTS symbols", [])?;
@@ -295,6 +335,7 @@ pub(crate) fn create_core_tables(conn: &Connection) -> Result<(), CacheError> {
     conn.execute(CREATE_BLOCKS, [])?;
     conn.execute(CREATE_HEADINGS, [])?;
     conn.execute(CREATE_BLOCK_FTS, [])?;
+    conn.execute(CREATE_BLOCK_NAMES, [])?;
     create_core_indexes(conn)?;
     Ok(())
 }
@@ -420,6 +461,19 @@ fn table_lacks_column(conn: &Connection, table: &str, column: &str) -> Result<bo
     Ok(any)
 }
 
+/// Whether `block_fts` exists (a cache written by an earlier build of
+/// the `^^` search) and `block_names` does not.
+fn block_names_missing_beside_block_fts(conn: &Connection) -> Result<bool, CacheError> {
+    let exists = |name: &str| -> Result<bool, CacheError> {
+        Ok(conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE name = ?1)",
+            [name],
+            |r| r.get(0),
+        )?)
+    };
+    Ok(exists("block_fts")? && !exists("block_names")?)
+}
+
 /// Whether the existing `blocks.block_id` column is declared
 /// `NOT NULL`. `false` if the table or column is missing.
 fn blocks_block_id_is_not_null(conn: &Connection) -> Result<bool, CacheError> {
@@ -448,14 +502,74 @@ fn blocks_block_id_is_not_null(conn: &Connection) -> Result<bool, CacheError> {
 ///   (G3);
 /// - the build before code symbols (G4) had no `symbols.line` (the
 ///   definition's first line) and no `blocks.symbol_id` (the symbol
-///   that owns a code block ID, G13).
+///   that owns a code block ID, G13);
+/// - the build before the `^^` search (G10) had a `block_fts` with only
+///   `unit_id`, `line` and `text`, and nothing wrote to it;
+/// - the build before the bounded `^^` search had a `block_fts` and no
+///   `block_names`, so the symbols and headings named like a query could
+///   not be found from the index.
 ///
 /// A missing table is not stale (the matching-version `CREATE ... IF
 /// NOT EXISTS` makes it).
 pub(crate) fn core_shape_is_stale(conn: &Connection) -> Result<bool, CacheError> {
     Ok(blocks_block_id_is_not_null(conn)?
         || table_lacks_column(conn, "symbols", "line")?
-        || table_lacks_column(conn, "blocks", "symbol_id")?)
+        || table_lacks_column(conn, "blocks", "symbol_id")?
+        || table_lacks_column(conn, "block_fts", "kind")?
+        || block_names_missing_beside_block_fts(conn)?)
+}
+
+/// Fails with [`CacheError::Fts5Unavailable`] when this SQLite has no
+/// FTS5 or no `trigram` tokenizer, which the `^^` search cannot work
+/// without. `rusqlite`'s `bundled` feature compiles both in, so this is
+/// a guard against a build that swapped the bundled library for another
+/// one, giving a clear message at start instead of a bare "no such
+/// tokenizer" from the first `CREATE VIRTUAL TABLE`. Creates and drops
+/// one temp table; touches nothing in the cache file itself.
+pub(crate) fn assert_fts5_available(conn: &Connection) -> Result<(), CacheError> {
+    conn.execute(
+        "CREATE VIRTUAL TABLE temp.tephra_fts5_probe USING fts5(x, tokenize = 'trigram')",
+        [],
+    )
+    .map_err(|e| {
+        CacheError::Fts5Unavailable(format!(
+            "this SQLite build lacks FTS5 with the trigram tokenizer (needs SQLite 3.34 or \
+             newer built with SQLITE_ENABLE_FTS5): {e}"
+        ))
+    })?;
+    conn.execute("DROP TABLE temp.tephra_fts5_probe", [])?;
+    Ok(())
+}
+
+/// Whether a cache at the current version holds files that should have
+/// `block_fts` rows but the index is empty: a file written by a build
+/// that did not populate it, or one whose index was lost. `true` means
+/// the open path flags every online source for a full rescan (the same
+/// bookkeeping a rebuild uses), so the index is filled on the next
+/// start instead of `^^` silently finding nothing.
+///
+/// "Should have rows" is a `prose`, `code` or `text-other` unit of an
+/// online source that is not `too_large`, not a provisional offline
+/// carry-over (`needs_rescan`) and not empty (`size` NULL counts as not
+/// known to be empty). A `document` is left out on purpose: an
+/// image-only PDF or a corrupt docx is a unit with no rows however
+/// often it is scanned. A cache with none of the former, or an empty
+/// cache, is left alone, so a source that legitimately has no text does
+/// not rescan on every start.
+pub(crate) fn fts_needs_backfill(conn: &Connection) -> Result<bool, CacheError> {
+    let any_fts: bool =
+        conn.query_row("SELECT EXISTS (SELECT 1 FROM block_fts)", [], |r| r.get(0))?;
+    if any_fts {
+        return Ok(false);
+    }
+    Ok(conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM units u JOIN sources s ON s.id = u.source_id \
+         WHERE s.status != 'offline' AND u.kind IN ('prose', 'code', 'text-other') \
+           AND u.too_large = 0 \
+           AND u.needs_rescan = 0 AND COALESCE(u.size, 1) > 0)",
+        [],
+        |r| r.get(0),
+    )?)
 }
 
 /// Gate for [`snapshot_offline_rows`]: `true` only if the *current*

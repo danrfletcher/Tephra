@@ -497,3 +497,195 @@ fn link_apply_refactor_without_required_params_is_invalid_params() {
         assert_eq!(err.0, INVALID_PARAMS, "params: {params}");
     }
 }
+
+// -- unit.search with scope "all_blocks" (G10, the `^^` search) --------
+//
+// Through the real `dispatch`, with a backend that records every
+// `search_all_blocks` it is handed: a request the dispatcher refuses
+// must leave that list empty (it never reached the cache).
+
+#[derive(Default)]
+struct RecordingSources {
+    all_blocks: std::sync::Mutex<Vec<(String, usize)>>,
+    names: std::sync::Mutex<Vec<(String, usize)>>,
+}
+impl tephrad::rpc::backend::SourceBackend for RecordingSources {
+    fn register(
+        &self,
+        _name: &str,
+        _root: &str,
+    ) -> Result<tephrad::rpc::backend::ScanStatsWire, String> {
+        unreachable!("a search never registers a source")
+    }
+    fn unregister(&self, _name: &str) -> Result<(), String> {
+        unreachable!("a search never unregisters a source")
+    }
+    fn list(&self) -> Result<Vec<tephrad::rpc::backend::SourceRowWire>, String> {
+        Ok(Vec::new())
+    }
+    fn rescan(&self, _name: &str) -> Result<tephrad::rpc::backend::ScanStatsWire, String> {
+        unreachable!("a search never rescans a source")
+    }
+    fn search_names(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<tephrad::rpc::backend::SearchHitWire>, tephrad::rpc::backend::SearchError> {
+        self.names.lock().unwrap().push((query.to_string(), limit));
+        Ok(Vec::new())
+    }
+    fn search_all_blocks(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<tephrad::rpc::backend::AllBlocksHitWire>, tephrad::rpc::backend::SearchError>
+    {
+        self.all_blocks
+            .lock()
+            .unwrap()
+            .push((query.to_string(), limit));
+        Ok(Vec::new())
+    }
+}
+
+fn search_all_blocks_dispatch(
+    sources: &RecordingSources,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, (i64, String)> {
+    static NULL_REFACTOR: tephrad::rpc::backend::UnsupportedRefactor =
+        tephrad::rpc::backend::UnsupportedRefactor;
+    let graph = NullGraph;
+    let p = proof();
+    dispatch(
+        &p,
+        "unit.search",
+        &params,
+        &Backends {
+            graph: &graph,
+            sources,
+            refactor: &NULL_REFACTOR,
+        },
+    )
+    .map_err(|(code, message, _)| (code, message))
+}
+
+#[test]
+fn unit_search_all_blocks_is_routed_to_the_all_blocks_backend_with_the_default_or_given_limit() {
+    let sources = RecordingSources::default();
+    assert_eq!(
+        search_all_blocks_dispatch(
+            &sources,
+            json!({"query": "conflict", "scope": "all_blocks"})
+        )
+        .unwrap(),
+        json!([])
+    );
+    assert_eq!(
+        search_all_blocks_dispatch(
+            &sources,
+            json!({"query": "^conflict", "scope": "all_blocks", "limit": 3})
+        )
+        .unwrap(),
+        json!([])
+    );
+    assert_eq!(
+        *sources.all_blocks.lock().unwrap(),
+        vec![
+            ("conflict".to_string(), tephrad::search::DEFAULT_LIMIT),
+            ("^conflict".to_string(), 3)
+        ]
+    );
+    assert!(sources.names.lock().unwrap().is_empty());
+}
+
+#[test]
+fn unit_search_with_an_unknown_scope_is_invalid_params_naming_the_scope_and_reaches_nothing() {
+    let sources = RecordingSources::default();
+    // Near-misses of `all_blocks` included: a scope is matched exactly,
+    // never case-folded or trimmed, and never quietly run as another.
+    for scope in [
+        "everything",
+        "all",
+        "All_Blocks",
+        "all-blocks",
+        "all_blocks ",
+        " all_blocks",
+        "^^",
+        "",
+    ] {
+        let (code, message) =
+            search_all_blocks_dispatch(&sources, json!({"query": "conflict", "scope": scope}))
+                .unwrap_err();
+        assert_eq!(code, INVALID_PARAMS, "scope {scope:?}");
+        assert!(
+            message.contains(&format!("unknown scope \"{scope}\"")),
+            "scope {scope:?}: {message}"
+        );
+        assert!(message.contains("all_blocks"), "{message}");
+    }
+    // A scope that is not a string at all.
+    for scope in [json!(5), json!(true), json!(["all_blocks"]), json!({})] {
+        let (code, _) =
+            search_all_blocks_dispatch(&sources, json!({"query": "conflict", "scope": scope}))
+                .unwrap_err();
+        assert_eq!(code, INVALID_PARAMS, "scope {scope}");
+    }
+    assert!(sources.all_blocks.lock().unwrap().is_empty());
+    assert!(sources.names.lock().unwrap().is_empty());
+}
+
+#[test]
+fn unit_search_all_blocks_without_a_usable_query_is_invalid_params_and_reaches_nothing() {
+    let sources = RecordingSources::default();
+    let missing_or_wrong_type = [
+        json!({"scope": "all_blocks"}),
+        json!({"query": null, "scope": "all_blocks"}),
+        json!({"query": 5, "scope": "all_blocks"}),
+        json!({"query": ["a"], "scope": "all_blocks"}),
+    ];
+    for params in missing_or_wrong_type {
+        let (code, message) = search_all_blocks_dispatch(&sources, params.clone()).unwrap_err();
+        assert_eq!(code, INVALID_PARAMS, "{params}");
+        assert!(message.contains("query"), "{params}: {message}");
+    }
+    for query in ["", " ", "   ", "\t", " \n\t "] {
+        let (code, message) =
+            search_all_blocks_dispatch(&sources, json!({"query": query, "scope": "all_blocks"}))
+                .unwrap_err();
+        assert_eq!(code, INVALID_PARAMS, "query {query:?}");
+        assert!(
+            message.contains("empty query"),
+            "query {query:?}: {message}"
+        );
+    }
+    assert!(sources.all_blocks.lock().unwrap().is_empty());
+}
+
+#[test]
+fn unit_search_all_blocks_refuses_an_in_param_and_a_bad_limit_and_reaches_nothing() {
+    let sources = RecordingSources::default();
+    let (code, message) = search_all_blocks_dispatch(
+        &sources,
+        json!({"query": "a", "scope": "all_blocks", "in": "@s:a.md"}),
+    )
+    .unwrap_err();
+    assert_eq!(code, INVALID_PARAMS);
+    assert!(message.contains("all_blocks"), "{message}");
+
+    for limit in [
+        json!(0),
+        json!(-1),
+        json!(1.5),
+        json!("5"),
+        json!(tephrad::search::MAX_LIMIT + 1),
+    ] {
+        let (code, message) = search_all_blocks_dispatch(
+            &sources,
+            json!({"query": "a", "scope": "all_blocks", "limit": limit}),
+        )
+        .unwrap_err();
+        assert_eq!(code, INVALID_PARAMS, "limit {limit}");
+        assert!(message.contains("limit"), "limit {limit}: {message}");
+    }
+    assert!(sources.all_blocks.lock().unwrap().is_empty());
+}

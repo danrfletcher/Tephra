@@ -194,8 +194,9 @@ fn a_malformed_or_non_string_in_is_refused() {
 fn unknown_scopes_are_still_refused_and_a_bad_query_is_still_refused() {
     let message = refused(json!({"query": "a", "scope": "Headings", "in": "@s:a.md"}));
     assert!(message.contains("unknown scope"), "{message}");
-    let message = refused(json!({"query": "a", "scope": "all_blocks"}));
-    assert!(message.contains("not supported yet"), "{message}");
+    // `all_blocks` is built (G10): a blank query is its refusal.
+    let message = refused(json!({"query": "  ", "scope": "all_blocks"}));
+    assert!(message.contains("empty query"), "{message}");
     for scope in ["headings", "blocks"] {
         refused(json!({"scope": scope, "in": "@s:a.md"}));
         refused(json!({"query": 5, "scope": scope, "in": "@s:a.md"}));

@@ -224,6 +224,78 @@ pub fn render_in_file_results(result: &Value) -> String {
     out
 }
 
+/// `search "^^q"`'s output (G10): one row per result, in the daemon's
+/// rank order. A hit with a line is `<id>:<line>  <what>  <text>`, a
+/// location a terminal or editor can jump to; a document hit has no line,
+/// so it is `<id>  <what>  <where>  <text>`:
+///
+/// ```text
+/// @repo:src/lib.rs:73  symbol  enum ConflictReason
+/// @repo:notes/a.md:7  paragraph  ...text around the match...  ^abc
+/// @repo:deck.pptx  document paragraph  slide 2 #1  Some text
+/// @old:b.md:3  comment  a note  (offline)
+/// ```
+///
+/// `<where>` is `page N`, `slide N #i` or `paragraph N`, as in
+/// [`render_in_file_results`]. A `^id` the block
+/// already has follows the text, then `  (offline)` for a source that is
+/// offline. A row has no trailing spaces. No results prints `no
+/// matches`. Ids and text come from file names and contents, so control
+/// characters are shown as `?`, and a long text is cut as in
+/// [`render_in_file_results`]. A part with nothing in it (a heading with
+/// no text) is left out, so a row has no double gaps.
+pub fn render_all_blocks_results(result: &Value) -> String {
+    let hits = result.as_array().map(Vec::as_slice).unwrap_or_default();
+    if hits.is_empty() {
+        return "no matches\n".to_string();
+    }
+    let mut out = String::new();
+    for hit in hits {
+        let mut unit = printable(str_field(hit, "unit"));
+        let place = match hit.get("line").and_then(Value::as_i64) {
+            Some(line) => {
+                unit = format!("{unit}:{line}");
+                String::new()
+            }
+            None => {
+                let place = ["page", "slide", "paragraph"]
+                    .into_iter()
+                    .find_map(|key| {
+                        hit.get(key)
+                            .and_then(Value::as_i64)
+                            .map(|n| format!("{key} {n}"))
+                    })
+                    .unwrap_or_else(|| "-".to_string());
+                match (
+                    hit.get("index").and_then(Value::as_i64),
+                    hit.get("paragraph"),
+                ) {
+                    (Some(index), None) => format!("{place} #{index}"),
+                    _ => place,
+                }
+            }
+        };
+        // A part with nothing in it (a heading with no text) leaves no
+        // gap: the parts are joined by two spaces.
+        let mut parts = vec![
+            unit,
+            printable(str_field(hit, "kind")),
+            place,
+            shown_text(str_field(hit, "snippet")),
+        ];
+        if let Some(id) = hit.get("block_id").and_then(Value::as_str) {
+            parts.push(format!("^{}", printable(id)));
+        }
+        if bool_field(hit, "offline") {
+            parts.push("(offline)".to_string());
+        }
+        parts.retain(|part| !part.is_empty());
+        out.push_str(&parts.join("  "));
+        out.push('\n');
+    }
+    out
+}
+
 /// `text` on one line: whitespace runs are one space, control
 /// characters are `?`, and a long text is cut at
 /// [`MAX_SHOWN_TEXT_CHARS`] characters.

@@ -51,5 +51,17 @@
       "end_line": 4
     }
   ],
+  "comment_blocks": [
+    {
+      "start_line": 1,
+      "end_line": 1,
+      "text": "Module docstring [[Doc]]"
+    },
+    {
+      "start_line": 2,
+      "end_line": 2,
+      "text": "line comment [[Line]]"
+    }
+  ],
   "diagnostics": []
 }

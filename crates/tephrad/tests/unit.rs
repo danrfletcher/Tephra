@@ -2,6 +2,9 @@
 //! includes, the same convention `tephra-graph`'s `tests/unit.rs`
 //! uses.
 
+#[path = "rpc_fixtures/mod.rs"]
+mod rpc_fixtures;
+
 #[path = "unit/rpc_auth.rs"]
 mod rpc_auth;
 #[path = "unit/rpc_envelope.rs"]

@@ -51,5 +51,17 @@
       "end_line": 3
     }
   ],
+  "comment_blocks": [
+    {
+      "start_line": 1,
+      "end_line": 1,
+      "text": "line comment [[Line]]"
+    },
+    {
+      "start_line": 2,
+      "end_line": 2,
+      "text": "trailing comment [[Doc]]"
+    }
+  ],
   "diagnostics": []
 }

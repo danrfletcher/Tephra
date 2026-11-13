@@ -5,7 +5,11 @@
 //! newline mismatch), constant-time compare property".
 
 use axum::http::{HeaderMap, HeaderValue};
+use serde_json::{json, Value};
 use tephrad::rpc::auth::{authenticate, constant_time_token_eq, AuthError};
+
+use crate::rpc_fixtures::SharedMock;
+use crate::rpc_fixtures::{connect_ws, spawn_with_token_and_any_sources, MockGraph, MockSources};
 
 fn headers_with_bearer(token: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
@@ -207,4 +211,127 @@ fn mismatch_position_does_not_change_the_boolean_outcome() {
 
     assert!(!constant_time_token_eq(&base, &mismatch_first));
     assert!(!constant_time_token_eq(&base, &mismatch_last));
+}
+
+// -- unit.search with scope "all_blocks" (G10, the `^^` search) --------
+//
+// Through the real router (the one the daemon serves, on an ephemeral
+// loopback port with a throwaway token), because the gate lives in the
+// transport handlers, before dispatch: a request with no or a wrong
+// token must be refused with 401 and must never reach the backend,
+// whatever its body says.
+
+fn all_blocks_request(id: u64, params: Value) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "method": "unit.search", "params": params})
+}
+
+#[tokio::test]
+async fn unit_search_all_blocks_with_no_or_a_wrong_token_is_401_and_reaches_nothing() {
+    let sources = std::sync::Arc::new(MockSources::new());
+    let token = "k".repeat(64);
+    let server = spawn_with_token_and_any_sources(
+        MockGraph::new(),
+        SharedMock(sources.clone()),
+        token.as_str(),
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    // A valid all_blocks search, an unknown scope, a missing query and
+    // an empty query: auth comes first, so none of them is ever told
+    // "invalid params" (that would show the dispatcher ran) and none
+    // reaches the backend.
+    let bodies = [
+        all_blocks_request(1, json!({"query": "conflict", "scope": "all_blocks"})),
+        all_blocks_request(2, json!({"query": "conflict", "scope": "everything"})),
+        all_blocks_request(3, json!({"scope": "all_blocks"})),
+        all_blocks_request(4, json!({"query": "", "scope": "all_blocks"})),
+    ];
+    for body in &bodies {
+        // No Authorization header.
+        let none = client
+            .post(server.http_url())
+            .json(body)
+            .send()
+            .await
+            .expect("request completes");
+        assert_eq!(none.status(), reqwest::StatusCode::UNAUTHORIZED, "{body}");
+        let parsed: Value = none.json().await.expect("JSON-RPC error body");
+        assert!(
+            parsed.get("result").is_none()
+                && parsed["error"]["code"] != json!(tephrad::rpc::protocol::INVALID_PARAMS),
+            "{body}: {parsed}"
+        );
+
+        // A wrong token, an empty token, and a token with a stray byte.
+        for wrong in ["not-the-right-token", "", &format!("{token}x")] {
+            let response = client
+                .post(server.http_url())
+                .header("Authorization", format!("Bearer {wrong}"))
+                .json(body)
+                .send()
+                .await
+                .expect("request completes");
+            assert_eq!(
+                response.status(),
+                reqwest::StatusCode::UNAUTHORIZED,
+                "{body} with token {wrong:?}"
+            );
+        }
+
+        // The wrong scheme is not a token either.
+        let basic = client
+            .post(server.http_url())
+            .header("Authorization", "Basic dXNlcjpwYXNz")
+            .json(body)
+            .send()
+            .await
+            .expect("request completes");
+        assert_eq!(basic.status(), reqwest::StatusCode::UNAUTHORIZED, "{body}");
+    }
+
+    // The WebSocket handshake refuses the same way.
+    assert!(connect_ws(&server.ws_url(), "not-the-right-token")
+        .await
+        .is_err());
+    assert!(connect_ws(&server.ws_url(), "").await.is_err());
+
+    assert!(
+        sources.all_blocks_calls().is_empty() && sources.search_calls().is_empty(),
+        "a refused request reached the backend"
+    );
+}
+
+#[tokio::test]
+async fn unit_search_all_blocks_with_the_right_token_reaches_the_backend_once_per_request() {
+    // The other half of the gate: it is the token that decides, so the
+    // same body with the right one is dispatched, to the all_blocks
+    // search and not to the names search.
+    let sources = std::sync::Arc::new(MockSources::new());
+    let token = "k".repeat(64);
+    let server = spawn_with_token_and_any_sources(
+        MockGraph::new(),
+        SharedMock(sources.clone()),
+        token.as_str(),
+    )
+    .await;
+    let response: Value = reqwest::Client::new()
+        .post(server.http_url())
+        .bearer_auth(&token)
+        .json(&all_blocks_request(
+            9,
+            json!({"query": "conflict", "scope": "all_blocks", "limit": 7}),
+        ))
+        .send()
+        .await
+        .expect("request completes")
+        .json()
+        .await
+        .expect("JSON body");
+    assert_eq!(response["result"], json!([]), "{response}");
+    assert_eq!(
+        sources.all_blocks_calls(),
+        vec![("conflict".to_string(), 7)]
+    );
+    assert!(sources.search_calls().is_empty());
 }

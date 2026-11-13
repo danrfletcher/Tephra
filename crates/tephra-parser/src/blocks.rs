@@ -73,6 +73,28 @@ pub(crate) fn is_block_id_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '-'
 }
 
+/// `line` without a trailing `^id` token (and the whitespace before
+/// it), and the ID: the same standalone-token rule [`scan`] reads, for
+/// text that is being indexed rather than scanned for anchors. A line
+/// with no such token comes back whole with `None`.
+pub(crate) fn strip_trailing_block_id(line: &str) -> (&str, Option<&str>) {
+    let trimmed = line.trim_end();
+    let Some(caret) = trimmed.rfind('^') else {
+        return (line, None);
+    };
+    let id = &trimmed[caret + 1..];
+    let standalone = caret == 0
+        || trimmed[..caret]
+            .chars()
+            .last()
+            .is_some_and(char::is_whitespace);
+    if standalone && !id.is_empty() && id.chars().all(is_block_id_char) {
+        (trimmed[..caret].trim_end(), Some(id))
+    } else {
+        (line, None)
+    }
+}
+
 pub(crate) fn scan(
     body: &str,
     body_start_line: usize,

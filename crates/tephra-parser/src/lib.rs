@@ -42,6 +42,7 @@ mod documents;
 mod fences;
 mod frontmatter;
 mod hash;
+mod index;
 mod line_index;
 mod markdown_pass;
 mod prose;
@@ -54,8 +55,8 @@ use serde::Serialize;
 
 pub use blocks::{BlockAnchor, Paragraph};
 pub use code::{
-    parse_code_unit, parse_code_unit_within, Language, Symbol, CODE_PARSE_BUDGET, EXTENSIONS,
-    MAX_CODE_PARSE_BYTES,
+    parse_code_unit, parse_code_unit_within, split_identifier, CommentBlock, Language, Symbol,
+    CODE_PARSE_BUDGET, EXTENSIONS, MAX_CODE_PARSE_BYTES,
 };
 pub use diagnostics::{Diagnostic, DiagnosticKind};
 pub use documents::{
@@ -63,6 +64,7 @@ pub use documents::{
     DocumentError, DocumentFormat, ParsedDocument, MAX_PART_BYTES,
 };
 pub use frontmatter::Frontmatter;
+pub use index::{text_other_rows, IndexRow, MAX_ROW_CHARS};
 pub use markdown_pass::{Heading, MarkdownLink};
 pub use prose::ProseFormat;
 pub use tags::Tag;
@@ -128,6 +130,11 @@ pub struct ParsedUnit {
     /// their children. Always empty for prose.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub symbols: Vec<Symbol>,
+    /// The comment blocks of a code file (G10), in file order: each a
+    /// run of consecutive line comments or one block comment, for the
+    /// full-text index. Always empty for prose.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub comment_blocks: Vec<CommentBlock>,
     /// Structured, non-fatal problems found while parsing (malformed
     /// frontmatter, empty/unterminated links, duplicate block ids).
     /// Diagnostics never replace or suppress whatever else could
@@ -382,6 +389,7 @@ fn parse_markdown(path: &Path, content: &str) -> ParsedUnit {
         blocks,
         paragraphs,
         symbols: Vec::new(),
+        comment_blocks: Vec::new(),
         diagnostics,
     }
 }
@@ -492,6 +500,7 @@ fn parse_native(path: &Path, content: &str, format: ProseFormat) -> ParsedUnit {
         blocks,
         paragraphs,
         symbols: Vec::new(),
+        comment_blocks: Vec::new(),
         diagnostics,
     }
 }

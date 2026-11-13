@@ -181,7 +181,10 @@ fn v2_ddl_has_every_table_and_column() {
     );
     assert_eq!(
         names(&columns(conn, "block_fts")),
-        ["unit_id", "line", "text"]
+        [
+            "unit_id", "line", "kind", "block_id", "name", "label", "place", "place_n", "idx",
+            "text"
+        ]
     );
     assert_eq!(
         names(&columns(conn, "scan_state")),
@@ -317,11 +320,20 @@ fn deleting_a_unit_removes_its_headings_symbols_and_fts_rows() {
             [unit],
         )
         .unwrap();
-        conn.execute(
-            "INSERT INTO block_fts (unit_id, line, text) VALUES (?1, 1, 'text here')",
-            [unit],
-        )
-        .unwrap();
+        // The rows go in through the cache's own writer: a unit's index
+        // rows are found by rowid (`unit_id << 24`), which a raw INSERT
+        // with an automatic rowid would not honour.
+        cache
+            .insert_fts_rows(
+                unit,
+                &[tephra_cache::NewFtsRow {
+                    kind: "paragraph",
+                    line: Some(1),
+                    text: "text here",
+                    ..Default::default()
+                }],
+            )
+            .unwrap();
     }
 
     cache.delete_unit(gone).unwrap();

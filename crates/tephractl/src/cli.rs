@@ -22,6 +22,7 @@ USAGE:
     tephractl ls <source> [folder] [-r] [--json]
     tephractl search <query> [--limit <n>] [--json]
     tephractl search --in <id> \"#<query>\" | \"^<query>\" [--limit <n>] [--json]
+    tephractl search \"^^<query>\" [--limit <n>] [--json]
     tephractl link resolve [--source <name>] <target> [--json]
     tephractl link refactor --source <name> --old <path> --new <path> [--apply] [--yes] [--json]
     tephractl daemon install [--from <path>] [--json]
@@ -49,6 +50,12 @@ SEARCH:
                           \"^\" lists them all, in file order. One row per result: kind,
                           line (or page/slide) and text or name; a ^id shows after it.
                           A '#' or '^' query needs --in: pick a file first.
+    search \"^^q\"        Find text in the blocks of every file of every source (offline ones
+                          included): paragraphs, code comments, symbol names, headings and
+                          document paragraphs; part of a word matches, best first. One row per
+                          result: file:line, kind, the text around the match (a document hit
+                          shows page/slide instead of :line); a ^id shows after it. Quote it:
+                          ^ is special to some shells.
 
 DAEMON (macOS only; need no token and no running daemon):
     daemon install    Copy tephrad to ~/Library/Application Support/tephra/bin, sign it
@@ -113,6 +120,16 @@ pub enum Command {
     SearchIn {
         unit: String,
         scope: InFileSearchScope,
+        query: String,
+        limit: Option<u64>,
+    },
+    /// `search "^^q"`: a full-text search of the blocks of every file of
+    /// every source (`unit.search`, scope `all_blocks`, G10). `query` is
+    /// what follows the `^^`; the `^^` itself is never sent. The parser
+    /// never builds one with a blank `query` (it refuses `^^` and `^^  `
+    /// as an "empty query" before any request); a hand-built one still
+    /// reaches the daemon, which refuses it too.
+    SearchAllBlocks {
         query: String,
         limit: Option<u64>,
     },
@@ -376,14 +393,19 @@ fn parse_ls<'a>(
 ///
 /// Without `--in`, a query that starts with a single `#` or `^` is a
 /// search inside one file, which needs the file picked first, and one
-/// that starts with `^^` is a block search across every file (a later
-/// PR). Both are refused here, with no RPC round-trip (like the
-/// source-name check above), and neither is ever sent as a names search.
+/// that starts with `^^` is a block search across every file (G10):
+/// what follows the `^^` is sent as the `all_blocks` query, a bare or
+/// blank `^^` is refused here as an "empty query" with no RPC round-trip,
+/// and it is never sent as a names search. A `#` or `^` query is refused
+/// here, with no RPC
+/// round-trip (like the source-name check above), and never sent as a
+/// names search.
 ///
 /// With `--in <id>` the query must start with `#` (headings) or `^`
 /// (blocks), and what follows the sigil is the query sent: a bare `#` or
 /// `^` sends an empty one, which lists everything. A query without a
-/// sigil is refused, never guessed at, and `^^` stays refused.
+/// sigil is refused, never guessed at, and `^^` is refused too: it
+/// searches every file, so it takes no `--in`.
 fn parse_search<'a>(
     iter: &mut impl Iterator<Item = &'a str>,
 ) -> Result<(Command, bool, Option<String>), ArgsError> {
@@ -440,11 +462,26 @@ fn parse_search<'a>(
     }
 
     let query = query.ok_or_else(|| ArgsError("search requires a <query>".to_string()))?;
-    if query.starts_with("^^") {
-        return Err(ArgsError(
-            "a query starting with '^^' searches blocks across every file, which is not \
-             available yet; it is not run as a name search"
-                .to_string(),
+    if let Some(rest) = query.strip_prefix("^^") {
+        if in_unit.is_some() {
+            return Err(ArgsError(
+                "a query starting with '^^' searches blocks across every file, so it takes no \
+                 --in; use '^' to search the blocks of one file"
+                    .to_string(),
+            ));
+        }
+        if rest.trim().is_empty() {
+            return Err(ArgsError(
+                "empty query: put the text to find after '^^', like \"^^conflict\"".to_string(),
+            ));
+        }
+        return Ok((
+            Command::SearchAllBlocks {
+                query: rest.to_string(),
+                limit,
+            },
+            json,
+            addr,
         ));
     }
     if let Some(unit) = in_unit {
@@ -1120,15 +1157,42 @@ mod tests {
         assert!(err.0.contains("pick a file first"), "{err}");
     }
 
-    /// `^^` is never sent as a names search either; it has its own
-    /// message, since "pick a file" would be wrong for it.
+    /// `^^` (G10) is a block search across every file: what follows it
+    /// is the query, and it is never sent as a names search.
     #[test]
-    fn search_refuses_a_double_caret_query_and_never_runs_it_as_a_name_search() {
-        for query in ["^^", "^^abc", "^^ a b"] {
-            let err = run(&["search", query]).unwrap_err();
-            assert!(err.0.contains("^^"), "{query}: {err}");
-            assert!(!err.0.contains("pick a file first"), "{query}: {err}");
+    fn search_with_a_double_caret_is_an_all_blocks_search_with_the_sigil_stripped() {
+        for (arg, want) in [("^^abc", "abc"), ("^^ a b", " a b"), ("^^^x", "^x")] {
+            let parsed = run(&["search", arg]).unwrap();
+            assert_eq!(
+                parsed.command,
+                Command::SearchAllBlocks {
+                    query: want.to_string(),
+                    limit: None
+                },
+                "{arg}"
+            );
         }
+        let parsed = run(&["--json", "search", "^^x", "--limit", "3"]).unwrap();
+        assert!(parsed.json);
+        assert_eq!(
+            parsed.command,
+            Command::SearchAllBlocks {
+                query: "x".to_string(),
+                limit: Some(3)
+            }
+        );
+    }
+
+    /// A bare or blank `^^` is refused while parsing, so no request is
+    /// ever built for it.
+    #[test]
+    fn search_with_a_blank_double_caret_query_is_refused_as_empty() {
+        for arg in ["^^", "^^ ", "^^   ", "^^\t"] {
+            let err = run(&["search", arg]).unwrap_err();
+            assert!(err.0.contains("empty query"), "{arg:?}: {err}");
+        }
+        let err = run(&["--json", "search", "^^", "--limit", "3"]).unwrap_err();
+        assert!(err.0.contains("empty query"), "{err}");
     }
 
     /// Only a *leading* `#`/`^` is special; elsewhere they are text.
