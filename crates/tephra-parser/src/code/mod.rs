@@ -31,8 +31,9 @@
 //! What is *not* done here, on purpose: no Markdown fence exclusion
 //! around a wikilink (the comment boundary is the only filter), no
 //! headings, tags or paragraphs, no name-based `#anchor` resolution to
-//! a symbol (F3), no writing of an ID into a file (PR-12.F1) and no
-//! I/O.
+//! a symbol (F3), no writing of an ID into a file and no I/O. What the
+//! end of a line is, which `block.ensure_id` needs to write an ID
+//! comment safely (PR-12.F1), is answered by [`classify_line_end`].
 //!
 //! A half-written file still gives what parses (E12), and a parse is
 //! bounded in time and in memory:
@@ -52,6 +53,7 @@
 mod comments;
 mod index;
 mod languages;
+mod line_end;
 mod symbols;
 
 use std::ops::ControlFlow;
@@ -60,6 +62,7 @@ use std::time::{Duration, Instant};
 
 pub use index::{split_identifier, CommentBlock};
 pub use languages::{Language, EXTENSIONS};
+pub use line_end::{classify_line_end, LineEnd};
 pub use symbols::Symbol;
 
 use crate::diagnostics::{Diagnostic, DiagnosticKind};

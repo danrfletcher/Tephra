@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 
 use tempfile::TempDir;
 use tephra_graph::{Edge, ResolveError, ResolveResult};
-use tephrad::block_id::{BlockIdError, EnsureIdWire};
+use tephrad::block_id::{BlockIdError, BlockTarget, EnsureIdWire};
 use tephrad::rpc::backend::{
     BlockBackend, GraphBackend, RefactorBackend, ScanStatsWire, SearchError, SearchHitWire,
     SourceBackend, SourceRowWire,
@@ -412,12 +412,12 @@ pub async fn spawn_with_token_and_any_sources(
     .await
 }
 
-/// A [`BlockBackend`] that records every `(unit, line)` it is asked for
+/// A [`BlockBackend`] that records every `(unit, target)` it is asked for
 /// and answers a canned result: `block.ensure_id`'s dispatch and
 /// transport tests drive the verb through the real router without a
 /// filesystem behind it.
 pub struct RecordingBlocks {
-    calls: Mutex<Vec<(String, u64)>>,
+    calls: Mutex<Vec<(String, BlockTarget)>>,
     reply: Result<EnsureIdWire, BlockIdError>,
 }
 
@@ -429,7 +429,7 @@ impl RecordingBlocks {
         }
     }
 
-    pub fn calls(&self) -> Vec<(String, u64)> {
+    pub fn calls(&self) -> Vec<(String, BlockTarget)> {
         self.calls.lock().unwrap().clone()
     }
 }
@@ -439,8 +439,12 @@ impl RecordingBlocks {
 pub struct SharedBlocks(pub Arc<RecordingBlocks>);
 
 impl BlockBackend for SharedBlocks {
-    fn ensure_id(&self, unit: &str, line: u64) -> Result<EnsureIdWire, BlockIdError> {
-        self.0.calls.lock().unwrap().push((unit.to_string(), line));
+    fn ensure_id(&self, unit: &str, target: &BlockTarget) -> Result<EnsureIdWire, BlockIdError> {
+        self.0
+            .calls
+            .lock()
+            .unwrap()
+            .push((unit.to_string(), target.clone()));
         self.0.reply.clone()
     }
 }

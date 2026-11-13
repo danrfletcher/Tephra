@@ -16,7 +16,7 @@ use std::io::{BufRead, Write};
 
 use serde_json::{json, Value};
 
-use crate::cli::{Command, InFileSearchScope};
+use crate::cli::{BlockTarget, Command, InFileSearchScope};
 use crate::render;
 use crate::transport::{RpcCallError, RpcClient};
 
@@ -105,7 +105,7 @@ pub fn execute_with_prompt_writer<R: BufRead, W: Write>(
             limit,
         } => search_in(unit, *scope, query, *limit, json, client),
         Command::SearchAllBlocks { query, limit } => search_all_blocks(query, *limit, json, client),
-        Command::BlockId { unit, line } => block_id(unit, *line, json, client),
+        Command::BlockId { unit, target } => block_id(unit, target, json, client),
         Command::LinkResolve {
             target,
             default_source,
@@ -309,8 +309,12 @@ fn search_all_blocks(
     }
 }
 
-fn block_id(unit: &str, line: u64, json: bool, client: &RpcClient) -> CommandOutcome {
-    match client.call("block.ensure_id", json!({"unit": unit, "line": line})) {
+fn block_id(unit: &str, target: &BlockTarget, json: bool, client: &RpcClient) -> CommandOutcome {
+    let params = match target {
+        BlockTarget::Line(line) => json!({"unit": unit, "line": line}),
+        BlockTarget::Symbol(symbol) => json!({"unit": unit, "symbol": symbol}),
+    };
+    match client.call("block.ensure_id", params) {
         Ok(result) => {
             CommandOutcome::ok(json_or(&result, || render::render_block_id(&result), json))
         }

@@ -445,5 +445,11 @@ async fn block_ensure_id_with_the_right_token_reaches_the_backend_once_per_reque
         json!({"id": "k3f9a2", "link": "[[@notes:a#^k3f9a2]]", "created": true}),
         "{response}"
     );
-    assert_eq!(blocks.calls(), vec![("@notes:a.md".to_string(), 4)]);
+    assert_eq!(
+        blocks.calls(),
+        vec![(
+            "@notes:a.md".to_string(),
+            tephrad::block_id::BlockTarget::Line(4)
+        )]
+    );
 }

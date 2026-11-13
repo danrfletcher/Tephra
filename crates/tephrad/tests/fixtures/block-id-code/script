@@ -1,0 +1,10 @@
+#!/bin/sh
+hello() {
+  echo hi
+}
+
+str() { echo "abc
+def"; }
+
+cont() { echo a \
+  b; }

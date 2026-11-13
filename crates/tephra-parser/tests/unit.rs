@@ -33,6 +33,8 @@ mod headings;
 mod index_rows;
 #[path = "unit/large_file.rs"]
 mod large_file;
+#[path = "unit/line_end.rs"]
+mod line_end;
 #[path = "unit/line_regions.rs"]
 mod line_regions;
 #[path = "unit/markdown_links.rs"]

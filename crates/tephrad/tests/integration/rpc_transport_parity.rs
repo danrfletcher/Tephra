@@ -215,7 +215,13 @@ async fn block_ensure_id_is_byte_identical_over_http_and_ws() {
         // Once per transport, and the same arguments both times.
         assert_eq!(
             blocks.calls(),
-            vec![("@notes:Tephra test.md".to_string(), 3); 2],
+            vec![
+                (
+                    "@notes:Tephra test.md".to_string(),
+                    tephrad::block_id::BlockTarget::Line(3)
+                );
+                2
+            ],
             "reply {i}"
         );
     }

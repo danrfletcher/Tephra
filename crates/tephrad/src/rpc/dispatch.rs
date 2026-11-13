@@ -330,16 +330,43 @@ fn link_apply_refactor(params: &Value, refactor: &dyn RefactorBackend) -> Dispat
 }
 
 fn block_ensure_id(params: &Value, blocks: &dyn BlockBackend) -> DispatchResult {
+    use crate::block_id::BlockTarget;
+
     let unit = require_str(params, "unit")?;
-    // A JSON integer from 1 up; 0, negatives, fractions and strings are
-    // refused here as malformed, a line past the file's end by the engine.
-    let line = params
-        .get("line")
-        .and_then(Value::as_u64)
-        .filter(|n| *n >= 1)
-        .ok_or_else(|| invalid_params("\"line\" (integer, 1 or more) is required"))?;
+    // Exactly one of `line` and `symbol` (`null` counts as absent).
+    let present = |key: &str| params.get(key).is_some_and(|v| !v.is_null());
+    let target = match (present("line"), present("symbol")) {
+        (true, true) => {
+            return Err(invalid_params(
+                "give either \"line\" or \"symbol\", not both",
+            ))
+        }
+        // A JSON integer from 1 up; 0, negatives, fractions and strings
+        // are refused here as malformed, a line past the file's end by
+        // the engine.
+        (true, false) => BlockTarget::Line(
+            params
+                .get("line")
+                .and_then(Value::as_u64)
+                .filter(|n| *n >= 1)
+                .ok_or_else(|| invalid_params("\"line\" (integer, 1 or more) is required"))?,
+        ),
+        (false, true) => BlockTarget::Symbol(
+            params
+                .get("symbol")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| invalid_params("\"symbol\" must be a non-empty string"))?
+                .to_string(),
+        ),
+        (false, false) => {
+            return Err(invalid_params(
+                "\"line\" (integer, 1 or more) or \"symbol\" (string) is required",
+            ))
+        }
+    };
     blocks
-        .ensure_id(unit, line)
+        .ensure_id(unit, &target)
         .map(|wire| serde_json::to_value(wire).expect("EnsureIdWire always serializes"))
         .map_err(|e| match e {
             crate::block_id::BlockIdError::InvalidParams(m) => invalid_params(m),
@@ -794,12 +821,12 @@ mod tests {
 
     // -- block.ensure_id (G11) ------------------------------------------
 
-    use crate::block_id::{BlockIdError, EnsureIdWire};
+    use crate::block_id::{BlockIdError, BlockTarget, EnsureIdWire};
 
-    /// A `BlockBackend` that records `(unit, line)` and answers a canned
+    /// A `BlockBackend` that records `(unit, target)` and answers a canned
     /// result. The validation under test is `block_ensure_id`'s own.
     struct BlockStub {
-        calls: Mutex<Vec<(String, u64)>>,
+        calls: Mutex<Vec<(String, BlockTarget)>>,
         reply: Result<EnsureIdWire, BlockIdError>,
     }
 
@@ -817,14 +844,21 @@ mod tests {
                 created: true,
             }))
         }
-        fn calls(&self) -> Vec<(String, u64)> {
+        fn calls(&self) -> Vec<(String, BlockTarget)> {
             self.calls.lock().unwrap().clone()
         }
     }
 
     impl BlockBackend for BlockStub {
-        fn ensure_id(&self, unit: &str, line: u64) -> Result<EnsureIdWire, BlockIdError> {
-            self.calls.lock().unwrap().push((unit.to_string(), line));
+        fn ensure_id(
+            &self,
+            unit: &str,
+            target: &BlockTarget,
+        ) -> Result<EnsureIdWire, BlockIdError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((unit.to_string(), target.clone()));
             self.reply.clone()
         }
     }
@@ -837,7 +871,56 @@ mod tests {
             value,
             json!({"id": "k3f9a2", "link": "[[@notes:a#^k3f9a2]]", "created": true})
         );
-        assert_eq!(stub.calls(), vec![("@notes:a.md".to_string(), 3)]);
+        assert_eq!(
+            stub.calls(),
+            vec![("@notes:a.md".to_string(), BlockTarget::Line(3))]
+        );
+    }
+
+    #[test]
+    fn block_ensure_id_passes_a_symbol_through() {
+        let stub = BlockStub::created();
+        block_ensure_id(
+            &json!({"unit": "@src:a.rs", "symbol": "Registry.register"}),
+            &stub,
+        )
+        .expect("ok");
+        // `null` for the other key counts as absent.
+        block_ensure_id(
+            &json!({"unit": "@src:a.rs", "symbol": "Foo", "line": null}),
+            &stub,
+        )
+        .expect("ok");
+        assert_eq!(
+            stub.calls(),
+            vec![
+                (
+                    "@src:a.rs".to_string(),
+                    BlockTarget::Symbol("Registry.register".into())
+                ),
+                ("@src:a.rs".to_string(), BlockTarget::Symbol("Foo".into())),
+            ]
+        );
+    }
+
+    #[test]
+    fn block_ensure_id_refuses_both_line_and_symbol_and_a_bad_symbol() {
+        for params in [
+            json!({"unit": "@src:a.rs", "line": 3, "symbol": "Foo"}),
+            json!({"unit": "@src:a.rs", "symbol": ""}),
+            json!({"unit": "@src:a.rs", "symbol": "  "}),
+            json!({"unit": "@src:a.rs", "symbol": 5}),
+            json!({"unit": "@src:a.rs", "symbol": ["Foo"]}),
+            json!({"unit": "@src:a.rs", "line": null, "symbol": null}),
+        ] {
+            let stub = BlockStub::created();
+            let err = block_ensure_id(&params, &stub).unwrap_err();
+            assert_eq!(err.0, INVALID_PARAMS, "{params}: {}", err.1);
+            assert!(
+                stub.calls().is_empty(),
+                "{params}: the backend must not be reached"
+            );
+        }
     }
 
     #[test]

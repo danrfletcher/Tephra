@@ -55,8 +55,8 @@ use serde::Serialize;
 
 pub use blocks::{BlockAnchor, Paragraph};
 pub use code::{
-    parse_code_unit, parse_code_unit_within, split_identifier, CommentBlock, Language, Symbol,
-    CODE_PARSE_BUDGET, EXTENSIONS, MAX_CODE_PARSE_BYTES,
+    classify_line_end, parse_code_unit, parse_code_unit_within, split_identifier, CommentBlock,
+    Language, LineEnd, Symbol, CODE_PARSE_BUDGET, EXTENSIONS, MAX_CODE_PARSE_BYTES,
 };
 pub use diagnostics::{Diagnostic, DiagnosticKind};
 pub use documents::{

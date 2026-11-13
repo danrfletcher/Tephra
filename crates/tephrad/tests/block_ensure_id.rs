@@ -373,14 +373,12 @@ async fn malformed_requests_are_invalid_params() {
 async fn files_that_are_not_prose_are_refused_by_kind() {
     let daemon = Daemon::start().await;
     let src = fixtures::empty_source();
-    src.write("code.rs", "fn main() {}\n");
     src.write("data.json", "{\"a\": 1}\n");
     src.write_bytes("pic.png", &[0x89, b'P', b'N', b'G', 0, 1, 2, 3, 0, 0, 0]);
     src.write_bytes("doc.pdf", b"%PDF-1.4\n%%EOF\n");
     daemon.register("notes", src.root()).await;
 
     for (path, word) in [
-        ("code.rs", "code file"),
         ("data.json", "text file of another type"),
         ("pic.png", "binary"),
         ("doc.pdf", "document"),
@@ -892,7 +890,7 @@ fn nothing_is_opened_for_write_and_the_watcher_is_not_touched_for_anything_refus
         ("doc.docx", &docx),
         ("pic.png", &[0x89, b'P', b'N', b'G', 0, 1, 2, 3, 0, 0]),
         ("data.json", b"{\"a\": 1}\n"),
-        ("code.rs", b"fn main() {}\n"),
+        ("code.rs", b"const A: u8 = 1;\n\nfn main() {}\n"),
         (
             "n.md",
             b"---\nk: v\n---\n\n```\ncode\n```\n\n| a |\n|---|\n| 1 |\n\nreal ^kept\n# Head\n",
@@ -911,13 +909,13 @@ fn nothing_is_opened_for_write_and_the_watcher_is_not_touched_for_anything_refus
         ("@notes:doc.docx", 1),
         ("@notes:pic.png", 1),
         ("@notes:data.json", 1),
-        ("@notes:code.rs", 1),
-        ("@notes:n.md", 1),  // frontmatter
-        ("@notes:n.md", 4),  // blank
-        ("@notes:n.md", 6),  // code
-        ("@notes:n.md", 10), // table
-        ("@notes:n.md", 13), // existing id
-        ("@notes:n.md", 14), // heading
+        ("@notes:code.rs", 2), // no symbol on a blank line
+        ("@notes:n.md", 1),    // frontmatter
+        ("@notes:n.md", 4),    // blank
+        ("@notes:n.md", 6),    // code
+        ("@notes:n.md", 10),   // table
+        ("@notes:n.md", 13),   // existing id
+        ("@notes:n.md", 14),   // heading
         ("@notes:n.md", 99),
         ("@notes:n.md", 0),
         ("@notes:missing.md", 1),

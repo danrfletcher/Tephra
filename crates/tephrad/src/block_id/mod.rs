@@ -1,5 +1,7 @@
-//! `block.ensure_id` for prose units (G11, G12): give the paragraph or
-//! list item holding a line a block ID, and return the link to it.
+//! `block.ensure_id` (G11, G12): give the paragraph or list item holding
+//! a line of a prose unit, or the symbol a line or a name points at in a
+//! code unit, a block ID, and return the link to it. The code half is in
+//! [`code`].
 //!
 //! Layout, like [`crate::refactor`]: pure functions first, each tested on
 //! its own, then [`BlockIdEngine`], which wires them to the real cache,
@@ -35,6 +37,8 @@ use crate::refactor::{rewrite_links_atomic_with, AtomicFs, RealFs, WatcherPauseC
 use crate::registry::SourceRegistry;
 use crate::watcher;
 
+pub mod code;
+
 /// A new ID's length.
 pub const ID_LEN: usize = 6;
 
@@ -53,7 +57,7 @@ const MAX_DRAWS: usize = 64;
 /// Where each line of `content` is: `(start, end)` byte offsets, `end`
 /// before the line's `\n` or `\r\n`. A final line with no line ending is a
 /// line; the empty text after the last line ending is not.
-fn line_spans(content: &str) -> Vec<(usize, usize)> {
+pub(crate) fn line_spans(content: &str) -> Vec<(usize, usize)> {
     let bytes = content.as_bytes();
     let mut spans = Vec::new();
     let mut start = 0usize;
@@ -72,6 +76,20 @@ fn line_spans(content: &str) -> Vec<(usize, usize)> {
         spans.push((start, bytes.len()));
     }
     spans
+}
+
+// ---------------------------------------------------------------
+// What a request points at
+// ---------------------------------------------------------------
+
+/// What `block.ensure_id` was asked to give an ID: a line of the file
+/// (prose and code), or a symbol of a code file by name (`name` or
+/// `Parent.name`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockTarget {
+    /// A line, counting from 1.
+    Line(u64),
+    Symbol(String),
 }
 
 // ---------------------------------------------------------------
@@ -152,7 +170,7 @@ impl From<LocateError> for BlockIdError {
     }
 }
 
-fn refused(message: impl Into<String>) -> BlockIdError {
+pub(crate) fn refused(message: impl Into<String>) -> BlockIdError {
     BlockIdError::Refused(message.into())
 }
 
@@ -504,28 +522,37 @@ impl BlockIdEngine {
         self
     }
 
-    /// `block.ensure_id {unit, line}`: see the module doc and G11/G12.
-    /// Everything that can be refused is refused before anything is
-    /// written; the write is one atomic replace of the file.
+    /// `block.ensure_id {unit, line}`: [`BlockIdEngine::ensure_target`]
+    /// for a line.
     pub fn ensure_id(&self, unit: &str, line: u64) -> Result<EnsureIdWire, BlockIdError> {
+        self.ensure_target(unit, &BlockTarget::Line(line))
+    }
+
+    /// `block.ensure_id {unit, line | symbol}`: see the module doc and
+    /// G11/G12. Everything that can be refused is refused before anything
+    /// is written; the write is one atomic replace of the file.
+    pub fn ensure_target(
+        &self,
+        unit: &str,
+        target: &BlockTarget,
+    ) -> Result<EnsureIdWire, BlockIdError> {
         let (source, rel_path) = crate::search::in_file::split_unit_id(unit).ok_or_else(|| {
             BlockIdError::InvalidParams(format!(
                 "\"unit\" must be a unit id like \"@source:path/to/file\", got \"{unit}\""
             ))
         })?;
-        let line = usize::try_from(line).unwrap_or(usize::MAX);
 
         // A first look, for the early refusals and the file's path. The
         // row is read again below once this request holds the file's
         // lock: a request that waited for another writer of the same
         // file must see the cache as that writer left it, not as it
         // was when this one arrived.
-        let (root, _) = self.checked_row(unit, source, rel_path)?;
+        let (root, _) = self.checked_row(unit, source, rel_path, target)?;
         let abs = safe_join(&root, rel_path)?;
 
         // One writer per file from the first look at it to the rename.
         let file_guard = file_lock::lock(&abs);
-        let (_, row) = self.checked_row(unit, source, rel_path)?;
+        let (_, row) = self.checked_row(unit, source, rel_path, target)?;
 
         let before = fs::symlink_metadata(&abs).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -563,7 +590,17 @@ impl BlockIdEngine {
 
         let plan = {
             let mut rng = self.rng.lock().unwrap_or_else(|p| p.into_inner());
-            plan_ensure(Path::new(rel_path), &content, line, &mut **rng)?
+            if row.kind == "code" {
+                code::plan_code(Path::new(rel_path), unit, &content, target, &mut **rng)?
+            } else {
+                // `checked_row` has refused a symbol request for a
+                // prose file, so this is a line.
+                let BlockTarget::Line(line) = target else {
+                    return Err(symbol_needs_code(unit));
+                };
+                let line = usize::try_from(*line).unwrap_or(usize::MAX);
+                plan_ensure(Path::new(rel_path), &content, line, &mut **rng)?
+            }
         };
         let (id, new_content) = match plan {
             Plan::Heading { anchor } => {
@@ -629,6 +666,7 @@ impl BlockIdEngine {
         unit: &str,
         source: &str,
         rel_path: &str,
+        target: &BlockTarget,
     ) -> Result<(PathBuf, tephra_cache::UnitRow), BlockIdError> {
         let cached = self
             .registry
@@ -653,12 +691,12 @@ impl BlockIdEngine {
             .unit
             .ok_or_else(|| refused(format!("no such unit: {unit}")))?;
         match row.kind.as_str() {
-            "prose" => {}
-            "code" => {
-                return Err(refused(format!(
-                    "{unit} is a code file: block IDs in code files are not supported yet"
-                )))
+            "prose" => {
+                if matches!(target, BlockTarget::Symbol(_)) {
+                    return Err(symbol_needs_code(unit));
+                }
             }
+            "code" => {}
             "document" => {
                 return Err(refused(format!(
                     "{unit} is a document (pdf, docx or pptx): Tephra never writes to documents"
@@ -666,7 +704,7 @@ impl BlockIdEngine {
             }
             "text-other" => {
                 return Err(refused(format!(
-                    "{unit} is a text file of another type: block IDs go only into md, markdown, txt, org, rst and adoc files"
+                    "{unit} is a text file of another type: block IDs go only into prose files (md, markdown, txt, org, rst, adoc) and code files with a bundled grammar"
                 )))
             }
             _ => {
@@ -712,6 +750,13 @@ impl BlockIdEngine {
             self.watcher.resume_all(&paths);
         }
     }
+}
+
+/// A `symbol` request for a file that has no symbols.
+fn symbol_needs_code(unit: &str) -> BlockIdError {
+    refused(format!(
+        "{unit} is not a code file, so it has no symbols: ask for a line instead"
+    ))
 }
 
 /// `root` joined with `rel_path`, refusing anything that is not a plain

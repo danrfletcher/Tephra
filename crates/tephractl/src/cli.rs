@@ -23,7 +23,7 @@ USAGE:
     tephractl search <query> [--limit <n>] [--json]
     tephractl search --in <id> \"#<query>\" | \"^<query>\" [--limit <n>] [--json]
     tephractl search \"^^<query>\" [--limit <n>] [--json]
-    tephractl block-id <unit-id> --line <n> [--json]
+    tephractl block-id <unit-id> --line <n> | --symbol <name> [--json]
     tephractl link resolve [--source <name>] <target> [--json]
     tephractl link refactor --source <name> --old <path> --new <path> [--apply] [--yes] [--json]
     tephractl daemon install [--from <path>] [--json]
@@ -60,13 +60,22 @@ SEARCH:
 
 BLOCK-ID:
     block-id <unit-id> --line <n>
-                          Give the paragraph or list item holding line <n> of a note a block
-                          ID and print the link to it (<unit-id> is @source:path/to/file; lines
-                          count from 1). A block that already has an ID is not changed: its
-                          link is printed. A heading prints its #Heading link. This is the one
-                          command that writes to your files: it appends \" ^id\" to the end of
-                          the block's last line, and nothing else. md, markdown, txt, org, rst
-                          and adoc files only.
+    block-id <unit-id> --symbol <name>
+                          Give a block of a file an ID and print the link to it (<unit-id> is
+                          @source:path/to/file). In a note, --line <n> (lines count from 1)
+                          picks the paragraph or list item holding that line. In a code file,
+                          --line <n> picks the symbol whose range holds the line (its
+                          attribute, decorator or doc-comment lines too) and --symbol <name>
+                          picks it by name (Parent.name when several share a name). Give one
+                          of the two, not both. A block that already has an ID is not changed:
+                          its link is printed. A heading prints its #Heading link. This is the
+                          one command that writes to your files: in a note it appends \" ^id\"
+                          to the end of the block's last line; in a code file it writes
+                          \"// ^id\", \"# ^id\" or \"-- ^id\" at the end of the symbol's
+                          definition line (or \" ^id\" at the end of the line comment already
+                          there), and nothing else. It refuses a line that ends inside a
+                          string or a block comment. md, markdown, txt, org, rst and adoc
+                          files and code files only.
 
 DAEMON (macOS only; need no token and no running daemon):
     daemon install    Copy tephrad to ~/Library/Application Support/tephra/bin, sign it
@@ -97,6 +106,14 @@ impl InFileSearchScope {
             InFileSearchScope::Blocks => "blocks",
         }
     }
+}
+
+/// What `block-id` points at: a line of the file, or a symbol of a code
+/// file by name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockTarget {
+    Line(u64),
+    Symbol(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,12 +161,13 @@ pub enum Command {
         query: String,
         limit: Option<u64>,
     },
-    /// `block-id <unit-id> --line <n>`: `block.ensure_id`. `line` counts
-    /// from 1; the parser refuses 0 and anything that is not a whole
-    /// number before any request.
+    /// `block-id <unit-id> --line <n> | --symbol <name>`:
+    /// `block.ensure_id`. A `line` counts from 1; the parser refuses 0 and
+    /// anything that is not a whole number before any request, and
+    /// refuses both flags, or neither.
     BlockId {
         unit: String,
-        line: u64,
+        target: BlockTarget,
     },
     LinkResolve {
         target: String,
@@ -601,6 +619,7 @@ fn parse_block_id<'a>(
 ) -> Result<(Command, bool, Option<String>), ArgsError> {
     let mut unit: Option<String> = None;
     let mut line: Option<u64> = None;
+    let mut symbol: Option<String> = None;
     let mut json = false;
     let mut addr = None;
 
@@ -618,6 +637,13 @@ fn parse_block_id<'a>(
                         )))
                     }
                 });
+            }
+            "--symbol" => {
+                let raw = take_value(iter, "--symbol")?;
+                if raw.trim().is_empty() {
+                    return Err(ArgsError("--symbol needs a symbol name".to_string()));
+                }
+                symbol = Some(raw);
             }
             other if other.starts_with('-') && other.len() > 1 => {
                 return Err(ArgsError(format!("unrecognized argument: {other}")))
@@ -647,8 +673,21 @@ fn parse_block_id<'a>(
     let unit = unit.ok_or_else(|| {
         ArgsError("block-id requires a <unit-id> like \"@source:path/to/file\"".to_string())
     })?;
-    let line = line.ok_or_else(|| ArgsError("block-id requires --line <n>".to_string()))?;
-    Ok((Command::BlockId { unit, line }, json, addr))
+    let target = match (line, symbol) {
+        (Some(line), None) => BlockTarget::Line(line),
+        (None, Some(symbol)) => BlockTarget::Symbol(symbol),
+        (Some(_), Some(_)) => {
+            return Err(ArgsError(
+                "block-id takes --line <n> or --symbol <name>, not both".to_string(),
+            ))
+        }
+        (None, None) => {
+            return Err(ArgsError(
+                "block-id requires --line <n> or --symbol <name>".to_string(),
+            ))
+        }
+    };
+    Ok((Command::BlockId { unit, target }, json, addr))
 }
 
 fn parse_link<'a>(

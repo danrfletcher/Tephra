@@ -604,13 +604,15 @@ impl RefactorBackend for UnsupportedRefactor {
 /// [`RefactorBackend`]: the dispatch tests can drive the verb without a
 /// real registry, cache or filesystem.
 pub trait BlockBackend: Send + Sync {
-    /// Gives the block holding `line` (1-indexed) of the prose file
-    /// `unit` (`"@source:path"`) a block ID if it has none, and returns
-    /// the link to it. See [`crate::block_id::BlockIdEngine::ensure_id`].
+    /// Gives the block `target` points at in the file `unit`
+    /// (`"@source:path"`) a block ID if it has none, and returns the link
+    /// to it: the paragraph or list item holding a line of a prose file,
+    /// the symbol a line or a name points at in a code file. See
+    /// [`crate::block_id::BlockIdEngine::ensure_target`].
     fn ensure_id(
         &self,
         unit: &str,
-        line: u64,
+        target: &crate::block_id::BlockTarget,
     ) -> Result<crate::block_id::EnsureIdWire, crate::block_id::BlockIdError>;
 }
 
@@ -618,9 +620,9 @@ impl BlockBackend for crate::block_id::BlockIdEngine {
     fn ensure_id(
         &self,
         unit: &str,
-        line: u64,
+        target: &crate::block_id::BlockTarget,
     ) -> Result<crate::block_id::EnsureIdWire, crate::block_id::BlockIdError> {
-        crate::block_id::BlockIdEngine::ensure_id(self, unit, line)
+        self.ensure_target(unit, target)
     }
 }
 
@@ -632,7 +634,7 @@ impl BlockBackend for UnsupportedBlockIds {
     fn ensure_id(
         &self,
         _unit: &str,
-        _line: u64,
+        _target: &crate::block_id::BlockTarget,
     ) -> Result<crate::block_id::EnsureIdWire, crate::block_id::BlockIdError> {
         Err(crate::block_id::BlockIdError::Refused(
             "block ID backend not configured for this test fixture".to_string(),
