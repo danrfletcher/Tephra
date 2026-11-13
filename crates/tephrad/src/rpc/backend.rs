@@ -24,6 +24,7 @@ use tephra_graph::{Edge, ResolveError, ResolveResult, UnitGraph};
 
 use crate::registry::{RegistryError, SourceListing, SourceRegistry};
 use crate::scan::ScanStats;
+pub use crate::search::{SearchError, SearchHitWire};
 pub use crate::unit_list::{UnitEntryWire, UnitListError, UnitListWire};
 
 /// `unit.resolve_link` / `graph.get_*` (G4), behind a trait so tests
@@ -302,6 +303,15 @@ pub trait SourceBackend: Send + Sync {
             "unit.list is not supported by this source backend".to_string(),
         ))
     }
+    /// `unit.search` with `scope: "names"` (G8): the best `limit` units
+    /// of every source for `query`, ranked. The dispatcher has already
+    /// checked `query` and `limit`. The default refuses, like
+    /// [`SourceBackend::list_units`].
+    fn search_names(&self, _query: &str, _limit: usize) -> Result<Vec<SearchHitWire>, SearchError> {
+        Err(SearchError::Source(
+            "unit.search is not supported by this source backend".to_string(),
+        ))
+    }
 }
 
 impl SourceBackend for SourceRegistry {
@@ -330,6 +340,9 @@ impl SourceBackend for SourceRegistry {
         recursive: bool,
     ) -> Result<UnitListWire, UnitListError> {
         SourceRegistry::list_units(self, source, folder, recursive)
+    }
+    fn search_names(&self, query: &str, limit: usize) -> Result<Vec<SearchHitWire>, SearchError> {
+        SourceRegistry::search_names(self, query, limit)
     }
 }
 

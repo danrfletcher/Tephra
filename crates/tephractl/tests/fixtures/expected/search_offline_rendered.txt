@@ -1,0 +1,3 @@
+@old-vault:Plans/Atlas.md  prose  Atlas  (offline)
+@notes:Obsidian Atlas/Atlas.md  prose  Atlas
+@old-vault:Scans/atlas-map.png  binary  atlas-map  (offline)

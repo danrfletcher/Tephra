@@ -207,23 +207,62 @@ fn unknown_method_returns_method_not_found() {
     assert_eq!(err.0, METHOD_NOT_FOUND);
 }
 
+/// The closed set: the ten verbs before the file-types ticket, then
+/// `unit.list` (PR-3.F1) and `unit.search` (PR-8.F1). Adding a method
+/// means changing this list on purpose.
+const EXPECTED_METHODS: [&str; 12] = [
+    "unit.resolve_link",
+    "graph.get_backlinks",
+    "graph.get_forward_links",
+    "graph.get_edges",
+    "source.register",
+    "source.unregister",
+    "source.list",
+    "source.rescan",
+    "link.preview_refactor",
+    "link.apply_refactor",
+    "unit.list",
+    "unit.search",
+];
+
 #[test]
-fn method_table_is_exactly_the_eleven_named_verbs() {
-    assert_eq!(METHOD_NAMES.len(), 11);
-    for name in [
-        "unit.resolve_link",
-        "graph.get_backlinks",
-        "graph.get_forward_links",
-        "graph.get_edges",
-        "source.register",
-        "source.unregister",
-        "source.list",
-        "source.rescan",
-        "link.preview_refactor",
-        "link.apply_refactor",
-        "unit.list",
-    ] {
-        assert!(METHOD_NAMES.contains(&name), "missing method {name}");
+fn method_table_is_exactly_the_twelve_named_verbs() {
+    assert_eq!(METHOD_NAMES, EXPECTED_METHODS);
+    // No duplicates either.
+    let mut sorted = METHOD_NAMES.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), METHOD_NAMES.len());
+}
+
+/// `unit.search` is routed (it reaches the sources backend, which here
+/// is the default that refuses), while near-misses are not methods.
+#[test]
+fn unit_search_is_accepted_and_a_misspelling_is_method_not_found() {
+    let graph = NullGraph;
+    let sources = NullSources;
+    let p = proof();
+
+    let accepted = dispatch(
+        &p,
+        "unit.search",
+        &json!({"query": "atlas"}),
+        &backends(&graph, &sources),
+    );
+    match accepted {
+        Ok(_) => {}
+        Err((code, _, _)) => assert_ne!(code, METHOD_NOT_FOUND, "unit.search must be routed"),
+    }
+
+    for typo in ["unit.searc", "unit.Search", "units.search", "search"] {
+        let err = dispatch(
+            &p,
+            typo,
+            &json!({"query": "atlas"}),
+            &backends(&graph, &sources),
+        )
+        .unwrap_err();
+        assert_eq!(err.0, METHOD_NOT_FOUND, "{typo}");
     }
 }
 

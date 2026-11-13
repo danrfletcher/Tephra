@@ -474,6 +474,19 @@ impl Cache {
         crate::listing::list_folder(&self.conn, source_name, folder, recursive)
     }
 
+    /// `unit.search` with `scope: "names"` (G8): offers every unit of
+    /// every source to `score` (one pass over `units`, in no particular
+    /// order) and returns the `limit` best of those it scored `Some`, in
+    /// rank order ([`crate::compare_hits`]: score, then shorter path, then
+    /// name). Memory is bounded by `limit`. Offline sources are included
+    /// (flagged), as is every kind, `too_large` files too. Read-only.
+    pub fn search_names<F>(&self, limit: usize, score: F) -> Result<Vec<crate::NameHit>, CacheError>
+    where
+        F: FnMut(&crate::NameCandidate<'_>) -> Option<f64>,
+    {
+        crate::search::search_names(&self.conn, limit, score)
+    }
+
     /// Every `tags` row belonging to `unit_id`. Read counterpart to
     /// [`Cache::insert_tag`] — the typed read path a caller (e.g.
     /// `tephra-graph`'s graph-construction code, PR-5) uses instead of

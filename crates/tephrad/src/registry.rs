@@ -835,6 +835,18 @@ impl SourceRegistry {
         crate::unit_list::list_units(&self.cache_path, source, folder, recursive)
     }
 
+    /// `unit.search` with `scope: "names"` (G8): the best `limit` units
+    /// of every source for `query`, from a fresh read-only cache
+    /// connection, like [`SourceRegistry::list_units`]: it never takes the
+    /// shared `self.cache` lock or the writer gate. See [`crate::search`].
+    pub fn search_names(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::search::SearchHitWire>, crate::search::SearchError> {
+        crate::search::search_names(&self.cache_path, query, limit)
+    }
+
     /// Whether `name` is currently marked `permission_denied`.
     pub fn is_permission_denied(&self, name: &str) -> bool {
         self.permission_denied.lock().unwrap().contains(name)

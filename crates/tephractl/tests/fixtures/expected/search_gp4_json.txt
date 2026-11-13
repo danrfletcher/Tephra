@@ -1,0 +1,26 @@
+[
+  {
+    "id": "@notes:Obsidian Atlas/plans/Atlas outside Obsidian Chrome plugin, VSCode plugin.md",
+    "kind": "prose",
+    "offline": false,
+    "score": 0.8219,
+    "source": "notes",
+    "title": "Atlas outside Obsidian Chrome plugin, VSCode plugin"
+  },
+  {
+    "id": "@tephra:crates/atlas/outside.rs",
+    "kind": "code",
+    "offline": false,
+    "score": 0.2563,
+    "source": "tephra",
+    "title": "outside"
+  },
+  {
+    "id": "@notes:unicode/café notes.md",
+    "kind": "prose",
+    "offline": false,
+    "score": 0.1,
+    "source": "notes",
+    "title": "café notes.md"
+  }
+]

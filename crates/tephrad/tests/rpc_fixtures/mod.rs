@@ -24,7 +24,8 @@ use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use tephra_graph::{Edge, ResolveError, ResolveResult};
 use tephrad::rpc::backend::{
-    GraphBackend, RefactorBackend, ScanStatsWire, SourceBackend, SourceRowWire,
+    GraphBackend, RefactorBackend, ScanStatsWire, SearchError, SearchHitWire, SourceBackend,
+    SourceRowWire,
 };
 use tephrad::rpc::server::{build_router, AppState};
 use tokio::net::TcpListener;
@@ -124,6 +125,8 @@ pub struct MockSources {
     unregister: Mutex<HashMap<String, Result<(), String>>>,
     list: Mutex<Option<Result<Vec<SourceRowWire>, String>>>,
     rescan: Mutex<HashMap<String, Result<ScanStatsWire, String>>>,
+    search: Mutex<Option<Result<Vec<SearchHitWire>, SearchError>>>,
+    search_calls: Mutex<Vec<(String, usize)>>,
 }
 
 impl MockSources {
@@ -155,6 +158,18 @@ impl MockSources {
     pub fn with_rescan(self, name: &str, result: Result<ScanStatsWire, String>) -> Self {
         self.rescan.lock().unwrap().insert(name.to_string(), result);
         self
+    }
+
+    /// What `unit.search` answers (default: no hits).
+    pub fn with_search(self, result: Result<Vec<SearchHitWire>, SearchError>) -> Self {
+        *self.search.lock().unwrap() = Some(result);
+        self
+    }
+
+    /// Every `(query, limit)` the backend was asked to search, in order.
+    /// An empty list after a rejected request proves nothing reached it.
+    pub fn search_calls(&self) -> Vec<(String, usize)> {
+        self.search_calls.lock().unwrap().clone()
     }
 }
 
@@ -192,6 +207,18 @@ impl SourceBackend for MockSources {
             .get(name)
             .cloned()
             .unwrap_or_else(|| Err(format!("no mock response configured for rescan({name})")))
+    }
+
+    fn search_names(&self, query: &str, limit: usize) -> Result<Vec<SearchHitWire>, SearchError> {
+        self.search_calls
+            .lock()
+            .unwrap()
+            .push((query.to_string(), limit));
+        self.search
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or(Ok(Vec::new()))
     }
 }
 

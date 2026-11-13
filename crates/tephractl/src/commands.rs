@@ -97,6 +97,7 @@ pub fn execute_with_prompt_writer<R: BufRead, W: Write>(
             folder,
             recursive,
         } => ls(source, folder, *recursive, json, client),
+        Command::Search { query, limit } => search(query, *limit, json, client),
         Command::LinkResolve {
             target,
             default_source,
@@ -225,6 +226,25 @@ fn ls(
         Ok(result) => {
             CommandOutcome::ok(json_or(&result, || render::render_unit_list(&result), json))
         }
+        Err(e) => CommandOutcome::err(describe_error(&e)),
+    }
+}
+
+/// `search` (G8): one `unit.search` call with scope `names`. The
+/// daemon's refusal of a blank query (INVALID_PARAMS) is printed as it
+/// comes, with a non-zero exit; no results is the plain line `no matches`
+/// and exit 0. `--json` is the raw result array.
+fn search(query: &str, limit: Option<u64>, json: bool, client: &RpcClient) -> CommandOutcome {
+    let mut params = json!({"query": query, "scope": "names"});
+    if let Some(limit) = limit {
+        params["limit"] = json!(limit);
+    }
+    match client.call("unit.search", params) {
+        Ok(result) => CommandOutcome::ok(json_or(
+            &result,
+            || render::render_search_results(&result),
+            json,
+        )),
         Err(e) => CommandOutcome::err(describe_error(&e)),
     }
 }

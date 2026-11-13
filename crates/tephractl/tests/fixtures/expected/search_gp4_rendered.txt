@@ -1,0 +1,3 @@
+@notes:Obsidian Atlas/plans/Atlas outside Obsidian Chrome plugin, VSCode plugin.md  prose  Atlas outside Obsidian Chrome plugin, VSCode plugin
+@tephra:crates/atlas/outside.rs  code  outside
+@notes:unicode/café notes.md  prose  café notes.md

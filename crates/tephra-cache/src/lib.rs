@@ -15,6 +15,7 @@
 mod cache;
 mod listing;
 mod schema;
+mod search;
 mod sources;
 mod units;
 
@@ -25,6 +26,7 @@ pub use listing::{
     compare_entries, compare_names, FolderEntry, FolderListing, FolderState, FOLDER_KIND,
 };
 pub use schema::KindInferrer;
+pub use search::{compare_hits, file_stem, resolve_title, NameCandidate, NameHit, NAME_SEARCH_SQL};
 pub use sources::{validate_transition, InvalidTransition, SourceRow, SourceStatus};
 pub use units::{
     BlockOccurrence, BlockRow, HeadingRow, LinkRow, NewBlock, NewHeading, NewLink, NewSymbol,

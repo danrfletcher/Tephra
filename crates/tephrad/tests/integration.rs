@@ -6,6 +6,8 @@ mod rpc_fixtures;
 
 #[path = "integration/rpc_concurrency.rs"]
 mod rpc_concurrency;
+#[path = "integration/rpc_search.rs"]
+mod rpc_search;
 #[path = "integration/rpc_server_http.rs"]
 mod rpc_server_http;
 #[path = "integration/rpc_server_ws.rs"]

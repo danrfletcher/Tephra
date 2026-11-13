@@ -14,7 +14,9 @@
 use serde_json::Value;
 
 use crate::rpc::auth::Authenticated;
-use crate::rpc::backend::{GraphBackend, RefactorBackend, SourceBackend, UnitListError};
+use crate::rpc::backend::{
+    GraphBackend, RefactorBackend, SearchError, SourceBackend, UnitListError,
+};
 use crate::rpc::protocol::{
     INVALID_PARAMS, METHOD_NOT_FOUND, REFACTOR_ERROR, RESOLVE_ERROR, SOURCE_ERROR,
 };
@@ -37,6 +39,7 @@ pub const METHOD_NAMES: &[&str] = &[
     "link.preview_refactor",
     "link.apply_refactor",
     "unit.list",
+    "unit.search",
 ];
 
 /// The three backends one `dispatch` call reads through, bundled so
@@ -93,6 +96,7 @@ pub fn dispatch(
         "link.preview_refactor" => link_preview_refactor(params, backends.refactor),
         "link.apply_refactor" => link_apply_refactor(params, backends.refactor),
         "unit.list" => unit_list(params, backends.sources),
+        "unit.search" => unit_search(params, backends.sources),
         other => Err((
             METHOD_NOT_FOUND,
             format!("unknown method \"{other}\""),
@@ -186,6 +190,66 @@ fn unit_list(params: &Value, sources: &dyn SourceBackend) -> DispatchResult {
         })
 }
 
+/// `unit.search {query, scope?, limit?}` (G8). `query` is a string with
+/// at least one non-blank character, at most
+/// [`crate::search::fuzzy::MAX_QUERY_CHARS`] long. `scope` (default
+/// `names`; `null` counts as absent) must be `names`: the `headings`,
+/// `blocks` and `all_blocks` scopes are not built yet, and any other
+/// value is unknown, and both are refused naming the scope; a search
+/// is never quietly run as a name search instead. `limit` (default
+/// [`crate::search::DEFAULT_LIMIT`]; `null` counts as absent) is an
+/// integer from 1 to [`crate::search::MAX_LIMIT`]. Every check happens
+/// here, before the backend is called and so before any cache read.
+fn unit_search(params: &Value, sources: &dyn SourceBackend) -> DispatchResult {
+    let query = match params.get("query") {
+        Some(Value::String(s)) => s.as_str(),
+        _ => return Err(invalid_params("\"query\" (non-empty string) is required")),
+    };
+    crate::search::parse_query(query).map_err(invalid_params)?;
+
+    match params.get("scope") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(scope)) if scope == "names" => {}
+        Some(Value::String(scope)) => {
+            return Err(invalid_params(match scope.as_str() {
+                "headings" | "blocks" | "all_blocks" => {
+                    format!("scope \"{scope}\" is not supported yet; only \"names\" is")
+                }
+                _ => format!("unknown scope \"{scope}\"; only \"names\" is supported"),
+            }))
+        }
+        Some(_) => return Err(invalid_params("\"scope\" must be a string")),
+    }
+
+    let limit = match params.get("limit") {
+        None | Some(Value::Null) => crate::search::DEFAULT_LIMIT,
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|n| (1..=crate::search::MAX_LIMIT).contains(n))
+            .ok_or_else(|| {
+                invalid_params(format!(
+                    "\"limit\" must be an integer from 1 to {}",
+                    crate::search::MAX_LIMIT
+                ))
+            })?,
+        Some(_) => {
+            return Err(invalid_params(format!(
+                "\"limit\" must be an integer from 1 to {}",
+                crate::search::MAX_LIMIT
+            )))
+        }
+    };
+
+    sources
+        .search_names(query, limit)
+        .map(|hits| serde_json::to_value(hits).expect("Vec<SearchHitWire> always serializes"))
+        .map_err(|e| match e {
+            SearchError::InvalidParams(message) => invalid_params(message),
+            SearchError::Source(message) => (SOURCE_ERROR, message, None),
+        })
+}
+
 fn link_preview_refactor(params: &Value, refactor: &dyn RefactorBackend) -> DispatchResult {
     let source = require_str(params, "source")?;
     let old_path = require_str(params, "old_path")?;
@@ -234,6 +298,7 @@ mod tests {
                 "link.preview_refactor",
                 "link.apply_refactor",
                 "unit.list",
+                "unit.search",
             ]
         );
     }
@@ -428,5 +493,179 @@ mod tests {
                 ]
             })
         );
+    }
+
+    // ---- unit.search ---------------------------------------------------
+
+    use crate::rpc::backend::SearchHitWire;
+
+    /// A `SourceBackend` whose only live verb is `search_names`: it
+    /// records the arguments it receives and answers a canned result.
+    struct SearchStub {
+        calls: Mutex<Vec<(String, usize)>>,
+        reply: Result<Vec<SearchHitWire>, SearchError>,
+    }
+
+    impl SearchStub {
+        fn answering(reply: Result<Vec<SearchHitWire>, SearchError>) -> Self {
+            SearchStub {
+                calls: Mutex::new(Vec::new()),
+                reply,
+            }
+        }
+        fn empty_ok() -> Self {
+            Self::answering(Ok(Vec::new()))
+        }
+        fn calls(&self) -> Vec<(String, usize)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl SourceBackend for SearchStub {
+        fn register(&self, _: &str, _: &str) -> Result<ScanStatsWire, String> {
+            unreachable!("unit.search never registers")
+        }
+        fn unregister(&self, _: &str) -> Result<(), String> {
+            unreachable!("unit.search never unregisters")
+        }
+        fn list(&self) -> Result<Vec<SourceRowWire>, String> {
+            unreachable!("unit.search never lists sources")
+        }
+        fn rescan(&self, _: &str) -> Result<ScanStatsWire, String> {
+            unreachable!("unit.search never rescans")
+        }
+        fn search_names(
+            &self,
+            query: &str,
+            limit: usize,
+        ) -> Result<Vec<SearchHitWire>, SearchError> {
+            self.calls.lock().unwrap().push((query.to_string(), limit));
+            self.reply.clone()
+        }
+    }
+
+    fn search_invalid(params: Value) -> String {
+        let stub = SearchStub::empty_ok();
+        let err = unit_search(&params, &stub).expect_err("should be rejected");
+        assert_eq!(err.0, INVALID_PARAMS, "{params}: {}", err.1);
+        assert!(stub.calls().is_empty(), "{params} reached the backend");
+        err.1
+    }
+
+    #[test]
+    fn unit_search_rejects_a_missing_blank_or_non_string_query_before_the_backend_runs() {
+        for params in [
+            json!({}),
+            json!({"query": ""}),
+            json!({"query": "   "}),
+            json!({"query": "\t\n"}),
+            json!({"query": null}),
+            json!({"query": 7}),
+            json!({"query": ["a"]}),
+            json!({"query": {"q": "a"}}),
+            json!({"scope": "names"}),
+        ] {
+            let message = search_invalid(params.clone());
+            assert!(message.contains("query"), "{params}: {message}");
+        }
+        let too_long = "a".repeat(crate::search::fuzzy::MAX_QUERY_CHARS + 1);
+        search_invalid(json!({ "query": too_long }));
+    }
+
+    #[test]
+    fn unit_search_refuses_every_scope_but_names_and_names_the_scope() {
+        for scope in ["headings", "blocks", "all_blocks"] {
+            let message = search_invalid(json!({"query": "a", "scope": scope}));
+            assert!(message.contains(scope), "{message}");
+            assert!(message.contains("not supported yet"), "{message}");
+        }
+        for scope in ["", "Names", "NAMES", "name", "files", "names "] {
+            let message = search_invalid(json!({"query": "a", "scope": scope}));
+            assert!(message.contains("unknown scope"), "{scope:?}: {message}");
+            assert!(message.contains(scope), "{scope:?}: {message}");
+        }
+        for scope in [json!(1), json!(true), json!(["names"]), json!({})] {
+            let message = search_invalid(json!({"query": "a", "scope": scope}));
+            assert!(message.contains("scope"), "{message}");
+        }
+    }
+
+    #[test]
+    fn unit_search_rejects_a_limit_that_is_not_a_positive_integer() {
+        for limit in [
+            json!(0),
+            json!(-1),
+            json!(-50),
+            json!(1.5),
+            json!(2.0),
+            json!(1e3),
+            json!("5"),
+            json!("abc"),
+            json!(true),
+            json!([5]),
+            json!({}),
+            json!(crate::search::MAX_LIMIT + 1),
+            json!(u64::MAX),
+        ] {
+            let message = search_invalid(json!({"query": "a", "limit": limit}));
+            assert!(message.contains("limit"), "{limit}: {message}");
+        }
+    }
+
+    #[test]
+    fn unit_search_passes_the_query_verbatim_with_the_default_or_given_limit() {
+        let cases = [
+            (json!({"query": "atlas outside"}), ("atlas outside", 50)),
+            (json!({"query": "atlas", "scope": "names"}), ("atlas", 50)),
+            (
+                json!({"query": "atlas", "scope": null, "limit": null}),
+                ("atlas", 50),
+            ),
+            (json!({"query": "CAF\u{c9}", "limit": 1}), ("CAF\u{c9}", 1)),
+            // Nothing is trimmed, escaped or reinterpreted.
+            (
+                json!({"query": " a,b @c/[[d]] .*( 100%_ "}),
+                (" a,b @c/[[d]] .*( 100%_ ", 50),
+            ),
+            (
+                json!({"query": "x", "limit": crate::search::MAX_LIMIT}),
+                ("x", crate::search::MAX_LIMIT),
+            ),
+        ];
+        for (params, (query, limit)) in cases {
+            let stub = SearchStub::empty_ok();
+            let value = unit_search(&params, &stub).expect("accepted");
+            assert_eq!(value, json!([]));
+            assert_eq!(stub.calls(), vec![(query.to_string(), limit)], "{params}");
+        }
+    }
+
+    #[test]
+    fn unit_search_serializes_each_hit_as_exactly_the_six_documented_fields() {
+        let stub = SearchStub::answering(Ok(vec![SearchHitWire {
+            id: "@notes:a/b.md".into(),
+            source: "notes".into(),
+            title: "B".into(),
+            kind: "prose".into(),
+            score: 0.875,
+            offline: true,
+        }]));
+        let value = unit_search(&json!({"query": "b"}), &stub).expect("ok");
+        assert_eq!(
+            value,
+            json!([{"id": "@notes:a/b.md", "source": "notes", "title": "B",
+                    "kind": "prose", "score": 0.875, "offline": true}])
+        );
+    }
+
+    #[test]
+    fn unit_search_maps_backend_errors_to_the_right_codes() {
+        let stub = SearchStub::answering(Err(SearchError::Source("cache is locked".into())));
+        let err = unit_search(&json!({"query": "a"}), &stub).unwrap_err();
+        assert_eq!((err.0, err.1.as_str()), (SOURCE_ERROR, "cache is locked"));
+
+        let stub = SearchStub::answering(Err(SearchError::InvalidParams("bad".into())));
+        let err = unit_search(&json!({"query": "a"}), &stub).unwrap_err();
+        assert_eq!((err.0, err.1.as_str()), (INVALID_PARAMS, "bad"));
     }
 }

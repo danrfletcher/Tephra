@@ -102,6 +102,40 @@ pub fn render_unit_list_with(result: &Value, format_time: &dyn Fn(i64) -> String
     out
 }
 
+// ---- unit.search ----------------------------------------------------
+
+/// `search`'s output (G8): one row per result, in the daemon's rank order,
+///
+/// ```text
+/// <id>  <kind>  <title>
+/// ```
+///
+/// with `  (offline)` after the title when the result's source is offline.
+/// No results prints the plain line `no matches`. Titles and ids come from
+/// file names and file contents, so control characters in them are shown
+/// as `?`, as in [`render_unit_list`].
+pub fn render_search_results(result: &Value) -> String {
+    let hits = result.as_array().map(Vec::as_slice).unwrap_or_default();
+    if hits.is_empty() {
+        return "no matches\n".to_string();
+    }
+    let mut out = String::new();
+    for hit in hits {
+        out.push_str(&format!(
+            "{}  {}  {}{}\n",
+            printable(str_field(hit, "id")),
+            printable(str_field(hit, "kind")),
+            printable(str_field(hit, "title")),
+            if bool_field(hit, "offline") {
+                "  (offline)"
+            } else {
+                ""
+            },
+        ));
+    }
+    out
+}
+
 /// Number of components in a source-relative path (`""` is 0).
 fn path_depth(rel: &str) -> usize {
     rel.split('/').filter(|s| !s.is_empty()).count()

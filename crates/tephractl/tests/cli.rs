@@ -18,6 +18,9 @@ mod source_commands;
 #[path = "cli/ls_commands.rs"]
 mod ls_commands;
 
+#[path = "cli/search_commands.rs"]
+mod search_commands;
+
 #[path = "cli/link_commands.rs"]
 mod link_commands;
 

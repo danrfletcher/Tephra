@@ -1,0 +1,30 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": [
+    {
+      "id": "@old-vault:Plans/Atlas.md",
+      "source": "old-vault",
+      "title": "Atlas",
+      "kind": "prose",
+      "score": 1.0,
+      "offline": true
+    },
+    {
+      "id": "@notes:Obsidian Atlas/Atlas.md",
+      "source": "notes",
+      "title": "Atlas",
+      "kind": "prose",
+      "score": 1.0,
+      "offline": false
+    },
+    {
+      "id": "@old-vault:Scans/atlas-map.png",
+      "source": "old-vault",
+      "title": "atlas-map",
+      "kind": "binary",
+      "score": 0.9,
+      "offline": true
+    }
+  ]
+}

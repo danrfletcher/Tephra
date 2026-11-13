@@ -6,7 +6,7 @@ A federated graph and link engine for plain-text notes and code folders, written
 
 **Where the code is.** `main` currently holds only these docs. The code is in seven stacked, open pull requests ([#1](https://github.com/danrfletcher/Tephra/pull/1) to [#7](https://github.com/danrfletcher/Tephra/pull/7)), not yet merged. The branch `vector/atlas-3/pr-7` contains all seven.
 
-**Works today (on that branch):** the daemon with config and bearer-token auth; a Markdown parser (wikilinks, `[[@source:path]]`, links, tags, blocks); a SQLite cache; a source registry with a filesystem watcher; a link graph and resolver; an authenticated JSON-RPC server over HTTP and WebSocket; and `tephractl` for `source add/remove/list`, `status`, `ls` and `link resolve`.
+**Works today (on that branch):** the daemon with config and bearer-token auth; a Markdown parser (wikilinks, `[[@source:path]]`, links, tags, blocks); a SQLite cache; a source registry with a filesystem watcher; a link graph and resolver; an authenticated JSON-RPC server over HTTP and WebSocket; and `tephractl` for `source add/remove/list`, `status`, `ls`, `search` and `link resolve`.
 
 **Not built yet:** link refactoring on disk (pull request 8, in review; `tephractl link refactor` exists but the daemon does not serve it yet), links to anything inside non-Markdown files, remote sources, and clients for Obsidian, VSCode and Chrome. Every file in a source is a unit, but only Markdown files are read for links, tags and blocks. No benchmark has been published.
 

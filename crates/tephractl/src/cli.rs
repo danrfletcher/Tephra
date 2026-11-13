@@ -20,6 +20,7 @@ USAGE:
     tephractl source list [--json]
     tephractl status [--json]
     tephractl ls <source> [folder] [-r] [--json]
+    tephractl search <query> [--limit <n>] [--json]
     tephractl link resolve [--source <name>] <target> [--json]
     tephractl link refactor --source <name> --old <path> --new <path> [--apply] [--yes] [--json]
     tephractl daemon install [--from <path>] [--json]
@@ -32,6 +33,14 @@ LS:
                           <folder> is relative to the source root (default: the root).
                           Works for an offline source too, from the cache.
     -r, --recursive       Also list everything below <folder>, indented by depth
+
+SEARCH:
+    search <query>        Find files by name across every source (offline ones included):
+                          fuzzy match on file name, title and path, best match first.
+                          One row per result: id, kind, title. Quote a query with spaces.
+    --limit <n>           Show at most <n> results (default 50)
+                          A query starting with '#' or '^' needs a file; use `--` before a
+                          query that starts with '-'.
 
 DAEMON (macOS only; need no token and no running daemon):
     daemon install    Copy tephrad to ~/Library/Application Support/tephra/bin, sign it
@@ -63,6 +72,13 @@ pub enum Command {
         source: String,
         folder: String,
         recursive: bool,
+    },
+    /// `search <query> [--limit <n>]`: a name search across every
+    /// source (`unit.search`, scope `names`). `limit` is `None` for the
+    /// daemon's default of 50.
+    Search {
+        query: String,
+        limit: Option<u64>,
     },
     LinkResolve {
         target: String,
@@ -197,6 +213,7 @@ where
         "source" => parse_source(&mut iter)?,
         "status" => parse_status(&mut iter)?,
         "ls" => parse_ls(&mut iter)?,
+        "search" => parse_search(&mut iter)?,
         "link" => parse_link(&mut iter)?,
         "daemon" => parse_daemon(&mut iter)?,
         other => return Err(ArgsError(format!("unrecognized command: {other}"))),
@@ -312,6 +329,84 @@ fn parse_ls<'a>(
         },
         json,
         addr,
+    ))
+}
+
+/// `search <query> [--limit <n>] [--json] [--addr <addr>]`, flags
+/// anywhere after `search`. Exactly one positional, the query: it may be
+/// empty or blank (the daemon refuses that, and its message is what the
+/// user sees). A query that starts with `-` can follow a `--`.
+///
+/// Two kinds of query can't be a name search, and are refused here, with
+/// no RPC round-trip (like the source-name check above): a query that
+/// starts with a single `#` or `^` is a search inside one file, which
+/// needs the file picked first (`--in`, a later PR), and one that starts
+/// with `^^` is a block search across every file (also later). Neither
+/// is ever sent as a names search.
+fn parse_search<'a>(
+    iter: &mut impl Iterator<Item = &'a str>,
+) -> Result<(Command, bool, Option<String>), ArgsError> {
+    let mut query: Option<String> = None;
+    let mut limit: Option<u64> = None;
+    let mut json = false;
+    let mut addr = None;
+    let mut only_positionals = false;
+
+    while let Some(arg) = iter.next() {
+        if only_positionals {
+            if query.is_some() {
+                return Err(too_many_search_words(arg));
+            }
+            query = Some(arg.to_string());
+            continue;
+        }
+        match arg {
+            "--" => only_positionals = true,
+            "--json" => json = true,
+            "--addr" => addr = Some(take_value(iter, "--addr")?),
+            "--limit" => {
+                let raw = take_value(iter, "--limit")?;
+                limit = Some(match raw.parse::<u64>() {
+                    Ok(n) if n >= 1 => n,
+                    _ => {
+                        return Err(ArgsError(format!(
+                            "--limit must be a whole number of at least 1, got \"{raw}\""
+                        )))
+                    }
+                });
+            }
+            other if other.starts_with('-') && other.len() > 1 => {
+                return Err(ArgsError(format!(
+                    "unrecognized argument: {other} (put -- before a query that starts with '-')"
+                )))
+            }
+            other if query.is_none() => query = Some(other.to_string()),
+            other => return Err(too_many_search_words(other)),
+        }
+    }
+
+    let query = query.ok_or_else(|| ArgsError("search requires a <query>".to_string()))?;
+    if query.starts_with("^^") {
+        return Err(ArgsError(
+            "a query starting with '^^' searches blocks across every file, which is not \
+             available yet; it is not run as a name search"
+                .to_string(),
+        ));
+    }
+    if query.starts_with('#') || query.starts_with('^') {
+        return Err(ArgsError(format!(
+            "pick a file first: a query starting with '{}' searches inside one file, \
+             which is not available yet; drop the '{}' to search by name",
+            &query[..1],
+            &query[..1]
+        )));
+    }
+    Ok((Command::Search { query, limit }, json, addr))
+}
+
+fn too_many_search_words(extra: &str) -> ArgsError {
+    ArgsError(format!(
+        "unrecognized argument: {extra} (quote a query that has spaces: tephractl search \"two words\")"
     ))
 }
 
@@ -837,5 +932,136 @@ mod tests {
         assert!(run(&["ls", "src", "--all"]).is_err());
         assert!(run(&["ls", "src", "-x"]).is_err());
         assert!(run(&["ls", "src", "--addr"]).is_err());
+    }
+
+    fn search(query: &str, limit: Option<u64>) -> Command {
+        Command::Search {
+            query: query.to_string(),
+            limit,
+        }
+    }
+
+    #[test]
+    fn search_parses_one_quoted_query() {
+        let parsed = run(&["search", "atlas outside"]).unwrap();
+        assert_eq!(parsed.command, search("atlas outside", None));
+        assert!(!parsed.json);
+        assert_eq!(parsed.addr, None);
+    }
+
+    #[test]
+    fn search_json_and_addr_work_leading_and_trailing_and_between() {
+        let leading = run(&["--json", "--addr", "127.0.0.1:1", "search", "atlas"]).unwrap();
+        assert!(leading.json);
+        assert_eq!(leading.addr.as_deref(), Some("127.0.0.1:1"));
+        assert_eq!(leading.command, search("atlas", None));
+
+        let trailing = run(&["search", "atlas", "--json", "--addr", "127.0.0.1:2"]).unwrap();
+        assert!(trailing.json);
+        assert_eq!(trailing.addr.as_deref(), Some("127.0.0.1:2"));
+        assert_eq!(trailing.command, search("atlas", None));
+
+        let between = run(&["search", "--addr", "127.0.0.1:3", "atlas", "--json"]).unwrap();
+        assert!(between.json);
+        assert_eq!(between.addr.as_deref(), Some("127.0.0.1:3"));
+    }
+
+    #[test]
+    fn search_limit_must_be_a_positive_whole_number() {
+        assert_eq!(
+            run(&["search", "a", "--limit", "7"]).unwrap().command,
+            search("a", Some(7))
+        );
+        assert_eq!(
+            run(&["search", "--limit", "1", "a"]).unwrap().command,
+            search("a", Some(1))
+        );
+        for bad in ["0", "-1", "1.5", "ten", ""] {
+            let err = run(&["search", "a", "--limit", bad]).unwrap_err();
+            assert!(err.0.contains("--limit"), "{bad}: {err}");
+        }
+        assert!(run(&["search", "a", "--limit"]).is_err());
+    }
+
+    #[test]
+    fn search_passes_an_empty_or_blank_query_on_for_the_daemon_to_refuse() {
+        assert_eq!(run(&["search", ""]).unwrap().command, search("", None));
+        assert_eq!(run(&["search", "  "]).unwrap().command, search("  ", None));
+    }
+
+    #[test]
+    fn search_needs_exactly_one_query() {
+        let err = run(&["search"]).unwrap_err();
+        assert!(err.0.contains("search requires a <query>"), "{err}");
+        assert!(run(&["search", "--json"]).is_err());
+        let err = run(&["search", "atlas", "outside"]).unwrap_err();
+        assert!(err.0.contains("quote"), "{err}");
+        assert!(run(&["search", "--unknown", "a"]).is_err());
+    }
+
+    #[test]
+    fn search_keeps_every_character_of_the_query() {
+        for query in [
+            "café",
+            "CAFÉ",
+            "100%_done",
+            "a, b",
+            "@notes:x",
+            "dir/file",
+            "[[Link]]",
+            ".*(",
+            "it's \"q\"",
+            "-dash",
+        ] {
+            let args: Vec<&str> = if query.starts_with('-') {
+                vec!["search", "--", query]
+            } else {
+                vec!["search", query]
+            };
+            assert_eq!(run(&args).unwrap().command, search(query, None), "{query}");
+        }
+        // After `--` flags are text.
+        assert_eq!(
+            run(&["search", "--", "--json"]).unwrap().command,
+            search("--json", None)
+        );
+    }
+
+    /// A query starting with a single `#` or `^` is a search inside one
+    /// file: refused here ("pick a file first"), before any RPC.
+    #[test]
+    fn search_refuses_a_hash_or_caret_query_with_pick_a_file_first() {
+        for query in ["#x", "#", "^abc", "^", "#heading text", "##x"] {
+            let err = run(&["search", query]).unwrap_err();
+            assert!(err.0.contains("pick a file first"), "{query}: {err}");
+        }
+        // Flags don't change that.
+        let err = run(&["search", "#x", "--json", "--addr", "127.0.0.1:1"]).unwrap_err();
+        assert!(err.0.contains("pick a file first"), "{err}");
+        let err = run(&["--json", "search", "^x"]).unwrap_err();
+        assert!(err.0.contains("pick a file first"), "{err}");
+    }
+
+    /// `^^` is never sent as a names search either; it has its own
+    /// message, since "pick a file" would be wrong for it.
+    #[test]
+    fn search_refuses_a_double_caret_query_and_never_runs_it_as_a_name_search() {
+        for query in ["^^", "^^abc", "^^ a b"] {
+            let err = run(&["search", query]).unwrap_err();
+            assert!(err.0.contains("^^"), "{query}: {err}");
+            assert!(!err.0.contains("pick a file first"), "{query}: {err}");
+        }
+    }
+
+    /// Only a *leading* `#`/`^` is special; elsewhere they are text.
+    #[test]
+    fn search_allows_hash_and_caret_inside_a_query() {
+        for query in ["c#", "a^b", "x #y", "  #x"] {
+            assert_eq!(
+                run(&["search", query]).unwrap().command,
+                search(query, None),
+                "{query:?}"
+            );
+        }
     }
 }
