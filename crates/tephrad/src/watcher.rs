@@ -371,6 +371,15 @@ impl WatcherPause {
             .paused = true;
     }
 
+    /// Whether batches are currently being held back.
+    pub fn is_paused(&self) -> bool {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .paused
+    }
+
     /// Resumes forwarding, and immediately flushes (as one merged
     /// batch, through the wrapped `on_batch`) anything that fired
     /// while paused. A no-op flush if nothing fired during the pause

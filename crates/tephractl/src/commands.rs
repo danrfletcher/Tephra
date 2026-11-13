@@ -105,6 +105,7 @@ pub fn execute_with_prompt_writer<R: BufRead, W: Write>(
             limit,
         } => search_in(unit, *scope, query, *limit, json, client),
         Command::SearchAllBlocks { query, limit } => search_all_blocks(query, *limit, json, client),
+        Command::BlockId { unit, line } => block_id(unit, *line, json, client),
         Command::LinkResolve {
             target,
             default_source,
@@ -304,6 +305,15 @@ fn search_all_blocks(
             || render::render_all_blocks_results(&result),
             json,
         )),
+        Err(e) => CommandOutcome::err(describe_error(&e)),
+    }
+}
+
+fn block_id(unit: &str, line: u64, json: bool, client: &RpcClient) -> CommandOutcome {
+    match client.call("block.ensure_id", json!({"unit": unit, "line": line})) {
+        Ok(result) => {
+            CommandOutcome::ok(json_or(&result, || render::render_block_id(&result), json))
+        }
         Err(e) => CommandOutcome::err(describe_error(&e)),
     }
 }

@@ -23,6 +23,7 @@ USAGE:
     tephractl search <query> [--limit <n>] [--json]
     tephractl search --in <id> \"#<query>\" | \"^<query>\" [--limit <n>] [--json]
     tephractl search \"^^<query>\" [--limit <n>] [--json]
+    tephractl block-id <unit-id> --line <n> [--json]
     tephractl link resolve [--source <name>] <target> [--json]
     tephractl link refactor --source <name> --old <path> --new <path> [--apply] [--yes] [--json]
     tephractl daemon install [--from <path>] [--json]
@@ -56,6 +57,16 @@ SEARCH:
                           result: file:line, kind, the text around the match (a document hit
                           shows page/slide instead of :line); a ^id shows after it. Quote it:
                           ^ is special to some shells.
+
+BLOCK-ID:
+    block-id <unit-id> --line <n>
+                          Give the paragraph or list item holding line <n> of a note a block
+                          ID and print the link to it (<unit-id> is @source:path/to/file; lines
+                          count from 1). A block that already has an ID is not changed: its
+                          link is printed. A heading prints its #Heading link. This is the one
+                          command that writes to your files: it appends \" ^id\" to the end of
+                          the block's last line, and nothing else. md, markdown, txt, org, rst
+                          and adoc files only.
 
 DAEMON (macOS only; need no token and no running daemon):
     daemon install    Copy tephrad to ~/Library/Application Support/tephra/bin, sign it
@@ -132,6 +143,13 @@ pub enum Command {
     SearchAllBlocks {
         query: String,
         limit: Option<u64>,
+    },
+    /// `block-id <unit-id> --line <n>`: `block.ensure_id`. `line` counts
+    /// from 1; the parser refuses 0 and anything that is not a whole
+    /// number before any request.
+    BlockId {
+        unit: String,
+        line: u64,
     },
     LinkResolve {
         target: String,
@@ -268,6 +286,7 @@ where
         "ls" => parse_ls(&mut iter)?,
         "search" => parse_search(&mut iter)?,
         "link" => parse_link(&mut iter)?,
+        "block-id" => parse_block_id(&mut iter)?,
         "daemon" => parse_daemon(&mut iter)?,
         other => return Err(ArgsError(format!("unrecognized command: {other}"))),
     };
@@ -575,6 +594,61 @@ fn parse_daemon_trailing<'a>(
         }
     }
     Ok((json, ()))
+}
+
+fn parse_block_id<'a>(
+    iter: &mut impl Iterator<Item = &'a str>,
+) -> Result<(Command, bool, Option<String>), ArgsError> {
+    let mut unit: Option<String> = None;
+    let mut line: Option<u64> = None;
+    let mut json = false;
+    let mut addr = None;
+
+    while let Some(arg) = iter.next() {
+        match arg {
+            "--json" => json = true,
+            "--addr" => addr = Some(take_value(iter, "--addr")?),
+            "--line" => {
+                let raw = take_value(iter, "--line")?;
+                line = Some(match raw.parse::<u64>() {
+                    Ok(n) if n >= 1 => n,
+                    _ => {
+                        return Err(ArgsError(format!(
+                            "--line must be a whole number of at least 1, got \"{raw}\""
+                        )))
+                    }
+                });
+            }
+            other if other.starts_with('-') && other.len() > 1 => {
+                return Err(ArgsError(format!("unrecognized argument: {other}")))
+            }
+            other if unit.is_none() => {
+                match other
+                    .strip_prefix('@')
+                    .and_then(|rest| rest.split_once(':'))
+                {
+                    Some((source, path)) if !source.is_empty() && !path.is_empty() => {}
+                    _ => {
+                        return Err(ArgsError(format!(
+                        "block-id needs a unit id like \"@source:path/to/file\", got \"{other}\""
+                    )))
+                    }
+                }
+                unit = Some(other.to_string());
+            }
+            other => {
+                return Err(ArgsError(format!(
+                    "block-id takes one unit id; unexpected extra argument: {other}"
+                )))
+            }
+        }
+    }
+
+    let unit = unit.ok_or_else(|| {
+        ArgsError("block-id requires a <unit-id> like \"@source:path/to/file\"".to_string())
+    })?;
+    let line = line.ok_or_else(|| ArgsError("block-id requires --line <n>".to_string()))?;
+    Ok((Command::BlockId { unit, line }, json, addr))
 }
 
 fn parse_link<'a>(

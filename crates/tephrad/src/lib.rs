@@ -9,7 +9,9 @@
 //! startup-sequence concerns with no API surface a later crate or
 //! test needs to call directly.
 pub mod access;
+pub mod block_id;
 pub mod file_kind;
+pub mod file_lock;
 pub mod ignore;
 pub mod refactor;
 pub mod registry;

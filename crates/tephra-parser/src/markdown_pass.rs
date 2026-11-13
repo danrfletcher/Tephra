@@ -84,6 +84,15 @@ pub(crate) struct MarkdownPass {
     /// just the destination portion of every inline link or image.
     /// Consumed only by the tag scanner.
     pub link_destination_ranges: Vec<(usize, usize)>,
+    /// `(first line, last line)` of every fenced or indented code block,
+    /// absolute within the original file, in document order.
+    pub code_block_lines: Vec<(usize, usize)>,
+    /// `(first line, last line)` of every table, absolute within the
+    /// original file, in document order.
+    pub table_lines: Vec<(usize, usize)>,
+    /// `(first line, last line)` of every heading, parallel to
+    /// `headings`: a setext heading spans its title and underline.
+    pub heading_lines: Vec<(usize, usize)>,
 }
 
 /// A list item whose text is being gathered: its first line and the
@@ -114,6 +123,9 @@ pub(crate) fn run(
     let mut links = Vec::new();
     let mut excluded_ranges = Vec::new();
     let mut link_destination_ranges = Vec::new();
+    let mut code_block_lines: Vec<(usize, usize)> = Vec::new();
+    let mut table_lines: Vec<(usize, usize)> = Vec::new();
+    let mut heading_lines: Vec<(usize, usize)> = Vec::new();
 
     let mut current_heading: Option<(u8, String, usize)> = None;
     let mut current_link: Option<CurrentLink> = None;
@@ -143,6 +155,22 @@ pub(crate) fn run(
             end_line,
             block_id: None,
         });
+    };
+
+    // `(first line, last line)` of a block's byte range: a trailing line
+    // ending belongs to no line of its own.
+    let block_lines = |range: &Range<usize>| -> (usize, usize) {
+        let start = range.start.min(body.len());
+        let mut end = range.end.min(body.len());
+        while end > start && matches!(body.as_bytes()[end - 1], b'\n' | b'\r') {
+            end -= 1;
+        }
+        let last = if end > start {
+            absolute_line(end - 1)
+        } else {
+            absolute_line(start)
+        };
+        (absolute_line(start), last)
     };
 
     for (event, range) in Parser::new_ext(body, Options::ENABLE_TABLES).into_offset_iter() {
@@ -202,8 +230,12 @@ pub(crate) fn run(
                 let level_num = heading_level_to_u8(level);
                 current_heading = Some((level_num, String::new(), range.start));
             }
+            Event::Start(Tag::Table(_)) => {
+                table_lines.push(block_lines(&range));
+            }
             Event::End(TagEnd::Heading(_)) => {
                 if let Some((level, text, start)) = current_heading.take() {
+                    heading_lines.push(block_lines(&range));
                     headings.push(Heading {
                         level,
                         text,
@@ -252,6 +284,7 @@ pub(crate) fn run(
             }
             Event::End(TagEnd::CodeBlock) => {
                 if let Some(start) = in_code_block_start.take() {
+                    code_block_lines.push(block_lines(&(start..range.end)));
                     excluded_ranges.push((start, range.end));
                 }
             }
@@ -299,6 +332,9 @@ pub(crate) fn run(
         links,
         excluded_ranges,
         link_destination_ranges,
+        code_block_lines,
+        table_lines,
+        heading_lines,
     }
 }
 

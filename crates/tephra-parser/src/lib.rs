@@ -505,6 +505,122 @@ fn parse_native(path: &Path, content: &str, format: ProseFormat) -> ParsedUnit {
     }
 }
 
+/// What a [`LineRegion`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegionKind {
+    /// The YAML frontmatter block, its `---` lines included.
+    Frontmatter,
+    /// A fenced or indented code block (Markdown), or a native literal
+    /// region (org `#+BEGIN_SRC`, rst `::` blocks, adoc `----` / `....`
+    /// blocks), delimiters included.
+    CodeBlock,
+    /// A Markdown table.
+    Table,
+    /// A heading, with every line that belongs to it (a setext or rst
+    /// underline and overline too). The number is the heading's index in
+    /// [`ParsedUnit::headings`].
+    Heading(usize),
+}
+
+/// A run of whole lines of a prose file that is not a paragraph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineRegion {
+    pub kind: RegionKind,
+    /// 1-indexed first line, absolute within the file.
+    pub start_line: usize,
+    /// 1-indexed last line (equal to `start_line` for one line).
+    pub end_line: usize,
+}
+
+/// The non-paragraph regions of the prose file `content` at `path`, by
+/// the same rules (and the same extension-to-format choice) as
+/// [`parse_unit`], so a line it names is never one of that parse's
+/// paragraphs: frontmatter, code blocks, tables and headings (with the
+/// lines that belong to them). Pure, like [`parse_unit`]. Lines that are
+/// in no region and in no paragraph are blank, or are something else
+/// the parser reads nothing from (a rule, an HTML block).
+pub fn line_regions(path: &Path, content: &str) -> Vec<LineRegion> {
+    let format = ProseFormat::from_path(path);
+    let mut out = Vec::new();
+    if format.is_markdown() {
+        let mut diagnostics = Vec::new();
+        let (frontmatter, body, body_start_line, body_start_byte) =
+            frontmatter::extract(content, &mut diagnostics);
+        if let Some(fm) = &frontmatter {
+            out.push(LineRegion {
+                kind: RegionKind::Frontmatter,
+                start_line: fm.start_line,
+                end_line: fm.end_line,
+            });
+        }
+        let pass = markdown_pass::run(body, body_start_line, body_start_byte, &mut diagnostics);
+        out.extend(pass.code_block_lines.iter().map(|&(s, e)| LineRegion {
+            kind: RegionKind::CodeBlock,
+            start_line: s,
+            end_line: e,
+        }));
+        out.extend(pass.table_lines.iter().map(|&(s, e)| LineRegion {
+            kind: RegionKind::Table,
+            start_line: s,
+            end_line: e,
+        }));
+        out.extend(
+            pass.heading_lines
+                .iter()
+                .enumerate()
+                .map(|(i, &(s, e))| LineRegion {
+                    kind: RegionKind::Heading(i),
+                    start_line: s,
+                    end_line: e,
+                }),
+        );
+    } else {
+        let bom_len = if content.starts_with('\u{FEFF}') {
+            '\u{FEFF}'.len_utf8()
+        } else {
+            0
+        };
+        let lines = prose::split_lines(&content[bom_len..]);
+        let literal = prose::literal_mask(format, &lines);
+        let mut run_start: Option<usize> = None;
+        for (i, &is_literal) in literal.iter().enumerate() {
+            match (is_literal, run_start) {
+                (true, None) => run_start = Some(i),
+                (false, Some(start)) => {
+                    out.push(LineRegion {
+                        kind: RegionKind::CodeBlock,
+                        start_line: start + 1,
+                        end_line: i,
+                    });
+                    run_start = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(start) = run_start {
+            out.push(LineRegion {
+                kind: RegionKind::CodeBlock,
+                start_line: start + 1,
+                end_line: literal.len(),
+            });
+        }
+        let native = prose::headings::find(format, &lines, &literal);
+        out.extend(
+            native
+                .spans
+                .iter()
+                .enumerate()
+                .map(|(i, &(s, e))| LineRegion {
+                    kind: RegionKind::Heading(i),
+                    start_line: s,
+                    end_line: e,
+                }),
+        );
+    }
+    out.sort_by_key(|r| (r.start_line, r.end_line));
+    out
+}
+
 // Compile-time assertion that `ParsedUnit` is `Send + Sync`, as
 // required for PR-4's parallel initial scan.
 const _: fn() = || {

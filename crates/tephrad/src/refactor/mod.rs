@@ -846,12 +846,16 @@ pub trait WatcherPauseControl: Send + Sync {
     fn resume_all(&self, written_paths: &HashSet<PathBuf>);
 }
 
+/// Reference-counted on the registry (see
+/// [`SourceRegistry::pause_for_write`]): every `pause_all` must be
+/// paired with one `resume_all`, and the watchers resume only when the
+/// last overlapping writer calls it.
 impl WatcherPauseControl for SourceRegistry {
     fn pause_all(&self) {
-        SourceRegistry::pause_all_watchers(self);
+        SourceRegistry::pause_for_write(self);
     }
     fn resume_all(&self, written_paths: &HashSet<PathBuf>) {
-        SourceRegistry::resume_all_watchers_except(self, written_paths);
+        SourceRegistry::resume_after_write(self, written_paths);
     }
 }
 
@@ -1223,6 +1227,14 @@ impl RefactorEngine {
                 });
                 continue;
             };
+
+            // Held from this file's mtime re-check to its rename: a
+            // `block.ensure_id` on the same file (see `crate::block_id`)
+            // takes the same lock, so neither starts from bytes the
+            // other is about to replace. If it wrote first, the mtime
+            // check below sees it and this file is reported as failed
+            // rather than overwritten.
+            let _file_guard = crate::file_lock::lock(&abs);
 
             // R7 review finding: `verify_staleness` only checked every
             // affected file's mtime once, up front in `apply`. On a

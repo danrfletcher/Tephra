@@ -23,9 +23,10 @@ use std::sync::{Arc, Mutex};
 
 use tempfile::TempDir;
 use tephra_graph::{Edge, ResolveError, ResolveResult};
+use tephrad::block_id::{BlockIdError, EnsureIdWire};
 use tephrad::rpc::backend::{
-    GraphBackend, RefactorBackend, ScanStatsWire, SearchError, SearchHitWire, SourceBackend,
-    SourceRowWire,
+    BlockBackend, GraphBackend, RefactorBackend, ScanStatsWire, SearchError, SearchHitWire,
+    SourceBackend, SourceRowWire,
 };
 use tephrad::rpc::server::{build_router, AppState};
 use tokio::net::TcpListener;
@@ -402,6 +403,56 @@ pub async fn spawn_with_token_and_any_sources(
     sources: impl SourceBackend + 'static,
     token: &str,
 ) -> TestServer {
+    spawn_with_token_sources_and_blocks(
+        graph,
+        sources,
+        tephrad::rpc::backend::UnsupportedBlockIds,
+        token,
+    )
+    .await
+}
+
+/// A [`BlockBackend`] that records every `(unit, line)` it is asked for
+/// and answers a canned result: `block.ensure_id`'s dispatch and
+/// transport tests drive the verb through the real router without a
+/// filesystem behind it.
+pub struct RecordingBlocks {
+    calls: Mutex<Vec<(String, u64)>>,
+    reply: Result<EnsureIdWire, BlockIdError>,
+}
+
+impl RecordingBlocks {
+    pub fn answering(reply: Result<EnsureIdWire, BlockIdError>) -> Self {
+        RecordingBlocks {
+            calls: Mutex::new(Vec::new()),
+            reply,
+        }
+    }
+
+    pub fn calls(&self) -> Vec<(String, u64)> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+/// Lets a test keep its own `Arc` to the recorder after handing it to
+/// the server.
+pub struct SharedBlocks(pub Arc<RecordingBlocks>);
+
+impl BlockBackend for SharedBlocks {
+    fn ensure_id(&self, unit: &str, line: u64) -> Result<EnsureIdWire, BlockIdError> {
+        self.0.calls.lock().unwrap().push((unit.to_string(), line));
+        self.0.reply.clone()
+    }
+}
+
+/// [`spawn_with_token_and_any_sources`] with a chosen `block.ensure_id`
+/// backend.
+pub async fn spawn_with_token_sources_and_blocks(
+    graph: MockGraph,
+    sources: impl SourceBackend + 'static,
+    blocks: impl BlockBackend + 'static,
+    token: &str,
+) -> TestServer {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let token_path = tempdir.path().join("token");
     write_token_file(&token_path, token);
@@ -411,27 +462,30 @@ pub async fn spawn_with_token_and_any_sources(
         .expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local_addr");
 
-    let state = Arc::new(AppState::new(
-        token_path,
-        Arc::new(graph) as Arc<dyn GraphBackend>,
-        Arc::new(sources) as Arc<dyn SourceBackend>,
-        // Same rationale as the graph refresh `None` below: none of
-        // these shared fixture-backed tests exercise
-        // `link.preview_refactor`/`link.apply_refactor` (those get
-        // their own dedicated real-engine integration tests —
-        // `tests/link_refactor_integration.rs`,
-        // `tests/link_refactor_auth.rs`), so there is nothing for a
-        // refactor backend to do here beyond erroring if one of those
-        // methods were ever accidentally called against it.
-        Arc::new(tephrad::rpc::backend::UnsupportedRefactor) as Arc<dyn RefactorBackend>,
-        // These fixtures always back `AppState` with a canned
-        // `MockGraph`, never a real `tephrad::rpc::backend::SharedGraph`
-        // — there is nothing for a successful `source.*` mutation to
-        // refresh here (R1 is instead covered end-to-end, against the
-        // real `SourceRegistry`/`UnitGraph`, by
-        // `tests/rpc_live_graph.rs`).
-        None,
-    ));
+    let state = Arc::new(
+        AppState::new(
+            token_path,
+            Arc::new(graph) as Arc<dyn GraphBackend>,
+            Arc::new(sources) as Arc<dyn SourceBackend>,
+            // Same rationale as the graph refresh `None` below: none of
+            // these shared fixture-backed tests exercise
+            // `link.preview_refactor`/`link.apply_refactor` (those get
+            // their own dedicated real-engine integration tests —
+            // `tests/link_refactor_integration.rs`,
+            // `tests/link_refactor_auth.rs`), so there is nothing for a
+            // refactor backend to do here beyond erroring if one of those
+            // methods were ever accidentally called against it.
+            Arc::new(tephrad::rpc::backend::UnsupportedRefactor) as Arc<dyn RefactorBackend>,
+            // These fixtures always back `AppState` with a canned
+            // `MockGraph`, never a real `tephrad::rpc::backend::SharedGraph`
+            // — there is nothing for a successful `source.*` mutation to
+            // refresh here (R1 is instead covered end-to-end, against the
+            // real `SourceRegistry`/`UnitGraph`, by
+            // `tests/rpc_live_graph.rs`).
+            None,
+        )
+        .with_blocks(Arc::new(blocks) as Arc<dyn BlockBackend>),
+    );
     let router = build_router(state.clone());
 
     let handle = tokio::spawn(async move {

@@ -16,10 +16,10 @@ use tephra_cache::InFileScope;
 
 use crate::rpc::auth::Authenticated;
 use crate::rpc::backend::{
-    GraphBackend, RefactorBackend, SearchError, SourceBackend, UnitListError,
+    BlockBackend, GraphBackend, RefactorBackend, SearchError, SourceBackend, UnitListError,
 };
 use crate::rpc::protocol::{
-    INVALID_PARAMS, METHOD_NOT_FOUND, REFACTOR_ERROR, RESOLVE_ERROR, SOURCE_ERROR,
+    BLOCK_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND, REFACTOR_ERROR, RESOLVE_ERROR, SOURCE_ERROR,
 };
 
 /// Every JSON-RPC method this server exposes, exactly matching the
@@ -41,6 +41,7 @@ pub const METHOD_NAMES: &[&str] = &[
     "link.apply_refactor",
     "unit.list",
     "unit.search",
+    "block.ensure_id",
 ];
 
 /// The three backends one `dispatch` call reads through, bundled so
@@ -50,6 +51,7 @@ pub struct Backends<'a> {
     pub graph: &'a dyn GraphBackend,
     pub sources: &'a dyn SourceBackend,
     pub refactor: &'a dyn RefactorBackend,
+    pub blocks: &'a dyn BlockBackend,
 }
 
 /// `(code, message, optional structured data)` — the shape every
@@ -98,6 +100,7 @@ pub fn dispatch(
         "link.apply_refactor" => link_apply_refactor(params, backends.refactor),
         "unit.list" => unit_list(params, backends.sources),
         "unit.search" => unit_search(params, backends.sources),
+        "block.ensure_id" => block_ensure_id(params, backends.blocks),
         other => Err((
             METHOD_NOT_FOUND,
             format!("unknown method \"{other}\""),
@@ -326,6 +329,24 @@ fn link_apply_refactor(params: &Value, refactor: &dyn RefactorBackend) -> Dispat
         .map_err(|e| (REFACTOR_ERROR, e, None))
 }
 
+fn block_ensure_id(params: &Value, blocks: &dyn BlockBackend) -> DispatchResult {
+    let unit = require_str(params, "unit")?;
+    // A JSON integer from 1 up; 0, negatives, fractions and strings are
+    // refused here as malformed, a line past the file's end by the engine.
+    let line = params
+        .get("line")
+        .and_then(Value::as_u64)
+        .filter(|n| *n >= 1)
+        .ok_or_else(|| invalid_params("\"line\" (integer, 1 or more) is required"))?;
+    blocks
+        .ensure_id(unit, line)
+        .map(|wire| serde_json::to_value(wire).expect("EnsureIdWire always serializes"))
+        .map_err(|e| match e {
+            crate::block_id::BlockIdError::InvalidParams(m) => invalid_params(m),
+            crate::block_id::BlockIdError::Refused(m) => (BLOCK_ERROR, m, None),
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,6 +376,7 @@ mod tests {
                 "link.apply_refactor",
                 "unit.list",
                 "unit.search",
+                "block.ensure_id",
             ]
         );
     }
@@ -768,5 +790,105 @@ mod tests {
         let stub = SearchStub::answering(Err(SearchError::InvalidParams("bad".into())));
         let err = unit_search(&json!({"query": "a"}), &stub).unwrap_err();
         assert_eq!((err.0, err.1.as_str()), (INVALID_PARAMS, "bad"));
+    }
+
+    // -- block.ensure_id (G11) ------------------------------------------
+
+    use crate::block_id::{BlockIdError, EnsureIdWire};
+
+    /// A `BlockBackend` that records `(unit, line)` and answers a canned
+    /// result. The validation under test is `block_ensure_id`'s own.
+    struct BlockStub {
+        calls: Mutex<Vec<(String, u64)>>,
+        reply: Result<EnsureIdWire, BlockIdError>,
+    }
+
+    impl BlockStub {
+        fn answering(reply: Result<EnsureIdWire, BlockIdError>) -> Self {
+            BlockStub {
+                calls: Mutex::new(Vec::new()),
+                reply,
+            }
+        }
+        fn created() -> Self {
+            Self::answering(Ok(EnsureIdWire {
+                id: Some("k3f9a2".into()),
+                link: "[[@notes:a#^k3f9a2]]".into(),
+                created: true,
+            }))
+        }
+        fn calls(&self) -> Vec<(String, u64)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl BlockBackend for BlockStub {
+        fn ensure_id(&self, unit: &str, line: u64) -> Result<EnsureIdWire, BlockIdError> {
+            self.calls.lock().unwrap().push((unit.to_string(), line));
+            self.reply.clone()
+        }
+    }
+
+    #[test]
+    fn block_ensure_id_passes_the_unit_and_line_through_and_serializes_the_result() {
+        let stub = BlockStub::created();
+        let value = block_ensure_id(&json!({"unit": "@notes:a.md", "line": 3}), &stub).expect("ok");
+        assert_eq!(
+            value,
+            json!({"id": "k3f9a2", "link": "[[@notes:a#^k3f9a2]]", "created": true})
+        );
+        assert_eq!(stub.calls(), vec![("@notes:a.md".to_string(), 3)]);
+    }
+
+    #[test]
+    fn block_ensure_id_serializes_a_heading_result_with_a_null_id() {
+        let stub = BlockStub::answering(Ok(EnsureIdWire {
+            id: None,
+            link: "[[@notes:a#Head]]".into(),
+            created: false,
+        }));
+        let value = block_ensure_id(&json!({"unit": "@notes:a.md", "line": 1}), &stub).unwrap();
+        assert_eq!(
+            value,
+            json!({"id": null, "link": "[[@notes:a#Head]]", "created": false})
+        );
+    }
+
+    #[test]
+    fn block_ensure_id_refuses_a_missing_unit_a_missing_line_or_a_line_that_is_no_positive_integer()
+    {
+        for params in [
+            json!({}),
+            json!({"line": 3}),
+            json!({"unit": "", "line": 3}),
+            json!({"unit": 5, "line": 3}),
+            json!({"unit": "@notes:a.md"}),
+            json!({"unit": "@notes:a.md", "line": null}),
+            json!({"unit": "@notes:a.md", "line": "3"}),
+            json!({"unit": "@notes:a.md", "line": 3.5}),
+            json!({"unit": "@notes:a.md", "line": -3}),
+            json!({"unit": "@notes:a.md", "line": 0}),
+            json!({"unit": "@notes:a.md", "line": true}),
+            json!({"unit": "@notes:a.md", "line": [3]}),
+        ] {
+            let stub = BlockStub::created();
+            let err = block_ensure_id(&params, &stub).unwrap_err();
+            assert_eq!(err.0, INVALID_PARAMS, "{params}: {}", err.1);
+            assert!(
+                stub.calls().is_empty(),
+                "{params}: the backend must not be reached"
+            );
+        }
+    }
+
+    #[test]
+    fn block_ensure_id_maps_the_engines_errors_to_the_right_codes() {
+        let stub = BlockStub::answering(Err(BlockIdError::Refused("line 5 is blank".into())));
+        let err = block_ensure_id(&json!({"unit": "@notes:a.md", "line": 5}), &stub).unwrap_err();
+        assert_eq!((err.0, err.1.as_str()), (BLOCK_ERROR, "line 5 is blank"));
+
+        let stub = BlockStub::answering(Err(BlockIdError::InvalidParams("bad unit".into())));
+        let err = block_ensure_id(&json!({"unit": "@notes:a.md", "line": 5}), &stub).unwrap_err();
+        assert_eq!((err.0, err.1.as_str()), (INVALID_PARAMS, "bad unit"));
     }
 }

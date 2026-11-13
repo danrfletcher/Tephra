@@ -188,6 +188,7 @@ fn backends<'a>(graph: &'a NullGraph, sources: &'a NullSources) -> Backends<'a> 
         graph,
         sources,
         refactor: &NULL_REFACTOR,
+        blocks: &tephrad::rpc::backend::UnsupportedBlockIds,
     }
 }
 
@@ -208,9 +209,10 @@ fn unknown_method_returns_method_not_found() {
 }
 
 /// The closed set: the ten verbs before the file-types ticket, then
-/// `unit.list` (PR-3.F1) and `unit.search` (PR-8.F1). Adding a method
+/// `unit.list` (PR-3.F1), `unit.search` (PR-8.F1) and `block.ensure_id`
+/// (PR-11.F1). Adding a method
 /// means changing this list on purpose.
-const EXPECTED_METHODS: [&str; 12] = [
+const EXPECTED_METHODS: [&str; 13] = [
     "unit.resolve_link",
     "graph.get_backlinks",
     "graph.get_forward_links",
@@ -223,10 +225,11 @@ const EXPECTED_METHODS: [&str; 12] = [
     "link.apply_refactor",
     "unit.list",
     "unit.search",
+    "block.ensure_id",
 ];
 
 #[test]
-fn method_table_is_exactly_the_twelve_named_verbs() {
+fn method_table_is_exactly_the_thirteen_named_verbs() {
     assert_eq!(METHOD_NAMES, EXPECTED_METHODS);
     // No duplicates either.
     let mut sorted = METHOD_NAMES.to_vec();
@@ -564,6 +567,7 @@ fn search_all_blocks_dispatch(
             graph: &graph,
             sources,
             refactor: &NULL_REFACTOR,
+            blocks: &tephrad::rpc::backend::UnsupportedBlockIds,
         },
     )
     .map_err(|(code, message, _)| (code, message))

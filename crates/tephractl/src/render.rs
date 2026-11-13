@@ -441,6 +441,15 @@ pub fn render_status(addr: &str, rows: &[Value]) -> String {
     out
 }
 
+// ---- block.ensure_id ------------------------------------------------
+
+/// `block-id`'s output: the link, alone on one line, so a script can
+/// take the whole of stdout. Nothing else is printed, whether the ID was
+/// just written or was already there (`--json` says which).
+pub fn render_block_id(result: &Value) -> String {
+    format!("{}\n", result["link"].as_str().unwrap_or_default())
+}
+
 // ---- unit.resolve_link ------------------------------------------------
 
 fn render_edge(edge: &Value) -> String {

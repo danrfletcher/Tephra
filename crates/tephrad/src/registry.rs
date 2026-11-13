@@ -426,6 +426,18 @@ pub struct SourceRegistry {
     /// [`SourceRegistry::list_with_runtime_status`] overlays it on the
     /// stored status, so `source.list` reports `permission_denied`.
     permission_denied: Mutex<HashSet<String>>,
+    /// Every writer that pauses the watchers around its own writes
+    /// (`link.apply_refactor`, `block.ensure_id`) goes through this one
+    /// count, see [`SourceRegistry::pause_for_write`].
+    write_pause: Mutex<WritePause>,
+}
+
+/// The writers currently holding the watchers paused, and the paths
+/// they have finished writing so far.
+#[derive(Default)]
+struct WritePause {
+    active: usize,
+    written: HashSet<PathBuf>,
 }
 
 /// One `source.list` row: the stored row plus the runtime
@@ -470,6 +482,7 @@ impl SourceRegistry {
             running: Mutex::new(HashMap::new()),
             events_tx,
             permission_denied: Mutex::new(HashSet::new()),
+            write_pause: Mutex::new(WritePause::default()),
         })
     }
 
@@ -779,6 +792,45 @@ impl SourceRegistry {
     pub fn resume_all_watchers_except(&self, written_paths: &HashSet<PathBuf>) {
         for running in self.running.lock().unwrap().values() {
             running.pause.resume_except(written_paths);
+        }
+    }
+
+    /// Whether any running source's watcher is currently paused.
+    pub fn watchers_paused(&self) -> bool {
+        self.running
+            .lock()
+            .unwrap()
+            .values()
+            .any(|running| running.pause.is_paused())
+    }
+
+    /// Pauses every watcher for one writer's own writes. Writers
+    /// overlap (an `ensure_id` while an `apply_refactor` is writing):
+    /// the first one in pauses, and the watchers stay paused until the
+    /// matching [`resume_after_write`](Self::resume_after_write) of the
+    /// last one out, so one writer finishing never resumes the watchers
+    /// under another that is still writing.
+    pub fn pause_for_write(&self) {
+        let mut gate = self.write_pause.lock().unwrap_or_else(|p| p.into_inner());
+        if gate.active == 0 {
+            self.pause_all_watchers();
+        }
+        gate.active += 1;
+    }
+
+    /// One writer is done: `written_paths` are the absolute paths it
+    /// wrote. The last writer out resumes the watchers, discarding
+    /// every path any of the overlapping writers wrote. Each writer
+    /// waits out the debounce window before calling this, so the
+    /// events of its own writes are already queued by then. Must pair
+    /// with a [`pause_for_write`](Self::pause_for_write).
+    pub fn resume_after_write(&self, written_paths: &HashSet<PathBuf>) {
+        let mut gate = self.write_pause.lock().unwrap_or_else(|p| p.into_inner());
+        gate.written.extend(written_paths.iter().cloned());
+        gate.active = gate.active.saturating_sub(1);
+        if gate.active == 0 {
+            let all = std::mem::take(&mut gate.written);
+            self.resume_all_watchers_except(&all);
         }
     }
 
@@ -1119,6 +1171,70 @@ impl SourceRegistry {
 
         Ok(stats)
     }
+
+    /// What `block.ensure_id` needs to know about the file `rel_path` of
+    /// `source`, from a fresh cache connection (it never takes the shared
+    /// `self.cache` lock): the source's root and state, and the cached
+    /// `units` row, if there is one. `Ok(None)` when no such source is
+    /// registered.
+    pub fn cached_unit(
+        &self,
+        source: &str,
+        rel_path: &str,
+    ) -> Result<Option<CachedUnit>, RegistryError> {
+        let cache = Cache::open_read_only(&self.cache_path)?;
+        let Some(row) = cache.get_source(source)? else {
+            return Ok(None);
+        };
+        let unit = cache.get_unit_by_rel_path(row.id, rel_path)?;
+        Ok(Some(CachedUnit {
+            source_id: row.id,
+            root: PathBuf::from(row.path),
+            status: row.status,
+            permission_denied: self.is_permission_denied(source),
+            unit,
+        }))
+    }
+
+    /// Re-indexes the one file `abs_path` of `source` now, in one
+    /// transaction (the same path the watcher's debounced batch takes), so
+    /// the cache describes the file as it is on disk before the caller
+    /// returns. Announces the change on the event stream, exactly as a
+    /// watcher batch would, so the graph refresh and the `graph:changed`
+    /// push still happen even though the caller discards the watcher's own
+    /// event for this write.
+    pub fn reindex_file(&self, source: &str, abs_path: &Path) -> Result<(), RegistryError> {
+        let cache = Cache::open(&self.cache_path)?;
+        let row = cache
+            .get_source(source)?
+            .ok_or_else(|| RegistryError::NotFound(source.to_string()))?;
+        let root = PathBuf::from(&row.path);
+        let ignore_rules = IgnoreRules::load(&root)?;
+        let changed: HashSet<PathBuf> = HashSet::from([abs_path.to_path_buf()]);
+        let outcome = scan::apply_change_batch(&cache, row.id, &root, &changed, &ignore_rules)?;
+        if !outcome.changed_paths.is_empty() {
+            let _ = self.events_tx.send(DaemonEvent::SourceChanged {
+                source: source.to_string(),
+                paths: outcome.changed_paths,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// [`SourceRegistry::cached_unit`]'s answer.
+#[derive(Debug, Clone)]
+pub struct CachedUnit {
+    pub source_id: i64,
+    /// The source's canonical root, as stored.
+    pub root: PathBuf,
+    /// The stored status (`active`, `stale` or `offline`).
+    pub status: SourceStatus,
+    /// The runtime overlay: the OS won't let `tephrad` list the root.
+    pub permission_denied: bool,
+    /// The cached row for the file; `None` for a path that is no file of
+    /// this source (or was never indexed).
+    pub unit: Option<tephra_cache::UnitRow>,
 }
 
 #[cfg(test)]

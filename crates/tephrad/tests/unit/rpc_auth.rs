@@ -9,7 +9,10 @@ use serde_json::{json, Value};
 use tephrad::rpc::auth::{authenticate, constant_time_token_eq, AuthError};
 
 use crate::rpc_fixtures::SharedMock;
-use crate::rpc_fixtures::{connect_ws, spawn_with_token_and_any_sources, MockGraph, MockSources};
+use crate::rpc_fixtures::{
+    connect_ws, spawn_with_token_and_any_sources, spawn_with_token_sources_and_blocks, MockGraph,
+    MockSources, RecordingBlocks, SharedBlocks,
+};
 
 fn headers_with_bearer(token: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
@@ -334,4 +337,113 @@ async fn unit_search_all_blocks_with_the_right_token_reaches_the_backend_once_pe
         vec![("conflict".to_string(), 7)]
     );
     assert!(sources.search_calls().is_empty());
+}
+
+// -- block.ensure_id (G11) ----------------------------------------------
+//
+// The gate lives in the transport handlers, before dispatch: a request
+// with no or a wrong token is refused with 401 and never reaches the
+// backend, so nothing can be written. (The same verb against the real
+// engine and a real file is in `tests/block_ensure_id.rs`.)
+
+fn ensure_id_request(id: u64, params: Value) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "method": "block.ensure_id", "params": params})
+}
+
+fn canned_created() -> Result<tephrad::block_id::EnsureIdWire, tephrad::block_id::BlockIdError> {
+    Ok(tephrad::block_id::EnsureIdWire {
+        id: Some("k3f9a2".into()),
+        link: "[[@notes:a#^k3f9a2]]".into(),
+        created: true,
+    })
+}
+
+#[tokio::test]
+async fn block_ensure_id_with_no_or_a_wrong_token_is_401_and_reaches_nothing() {
+    let blocks = std::sync::Arc::new(RecordingBlocks::answering(canned_created()));
+    let token = "k".repeat(64);
+    let server = spawn_with_token_sources_and_blocks(
+        MockGraph::new(),
+        MockSources::new(),
+        SharedBlocks(blocks.clone()),
+        token.as_str(),
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    // A valid call, a malformed one and an empty one: auth comes first,
+    // so none of them is told "invalid params".
+    let bodies = [
+        ensure_id_request(1, json!({"unit": "@notes:a.md", "line": 1})),
+        ensure_id_request(2, json!({"unit": "@notes:a.md"})),
+        ensure_id_request(3, json!({})),
+    ];
+    for body in &bodies {
+        let none = client
+            .post(server.http_url())
+            .json(body)
+            .send()
+            .await
+            .expect("request completes");
+        assert_eq!(none.status(), reqwest::StatusCode::UNAUTHORIZED, "{body}");
+        let parsed: Value = none.json().await.expect("JSON-RPC error body");
+        assert!(
+            parsed.get("result").is_none()
+                && parsed["error"]["code"] != json!(tephrad::rpc::protocol::INVALID_PARAMS),
+            "{body}: {parsed}"
+        );
+        for wrong in ["not-the-right-token", "", &format!("{token}x")] {
+            let response = client
+                .post(server.http_url())
+                .header("Authorization", format!("Bearer {wrong}"))
+                .json(body)
+                .send()
+                .await
+                .expect("request completes");
+            assert_eq!(
+                response.status(),
+                reqwest::StatusCode::UNAUTHORIZED,
+                "{body} with token {wrong:?}"
+            );
+        }
+    }
+    assert!(connect_ws(&server.ws_url(), "not-the-right-token")
+        .await
+        .is_err());
+    assert!(
+        blocks.calls().is_empty(),
+        "a refused request reached the backend"
+    );
+}
+
+#[tokio::test]
+async fn block_ensure_id_with_the_right_token_reaches_the_backend_once_per_request() {
+    let blocks = std::sync::Arc::new(RecordingBlocks::answering(canned_created()));
+    let token = "k".repeat(64);
+    let server = spawn_with_token_sources_and_blocks(
+        MockGraph::new(),
+        MockSources::new(),
+        SharedBlocks(blocks.clone()),
+        token.as_str(),
+    )
+    .await;
+    let response: Value = reqwest::Client::new()
+        .post(server.http_url())
+        .bearer_auth(&token)
+        .json(&ensure_id_request(
+            9,
+            json!({"unit": "@notes:a.md", "line": 4}),
+        ))
+        .send()
+        .await
+        .expect("request completes")
+        .json()
+        .await
+        .expect("JSON body");
+    assert_eq!(
+        response["result"],
+        json!({"id": "k3f9a2", "link": "[[@notes:a#^k3f9a2]]", "created": true}),
+        "{response}"
+    );
+    assert_eq!(blocks.calls(), vec![("@notes:a.md".to_string(), 4)]);
 }

@@ -447,7 +447,10 @@ fn run_server(
             )) as Arc<dyn RefactorBackend>,
             Some(graph_refresh),
             Some(shutdown_rx.clone()),
-        ));
+        )
+        .with_blocks(Arc::new(tephrad::block_id::BlockIdEngine::new(
+            registry.clone(),
+        ))));
 
         // Forwards every `DaemonEvent` the registry's watchers/rescans
         // produce (GP6) to connected WebSocket clients as a

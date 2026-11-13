@@ -1,0 +1,4 @@
+first log line
+second log line
+
+another paragraph

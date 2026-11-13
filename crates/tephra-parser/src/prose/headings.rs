@@ -29,12 +29,17 @@ use crate::markdown_pass::Heading;
 pub(crate) struct NativeHeadings {
     pub headings: Vec<Heading>,
     pub heading_lines: Vec<bool>,
+    /// `(first line, last line)` of each heading, 1-indexed and parallel
+    /// to `headings`: an rst title spans its underline and, with one,
+    /// its overline.
+    pub spans: Vec<(usize, usize)>,
 }
 
 pub(crate) fn find(format: ProseFormat, lines: &[Line<'_>], literal: &[bool]) -> NativeHeadings {
     let mut out = NativeHeadings {
         headings: Vec::new(),
         heading_lines: vec![false; lines.len()],
+        spans: Vec::new(),
     };
     match format {
         ProseFormat::Org => star_or_equals(lines, literal, b'*', usize::MAX, &mut out),
@@ -77,6 +82,7 @@ fn star_or_equals(
             line: i + 1,
         });
         out.heading_lines[i] = true;
+        out.spans.push((i + 1, i + 1));
     }
 }
 
@@ -133,6 +139,7 @@ fn rst(lines: &[Line<'_>], literal: &[bool], out: &mut NativeHeadings) {
                 for flag in &mut out.heading_lines[i..=i + 2] {
                     *flag = true;
                 }
+                out.spans.push((i + 1, i + 3));
                 prev_is_text = false;
                 i += 3;
                 continue;
@@ -160,6 +167,7 @@ fn rst(lines: &[Line<'_>], literal: &[bool], out: &mut NativeHeadings) {
                     });
                     out.heading_lines[i] = true;
                     out.heading_lines[i + 1] = true;
+                    out.spans.push((i + 1, i + 2));
                     prev_is_text = false;
                     i += 2;
                     continue;
