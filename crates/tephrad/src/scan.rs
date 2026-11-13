@@ -103,7 +103,7 @@
 //! deterministic and free when uncontended instead: see
 //! `crate::writer_gate`'s module doc comment for the full rationale.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::io;
@@ -114,9 +114,10 @@ use rusqlite::{Transaction, TransactionBehavior};
 use tephra_cache::{Cache, NewFtsRow, NewUnit};
 use tephra_parser::IndexRow;
 
+use crate::dup_ids::{self, CachedId, Fixed};
 use crate::file_kind::{self, FileKind, MAX_INDEXED_BYTES};
 use crate::ignore::IgnoreRules;
-use crate::refactor;
+use crate::refactor::{self, AtomicFs, RealFs};
 use crate::writer_gate::{self, WriterGate, WriterGateGuard};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -148,10 +149,16 @@ impl ScanStats {
 /// that turned out not to need any cache write at all (R5 review
 /// finding). A caller reporting `source_changed` uses
 /// `changed_paths`, not the raw input batch.
+///
+/// `deferred` are the paths of files left alone because their duplicate
+/// block ID rename ([`Fixed::Deferred`]) could not be written yet: the
+/// file's rows are as they were. The caller tries them again
+/// ([`settle_deferred`]).
 #[derive(Debug, Default, Clone)]
 pub struct ChangeOutcome {
     pub stats: ScanStats,
     pub changed_paths: Vec<PathBuf>,
+    pub deferred: Vec<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -304,6 +311,61 @@ fn open_chunk<'c, 'g>(
     Ok((permit, tx))
 }
 
+/// A rescan's duplicate ID context: the filesystem a rename writes
+/// through, the cache's block IDs per file path from before it cleared,
+/// and where the files left for a retry are collected ([`DupCtx`]'s
+/// `can_defer`): the rescan retries them once its walk has committed.
+#[derive(Clone, Copy)]
+struct DupSource<'a> {
+    fs: &'a dyn AtomicFs,
+    cached: &'a HashMap<String, Vec<CachedId>>,
+    deferred: &'a std::cell::RefCell<Vec<PathBuf>>,
+}
+
+/// What `write_unit` needs to rename a duplicate block ID (G19): the
+/// block IDs the cache held for the file before this write, and the
+/// filesystem the rename writes through. A file with no context (a new
+/// one, a first scan) is never written (E7).
+struct DupCtx<'a> {
+    fs: &'a dyn AtomicFs,
+    cached: &'a [CachedId],
+    /// Whether a file someone else is changing (or that another writer
+    /// holds) may be left for a retry ([`Fixed::Deferred`]) instead of
+    /// being indexed with the duplicate in it. The caller then retries
+    /// it ([`settle_deferred`]); only a caller's last try says no, so
+    /// that a file that never settles still gets indexed as it is.
+    can_defer: bool,
+    /// Set when `write_unit` left the file alone for that reason: it
+    /// wrote nothing and changed no row.
+    deferred: std::cell::Cell<bool>,
+}
+
+/// Every block ID the cache holds for `source_id`'s files, by path, with
+/// the text indexed for it: the cache as it was before a rescan clears
+/// it, so an ID that is repeated after an edit made while the daemon was
+/// stopped is told from one the file already had twice.
+fn cached_ids_of_source(
+    cache: &Cache,
+    source_id: i64,
+) -> Result<HashMap<String, Vec<CachedId>>, ScanError> {
+    let mut out: HashMap<String, Vec<CachedId>> = HashMap::new();
+    cache.for_each_id_block(source_id, None, |b| {
+        out.entry(b.rel_path.clone()).or_default().push((&b).into());
+    })?;
+    Ok(out)
+}
+
+/// The block IDs the cache holds for the one file `rel_path`.
+fn cached_ids_of_file(
+    cache: &Cache,
+    source_id: i64,
+    rel_path: &str,
+) -> Result<Vec<CachedId>, ScanError> {
+    let mut out = Vec::new();
+    cache.for_each_id_block(source_id, Some(rel_path), |b| out.push((&b).into()))?;
+    Ok(out)
+}
+
 /// Relative path, normalized to forward slashes regardless of
 /// platform, for storage in `units.rel_path` and for matching against
 /// [`IgnoreRules`].
@@ -416,6 +478,7 @@ fn write_unit(
     source_id: i64,
     root: &Path,
     abs_path: &Path,
+    dup: Option<&DupCtx<'_>>,
 ) -> Result<Option<ScanStats>, ScanError> {
     let rel_path = match to_rel_string(root, abs_path) {
         Some(r) => r,
@@ -486,6 +549,16 @@ fn write_unit(
             parsed_doc = parse_document(abs_path, &bytes);
         }
     }
+    // G19: size and mtime from before the read, for the check just
+    // before a duplicate ID rename. Taken only for a file the cache has
+    // block IDs for: no other file can be renamed.
+    // A file whose rename was given up on at the last try (and so was
+    // indexed with its duplicate) plans against the IDs it had before
+    // that edit, not against the cache's rows, which now hold the ID
+    // twice.
+    let given_up = dup.and_then(|_| dup_ids::given_up_ids(cache.path(), source_id, &rel_path));
+    let dup = dup.filter(|d| !d.cached.is_empty() || given_up.is_some());
+    let fingerprint = dup.as_ref().and_then(|d| d.fs.fingerprint(abs_path).ok());
     if !too_large && matches!(kind, FileKind::Prose | FileKind::Code) {
         let bytes = match read_capped(abs_path) {
             Ok(b) => b,
@@ -501,6 +574,66 @@ fn write_unit(
         } else {
             match parse_file(kind, abs_path, file_name, &head, &bytes) {
                 Ok(Some((unit, rows))) => {
+                    // G19: an ID the file had in the cache that an
+                    // edit made appear again is renamed on disk, and
+                    // the file is read again (once: no context the
+                    // second time) so the rows hold the new ID.
+                    if let (Some(d), Ok(text)) = (&dup, std::str::from_utf8(&bytes)) {
+                        let lang = file_kind::language_for(file_name, &head);
+                        let parse = |t: &str| match (kind, lang) {
+                            (FileKind::Code, Some(lang)) => {
+                                tephra_parser::parse_code_unit(abs_path, lang, t)
+                            }
+                            _ => tephra_parser::parse_unit(abs_path, t),
+                        };
+                        let unit_id = || {
+                            let name = cache
+                                .list_sources()
+                                .ok()
+                                .and_then(|all| all.into_iter().find(|s| s.id == source_id))
+                                .map_or_else(|| source_id.to_string(), |s| s.name);
+                            format!("@{name}:{rel_path}")
+                        };
+                        let cached = given_up.as_deref().unwrap_or(d.cached);
+                        let fixed = dup_ids::fix_file(
+                            d.fs,
+                            abs_path,
+                            &unit_id,
+                            text,
+                            fingerprint,
+                            &unit,
+                            &rows,
+                            cached,
+                            &parse,
+                            &mut rand::thread_rng(),
+                        );
+                        match fixed {
+                            Fixed::Renamed(_) => {
+                                dup_ids::forget_given_up(cache.path(), source_id, &rel_path);
+                                return write_unit(cache, source_id, root, abs_path, None);
+                            }
+                            Fixed::Deferred if d.can_defer => {
+                                d.deferred.set(true);
+                                return Ok(None);
+                            }
+                            Fixed::Deferred => {
+                                // The last try: the file is indexed with
+                                // its duplicate below, so keep what the
+                                // cache held, or the planner would take
+                                // the ID for an old duplicate (E7) and
+                                // never rename it.
+                                dup_ids::remember_given_up(
+                                    cache.path(),
+                                    source_id,
+                                    &rel_path,
+                                    cached,
+                                );
+                            }
+                            Fixed::Untouched => {
+                                dup_ids::forget_given_up(cache.path(), source_id, &rel_path);
+                            }
+                        }
+                    }
                     parsed = Some(unit);
                     index_rows = rows;
                 }
@@ -575,7 +708,10 @@ fn write_unit(
 
     // E7: an ID that appears twice is stored twice (below) and
     // reported here. E12: so is a code parse that was given up on.
-    // The file itself is never touched by a scan.
+    // The one write a scan makes is G19's rename of an ID an edit made
+    // appear again (above, in the parse step, before this point); a
+    // duplicate that was there when the file was first scanned is never
+    // written.
     for diag in &parsed.diagnostics {
         match diag.kind {
             tephra_parser::DiagnosticKind::DuplicateBlockId => tracing::warn!(
@@ -839,6 +975,7 @@ fn walk_and_write(
     ignore: &IgnoreRules,
     gate: &WriterGate,
     first_chunk: (WriterGateGuard<'_>, Transaction<'_>),
+    dup: Option<DupSource<'_>>,
 ) -> Result<ScanStats, ScanError> {
     let mut stats = ScanStats::default();
     let (mut permit, mut tx) = (Some(first_chunk.0), Some(first_chunk.1));
@@ -914,7 +1051,24 @@ fn walk_and_write(
             stats.files_ignored += 1;
             continue;
         }
-        if let Some(file_stats) = write_unit(cache, source_id, root, entry.path())? {
+        let ctx = dup.and_then(|d| {
+            let cached = d.cached.get(&to_rel_string(root, entry.path())?)?;
+            Some(DupCtx {
+                fs: d.fs,
+                cached,
+                can_defer: true,
+                deferred: std::cell::Cell::new(false),
+            })
+        });
+        let written = write_unit(cache, source_id, root, entry.path(), ctx.as_ref())?;
+        if ctx.as_ref().is_some_and(|c| c.deferred.get()) {
+            // Not indexed: the rescan's rows for it were cleared, so
+            // the walk leaves it out and the rescan retries it after
+            // this walk commits (with the same cached IDs).
+            if let Some(d) = dup {
+                d.deferred.borrow_mut().push(entry.path().to_path_buf());
+            }
+        } else if let Some(file_stats) = written {
             stats.accumulate(file_stats);
         }
 
@@ -1067,7 +1221,7 @@ pub fn scan_source(
     let gate = writer_gate::for_path(cache.path());
     record_scan_started(cache, &gate, source_id)?;
     let first_chunk = open_chunk(cache, &gate)?;
-    let stats = walk_and_write(cache, source_id, root, ignore, &gate, first_chunk)?;
+    let stats = walk_and_write(cache, source_id, root, ignore, &gate, first_chunk, None)?;
     record_scan_finished(cache, &gate, source_id)?;
     Ok(stats)
 }
@@ -1083,19 +1237,128 @@ pub fn scan_source(
 /// rescan can still leave the source with only part of its rows
 /// restored until the next rescan, a deliberate trade against holding
 /// the sole SQLite writer lock for the whole walk.
+///
+/// G19: the block IDs the rows held before the clear are what tells an
+/// ID that an edit made while the daemon was stopped repeated (renamed)
+/// from one the file had twice already (left alone). A source with no
+/// rows to clear (a schema rebuild emptied it) has none, so nothing is
+/// renamed (E7).
 pub fn rescan_source(
     cache: &Cache,
     source_id: i64,
     root: &Path,
     ignore: &IgnoreRules,
 ) -> Result<ScanStats, ScanError> {
+    rescan_source_with(cache, source_id, root, ignore, &RealFs)
+}
+
+/// [`rescan_source`] with the filesystem a duplicate ID rename writes
+/// through injected (a test makes the write fail or the file change).
+pub fn rescan_source_with(
+    cache: &Cache,
+    source_id: i64,
+    root: &Path,
+    ignore: &IgnoreRules,
+    fs_ops: &dyn AtomicFs,
+) -> Result<ScanStats, ScanError> {
     let gate = writer_gate::for_path(cache.path());
     record_scan_started(cache, &gate, source_id)?;
     let first_chunk = open_chunk(cache, &gate)?;
+    let cached = cached_ids_of_source(cache, source_id)?;
     cache.delete_units_for_source(source_id)?;
-    let stats = walk_and_write(cache, source_id, root, ignore, &gate, first_chunk)?;
+    let deferred = std::cell::RefCell::new(Vec::new());
+    let mut stats = walk_and_write(
+        cache,
+        source_id,
+        root,
+        ignore,
+        &gate,
+        first_chunk,
+        Some(DupSource {
+            fs: fs_ops,
+            cached: &cached,
+            deferred: &deferred,
+        }),
+    )?;
+    // A file whose rename could not be written during the walk (another
+    // writer held it, or it changed under the read) has no rows yet:
+    // try it again, with the IDs the cache held for it before the clear,
+    // until it settles. The scan is not finished until then.
+    let pending: HashSet<PathBuf> = deferred.into_inner().into_iter().collect();
+    if !pending.is_empty() {
+        let outcome = settle_deferred(
+            pending,
+            DEFER_RETRY_DELAY,
+            |paths, can_defer| {
+                retry_on_busy(|| {
+                    apply_change_batch_once(
+                        cache,
+                        source_id,
+                        root,
+                        paths,
+                        ignore,
+                        fs_ops,
+                        BatchOpts {
+                            can_defer,
+                            cached: Some(&cached),
+                        },
+                    )
+                })
+            },
+            |_| {},
+        )?;
+        stats.accumulate(outcome.stats);
+    }
     record_scan_finished(cache, &gate, source_id)?;
     Ok(stats)
+}
+
+/// How many times a file whose duplicate ID rename could not be written
+/// yet is tried again, and the pause between tries (about two seconds in
+/// all). After the last one the file is indexed as it is, with the
+/// duplicate; the IDs the cache held for it are kept in memory
+/// ([`dup_ids::remember_given_up`]), so its next re-parse (an edit, a
+/// rescan) renames the copy. A restart forgets them, and the file then
+/// counts as one scanned with its duplicate (E7).
+pub const DEFER_RETRIES: u32 = 8;
+pub const DEFER_RETRY_DELAY: Duration = Duration::from_millis(250);
+
+/// Runs `attempt` on `changed` and then, until none is left, on the
+/// paths it hands back as [`ChangeOutcome::deferred`], pausing `delay`
+/// between rounds. `attempt` gets the paths and whether it may defer
+/// again: the last round may not, so every file ends up indexed from
+/// what is on disk. The pause runs with no lock of the caller's held
+/// (`attempt` takes what it needs for one round only). `report` sees
+/// every round's outcome as it happens. Returns the rounds merged.
+pub fn settle_deferred(
+    changed: HashSet<PathBuf>,
+    delay: Duration,
+    mut attempt: impl FnMut(&HashSet<PathBuf>, bool) -> Result<ChangeOutcome, ScanError>,
+    mut report: impl FnMut(&ChangeOutcome),
+) -> Result<ChangeOutcome, ScanError> {
+    let mut total = ChangeOutcome::default();
+    let mut pending = changed;
+    for round in 0..=DEFER_RETRIES {
+        let can_defer = round < DEFER_RETRIES;
+        if !can_defer {
+            tracing::warn!(
+                paths = ?pending,
+                "a duplicate block ID could not be renamed after {DEFER_RETRIES} tries; indexing the file as it is"
+            );
+        }
+        let outcome = attempt(&pending, can_defer)?;
+        report(&outcome);
+        total.stats.accumulate(outcome.stats);
+        total.stats.files_seen += outcome.stats.files_seen;
+        total.stats.files_ignored += outcome.stats.files_ignored;
+        total.changed_paths.extend(outcome.changed_paths);
+        if outcome.deferred.is_empty() {
+            return Ok(total);
+        }
+        std::thread::sleep(delay);
+        pending = outcome.deferred.into_iter().collect();
+    }
+    Ok(total)
 }
 
 /// Walks an existing directory that arrived as one changed path (a
@@ -1155,7 +1418,7 @@ fn upsert_directory(
         let had_existing = delete_existing_unit(cache, source_id, &rel_path)?;
         stats.files_seen += 1;
         let mut wrote_unit = false;
-        if let Some(file_stats) = write_unit(cache, source_id, root, entry.path())? {
+        if let Some(file_stats) = write_unit(cache, source_id, root, entry.path(), None)? {
             stats.accumulate(file_stats);
             wrote_unit = true;
         }
@@ -1207,7 +1470,65 @@ pub fn apply_change_batch(
     changed: &HashSet<PathBuf>,
     ignore: &IgnoreRules,
 ) -> Result<ChangeOutcome, ScanError> {
-    retry_on_busy(|| apply_change_batch_once(cache, source_id, root, changed, ignore))
+    apply_change_batch_with(cache, source_id, root, changed, ignore, &RealFs)
+}
+
+/// [`apply_change_batch`] with the filesystem a duplicate block ID
+/// rename (G19) writes through injected: a test makes the write fail or
+/// the file change between the read and the write. A changed file the
+/// cache already has block IDs for is parsed, and an ID it held once that
+/// the file now holds again is renamed on disk before the file's rows
+/// replace the cached ones; every other file is only read.
+pub fn apply_change_batch_with(
+    cache: &Cache,
+    source_id: i64,
+    root: &Path,
+    changed: &HashSet<PathBuf>,
+    ignore: &IgnoreRules,
+    fs_ops: &dyn AtomicFs,
+) -> Result<ChangeOutcome, ScanError> {
+    apply_change_batch_deferring(cache, source_id, root, changed, ignore, fs_ops, true)
+}
+
+/// [`apply_change_batch_with`] where the caller says whether a file whose
+/// rename cannot be written yet may be left for another try
+/// (`can_defer`, [`ChangeOutcome::deferred`]) or must be indexed as it is
+/// on disk. A caller that can try again ([`settle_deferred`]) passes
+/// `true` until its last round.
+pub fn apply_change_batch_deferring(
+    cache: &Cache,
+    source_id: i64,
+    root: &Path,
+    changed: &HashSet<PathBuf>,
+    ignore: &IgnoreRules,
+    fs_ops: &dyn AtomicFs,
+    can_defer: bool,
+) -> Result<ChangeOutcome, ScanError> {
+    retry_on_busy(|| {
+        apply_change_batch_once(
+            cache,
+            source_id,
+            root,
+            changed,
+            ignore,
+            fs_ops,
+            BatchOpts {
+                can_defer,
+                cached: None,
+            },
+        )
+    })
+}
+
+/// How one attempt at a batch treats duplicate block IDs.
+#[derive(Clone, Copy)]
+struct BatchOpts<'a> {
+    /// See [`DupCtx`]'s `can_defer`.
+    can_defer: bool,
+    /// The block IDs to take as the cache's for each file path, in place
+    /// of reading the cache: a rescan's retry of a file has no rows of
+    /// its own any more, only the IDs the cache held before the clear.
+    cached: Option<&'a HashMap<String, Vec<CachedId>>>,
 }
 
 /// One attempt at [`apply_change_batch`]'s work, run inside its own
@@ -1223,9 +1544,12 @@ fn apply_change_batch_once(
     root: &Path,
     changed: &HashSet<PathBuf>,
     ignore: &IgnoreRules,
+    fs_ops: &dyn AtomicFs,
+    opts: BatchOpts<'_>,
 ) -> Result<ChangeOutcome, ScanError> {
     let mut stats = ScanStats::default();
     let mut touched_paths: Vec<PathBuf> = Vec::new();
+    let mut deferred_paths: Vec<PathBuf> = Vec::new();
 
     // Brackets the whole batch in one BEGIN IMMEDIATE/COMMIT (E5):
     // `cache`'s typed insert/delete helpers below still operate
@@ -1285,13 +1609,40 @@ fn apply_change_batch_once(
                 )?;
             }
             Ok(meta) if meta.is_file() => {
-                let had_existing = delete_existing_unit(cache, source_id, &rel_path)?;
-                stats.files_seen += 1;
-                let mut wrote_unit = false;
-                if let Some(file_stats) = write_unit(cache, source_id, root, abs_path)? {
-                    stats.accumulate(file_stats);
-                    wrote_unit = true;
+                // G19: what the cache held for the file, before its
+                // row is replaced.
+                let cached = match opts.cached {
+                    Some(map) => map.get(&rel_path).cloned().unwrap_or_default(),
+                    None => cached_ids_of_file(cache, source_id, &rel_path)?,
+                };
+                let had_existing = cache.get_unit_by_rel_path(source_id, &rel_path)?.is_some();
+                let ctx = DupCtx {
+                    fs: fs_ops,
+                    cached: &cached,
+                    can_defer: opts.can_defer,
+                    deferred: std::cell::Cell::new(false),
+                };
+                let written = write_unit(cache, source_id, root, abs_path, Some(&ctx))?;
+                if ctx.deferred.get() {
+                    // A file in flux: its rows are as they were (none,
+                    // in a rescan's retry), and the caller tries it
+                    // again.
+                    deferred_paths.push(abs_path.clone());
+                    continue;
                 }
+                stats.files_seen += 1;
+                let wrote_unit = match written {
+                    Some(file_stats) => {
+                        stats.accumulate(file_stats);
+                        true
+                    }
+                    None => {
+                        // Nothing to index (it vanished, is a symlink,
+                        // or cannot be read): its old row goes.
+                        delete_existing_unit(cache, source_id, &rel_path)?;
+                        false
+                    }
+                };
                 if had_existing || wrote_unit {
                     touched_paths.push(abs_path.clone());
                 }
@@ -1313,6 +1664,8 @@ fn apply_change_batch_once(
                 // advance which one it used to be.
                 let had_existing = delete_existing_unit(cache, source_id, &rel_path)?;
                 let nested_deleted = cache.delete_units_under_prefix(source_id, &rel_path)?;
+                // A file that is gone has no rename to wait for.
+                dup_ids::forget_given_up(cache.path(), source_id, &rel_path);
                 if had_existing || nested_deleted > 0 {
                     touched_paths.push(abs_path.clone());
                 }
@@ -1325,5 +1678,6 @@ fn apply_change_batch_once(
     Ok(ChangeOutcome {
         stats,
         changed_paths: touched_paths,
+        deferred: deferred_paths,
     })
 }

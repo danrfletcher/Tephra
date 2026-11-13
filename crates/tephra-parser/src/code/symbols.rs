@@ -1577,6 +1577,7 @@ fn own_block_ids(
                 block_id: id.to_string(),
                 line: owner.map_or(row, |o| symbols[o].line),
                 symbol: owner,
+                token_line: row,
             });
         }
     }

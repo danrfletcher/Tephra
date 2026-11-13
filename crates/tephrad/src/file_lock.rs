@@ -58,6 +58,38 @@ pub fn lock(path: &Path) -> FileLockGuard {
     FileLockGuard { key, slot }
 }
 
+/// Like [`lock`], but returns `None` at once when another caller holds
+/// the lock for `path`, instead of waiting. For a writer that already
+/// holds something the holder may be waiting for (the duplicate ID
+/// rename runs inside a cache transaction, while `block.ensure_id` holds
+/// this lock and then waits for the cache), so waiting could deadlock.
+pub fn try_lock(path: &Path) -> Option<FileLockGuard> {
+    let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let slot = {
+        let mut map = slots().lock().unwrap_or_else(|p| p.into_inner());
+        Arc::clone(map.entry(key.clone()).or_insert_with(|| {
+            Arc::new(Slot {
+                held: Mutex::new(false),
+                freed: Condvar::new(),
+            })
+        }))
+    };
+    let mut held = slot.held.lock().unwrap_or_else(|p| p.into_inner());
+    if *held {
+        drop(held);
+        // Give the slot back the way a guard would: forget it when no
+        // one else holds or waits on it (the map and this clone).
+        let mut map = slots().lock().unwrap_or_else(|p| p.into_inner());
+        if Arc::strong_count(&slot) == 2 {
+            map.remove(&key);
+        }
+        return None;
+    }
+    *held = true;
+    drop(held);
+    Some(FileLockGuard { key, slot })
+}
+
 impl Drop for FileLockGuard {
     fn drop(&mut self) {
         {

@@ -661,7 +661,16 @@ impl SourceRegistry {
         let blocking_handle = self.runtime.handle().clone();
         let ignore_for_batch = Arc::clone(&ignore_rules);
 
-        let on_batch = move |changed: std::collections::HashSet<PathBuf>| {
+        let on_batch = move |mut changed: std::collections::HashSet<PathBuf>| {
+            // G19: the file events of Tephra's own duplicate ID rename
+            // are not changes to react to: the file was indexed again
+            // as part of the rename. A batch made only of them stops
+            // here, so a rename never starts another batch.
+            let own = crate::dup_ids::drop_self_writes(&mut changed);
+            if own > 0 && changed.is_empty() {
+                tracing::debug!(source = %source_name, own, "debounce_fired for Tephra's own write; skipped");
+                return;
+            }
             tracing::info!(
                 source = %source_name,
                 batch_size = changed.len(),
@@ -682,22 +691,42 @@ impl SourceRegistry {
             // whole batch — doing so would stall every other
             // source's watcher sharing that runtime.
             let join_handle = blocking_handle.spawn_blocking(move || {
-                // R12: read the *current* shared rules, not a
-                // snapshot reloaded from disk independently of the
-                // watcher's own event filter — a rescan writes its
-                // freshly reloaded rules into this same lock, so the
-                // batch-apply path and the event filter always agree
-                // on what's ignored.
-                let ignore_rules = ignore_for_batch.read().unwrap().clone();
-                let cache = batch_cache.lock().unwrap();
-                match scan::apply_change_batch(&cache, source_id, &source_root, &changed, &ignore_rules) {
-                    Ok(outcome) => {
-                        // R5: report only the paths that were
-                        // actually upserted or deleted, and skip the
-                        // event entirely when nothing really changed
-                        // (e.g. a batch made entirely of
-                        // ignored/directory-only paths that the
-                        // watcher-level filter let through anyway).
+                // A file whose duplicate ID rename could not be written
+                // yet (another writer holds it, or it changed under the
+                // read) comes back as deferred and is tried again after
+                // a pause, with no lock of ours held in between: a held
+                // file lock raises no file event, so nothing else would
+                // bring the file back, and its cached rows would stay
+                // stale (`block.ensure_id` refuses against them).
+                let result = scan::settle_deferred(
+                    changed,
+                    scan::DEFER_RETRY_DELAY,
+                    |paths, can_defer| {
+                        // R12: read the *current* shared rules, not a
+                        // snapshot reloaded from disk independently of
+                        // the watcher's own event filter — a rescan
+                        // writes its freshly reloaded rules into this
+                        // same lock, so the batch-apply path and the
+                        // event filter always agree on what's ignored.
+                        let ignore_rules = ignore_for_batch.read().unwrap().clone();
+                        let cache = batch_cache.lock().unwrap();
+                        scan::apply_change_batch_deferring(
+                            &cache,
+                            source_id,
+                            &source_root,
+                            paths,
+                            &ignore_rules,
+                            &crate::refactor::RealFs,
+                            can_defer,
+                        )
+                    },
+                    |outcome| {
+                        // R5: report only the paths that were actually
+                        // upserted or deleted, and skip the event
+                        // entirely when nothing really changed (e.g. a
+                        // batch made entirely of ignored/directory-only
+                        // paths that the watcher-level filter let
+                        // through anyway).
                         if !outcome.changed_paths.is_empty() {
                             tracing::info!(
                                 source = %source_name,
@@ -705,14 +734,14 @@ impl SourceRegistry {
                                 "source_changed"
                             );
                             let _ = events_tx.send(DaemonEvent::SourceChanged {
-                                source: source_name,
-                                paths: outcome.changed_paths,
+                                source: source_name.clone(),
+                                paths: outcome.changed_paths.clone(),
                             });
                         }
-                    }
-                    Err(e) => {
-                        tracing::warn!(source = %source_name, error = %e, "failed to apply change batch");
-                    }
+                    },
+                );
+                if let Err(e) = result {
+                    tracing::warn!(source = %source_name, error = %e, "failed to apply change batch");
                 }
             });
             // Fire-and-forget: `on_batch` itself is a synchronous

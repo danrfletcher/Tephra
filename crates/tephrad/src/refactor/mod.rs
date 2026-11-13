@@ -715,6 +715,16 @@ pub trait AtomicFs: Send + Sync {
     /// Atomically replaces `to` with `from` (same directory, so this
     /// is a single `rename(2)`/`MoveFileEx` syscall, not a copy).
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
+    /// What identifies the exact bytes of `path` between two looks at
+    /// it: its size and mtime (the entry itself, a symlink not followed).
+    /// A writer that read a file takes this before the read and again
+    /// just before its write (G19's duplicate ID rename), and writes
+    /// nothing if the two differ. Behind the trait so a test can make the
+    /// file change between the two looks.
+    fn fingerprint(&self, path: &Path) -> io::Result<(u64, Option<std::time::SystemTime>)> {
+        let meta = fs::symlink_metadata(path)?;
+        Ok((meta.len(), meta.modified().ok()))
+    }
 }
 
 /// The real implementation: `std::fs` all the way down.

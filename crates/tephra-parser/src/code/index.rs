@@ -344,16 +344,19 @@ mod tests {
                 block_id: "k3f9a2".into(),
                 line: 1,
                 symbol: None,
+                token_line: 1,
             },
             BlockAnchor {
                 block_id: "other".into(),
                 line: 2,
                 symbol: Some(0),
+                token_line: 2,
             },
             BlockAnchor {
                 block_id: "solo".into(),
                 line: 4,
                 symbol: Some(0),
+                token_line: 4,
             },
         ];
         let blocks = blocks_of(src, &anchors);

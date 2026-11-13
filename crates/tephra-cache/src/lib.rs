@@ -35,8 +35,8 @@ pub use schema::KindInferrer;
 pub use search::{compare_hits, file_stem, resolve_title, NameCandidate, NameHit, NAME_SEARCH_SQL};
 pub use sources::{validate_transition, InvalidTransition, SourceRow, SourceStatus};
 pub use units::{
-    BlockOccurrence, BlockRow, HeadingRow, LinkRow, NewBlock, NewHeading, NewLink, NewSymbol,
-    NewTag, NewUnit, SymbolRow, TagRow, UnitRow, UnitWithSourceStatus,
+    BlockOccurrence, BlockRow, HeadingRow, IdBlockText, LinkRow, NewBlock, NewHeading, NewLink,
+    NewSymbol, NewTag, NewUnit, SymbolRow, TagRow, UnitRow, UnitWithSourceStatus,
 };
 
 /// The schema version this build of the crate expects. Bumping this

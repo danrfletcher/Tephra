@@ -11,8 +11,8 @@ use rusqlite::Connection;
 use crate::schema::{self, KindInferrer};
 use crate::sources::{self, SourceRow, SourceStatus};
 use crate::units::{
-    self, BlockOccurrence, BlockRow, HeadingRow, LinkRow, NewBlock, NewHeading, NewLink, NewSymbol,
-    NewTag, NewUnit, SymbolRow, TagRow, UnitRow, UnitWithSourceStatus,
+    self, BlockOccurrence, BlockRow, HeadingRow, IdBlockText, LinkRow, NewBlock, NewHeading,
+    NewLink, NewSymbol, NewTag, NewUnit, SymbolRow, TagRow, UnitRow, UnitWithSourceStatus,
 };
 use crate::{CacheError, CURRENT_SCHEMA_VERSION};
 
@@ -563,6 +563,20 @@ impl Cache {
         block_id: &str,
     ) -> Result<Vec<BlockOccurrence>, CacheError> {
         units::blocks_with_id(&self.conn, source_id, block_id)
+    }
+
+    /// Every block ID occurrence of `source_id`'s units (only the unit at
+    /// `rel_path`, when given) with the index text stored for it, handed
+    /// to `f` one at a time, in path then line order. What the duplicate
+    /// ID rename (G19) reads to know what a file's cache held before an
+    /// edit.
+    pub fn for_each_id_block(
+        &self,
+        source_id: i64,
+        rel_path: Option<&str>,
+        f: impl FnMut(IdBlockText),
+    ) -> Result<(), CacheError> {
+        units::for_each_id_block(&self.conn, source_id, rel_path, f)
     }
 
     /// Every `links` row authored by `from_unit_id`. Read counterpart

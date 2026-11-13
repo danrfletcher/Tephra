@@ -33,6 +33,12 @@ pub struct BlockAnchor {
     /// comment with no symbol to own it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbol: Option<usize>,
+    /// 1-indexed line the `^id` token itself is on. Equal to `line` for
+    /// prose; for a code ID that belongs to a symbol it is the line of
+    /// the comment, which can be above `line` (G19 renames the token in
+    /// place, so it needs to know where it is). Not serialised.
+    #[serde(skip)]
+    pub token_line: usize,
 }
 
 /// One block of prose: a paragraph, or one list item's own text, with
@@ -140,6 +146,7 @@ pub(crate) fn scan(
                     block_id: id.to_string(),
                     line: absolute_line,
                     symbol: None,
+                    token_line: absolute_line,
                 });
             }
         }

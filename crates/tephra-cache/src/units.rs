@@ -604,6 +604,54 @@ pub(crate) fn blocks_with_id(
     Ok(out)
 }
 
+/// One stored block ID occurrence with the text the `^^` index holds for
+/// it: what [`for_each_id_block`] hands its callback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdBlockText {
+    pub rel_path: String,
+    pub block_id: String,
+    /// The `blocks` row's line (a code symbol's first line).
+    pub line: i64,
+    /// The text of the first `block_fts` row of the same unit that
+    /// carries this ID (the paragraph without its `^id`, a symbol's name,
+    /// a comment block's text); `None` when the index has no such row.
+    pub text: Option<String>,
+}
+
+/// Calls `f` for every `blocks` row with a block ID in the units of
+/// `source_id` (only the unit at `rel_path`, when given), in path, line
+/// order, one at a time so a caller can fold each into something small
+/// instead of holding every text. The text comes from the unit's own
+/// `block_fts` rowid range, so it is one bounded range scan per row.
+pub(crate) fn for_each_id_block(
+    conn: &Connection,
+    source_id: i64,
+    rel_path: Option<&str>,
+    mut f: impl FnMut(IdBlockText),
+) -> Result<(), CacheError> {
+    let mut stmt = conn.prepare(
+        "SELECT u.rel_path, b.block_id, b.line, \
+                (SELECT f.text FROM block_fts f \
+                  WHERE f.rowid >= (u.id << 24) AND f.rowid < ((u.id + 1) << 24) \
+                    AND f.block_id = b.block_id \
+                  ORDER BY f.rowid LIMIT 1) \
+         FROM units u JOIN blocks b ON b.unit_id = u.id \
+         WHERE u.source_id = ?1 AND b.block_id IS NOT NULL \
+           AND (?2 IS NULL OR u.rel_path = ?2) \
+         ORDER BY u.rel_path, b.line, b.id",
+    )?;
+    let mut rows = stmt.query(rusqlite::params![source_id, rel_path])?;
+    while let Some(row) = rows.next()? {
+        f(IdBlockText {
+            rel_path: row.get(0)?,
+            block_id: row.get(1)?,
+            line: row.get(2)?,
+            text: row.get(3)?,
+        });
+    }
+    Ok(())
+}
+
 /// Every `headings` row belonging to `unit_id`, in file order (line,
 /// then insertion). Read counterpart to [`insert_heading`].
 pub(crate) fn headings_for_unit(
