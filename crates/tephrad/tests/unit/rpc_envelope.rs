@@ -188,6 +188,7 @@ fn backends<'a>(graph: &'a NullGraph, sources: &'a NullSources) -> Backends<'a> 
         graph,
         sources,
         refactor: &NULL_REFACTOR,
+        blocks: &tephrad::rpc::backend::UnsupportedBlockIds,
     }
 }
 
@@ -207,23 +208,95 @@ fn unknown_method_returns_method_not_found() {
     assert_eq!(err.0, METHOD_NOT_FOUND);
 }
 
+/// The closed set: the ten verbs before the file-types ticket, then
+/// `unit.list` (PR-3.F1), `unit.search` (PR-8.F1) and `block.ensure_id`
+/// (PR-11.F1). Adding a method
+/// means changing this list on purpose.
+const EXPECTED_METHODS: [&str; 13] = [
+    "unit.resolve_link",
+    "graph.get_backlinks",
+    "graph.get_forward_links",
+    "graph.get_edges",
+    "source.register",
+    "source.unregister",
+    "source.list",
+    "source.rescan",
+    "link.preview_refactor",
+    "link.apply_refactor",
+    "unit.list",
+    "unit.search",
+    "block.ensure_id",
+];
+
 #[test]
-fn method_table_is_exactly_the_ten_named_verbs() {
-    assert_eq!(METHOD_NAMES.len(), 10);
-    for name in [
-        "unit.resolve_link",
-        "graph.get_backlinks",
-        "graph.get_forward_links",
-        "graph.get_edges",
-        "source.register",
-        "source.unregister",
-        "source.list",
-        "source.rescan",
-        "link.preview_refactor",
-        "link.apply_refactor",
-    ] {
-        assert!(METHOD_NAMES.contains(&name), "missing method {name}");
+fn method_table_is_exactly_the_thirteen_named_verbs() {
+    assert_eq!(METHOD_NAMES, EXPECTED_METHODS);
+    // No duplicates either.
+    let mut sorted = METHOD_NAMES.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), METHOD_NAMES.len());
+}
+
+/// `unit.search` is routed (it reaches the sources backend, which here
+/// is the default that refuses), while near-misses are not methods.
+#[test]
+fn unit_search_is_accepted_and_a_misspelling_is_method_not_found() {
+    let graph = NullGraph;
+    let sources = NullSources;
+    let p = proof();
+
+    let accepted = dispatch(
+        &p,
+        "unit.search",
+        &json!({"query": "atlas"}),
+        &backends(&graph, &sources),
+    );
+    match accepted {
+        Ok(_) => {}
+        Err((code, _, _)) => assert_ne!(code, METHOD_NOT_FOUND, "unit.search must be routed"),
     }
+
+    for typo in ["unit.searc", "unit.Search", "units.search", "search"] {
+        let err = dispatch(
+            &p,
+            typo,
+            &json!({"query": "atlas"}),
+            &backends(&graph, &sources),
+        )
+        .unwrap_err();
+        assert_eq!(err.0, METHOD_NOT_FOUND, "{typo}");
+    }
+}
+
+/// `unit.list` is routed (it reaches the sources backend, which here
+/// is the default that refuses), while a one-letter typo is not a
+/// method at all.
+#[test]
+fn unit_list_is_accepted_and_a_misspelling_is_method_not_found() {
+    let graph = NullGraph;
+    let sources = NullSources;
+    let p = proof();
+
+    let accepted = dispatch(
+        &p,
+        "unit.list",
+        &json!({"source": "notes"}),
+        &backends(&graph, &sources),
+    );
+    match accepted {
+        Ok(_) => {}
+        Err((code, _, _)) => assert_ne!(code, METHOD_NOT_FOUND, "unit.list must be routed"),
+    }
+
+    let err = dispatch(
+        &p,
+        "unit.lst",
+        &json!({"source": "notes"}),
+        &backends(&graph, &sources),
+    )
+    .unwrap_err();
+    assert_eq!(err.0, METHOD_NOT_FOUND);
 }
 
 #[test]
@@ -426,4 +499,197 @@ fn link_apply_refactor_without_required_params_is_invalid_params() {
         .unwrap_err();
         assert_eq!(err.0, INVALID_PARAMS, "params: {params}");
     }
+}
+
+// -- unit.search with scope "all_blocks" (G10, the `^^` search) --------
+//
+// Through the real `dispatch`, with a backend that records every
+// `search_all_blocks` it is handed: a request the dispatcher refuses
+// must leave that list empty (it never reached the cache).
+
+#[derive(Default)]
+struct RecordingSources {
+    all_blocks: std::sync::Mutex<Vec<(String, usize)>>,
+    names: std::sync::Mutex<Vec<(String, usize)>>,
+}
+impl tephrad::rpc::backend::SourceBackend for RecordingSources {
+    fn register(
+        &self,
+        _name: &str,
+        _root: &str,
+    ) -> Result<tephrad::rpc::backend::ScanStatsWire, String> {
+        unreachable!("a search never registers a source")
+    }
+    fn unregister(&self, _name: &str) -> Result<(), String> {
+        unreachable!("a search never unregisters a source")
+    }
+    fn list(&self) -> Result<Vec<tephrad::rpc::backend::SourceRowWire>, String> {
+        Ok(Vec::new())
+    }
+    fn rescan(&self, _name: &str) -> Result<tephrad::rpc::backend::ScanStatsWire, String> {
+        unreachable!("a search never rescans a source")
+    }
+    fn search_names(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<tephrad::rpc::backend::SearchHitWire>, tephrad::rpc::backend::SearchError> {
+        self.names.lock().unwrap().push((query.to_string(), limit));
+        Ok(Vec::new())
+    }
+    fn search_all_blocks(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<tephrad::rpc::backend::AllBlocksHitWire>, tephrad::rpc::backend::SearchError>
+    {
+        self.all_blocks
+            .lock()
+            .unwrap()
+            .push((query.to_string(), limit));
+        Ok(Vec::new())
+    }
+}
+
+fn search_all_blocks_dispatch(
+    sources: &RecordingSources,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, (i64, String)> {
+    static NULL_REFACTOR: tephrad::rpc::backend::UnsupportedRefactor =
+        tephrad::rpc::backend::UnsupportedRefactor;
+    let graph = NullGraph;
+    let p = proof();
+    dispatch(
+        &p,
+        "unit.search",
+        &params,
+        &Backends {
+            graph: &graph,
+            sources,
+            refactor: &NULL_REFACTOR,
+            blocks: &tephrad::rpc::backend::UnsupportedBlockIds,
+        },
+    )
+    .map_err(|(code, message, _)| (code, message))
+}
+
+#[test]
+fn unit_search_all_blocks_is_routed_to_the_all_blocks_backend_with_the_default_or_given_limit() {
+    let sources = RecordingSources::default();
+    assert_eq!(
+        search_all_blocks_dispatch(
+            &sources,
+            json!({"query": "conflict", "scope": "all_blocks"})
+        )
+        .unwrap(),
+        json!([])
+    );
+    assert_eq!(
+        search_all_blocks_dispatch(
+            &sources,
+            json!({"query": "^conflict", "scope": "all_blocks", "limit": 3})
+        )
+        .unwrap(),
+        json!([])
+    );
+    assert_eq!(
+        *sources.all_blocks.lock().unwrap(),
+        vec![
+            ("conflict".to_string(), tephrad::search::DEFAULT_LIMIT),
+            ("^conflict".to_string(), 3)
+        ]
+    );
+    assert!(sources.names.lock().unwrap().is_empty());
+}
+
+#[test]
+fn unit_search_with_an_unknown_scope_is_invalid_params_naming_the_scope_and_reaches_nothing() {
+    let sources = RecordingSources::default();
+    // Near-misses of `all_blocks` included: a scope is matched exactly,
+    // never case-folded or trimmed, and never quietly run as another.
+    for scope in [
+        "everything",
+        "all",
+        "All_Blocks",
+        "all-blocks",
+        "all_blocks ",
+        " all_blocks",
+        "^^",
+        "",
+    ] {
+        let (code, message) =
+            search_all_blocks_dispatch(&sources, json!({"query": "conflict", "scope": scope}))
+                .unwrap_err();
+        assert_eq!(code, INVALID_PARAMS, "scope {scope:?}");
+        assert!(
+            message.contains(&format!("unknown scope \"{scope}\"")),
+            "scope {scope:?}: {message}"
+        );
+        assert!(message.contains("all_blocks"), "{message}");
+    }
+    // A scope that is not a string at all.
+    for scope in [json!(5), json!(true), json!(["all_blocks"]), json!({})] {
+        let (code, _) =
+            search_all_blocks_dispatch(&sources, json!({"query": "conflict", "scope": scope}))
+                .unwrap_err();
+        assert_eq!(code, INVALID_PARAMS, "scope {scope}");
+    }
+    assert!(sources.all_blocks.lock().unwrap().is_empty());
+    assert!(sources.names.lock().unwrap().is_empty());
+}
+
+#[test]
+fn unit_search_all_blocks_without_a_usable_query_is_invalid_params_and_reaches_nothing() {
+    let sources = RecordingSources::default();
+    let missing_or_wrong_type = [
+        json!({"scope": "all_blocks"}),
+        json!({"query": null, "scope": "all_blocks"}),
+        json!({"query": 5, "scope": "all_blocks"}),
+        json!({"query": ["a"], "scope": "all_blocks"}),
+    ];
+    for params in missing_or_wrong_type {
+        let (code, message) = search_all_blocks_dispatch(&sources, params.clone()).unwrap_err();
+        assert_eq!(code, INVALID_PARAMS, "{params}");
+        assert!(message.contains("query"), "{params}: {message}");
+    }
+    for query in ["", " ", "   ", "\t", " \n\t "] {
+        let (code, message) =
+            search_all_blocks_dispatch(&sources, json!({"query": query, "scope": "all_blocks"}))
+                .unwrap_err();
+        assert_eq!(code, INVALID_PARAMS, "query {query:?}");
+        assert!(
+            message.contains("empty query"),
+            "query {query:?}: {message}"
+        );
+    }
+    assert!(sources.all_blocks.lock().unwrap().is_empty());
+}
+
+#[test]
+fn unit_search_all_blocks_refuses_an_in_param_and_a_bad_limit_and_reaches_nothing() {
+    let sources = RecordingSources::default();
+    let (code, message) = search_all_blocks_dispatch(
+        &sources,
+        json!({"query": "a", "scope": "all_blocks", "in": "@s:a.md"}),
+    )
+    .unwrap_err();
+    assert_eq!(code, INVALID_PARAMS);
+    assert!(message.contains("all_blocks"), "{message}");
+
+    for limit in [
+        json!(0),
+        json!(-1),
+        json!(1.5),
+        json!("5"),
+        json!(tephrad::search::MAX_LIMIT + 1),
+    ] {
+        let (code, message) = search_all_blocks_dispatch(
+            &sources,
+            json!({"query": "a", "scope": "all_blocks", "limit": limit}),
+        )
+        .unwrap_err();
+        assert_eq!(code, INVALID_PARAMS, "limit {limit}");
+        assert!(message.contains("limit"), "limit {limit}: {message}");
+    }
+    assert!(sources.all_blocks.lock().unwrap().is_empty());
 }

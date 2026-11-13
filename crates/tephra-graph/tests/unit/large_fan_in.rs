@@ -31,6 +31,9 @@ fn five_thousand_edges_resolve_and_get_backlinks_stays_bounded_time() {
         .expect("register_source hub-source");
     let hub_unit_id = cache
         .insert_unit(&NewUnit {
+            kind: "prose",
+            size: None,
+            too_large: false,
             source_id: hub_source_id,
             rel_path: "Hub.md",
             mtime: None,
@@ -47,6 +50,9 @@ fn five_thousand_edges_resolve_and_get_backlinks_stays_bounded_time() {
             let rel_path = format!("Spoke{i}.md");
             let spoke_unit_id = cache
                 .insert_unit(&NewUnit {
+                    kind: "prose",
+                    size: None,
+                    too_large: false,
                     source_id,
                     rel_path: &rel_path,
                     mtime: None,
@@ -59,6 +65,7 @@ fn five_thousand_edges_resolve_and_get_backlinks_stays_bounded_time() {
                     to_raw: "@hub-source:Hub",
                     to_unit_id: None,
                     kind: tephra_parser::LINK_KIND_WIKILINK,
+                    line: None,
                 })
                 .expect("insert spoke -> hub link");
         }

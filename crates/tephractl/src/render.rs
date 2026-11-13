@@ -28,6 +28,323 @@ fn bool_field(value: &Value, field: &str) -> bool {
     value.get(field).and_then(Value::as_bool).unwrap_or(false)
 }
 
+// ---- unit.list ------------------------------------------------------
+
+/// `ls`'s output (G1). The offline banner, when the response says
+/// `offline: true`, comes first; then one row per entry:
+///
+/// ```text
+/// KIND             SIZE MODIFIED         NAME
+/// ```
+///
+/// (no header is printed; the columns are `kind` padded to 10, `size`
+/// right-aligned to 10, local `YYYY-MM-DD HH:MM`, then the name).
+/// Recursive output indents each name by two spaces per level below
+/// the listed folder. A `prose` entry's `title`, when the response has
+/// one, follows the name as `  # <title>`; entries without one print
+/// nothing there. An unknown size or mtime prints `-`. An empty list
+/// prints `(empty)`.
+///
+/// Names and titles come from the filesystem and from file contents, so
+/// control characters in them (an ESC would let a file name drive the
+/// terminal) are shown as `?`.
+pub fn render_unit_list(result: &Value) -> String {
+    render_unit_list_with(result, &local_time)
+}
+
+/// [`render_unit_list`] with the time formatter supplied, so tests don't
+/// depend on the machine's time zone.
+pub fn render_unit_list_with(result: &Value, format_time: &dyn Fn(i64) -> String) -> String {
+    let mut out = String::new();
+    if bool_field(result, "offline") {
+        out.push_str(&format!(
+            "source {} is offline (cached listing)\n",
+            printable(str_field(result, "source"))
+        ));
+    }
+    let entries = result
+        .get("entries")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if entries.is_empty() {
+        out.push_str("(empty)\n");
+        return out;
+    }
+
+    let base_depth = path_depth(str_field(result, "folder"));
+    let recursive = bool_field(result, "recursive");
+    for entry in entries {
+        let kind = str_field(entry, "kind");
+        let size = entry
+            .get("size")
+            .and_then(Value::as_i64)
+            .map_or_else(|| "-".to_string(), |n| n.to_string());
+        let modified = entry
+            .get("mtime")
+            .and_then(Value::as_i64)
+            .map_or_else(|| "-".to_string(), format_time);
+        let depth = if recursive {
+            path_depth(str_field(entry, "rel_path")).saturating_sub(base_depth + 1)
+        } else {
+            0
+        };
+        let name = printable(str_field(entry, "name"));
+        let title = match entry.get("title").and_then(Value::as_str) {
+            Some(t) if !t.is_empty() => format!("  # {}", printable(t)),
+            _ => String::new(),
+        };
+        out.push_str(&format!(
+            "{kind:<10} {size:>10} {modified:<16} {indent}{name}{title}\n",
+            indent = "  ".repeat(depth),
+        ));
+    }
+    out
+}
+
+// ---- unit.search ----------------------------------------------------
+
+/// `search`'s output (G8): one row per result, in the daemon's rank order,
+///
+/// ```text
+/// <id>  <kind>  <title>
+/// ```
+///
+/// with `  (offline)` after the title when the result's source is offline.
+/// No results prints the plain line `no matches`. Titles and ids come from
+/// file names and file contents, so control characters in them are shown
+/// as `?`, as in [`render_unit_list`].
+pub fn render_search_results(result: &Value) -> String {
+    let hits = result.as_array().map(Vec::as_slice).unwrap_or_default();
+    if hits.is_empty() {
+        return "no matches\n".to_string();
+    }
+    let mut out = String::new();
+    for hit in hits {
+        out.push_str(&format!(
+            "{}  {}  {}{}\n",
+            printable(str_field(hit, "id")),
+            printable(str_field(hit, "kind")),
+            printable(str_field(hit, "title")),
+            if bool_field(hit, "offline") {
+                "  (offline)"
+            } else {
+                ""
+            },
+        ));
+    }
+    out
+}
+
+/// The longest paragraph text [`render_in_file_results`] shows, in
+/// characters; a longer one is cut with `...`. `--json` is never cut.
+const MAX_SHOWN_TEXT_CHARS: usize = 120;
+
+/// `search --in`'s output (G9): one row per result, in the daemon's
+/// order, as `<what>  <where>  <text>`:
+///
+/// ```text
+/// heading h2  line 9  Second café
+/// symbol enum  line 73  ConflictReason  ^abc
+/// paragraph  line 7  A paragraph about alpha.  ^dup
+/// document paragraph  page 2 #3  Some text
+/// ```
+///
+/// `<where>` is `line N`, or `page N`, `slide N` or `paragraph N` for a
+/// document, with `#<index>` for a paragraph's place on its page or
+/// slide. A `^id` the block already has follows the text; a row has no
+/// trailing spaces (a paragraph with no text is just its place). Runs of
+/// whitespace (a paragraph over several lines) become one space, and
+/// control characters are shown as `?`, as in [`render_search_results`].
+/// A leading note says when the file's source is offline or when the
+/// paragraph text could not be read. No results prints `no matches`.
+pub fn render_in_file_results(result: &Value) -> String {
+    let mut out = String::new();
+    if bool_field(result, "offline") {
+        out.push_str(&format!(
+            "{} is offline (cached results)\n",
+            printable(str_field(result, "unit"))
+        ));
+    }
+    if bool_field(result, "text_unavailable") {
+        out.push_str("paragraph text could not be read; only an empty query lists paragraphs\n");
+    }
+    let hits = result
+        .get("results")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if hits.is_empty() {
+        out.push_str("no matches\n");
+        return out;
+    }
+    for hit in hits {
+        let kind = str_field(hit, "kind");
+        let what = match kind {
+            "heading" => match hit.get("level").and_then(Value::as_i64) {
+                Some(level) => format!("heading h{level}"),
+                None => "heading".to_string(),
+            },
+            "symbol" => match str_field(hit, "symbol_kind") {
+                "" => "symbol".to_string(),
+                symbol_kind => format!("symbol {}", printable(symbol_kind)),
+            },
+            other => printable(other),
+        };
+        let place = ["line", "page", "slide", "paragraph"]
+            .into_iter()
+            .find_map(|key| {
+                hit.get(key)
+                    .and_then(Value::as_i64)
+                    .map(|n| format!("{key} {n}"))
+            })
+            .unwrap_or_else(|| "-".to_string());
+        // The index within a page or slide; a docx paragraph's equals
+        // its number, so it is left out there.
+        let place = match (
+            hit.get("index").and_then(Value::as_i64),
+            hit.get("paragraph"),
+        ) {
+            (Some(index), None) => format!("{place} #{index}"),
+            _ => place,
+        };
+        let text = hit
+            .get("text")
+            .or_else(|| hit.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let id = match hit.get("block_id").and_then(Value::as_str) {
+            Some(id) => format!("  ^{}", printable(id)),
+            None => String::new(),
+        };
+        let row = format!("{what}  {place}  {}{id}", shown_text(text));
+        out.push_str(row.trim_end());
+        out.push('\n');
+    }
+    out
+}
+
+/// `search "^^q"`'s output (G10): one row per result, in the daemon's
+/// rank order. A hit with a line is `<id>:<line>  <what>  <text>`, a
+/// location a terminal or editor can jump to; a document hit has no line,
+/// so it is `<id>  <what>  <where>  <text>`:
+///
+/// ```text
+/// @repo:src/lib.rs:73  symbol  enum ConflictReason
+/// @repo:notes/a.md:7  paragraph  ...text around the match...  ^abc
+/// @repo:deck.pptx  document paragraph  slide 2 #1  Some text
+/// @old:b.md:3  comment  a note  (offline)
+/// ```
+///
+/// `<where>` is `page N`, `slide N #i` or `paragraph N`, as in
+/// [`render_in_file_results`]. A `^id` the block
+/// already has follows the text, then `  (offline)` for a source that is
+/// offline. A row has no trailing spaces. No results prints `no
+/// matches`. Ids and text come from file names and contents, so control
+/// characters are shown as `?`, and a long text is cut as in
+/// [`render_in_file_results`]. A part with nothing in it (a heading with
+/// no text) is left out, so a row has no double gaps.
+pub fn render_all_blocks_results(result: &Value) -> String {
+    let hits = result.as_array().map(Vec::as_slice).unwrap_or_default();
+    if hits.is_empty() {
+        return "no matches\n".to_string();
+    }
+    let mut out = String::new();
+    for hit in hits {
+        let mut unit = printable(str_field(hit, "unit"));
+        let place = match hit.get("line").and_then(Value::as_i64) {
+            Some(line) => {
+                unit = format!("{unit}:{line}");
+                String::new()
+            }
+            None => {
+                let place = ["page", "slide", "paragraph"]
+                    .into_iter()
+                    .find_map(|key| {
+                        hit.get(key)
+                            .and_then(Value::as_i64)
+                            .map(|n| format!("{key} {n}"))
+                    })
+                    .unwrap_or_else(|| "-".to_string());
+                match (
+                    hit.get("index").and_then(Value::as_i64),
+                    hit.get("paragraph"),
+                ) {
+                    (Some(index), None) => format!("{place} #{index}"),
+                    _ => place,
+                }
+            }
+        };
+        // A part with nothing in it (a heading with no text) leaves no
+        // gap: the parts are joined by two spaces.
+        let mut parts = vec![
+            unit,
+            printable(str_field(hit, "kind")),
+            place,
+            shown_text(str_field(hit, "snippet")),
+        ];
+        if let Some(id) = hit.get("block_id").and_then(Value::as_str) {
+            parts.push(format!("^{}", printable(id)));
+        }
+        if bool_field(hit, "offline") {
+            parts.push("(offline)".to_string());
+        }
+        parts.retain(|part| !part.is_empty());
+        out.push_str(&parts.join("  "));
+        out.push('\n');
+    }
+    out
+}
+
+/// `text` on one line: whitespace runs are one space, control
+/// characters are `?`, and a long text is cut at
+/// [`MAX_SHOWN_TEXT_CHARS`] characters.
+fn shown_text(text: &str) -> String {
+    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let one_line = printable(&one_line);
+    if one_line.chars().count() > MAX_SHOWN_TEXT_CHARS {
+        let cut: String = one_line.chars().take(MAX_SHOWN_TEXT_CHARS).collect();
+        format!("{}...", cut.trim_end())
+    } else {
+        one_line
+    }
+}
+
+/// Number of components in a source-relative path (`""` is 0).
+fn path_depth(rel: &str) -> usize {
+    rel.split('/').filter(|s| !s.is_empty()).count()
+}
+
+/// `text` with every control character replaced by `?`.
+fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
+/// A Unix timestamp as local `YYYY-MM-DD HH:MM`. Falls back to the UTC
+/// reading if the C library can't convert it.
+pub fn local_time(secs: i64) -> String {
+    let t = secs as libc::time_t;
+    // SAFETY: `tm` is plain data that `localtime_r` fully initializes
+    // when it returns non-null; both pointers are valid for the call.
+    let tm = unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&t, &mut tm).is_null() {
+            return format!("{secs}");
+        }
+        tm
+    };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        tm.tm_year as i64 + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min
+    )
+}
+
 // ---- source.* -------------------------------------------------------
 
 /// `source add` success (G8): names the registered source and path,
@@ -78,14 +395,22 @@ pub fn error_means_not_found(message: &str) -> bool {
 
 /// `source list` / `status`'s shared table renderer. Rows are
 /// `SourceRowWire`-shaped JSON (`name`, `path`, `status`,
-/// `last_scanned_at`). Zero rows renders the "no sources registered"
+/// `last_scanned_at`). `status` is `active`, `stale`, `offline` or
+/// `permission_denied` (macOS Full Disk Access not granted, E13).
+/// Zero rows renders the "no sources registered"
 /// line the spec requires instead of an empty table.
 pub fn render_source_table(rows: &[Value]) -> String {
     if rows.is_empty() {
         return "no sources registered\n".to_string();
     }
 
-    let mut out = String::from("NAME                 STATUS    PATH\n");
+    // `permission_denied` (E13) is longer than the other statuses;
+    // widen the column for it instead of breaking the alignment.
+    let status_width = rows
+        .iter()
+        .map(|row| str_field(row, "status").chars().count())
+        .fold(9, usize::max);
+    let mut out = format!("{:<20} {:<status_width$} PATH\n", "NAME", "STATUS");
     for row in rows {
         let name = str_field(row, "name");
         let path = str_field(row, "path");
@@ -95,7 +420,9 @@ pub fn render_source_table(rows: &[Value]) -> String {
         } else {
             ""
         };
-        out.push_str(&format!("{name:<20} {status:<9} {path}{offline_marker}\n"));
+        out.push_str(&format!(
+            "{name:<20} {status:<status_width$} {path}{offline_marker}\n"
+        ));
     }
     out
 }
@@ -112,6 +439,15 @@ pub fn render_status(addr: &str, rows: &[Value]) -> String {
     out.push_str("Daemon uptime: unavailable (tephrad does not expose an uptime RPC method)\n");
     out.push_str(&render_source_table(rows));
     out
+}
+
+// ---- block.ensure_id ------------------------------------------------
+
+/// `block-id`'s output: the link, alone on one line, so a script can
+/// take the whole of stdout. Nothing else is printed, whether the ID was
+/// just written or was already there (`--json` says which).
+pub fn render_block_id(result: &Value) -> String {
+    format!("{}\n", result["link"].as_str().unwrap_or_default())
 }
 
 // ---- unit.resolve_link ------------------------------------------------
@@ -189,6 +525,21 @@ pub fn render_resolve_result(result: &Value, requested_default_source: Option<&s
         }
     ));
 
+    // A block link (G13): the block it points at. A link to a file, a
+    // heading or a symbol name has `block: null` and prints nothing.
+    if let Some(block) = result.get("block").filter(|b| b.is_object()) {
+        let moved = if bool_field(block, "moved") {
+            " (moved: found in another file of the source)"
+        } else {
+            ""
+        };
+        out.push_str(&format!(
+            "Block: ^{} at line {}{moved}\n",
+            printable(str_field(block, "id")),
+            block.get("line").and_then(Value::as_i64).unwrap_or(0),
+        ));
+    }
+
     out.push_str(&format!("Outgoing edges ({}):\n", edges.len()));
     let shown = edges.iter().take(MAX_EDGES_DISPLAYED);
     for edge in shown {
@@ -229,12 +580,63 @@ pub fn render_resolve_error(err: &RpcCallError) -> String {
                 for (i, candidate) in candidates.iter().enumerate() {
                     out.push_str(&format!("  {}. {candidate}\n", i + 1));
                 }
+                // A block ID found in more than one place (E7/E8) also
+                // lists every occurrence, one unit:line each.
+                let lines = inner
+                    .get("lines")
+                    .and_then(Value::as_array)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                if !lines.is_empty() {
+                    out.push_str("found at:\n");
+                    for place in lines {
+                        out.push_str(&format!(
+                            "  {}:{}\n",
+                            printable(str_field(place, "unit")),
+                            place.get("line").and_then(Value::as_i64).unwrap_or(0)
+                        ));
+                    }
+                }
                 return out;
             }
         }
         return format!("{message}\n");
     }
     format!("{err}\n")
+}
+
+// ---- graph.get_backlinks ----------------------------------------------
+
+/// `backlinks`' output (G16): one row per link occurrence, in the
+/// daemon's order: `from:line  [kind] to_raw`, with `(offline)` after
+/// a link of an offline source. A link with no line (one in a document)
+/// shows the unit alone. An empty list prints `no backlinks`.
+///
+/// Unit ids and link text come from file names and file contents, so
+/// control characters in them are shown as `?`.
+pub fn render_backlinks(result: &Value) -> String {
+    let edges = result.as_array().map(Vec::as_slice).unwrap_or_default();
+    if edges.is_empty() {
+        return "no backlinks\n".to_string();
+    }
+    let mut out = String::new();
+    for edge in edges {
+        let mut place = printable(str_field(edge, "from"));
+        if let Some(line) = edge.get("line").and_then(Value::as_i64) {
+            place = format!("{place}:{line}");
+        }
+        let mut row = format!(
+            "{place}  [{}] {}",
+            printable(str_field(edge, "kind")),
+            printable(str_field(edge, "to_raw"))
+        );
+        if bool_field(edge, "offline") {
+            row.push_str("  (offline)");
+        }
+        out.push_str(&row);
+        out.push('\n');
+    }
+    out
 }
 
 // ---- link.preview_refactor / link.apply_refactor ----------------------
@@ -372,6 +774,21 @@ mod tests {
         assert!(rendered.contains("active"));
         assert!(rendered.contains("old"));
         assert!(rendered.contains("(offline)"));
+    }
+
+    #[test]
+    fn source_table_shows_permission_denied_and_keeps_the_columns_aligned() {
+        let rows = vec![
+            json!({"name": "notes", "path": "/Users/dan/Documents/Notes", "status": "permission_denied", "last_scanned_at": 1}),
+            json!({"name": "work", "path": "/vault/work", "status": "active", "last_scanned_at": 1}),
+        ];
+        let rendered = render_source_table(&rows);
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert!(lines[0].starts_with("NAME                 STATUS            PATH"));
+        assert!(lines[1].contains("permission_denied /Users/dan/Documents/Notes"));
+        assert!(!lines[1].contains("(offline)"), "never reported as offline");
+        let path_col = |l: &str| l.find('/').unwrap();
+        assert_eq!(path_col(lines[1]), path_col(lines[2]));
     }
 
     #[test]
@@ -532,5 +949,154 @@ mod tests {
             render_refactor_apply(&result),
             "Refactor aborted: file modified since preview\n"
         );
+    }
+
+    fn fixed_time(secs: i64) -> String {
+        format!("T{secs}")
+    }
+
+    fn sample_list(offline: bool, recursive: bool) -> Value {
+        json!({
+            "source": "notes", "folder": "docs", "recursive": recursive,
+            "offline": offline, "needs_rescan": false,
+            "entries": [
+                {"id": "@notes:docs/img", "name": "img", "rel_path": "docs/img",
+                 "kind": "folder", "size": 2, "mtime": 100},
+                {"id": "@notes:docs/img/logo.png", "name": "logo.png",
+                 "rel_path": "docs/img/logo.png", "kind": "binary", "size": 12345, "mtime": 200},
+                {"id": "@notes:docs/img/deep", "name": "deep", "rel_path": "docs/img/deep",
+                 "kind": "folder", "size": 1, "mtime": 300},
+                {"id": "@notes:docs/img/deep/x.rs", "name": "x.rs",
+                 "rel_path": "docs/img/deep/x.rs", "kind": "code", "size": 7, "mtime": 400},
+                {"id": "@notes:docs/guide.md", "name": "guide.md", "rel_path": "docs/guide.md",
+                 "kind": "prose", "size": 99, "mtime": 500, "title": "The Guide"},
+            ]
+        })
+    }
+
+    #[test]
+    fn unit_list_columns_are_kind_size_modified_name() {
+        let rendered = render_unit_list_with(&sample_list(false, false), &fixed_time);
+        let expected = "\
+folder              2 T100             img
+binary          12345 T200             logo.png
+folder              1 T300             deep
+code                7 T400             x.rs
+prose              99 T500             guide.md  # The Guide
+";
+        // Non-recursive: no indentation, whatever the paths look like.
+        assert_eq!(rendered, expected);
+    }
+
+    #[test]
+    fn unit_list_recursive_indents_two_spaces_per_level_below_the_listed_folder() {
+        let rendered = render_unit_list_with(&sample_list(false, true), &fixed_time);
+        let expected = "\
+folder              2 T100             img
+binary          12345 T200               logo.png
+folder              1 T300               deep
+code                7 T400                 x.rs
+prose              99 T500             guide.md  # The Guide
+";
+        assert_eq!(rendered, expected);
+    }
+
+    #[test]
+    fn unit_list_at_the_source_root_indents_by_absolute_depth() {
+        let list = json!({
+            "source": "s", "folder": "", "recursive": true, "offline": false,
+            "entries": [
+                {"name": "a", "rel_path": "a", "kind": "folder", "size": 1, "mtime": 1},
+                {"name": "b.txt", "rel_path": "a/b.txt", "kind": "text-other", "size": 2, "mtime": 2},
+            ]
+        });
+        let expected = "\
+folder              1 T1               a
+text-other          2 T2                 b.txt
+";
+        assert_eq!(render_unit_list_with(&list, &fixed_time), expected);
+    }
+
+    #[test]
+    fn unit_list_offline_banner_comes_first_and_only_when_offline() {
+        let offline = render_unit_list_with(&sample_list(true, false), &fixed_time);
+        assert!(
+            offline.starts_with("source notes is offline (cached listing)\nfolder "),
+            "{offline}"
+        );
+        let online = render_unit_list_with(&sample_list(false, false), &fixed_time);
+        assert!(!online.contains("offline"), "{online}");
+    }
+
+    #[test]
+    fn unit_list_title_shows_only_on_entries_that_have_one() {
+        let rendered = render_unit_list_with(&sample_list(false, false), &fixed_time);
+        assert_eq!(rendered.matches('#').count(), 1);
+        let blank = json!({"source": "s", "folder": "", "recursive": false, "entries": [
+            {"name": "a.md", "rel_path": "a.md", "kind": "prose", "size": 1, "mtime": 1, "title": ""},
+            {"name": "b.md", "rel_path": "b.md", "kind": "prose", "size": 1, "mtime": 1},
+        ]});
+        assert!(!render_unit_list_with(&blank, &fixed_time).contains('#'));
+    }
+
+    #[test]
+    fn unit_list_empty_folder_prints_empty_and_keeps_the_offline_banner() {
+        let empty = json!({"source": "s", "folder": "x", "recursive": false,
+                           "offline": false, "entries": []});
+        assert_eq!(render_unit_list_with(&empty, &fixed_time), "(empty)\n");
+        let offline = json!({"source": "s", "folder": "x", "recursive": false,
+                             "offline": true, "entries": []});
+        assert_eq!(
+            render_unit_list_with(&offline, &fixed_time),
+            "source s is offline (cached listing)\n(empty)\n"
+        );
+    }
+
+    #[test]
+    fn unit_list_unknown_size_and_mtime_print_a_dash() {
+        let list = json!({"source": "s", "folder": "", "recursive": false, "offline": true,
+            "entries": [{"name": "d", "rel_path": "d", "kind": "folder", "size": 1, "mtime": null},
+                        {"name": "f", "rel_path": "f", "kind": "text-other", "size": null, "mtime": 5}]});
+        let rendered = render_unit_list_with(&list, &fixed_time);
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines[1], "folder              1 -                d");
+        assert_eq!(lines[2], "text-other          - T5               f");
+    }
+
+    #[test]
+    fn unit_list_control_characters_in_names_never_reach_the_terminal() {
+        let list = json!({"source": "s", "folder": "", "recursive": false, "entries": [
+            {"name": "evil\u{1b}[2Jname\n", "rel_path": "x", "kind": "prose", "size": 1,
+             "mtime": 1, "title": "t\u{7}itle"}]});
+        let rendered = render_unit_list_with(&list, &fixed_time);
+        assert!(!rendered.contains('\u{1b}') && !rendered.contains('\u{7}'));
+        assert!(rendered.contains("evil?[2Jname?  # t?itle"), "{rendered:?}");
+        assert_eq!(rendered.matches('\n').count(), 1);
+    }
+
+    #[test]
+    fn local_time_has_the_documented_shape_and_round_trips() {
+        let secs = 1_700_000_040;
+        let text = local_time(secs);
+        assert_eq!(text.len(), 16, "{text}");
+        let b = text.as_bytes();
+        assert!(
+            b[4] == b'-' && b[7] == b'-' && b[10] == b' ' && b[13] == b':',
+            "{text}"
+        );
+        // Turn the local reading back into an instant: it must be the
+        // original, to the minute.
+        let num = |r: std::ops::Range<usize>| text[r].parse::<i32>().unwrap();
+        let back = unsafe {
+            let mut tm: libc::tm = std::mem::zeroed();
+            tm.tm_year = num(0..4) - 1900;
+            tm.tm_mon = num(5..7) - 1;
+            tm.tm_mday = num(8..10);
+            tm.tm_hour = num(11..13);
+            tm.tm_min = num(14..16);
+            tm.tm_isdst = -1;
+            libc::mktime(&mut tm) as i64
+        };
+        assert_eq!(back, secs - secs % 60);
     }
 }

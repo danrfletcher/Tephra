@@ -715,6 +715,16 @@ pub trait AtomicFs: Send + Sync {
     /// Atomically replaces `to` with `from` (same directory, so this
     /// is a single `rename(2)`/`MoveFileEx` syscall, not a copy).
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
+    /// What identifies the exact bytes of `path` between two looks at
+    /// it: its size and mtime (the entry itself, a symlink not followed).
+    /// A writer that read a file takes this before the read and again
+    /// just before its write (G19's duplicate ID rename), and writes
+    /// nothing if the two differ. Behind the trait so a test can make the
+    /// file change between the two looks.
+    fn fingerprint(&self, path: &Path) -> io::Result<(u64, Option<std::time::SystemTime>)> {
+        let meta = fs::symlink_metadata(path)?;
+        Ok((meta.len(), meta.modified().ok()))
+    }
 }
 
 /// The real implementation: `std::fs` all the way down.
@@ -846,12 +856,16 @@ pub trait WatcherPauseControl: Send + Sync {
     fn resume_all(&self, written_paths: &HashSet<PathBuf>);
 }
 
+/// Reference-counted on the registry (see
+/// [`SourceRegistry::pause_for_write`]): every `pause_all` must be
+/// paired with one `resume_all`, and the watchers resume only when the
+/// last overlapping writer calls it.
 impl WatcherPauseControl for SourceRegistry {
     fn pause_all(&self) {
-        SourceRegistry::pause_all_watchers(self);
+        SourceRegistry::pause_for_write(self);
     }
     fn resume_all(&self, written_paths: &HashSet<PathBuf>) {
-        SourceRegistry::resume_all_watchers_except(self, written_paths);
+        SourceRegistry::resume_after_write(self, written_paths);
     }
 }
 
@@ -931,6 +945,11 @@ struct StoredPreview {
     changes: Vec<LinkChange>,
     mtimes: HashMap<String, SystemTime>,
 }
+
+/// Why a referring docx, pptx or PDF is left out of a refactor: Tephra
+/// never writes to a document (F4), so a link inside one stays as it is.
+pub const DOCUMENT_READ_ONLY: &str =
+    "read-only document: links inside a docx, pptx or pdf are never rewritten";
 
 /// One referring file [`RefactorEngine::preview`] could not read or
 /// stat, and therefore could not scan for incoming links at all.
@@ -1049,6 +1068,19 @@ impl RefactorEngine {
                 let Some(abs) = self.resolve_abs_path(&edge.from, &roots) else {
                     continue;
                 };
+                // G5/F4: a docx, pptx or PDF is read-only. A link inside
+                // one is never rewritten, so the file is reported as
+                // skipped and never read as text.
+                // A document holds many links, so one entry per file.
+                if tephra_parser::DocumentFormat::from_path(&abs).is_some() {
+                    if !skipped.iter().any(|s: &SkippedFile| s.file == edge.from) {
+                        skipped.push(SkippedFile {
+                            file: edge.from.clone(),
+                            error: DOCUMENT_READ_ONLY.to_string(),
+                        });
+                    }
+                    continue;
+                }
                 let content = match fs::read_to_string(&abs) {
                     Ok(c) => c,
                     Err(e) => {
@@ -1206,6 +1238,14 @@ impl RefactorEngine {
                 continue;
             };
 
+            // Held from this file's mtime re-check to its rename: a
+            // `block.ensure_id` on the same file (see `crate::block_id`)
+            // takes the same lock, so neither starts from bytes the
+            // other is about to replace. If it wrote first, the mtime
+            // check below sees it and this file is reported as failed
+            // rather than overwritten.
+            let _file_guard = crate::file_lock::lock(&abs);
+
             // R7 review finding: `verify_staleness` only checked every
             // affected file's mtime once, up front in `apply`. On a
             // large fan-in that loop below can run long enough for a
@@ -1308,6 +1348,7 @@ mod tests {
             to_raw: to_raw.to_string(),
             kind: kind.to_string(),
             offline: false,
+            line: None,
         }
     }
 

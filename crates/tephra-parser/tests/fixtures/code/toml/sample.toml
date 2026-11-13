@@ -1,0 +1,3 @@
+# line comment [[Line]]
+name = "[[Decoy]]" # trailing comment [[Doc]]
+list = [["DecoyNested"]]

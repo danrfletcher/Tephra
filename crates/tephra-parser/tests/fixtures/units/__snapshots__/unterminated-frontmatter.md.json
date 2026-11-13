@@ -18,5 +18,17 @@
     }
   ],
   "blocks": [],
+  "paragraphs": [
+    {
+      "start_line": 2,
+      "end_line": 2,
+      "block_id": null
+    },
+    {
+      "start_line": 6,
+      "end_line": 6,
+      "block_id": null
+    }
+  ],
   "diagnostics": []
 }

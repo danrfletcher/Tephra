@@ -1,0 +1,26 @@
+[
+  {
+    "id": "@old-vault:Plans/Atlas.md",
+    "kind": "prose",
+    "offline": true,
+    "score": 1.0,
+    "source": "old-vault",
+    "title": "Atlas"
+  },
+  {
+    "id": "@notes:Obsidian Atlas/Atlas.md",
+    "kind": "prose",
+    "offline": false,
+    "score": 1.0,
+    "source": "notes",
+    "title": "Atlas"
+  },
+  {
+    "id": "@old-vault:Scans/atlas-map.png",
+    "kind": "binary",
+    "offline": true,
+    "score": 0.9,
+    "source": "old-vault",
+    "title": "atlas-map"
+  }
+]

@@ -23,8 +23,10 @@ use std::sync::{Arc, Mutex};
 
 use tempfile::TempDir;
 use tephra_graph::{Edge, ResolveError, ResolveResult};
+use tephrad::block_id::{BlockIdError, BlockTarget, EnsureIdWire};
 use tephrad::rpc::backend::{
-    GraphBackend, RefactorBackend, ScanStatsWire, SourceBackend, SourceRowWire,
+    BlockBackend, GraphBackend, RefactorBackend, ScanStatsWire, SearchError, SearchHitWire,
+    SourceBackend, SourceRowWire,
 };
 use tephrad::rpc::server::{build_router, AppState};
 use tokio::net::TcpListener;
@@ -124,6 +126,9 @@ pub struct MockSources {
     unregister: Mutex<HashMap<String, Result<(), String>>>,
     list: Mutex<Option<Result<Vec<SourceRowWire>, String>>>,
     rescan: Mutex<HashMap<String, Result<ScanStatsWire, String>>>,
+    search: Mutex<Option<Result<Vec<SearchHitWire>, SearchError>>>,
+    search_calls: Mutex<Vec<(String, usize)>>,
+    all_blocks_calls: Mutex<Vec<(String, usize)>>,
 }
 
 impl MockSources {
@@ -155,6 +160,24 @@ impl MockSources {
     pub fn with_rescan(self, name: &str, result: Result<ScanStatsWire, String>) -> Self {
         self.rescan.lock().unwrap().insert(name.to_string(), result);
         self
+    }
+
+    /// What `unit.search` answers (default: no hits).
+    pub fn with_search(self, result: Result<Vec<SearchHitWire>, SearchError>) -> Self {
+        *self.search.lock().unwrap() = Some(result);
+        self
+    }
+
+    /// Every `(query, limit)` the backend was asked to search, in order.
+    /// An empty list after a rejected request proves nothing reached it.
+    pub fn search_calls(&self) -> Vec<(String, usize)> {
+        self.search_calls.lock().unwrap().clone()
+    }
+
+    /// Every `(query, limit)` the backend was asked to search with
+    /// `scope: "all_blocks"`, in order (it answers no hits).
+    pub fn all_blocks_calls(&self) -> Vec<(String, usize)> {
+        self.all_blocks_calls.lock().unwrap().clone()
     }
 }
 
@@ -192,6 +215,63 @@ impl SourceBackend for MockSources {
             .get(name)
             .cloned()
             .unwrap_or_else(|| Err(format!("no mock response configured for rescan({name})")))
+    }
+
+    fn search_names(&self, query: &str, limit: usize) -> Result<Vec<SearchHitWire>, SearchError> {
+        self.search_calls
+            .lock()
+            .unwrap()
+            .push((query.to_string(), limit));
+        self.search
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or(Ok(Vec::new()))
+    }
+
+    fn search_all_blocks(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<tephrad::rpc::backend::AllBlocksHitWire>, SearchError> {
+        self.all_blocks_calls
+            .lock()
+            .unwrap()
+            .push((query.to_string(), limit));
+        Ok(Vec::new())
+    }
+}
+
+/// Lets a test keep a handle on the mock the server owns.
+pub struct SharedMock(pub std::sync::Arc<MockSources>);
+
+impl tephrad::rpc::backend::SourceBackend for SharedMock {
+    fn register(&self, n: &str, r: &str) -> Result<tephrad::rpc::backend::ScanStatsWire, String> {
+        self.0.register(n, r)
+    }
+    fn unregister(&self, n: &str) -> Result<(), String> {
+        self.0.unregister(n)
+    }
+    fn list(&self) -> Result<Vec<tephrad::rpc::backend::SourceRowWire>, String> {
+        self.0.list()
+    }
+    fn rescan(&self, n: &str) -> Result<tephrad::rpc::backend::ScanStatsWire, String> {
+        self.0.rescan(n)
+    }
+    fn search_names(
+        &self,
+        q: &str,
+        l: usize,
+    ) -> Result<Vec<SearchHitWire>, tephrad::rpc::backend::SearchError> {
+        self.0.search_names(q, l)
+    }
+    fn search_all_blocks(
+        &self,
+        q: &str,
+        l: usize,
+    ) -> Result<Vec<tephrad::rpc::backend::AllBlocksHitWire>, tephrad::rpc::backend::SearchError>
+    {
+        self.0.search_all_blocks(q, l)
     }
 }
 
@@ -323,6 +403,60 @@ pub async fn spawn_with_token_and_any_sources(
     sources: impl SourceBackend + 'static,
     token: &str,
 ) -> TestServer {
+    spawn_with_token_sources_and_blocks(
+        graph,
+        sources,
+        tephrad::rpc::backend::UnsupportedBlockIds,
+        token,
+    )
+    .await
+}
+
+/// A [`BlockBackend`] that records every `(unit, target)` it is asked for
+/// and answers a canned result: `block.ensure_id`'s dispatch and
+/// transport tests drive the verb through the real router without a
+/// filesystem behind it.
+pub struct RecordingBlocks {
+    calls: Mutex<Vec<(String, BlockTarget)>>,
+    reply: Result<EnsureIdWire, BlockIdError>,
+}
+
+impl RecordingBlocks {
+    pub fn answering(reply: Result<EnsureIdWire, BlockIdError>) -> Self {
+        RecordingBlocks {
+            calls: Mutex::new(Vec::new()),
+            reply,
+        }
+    }
+
+    pub fn calls(&self) -> Vec<(String, BlockTarget)> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+/// Lets a test keep its own `Arc` to the recorder after handing it to
+/// the server.
+pub struct SharedBlocks(pub Arc<RecordingBlocks>);
+
+impl BlockBackend for SharedBlocks {
+    fn ensure_id(&self, unit: &str, target: &BlockTarget) -> Result<EnsureIdWire, BlockIdError> {
+        self.0
+            .calls
+            .lock()
+            .unwrap()
+            .push((unit.to_string(), target.clone()));
+        self.0.reply.clone()
+    }
+}
+
+/// [`spawn_with_token_and_any_sources`] with a chosen `block.ensure_id`
+/// backend.
+pub async fn spawn_with_token_sources_and_blocks(
+    graph: MockGraph,
+    sources: impl SourceBackend + 'static,
+    blocks: impl BlockBackend + 'static,
+    token: &str,
+) -> TestServer {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let token_path = tempdir.path().join("token");
     write_token_file(&token_path, token);
@@ -332,27 +466,30 @@ pub async fn spawn_with_token_and_any_sources(
         .expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local_addr");
 
-    let state = Arc::new(AppState::new(
-        token_path,
-        Arc::new(graph) as Arc<dyn GraphBackend>,
-        Arc::new(sources) as Arc<dyn SourceBackend>,
-        // Same rationale as the graph refresh `None` below: none of
-        // these shared fixture-backed tests exercise
-        // `link.preview_refactor`/`link.apply_refactor` (those get
-        // their own dedicated real-engine integration tests —
-        // `tests/link_refactor_integration.rs`,
-        // `tests/link_refactor_auth.rs`), so there is nothing for a
-        // refactor backend to do here beyond erroring if one of those
-        // methods were ever accidentally called against it.
-        Arc::new(tephrad::rpc::backend::UnsupportedRefactor) as Arc<dyn RefactorBackend>,
-        // These fixtures always back `AppState` with a canned
-        // `MockGraph`, never a real `tephrad::rpc::backend::SharedGraph`
-        // — there is nothing for a successful `source.*` mutation to
-        // refresh here (R1 is instead covered end-to-end, against the
-        // real `SourceRegistry`/`UnitGraph`, by
-        // `tests/rpc_live_graph.rs`).
-        None,
-    ));
+    let state = Arc::new(
+        AppState::new(
+            token_path,
+            Arc::new(graph) as Arc<dyn GraphBackend>,
+            Arc::new(sources) as Arc<dyn SourceBackend>,
+            // Same rationale as the graph refresh `None` below: none of
+            // these shared fixture-backed tests exercise
+            // `link.preview_refactor`/`link.apply_refactor` (those get
+            // their own dedicated real-engine integration tests —
+            // `tests/link_refactor_integration.rs`,
+            // `tests/link_refactor_auth.rs`), so there is nothing for a
+            // refactor backend to do here beyond erroring if one of those
+            // methods were ever accidentally called against it.
+            Arc::new(tephrad::rpc::backend::UnsupportedRefactor) as Arc<dyn RefactorBackend>,
+            // These fixtures always back `AppState` with a canned
+            // `MockGraph`, never a real `tephrad::rpc::backend::SharedGraph`
+            // — there is nothing for a successful `source.*` mutation to
+            // refresh here (R1 is instead covered end-to-end, against the
+            // real `SourceRegistry`/`UnitGraph`, by
+            // `tests/rpc_live_graph.rs`).
+            None,
+        )
+        .with_blocks(Arc::new(blocks) as Arc<dyn BlockBackend>),
+    );
     let router = build_router(state.clone());
 
     let handle = tokio::spawn(async move {

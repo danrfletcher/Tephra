@@ -1,0 +1,76 @@
+{
+  "path": "tests/fixtures/code/java/Sample.java",
+  "content_hash": "cccd20438e942427f08e9b098f9cd2d8c835f62a406f347225c6e57c577f803a",
+  "frontmatter": null,
+  "headings": [],
+  "wikilinks": [
+    {
+      "source_prefix": null,
+      "target": "Line",
+      "anchor": null,
+      "alias": null,
+      "raw": "Line",
+      "line": 1,
+      "span": [
+        16,
+        24
+      ]
+    },
+    {
+      "source_prefix": null,
+      "target": "Block",
+      "anchor": null,
+      "alias": null,
+      "raw": "Block",
+      "line": 2,
+      "span": [
+        42,
+        51
+      ]
+    },
+    {
+      "source_prefix": null,
+      "target": "Doc",
+      "anchor": null,
+      "alias": null,
+      "raw": "Doc",
+      "line": 3,
+      "span": [
+        75,
+        82
+      ]
+    }
+  ],
+  "markdown_links": [],
+  "tags": [],
+  "blocks": [],
+  "paragraphs": [],
+  "symbols": [
+    {
+      "kind": "class",
+      "name": "Sample",
+      "parent": null,
+      "line": 4,
+      "start_line": 3,
+      "end_line": 9
+    }
+  ],
+  "comment_blocks": [
+    {
+      "start_line": 1,
+      "end_line": 1,
+      "text": "line comment [[Line]]"
+    },
+    {
+      "start_line": 2,
+      "end_line": 2,
+      "text": "block comment [[Block]]"
+    },
+    {
+      "start_line": 3,
+      "end_line": 3,
+      "text": "javadoc comment [[Doc]]"
+    }
+  ],
+  "diagnostics": []
+}

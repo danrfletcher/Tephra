@@ -13,6 +13,15 @@ use serde::Serialize;
 
 use crate::resolver::{basename_of, normalize_key, strip_markdown_extension};
 
+/// One `^id` occurrence in a unit: the ID (without the caret) and the
+/// first line of the block that carries it (1-based). A unit that
+/// repeats an ID has one `BlockFact` per occurrence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockFact {
+    pub id: String,
+    pub line: i64,
+}
+
 /// One unit's identity and derived metadata, keyed by its federated
 /// `@source:path` id. This is the exact shape [`crate::ResolveResult`]
 /// and [`crate::Edge`] embed, and the one GP5 freezes for PR-6's RPC
@@ -30,6 +39,9 @@ pub struct UnitMetadata {
     pub rel_path: String,
     pub frontmatter_json: Option<String>,
     pub tags: Vec<String>,
+    /// The unit's block IDs in file order, one entry per occurrence
+    /// (a repeated ID repeats here). The occurrences' lines are
+    /// [`UnitGraph::block_occurrences`].
     pub blocks: Vec<String>,
     /// Whether this unit's owning source is currently marked offline
     /// (E2/P4): a cached-but-possibly-stale unit is still returned,
@@ -76,6 +88,20 @@ pub struct Edge {
     /// source (E2/P4): the edge is still returned, annotated, rather
     /// than dropped or erroring.
     pub offline: bool,
+    /// 1-based line of the link in `from`'s file: what a backlink
+    /// reports. `None` for a link in a document (a docx, pptx or PDF
+    /// has pages, not lines) and for a link read from a cache written
+    /// before lines were stored.
+    pub line: Option<i64>,
+}
+
+/// One outgoing link of a unit as held internally: its raw text, its
+/// kind and the line it is on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LinkFact {
+    pub to_raw: String,
+    pub kind: String,
+    pub line: Option<i64>,
 }
 
 /// One unit's facts as held internally: everything [`UnitMetadata`]
@@ -89,10 +115,9 @@ pub(crate) struct NodeFacts {
     pub rel_path: String,
     pub frontmatter_json: Option<String>,
     pub tags: Vec<String>,
-    pub blocks: Vec<String>,
-    /// `(to_raw, kind)` pairs, one per outgoing link this unit's
-    /// content contains.
-    pub links: Vec<(String, String)>,
+    pub blocks: Vec<BlockFact>,
+    /// One entry per outgoing link this unit's content contains.
+    pub links: Vec<LinkFact>,
 }
 
 /// The federated id of a unit: `"@<source>:<rel_path>"`, matching the
@@ -110,6 +135,32 @@ pub(crate) fn federated_id(source: &str, rel_path: &str) -> String {
 /// scoped to the right source without requiring the node to exist.
 pub(crate) fn parse_federated_id(id: &str) -> Option<(&str, &str)> {
     id.strip_prefix('@')?.split_once(':')
+}
+
+/// Splits a block id (`"@<source>:<rel_path>#^<block-id>"`) into the
+/// unit id and the block ID without its caret. `None` when `id` has no
+/// `#^` suffix, or the part after it is not a block ID (ASCII letters,
+/// digits and hyphens): such an id is looked up as a unit id, exactly
+/// as before block backlinks existed.
+pub(crate) fn split_block_id(id: &str) -> Option<(&str, &str)> {
+    let (unit, block) = id.rsplit_once("#^")?;
+    is_block_id(block).then_some((unit, block))
+}
+
+/// Whether `s` is a block ID the way every parser reads one (G12):
+/// one or more ASCII letters, digits or hyphens.
+pub(crate) fn is_block_id(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// Whether `s` is a Tephra-format block ID (G13): exactly 6 characters
+/// `[a-z0-9]`. Only such an ID is searched for in other files when it
+/// is missing from the file a link names; any other ID is typed by a
+/// person and, once missing, is dangling.
+pub(crate) fn is_tephra_block_id(s: &str) -> bool {
+    s.len() == 6
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
 }
 
 /// The in-memory federated link graph (G4): nodes keyed by federated
@@ -212,6 +263,18 @@ pub struct UnitGraph {
     /// alongside the slot sidesteps the need to recompute it from
     /// state that might already be gone.
     pub(crate) edge_keys: Vec<Option<(String, String)>>,
+    /// Source name -> Tephra-format block ID (G13: exactly 6 chars
+    /// `[a-z0-9]`) -> ids of the units of that source that carry it.
+    /// What a *moved* ID is looked up in, so finding the one other
+    /// file that has an ID never scans every unit of the source. A
+    /// typed ID (`^summary`) is never moved, so it is not indexed.
+    pub(crate) block_index: HashMap<String, HashMap<String, Vec<String>>>,
+    /// Block ID -> indices into `edges` of every edge whose link
+    /// anchor is `^<id>`, wherever it currently resolves. Lets
+    /// [`UnitGraph::get_backlinks`] for a block find the links to it
+    /// (including ones written to its old file) without a scan of
+    /// every edge in the graph.
+    pub(crate) anchor_index: HashMap<String, Vec<usize>>,
 }
 
 impl Default for UnitGraph {
@@ -238,6 +301,8 @@ impl UnitGraph {
             backward_index: HashMap::new(),
             match_index: HashMap::new(),
             edge_keys: Vec::new(),
+            block_index: HashMap::new(),
+            anchor_index: HashMap::new(),
         }
     }
 
@@ -307,6 +372,16 @@ impl UnitGraph {
         self.known_sources.iter().cloned().collect()
     }
 
+    /// Every `^id` occurrence of unit `id`, in file order, each with
+    /// its line, nothing deduplicated. Empty if the unit has none or
+    /// is not in the graph.
+    pub fn block_occurrences(&self, id: &str) -> Vec<BlockFact> {
+        self.nodes
+            .get(id)
+            .map(|f| f.blocks.clone())
+            .unwrap_or_default()
+    }
+
     /// The metadata for one unit, by federated id, or `None` if no
     /// such unit is currently in the graph (never an error — a stale
     /// id is simply absent).
@@ -317,7 +392,7 @@ impl UnitGraph {
             rel_path: f.rel_path.clone(),
             frontmatter_json: f.frontmatter_json.clone(),
             tags: f.tags.clone(),
-            blocks: f.blocks.clone(),
+            blocks: f.blocks.iter().map(|b| b.id.clone()).collect(),
             offline: self.offline_sources.contains(&f.source),
         })
     }
@@ -335,20 +410,33 @@ impl UnitGraph {
             .get(id)
             .map(|idxs| idxs.iter().filter_map(|&i| self.edges[i].clone()).collect())
             .unwrap_or_default();
-        let mut out = dedup_for_query(edges);
+        let mut out = dedup_for_query(edges, Dedup::PerTarget);
         out.sort_by(edge_sort_key);
         out
     }
 
-    /// `graph.get_backlinks` (G4): every edge whose target resolved
-    /// to `id`, de-duplicated for query output (R16/R2 — see
-    /// [`UnitGraph::get_forward_links`]) and sorted for deterministic
-    /// output. Looked up through [`UnitGraph::backward_index`], so
-    /// this stays bounded-time regardless of how many thousands of
-    /// edges target `id` (no linear scan over every edge in the
-    /// graph).
+    /// `graph.get_backlinks` (G4, G16): the links to `id`, one row per
+    /// link occurrence — `(from, line)` — so two links in one file are
+    /// two rows, and sorted for deterministic output. (Occurrences
+    /// that share a `(from, line)`, such as two links to the same
+    /// target on one line, are one row.) Looked up through
+    /// [`UnitGraph::backward_index`], so this stays bounded-time
+    /// regardless of how many thousands of edges target `id` (no
+    /// linear scan over every edge in the graph).
     ///
-    /// When `id` names no unit currently in the graph — most
+    /// `id` is either a unit (`@source:path`) or a block
+    /// (`@source:path#^block-id`, G13, G16):
+    ///
+    /// - A **unit** id returns every link whose target resolved to
+    ///   the unit, whether or not the link carries an anchor.
+    /// - A **block** id returns only the links whose anchor is that
+    ///   block and that resolve to it: a link written to the block's
+    ///   old file that finds it there by the moved-ID rule counts
+    ///   (see [`crate::ResolveResult::block`]). A link whose ID is
+    ///   ambiguous or dangling resolves to no block and is not
+    ///   listed.
+    ///
+    /// When a unit `id` names no unit currently in the graph — most
     /// pointedly, the pre-rename path of a note PR-4's watcher just
     /// moved (GP7) — also includes every currently-[`EdgeTarget::Dangling`]
     /// edge whose own match key equals `id`'s path or basename
@@ -371,29 +459,30 @@ impl UnitGraph {
     /// `id` at all.
     pub fn get_backlinks(&self, id: &str) -> Vec<Edge> {
         let edges = self.backlink_candidates(id);
-        let mut out = dedup_for_query(edges);
+        let mut out = dedup_for_query(edges, Dedup::PerOccurrence);
         out.sort_by(edge_sort_key);
         out
     }
 
     /// Same lookup as [`UnitGraph::get_backlinks`], but without that
-    /// method's query-display [`dedup_for_query`] collapse. For a
-    /// `Resolved` target, [`DedupKey::Resolved`] deliberately ignores
-    /// `kind`/`to_raw` entirely — exactly right for `get_backlinks`'s
-    /// own display RPC (G4), where one row per distinct *referring
-    /// unit* is what a caller wants to see, but wrong for a caller
-    /// (PR-8's link refactor engine) that must find and rewrite
-    /// *every* raw occurrence of an incoming link to `id`, including a
-    /// file that links to it more than once via a different link kind
-    /// or a differently-spelled raw target: `get_backlinks` would
-    /// silently report only one of those occurrences, picking
+    /// method's query-display [`dedup_for_query`] collapse. A
+    /// `Resolved` target's dedup key deliberately ignores
+    /// `kind`/`to_raw`, which is exactly right for `get_backlinks`'s
+    /// own display RPC (G4), where one row per link *occurrence* is
+    /// what a caller wants to see, but wrong for a caller (PR-8's
+    /// link refactor engine) that must find and rewrite *every* raw
+    /// occurrence of an incoming link to `id`, including a file that
+    /// links to it more than once on one line, via a different link
+    /// kind or a differently-spelled raw target: `get_backlinks`
+    /// would silently report only one of those occurrences, picking
     /// whichever (`kind`, `to_raw`) pair sorts first, and this PR's
     /// refactor engine would then never even consider rewriting the
     /// others.
     ///
     /// Still sorted for deterministic output, and a dangling-edge
     /// lookup for a stale id (GP7's renamed-note scenario) behaves
-    /// exactly as `get_backlinks` documents.
+    /// exactly as `get_backlinks` documents. `id` may be a block id
+    /// too (see `get_backlinks`).
     pub fn get_backlinks_all(&self, id: &str) -> Vec<Edge> {
         let mut out = self.backlink_candidates(id);
         out.sort_by(edge_sort_key);
@@ -401,13 +490,18 @@ impl UnitGraph {
     }
 
     /// The raw, not-yet-deduplicated edge set [`UnitGraph::get_backlinks`]
-    /// and [`UnitGraph::get_backlinks_all`] both start from: every
-    /// edge indexed under `id` in [`UnitGraph::backward_index`], plus
-    /// — when `id` names no current node — every still-dangling edge
-    /// whose match key equals `id`'s stale path or basename (see
+    /// and [`UnitGraph::get_backlinks_all`] both start from. For a
+    /// block id, the edges anchored on that block that resolve to it
+    /// ([`UnitGraph::block_backlink_candidates`]). For a unit id,
+    /// every edge indexed under `id` in [`UnitGraph::backward_index`],
+    /// plus — when `id` names no current node — every still-dangling
+    /// edge whose match key equals `id`'s stale path or basename (see
     /// `get_backlinks`'s own doc comment for why that lookup is
     /// skipped for a *live* id, R11).
     fn backlink_candidates(&self, id: &str) -> Vec<Edge> {
+        if let Some((unit_id, block_id)) = split_block_id(id) {
+            return self.block_backlink_candidates(unit_id, block_id);
+        }
         let mut idxs: Vec<usize> = self.backward_index.get(id).cloned().unwrap_or_default();
 
         if !self.nodes.contains_key(id) {
@@ -433,12 +527,38 @@ impl UnitGraph {
         idxs.iter().filter_map(|&i| self.edges[i].clone()).collect()
     }
 
+    /// The edges anchored on block `block_id` that resolve to that
+    /// block *of unit `unit_id`* (G13): found through
+    /// [`UnitGraph::anchor_index`], each one resolved with the same
+    /// rule [`UnitGraph::resolve_link`] uses, so a link written to
+    /// the block's old file counts once the block has moved here.
+    /// Empty when `unit_id` is not in the graph.
+    fn block_backlink_candidates(&self, unit_id: &str, block_id: &str) -> Vec<Edge> {
+        if !self.nodes.contains_key(unit_id) {
+            return Vec::new();
+        }
+        let Some(slots) = self.anchor_index.get(block_id) else {
+            return Vec::new();
+        };
+        let mut idxs: Vec<usize> = slots.clone();
+        idxs.sort_unstable();
+        idxs.dedup();
+        idxs.iter()
+            .filter_map(|&i| self.edges[i].as_ref())
+            .filter(|edge| {
+                crate::resolver::resolve_edge_block(self, edge)
+                    .is_some_and(|hit| hit.unit == unit_id)
+            })
+            .cloned()
+            .collect()
+    }
+
     /// `graph.get_edges` (G4): every edge in the graph, de-duplicated
     /// for query output (R16/R2) and sorted for deterministic output.
     /// Empty (never `null`) for an empty graph.
     pub fn get_edges(&self) -> Vec<Edge> {
         let edges: Vec<Edge> = self.edges.iter().filter_map(|e| e.clone()).collect();
-        let mut out = dedup_for_query(edges);
+        let mut out = dedup_for_query(edges, Dedup::PerTarget);
         out.sort_by(edge_sort_key);
         out
     }
@@ -449,26 +569,50 @@ fn edge_sort_key(a: &Edge, b: &Edge) -> std::cmp::Ordering {
         EdgeTarget::Resolved(id) => (0u8, id.clone()),
         EdgeTarget::Dangling => (1u8, String::new()),
     };
-    (a.from.clone(), to_key(a), a.kind.clone(), a.to_raw.clone()).cmp(&(
-        b.from.clone(),
-        to_key(b),
-        b.kind.clone(),
-        b.to_raw.clone(),
-    ))
+    (
+        a.from.clone(),
+        to_key(a),
+        a.line,
+        a.kind.clone(),
+        a.to_raw.clone(),
+    )
+        .cmp(&(
+            b.from.clone(),
+            to_key(b),
+            b.line,
+            b.kind.clone(),
+            b.to_raw.clone(),
+        ))
+}
+
+/// How [`dedup_for_query`] folds raw edges into query-output rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dedup {
+    /// One row per `(from, target)`: `get_edges` and
+    /// `get_forward_links`, where a caller wants to know *that* a unit
+    /// links somewhere, not how many times. The surviving row's `line`
+    /// is that of the surviving link (see [`keeps_priority`]).
+    PerTarget,
+    /// One row per link occurrence, `(from, target, line)`:
+    /// `get_backlinks`, where each row says where the link is.
+    PerOccurrence,
 }
 
 /// De-duplication key for one edge's query-output identity (R16/R2):
 /// every raw link that resolves to the *same* real unit collapses to
-/// one edge at query time (e.g. a note containing `[[B]]` twice, or
-/// `[[A]]`/`[[#H]]` both resolving to the note's own self-edge) —
-/// but, unlike the pre-R16 behaviour, the *other* raw link's own
-/// [`Edge`] record is never discarded from storage, only folded away
-/// here when building a query's output rows (see [`dedup_for_query`]
-/// and `crate::ingest`'s module doc for why that distinction matters:
-/// an edge that currently shares a dedup key with another can
-/// *diverge* from it again on a later insert/remove, and the only way
-/// to re-resolve it then is for its own `(to_raw, kind)` to still
-/// have its own indexed record to re-resolve).
+/// one edge at query time (e.g. a note containing `[[B]]` twice on one
+/// line, or `[[A]]`/`[[#H]]` both resolving to the note's own
+/// self-edge) — but the *other* raw link's own [`Edge`] record is
+/// never discarded from storage, only folded away here when building
+/// a query's output rows (see [`dedup_for_query`] and `crate::ingest`'s
+/// module doc for why that distinction matters: an edge that currently
+/// shares a dedup key with another can *diverge* from it again on a
+/// later insert/remove, and the only way to re-resolve it then is for
+/// its own `(to_raw, kind)` to still have its own indexed record to
+/// re-resolve).
+///
+/// With [`Dedup::PerOccurrence`] the key also holds the link's `line`,
+/// so two links to the same unit on different lines stay two rows.
 ///
 /// A dangling edge is *not* collapsed just because another edge from
 /// the same unit is also dangling — two different unresolved targets
@@ -478,41 +622,49 @@ fn edge_sort_key(a: &Edge, b: &Edge) -> std::cmp::Ordering {
 /// collapsing only an exact repeat of the identical raw link.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum DedupKey {
-    Resolved(String, String),
-    Dangling(String, String, String),
+    Resolved(String, String, Option<i64>),
+    Dangling(String, String, String, Option<i64>),
 }
 
-fn dedup_key(edge: &Edge) -> DedupKey {
+fn dedup_key(edge: &Edge, mode: Dedup) -> DedupKey {
+    let line = match mode {
+        Dedup::PerTarget => None,
+        Dedup::PerOccurrence => edge.line,
+    };
     match &edge.to {
-        EdgeTarget::Resolved(id) => DedupKey::Resolved(edge.from.clone(), id.clone()),
-        EdgeTarget::Dangling => {
-            DedupKey::Dangling(edge.from.clone(), edge.kind.clone(), edge.to_raw.clone())
-        }
+        EdgeTarget::Resolved(id) => DedupKey::Resolved(edge.from.clone(), id.clone(), line),
+        EdgeTarget::Dangling => DedupKey::Dangling(
+            edge.from.clone(),
+            edge.kind.clone(),
+            edge.to_raw.clone(),
+            line,
+        ),
     }
 }
 
 /// Picks, between two edges that share a [`DedupKey`], the one that
 /// survives in query output: the lexicographically smaller
-/// `(kind, to_raw)` pair, for a deterministic, input-order-independent
-/// winner.
+/// `(kind, to_raw, line)` triple, for a deterministic,
+/// input-order-independent winner.
 fn keeps_priority(a: &Edge, b: &Edge) -> bool {
-    (a.kind.as_str(), a.to_raw.as_str()) <= (b.kind.as_str(), b.to_raw.as_str())
+    (a.kind.as_str(), a.to_raw.as_str(), a.line) <= (b.kind.as_str(), b.to_raw.as_str(), b.line)
 }
 
 /// Collapses `edges` by [`dedup_key`] (R16/R2), keeping, for each
-/// key, the edge with the lexicographically smallest `(kind, to_raw)`
-/// so the survivor is deterministic regardless of input order. Used
-/// only by [`UnitGraph::get_edges`]/[`UnitGraph::get_forward_links`]/
-/// [`UnitGraph::get_backlinks`] when building their returned rows —
+/// key, the edge with the lexicographically smallest
+/// `(kind, to_raw, line)` so the survivor is deterministic regardless
+/// of input order. Used only by [`UnitGraph::get_edges`]/
+/// [`UnitGraph::get_forward_links`]/[`UnitGraph::get_backlinks`] when
+/// building their returned rows —
 /// every raw link still has its own [`Edge`] record in `self.edges`
 /// and its own [`UnitGraph::match_index`] entry (R16), so an
 /// insert/remove that changes one raw link's resolution without
 /// affecting another's can still find and re-resolve it even after
 /// the two used to collapse to the same query-output row.
-fn dedup_for_query(edges: Vec<Edge>) -> Vec<Edge> {
+fn dedup_for_query(edges: Vec<Edge>, mode: Dedup) -> Vec<Edge> {
     let mut by_key: HashMap<DedupKey, Edge> = HashMap::new();
     for edge in edges {
-        let key = dedup_key(&edge);
+        let key = dedup_key(&edge, mode);
         match by_key.get(&key) {
             Some(existing) if keeps_priority(existing, &edge) => {}
             _ => {

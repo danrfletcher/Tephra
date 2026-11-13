@@ -1,0 +1,67 @@
+{
+  "path": "tests/fixtures/code/python/sample.py",
+  "content_hash": "70fec97cb11a6688454e0c5d84e4cf98c2516b493cbac5271ead19ca9bdb276a",
+  "frontmatter": null,
+  "headings": [],
+  "wikilinks": [
+    {
+      "source_prefix": null,
+      "target": "Doc",
+      "anchor": null,
+      "alias": null,
+      "raw": "Doc",
+      "line": 1,
+      "span": [
+        20,
+        27
+      ]
+    },
+    {
+      "source_prefix": null,
+      "target": "Line",
+      "anchor": null,
+      "alias": null,
+      "raw": "Line",
+      "line": 2,
+      "span": [
+        46,
+        54
+      ]
+    }
+  ],
+  "markdown_links": [],
+  "tags": [],
+  "blocks": [],
+  "paragraphs": [],
+  "symbols": [
+    {
+      "kind": "variable",
+      "name": "s",
+      "parent": null,
+      "line": 3,
+      "start_line": 3,
+      "end_line": 3
+    },
+    {
+      "kind": "variable",
+      "name": "f",
+      "parent": null,
+      "line": 4,
+      "start_line": 4,
+      "end_line": 4
+    }
+  ],
+  "comment_blocks": [
+    {
+      "start_line": 1,
+      "end_line": 1,
+      "text": "Module docstring [[Doc]]"
+    },
+    {
+      "start_line": 2,
+      "end_line": 2,
+      "text": "line comment [[Line]]"
+    }
+  ],
+  "diagnostics": []
+}

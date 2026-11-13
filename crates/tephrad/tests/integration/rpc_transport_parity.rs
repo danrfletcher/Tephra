@@ -16,7 +16,10 @@ use serde_json::{json, Value};
 use tephra_graph::{Edge, EdgeTarget, ResolveError, ResolveResult, UnitMetadata};
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::rpc_fixtures::{connect_ws, spawn, MockGraph, MockSources};
+use crate::rpc_fixtures::{
+    connect_ws, spawn, spawn_with_token_sources_and_blocks, MockGraph, MockSources,
+    RecordingBlocks, SharedBlocks,
+};
 
 async fn http_response_bytes(server: &crate::rpc_fixtures::TestServer, request: &Value) -> Vec<u8> {
     let client = reqwest::Client::new();
@@ -69,6 +72,7 @@ fn sample_edge() -> Edge {
         to_raw: "[[one]]".to_string(),
         kind: "wikilink".to_string(),
         offline: false,
+        line: Some(4),
     }
 }
 
@@ -88,6 +92,7 @@ async fn http_and_ws_produce_byte_identical_responses_across_every_standard_outc
                     offline: false,
                 },
                 edges: vec![sample_edge()],
+                block: None,
             }),
         )
         .with_resolve(
@@ -173,4 +178,72 @@ async fn http_and_ws_produce_byte_identical_responses_across_every_standard_outc
         String::from_utf8_lossy(&http_parse_error),
         String::from_utf8_lossy(&ws_parse_error),
     );
+}
+
+/// `block.ensure_id` (G11): HTTP and WebSocket answer byte for byte
+/// alike for a created ID, a heading, a refusal and a malformed request.
+#[tokio::test]
+async fn block_ensure_id_is_byte_identical_over_http_and_ws() {
+    use tephrad::block_id::{BlockIdError, EnsureIdWire};
+
+    let replies = [
+        Ok(EnsureIdWire {
+            id: Some("k3f9a2".into()),
+            link: "[[@notes:Tephra test#^k3f9a2]]".into(),
+            created: true,
+        }),
+        Ok(EnsureIdWire {
+            id: None,
+            link: "[[@notes:Tephra test#Head]]".into(),
+            created: false,
+        }),
+        Err(BlockIdError::Refused("file changed, try again".into())),
+    ];
+    for (i, reply) in replies.into_iter().enumerate() {
+        let blocks = std::sync::Arc::new(RecordingBlocks::answering(reply));
+        let server = spawn_with_token_sources_and_blocks(
+            MockGraph::new(),
+            MockSources::new(),
+            SharedBlocks(blocks.clone()),
+            &"t".repeat(64),
+        )
+        .await;
+        assert_transport_parity(
+            &server,
+            json!({"jsonrpc": "2.0", "id": 20 + i, "method": "block.ensure_id",
+                   "params": {"unit": "@notes:Tephra test.md", "line": 3}}),
+        )
+        .await;
+        // Once per transport, and the same arguments both times.
+        assert_eq!(
+            blocks.calls(),
+            vec![
+                (
+                    "@notes:Tephra test.md".to_string(),
+                    tephrad::block_id::BlockTarget::Line(3)
+                );
+                2
+            ],
+            "reply {i}"
+        );
+    }
+
+    // Malformed: -32602 the same way on both, and the backend untouched.
+    let blocks = std::sync::Arc::new(RecordingBlocks::answering(Err(BlockIdError::Refused(
+        "unreachable".into(),
+    ))));
+    let server = spawn_with_token_sources_and_blocks(
+        MockGraph::new(),
+        MockSources::new(),
+        SharedBlocks(blocks.clone()),
+        &"t".repeat(64),
+    )
+    .await;
+    assert_transport_parity(
+        &server,
+        json!({"jsonrpc": "2.0", "id": 30, "method": "block.ensure_id",
+               "params": {"unit": "@notes:a.md", "line": 0}}),
+    )
+    .await;
+    assert!(blocks.calls().is_empty());
 }

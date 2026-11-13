@@ -1,0 +1,14 @@
+{
+  "offline": true,
+  "results": [
+    {
+      "kind": "paragraph",
+      "line": 3,
+      "text": "",
+      "unit": "@notes:plan.md"
+    }
+  ],
+  "scope": "blocks",
+  "text_unavailable": true,
+  "unit": "@notes:plan.md"
+}

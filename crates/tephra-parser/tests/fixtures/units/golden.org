@@ -1,0 +1,12 @@
+#+TITLE: Golden org
+* Overview
+Links: [[Project Plan]], [[Project Plan|the plan]] and [[file:other.org][Other]].
+Also [the spec](docs/spec.md). ^ov-1
+** Details
+#+BEGIN_SRC python
+print("[[Hidden]] ^hidden")
+* not a heading
+#+END_SRC
+Text with *bold* inside and a #tag. ^det-1
+*** Deep
+Final [[Deep Note#Section]].

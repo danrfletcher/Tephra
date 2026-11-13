@@ -13,6 +13,8 @@ name = "tephractl"
 path = "src/main.rs"
 
 [dependencies]
+# `localtime_r`, for `ls`'s local modified-time column (no date crate).
+libc = "0.2"
 reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "json", "rustls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.154"

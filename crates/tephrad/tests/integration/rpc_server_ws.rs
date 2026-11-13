@@ -45,6 +45,7 @@ async fn an_authenticated_websocket_serves_requests_with_the_same_results_as_htt
             to_raw: "[[one]]".to_string(),
             kind: "wikilink".to_string(),
             offline: false,
+            line: Some(4),
         }],
     );
     let server = spawn(graph, MockSources::new()).await;

@@ -1,0 +1,164 @@
+{
+  "content_hash": "58e9fe401e4a6b0ad99263d8c92d0d765adf1dae7ff5c8987cd8aadd83e3eba6",
+  "diagnostics": [],
+  "format": "pdf",
+  "headings": [
+    {
+      "level": 1,
+      "location": {
+        "page": 1
+      },
+      "text": "Chapter one"
+    },
+    {
+      "level": 2,
+      "location": {
+        "page": 1
+      },
+      "text": "Section 1.1"
+    },
+    {
+      "level": 1,
+      "location": {
+        "page": 2
+      },
+      "text": "Chapter two"
+    }
+  ],
+  "markdown_links": [
+    {
+      "index": 3,
+      "link": {
+        "line": 3,
+        "span": [
+          13,
+          22
+        ],
+        "target": "Target.md",
+        "text": "doc link"
+      },
+      "location": {
+        "page": 1
+      }
+    }
+  ],
+  "paragraphs": [
+    {
+      "index": 1,
+      "location": {
+        "page": 1
+      },
+      "text": "Chapter one"
+    },
+    {
+      "index": 2,
+      "location": {
+        "page": 1
+      },
+      "text": "See [[Target]] for details"
+    },
+    {
+      "index": 3,
+      "location": {
+        "page": 1
+      },
+      "text": "A [doc link](Target.md) here"
+    },
+    {
+      "index": 4,
+      "location": {
+        "page": 1
+      },
+      "text": "Federated [[@notes:Tephra test#Intro|shown]] too"
+    },
+    {
+      "index": 1,
+      "location": {
+        "page": 2
+      },
+      "text": "Chapter two"
+    },
+    {
+      "index": 2,
+      "location": {
+        "page": 2
+      },
+      "text": "Block [[Target#^abc123]] and [[Other]]"
+    }
+  ],
+  "path": "tests/fixtures/documents/text.pdf",
+  "wikilinks": [
+    {
+      "index": 2,
+      "link": {
+        "alias": null,
+        "anchor": null,
+        "line": 2,
+        "raw": "Target",
+        "source_prefix": null,
+        "span": [
+          4,
+          14
+        ],
+        "target": "Target"
+      },
+      "location": {
+        "page": 1
+      }
+    },
+    {
+      "index": 4,
+      "link": {
+        "alias": "shown",
+        "anchor": "Intro",
+        "line": 4,
+        "raw": "@notes:Tephra test#Intro|shown",
+        "source_prefix": "notes",
+        "span": [
+          10,
+          44
+        ],
+        "target": "Tephra test"
+      },
+      "location": {
+        "page": 1
+      }
+    },
+    {
+      "index": 2,
+      "link": {
+        "alias": null,
+        "anchor": "^abc123",
+        "line": 2,
+        "raw": "Target#^abc123",
+        "source_prefix": null,
+        "span": [
+          6,
+          24
+        ],
+        "target": "Target"
+      },
+      "location": {
+        "page": 2
+      }
+    },
+    {
+      "index": 2,
+      "link": {
+        "alias": null,
+        "anchor": null,
+        "line": 2,
+        "raw": "Other",
+        "source_prefix": null,
+        "span": [
+          29,
+          38
+        ],
+        "target": "Other"
+      },
+      "location": {
+        "page": 2
+      }
+    }
+  ]
+}

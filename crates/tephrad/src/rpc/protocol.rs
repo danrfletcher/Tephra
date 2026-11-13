@@ -36,6 +36,10 @@ pub const SOURCE_ERROR: i64 = -32011;
 /// but reported `"aborted"`/`"partial"` in its *result*; that is a
 /// normal successful RPC response, not an error (G7).
 pub const REFACTOR_ERROR: i64 = -32012;
+/// `block.ensure_id` refused a valid request (a line in a code block,
+/// a stale file, a read-only source...): nothing was written, and the
+/// message says why.
+pub const BLOCK_ERROR: i64 = -32013;
 /// Standard JSON-RPC 2.0 "Internal error" (§5.1): used only when a
 /// dispatch call panicked inside its `tokio::task::spawn_blocking`
 /// task (R6) — a bug, not a client-facing validation/auth/domain

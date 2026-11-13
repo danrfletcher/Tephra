@@ -28,6 +28,7 @@ fn sample_edge() -> Edge {
         to_raw: "[[one]]".to_string(),
         kind: "wikilink".to_string(),
         offline: false,
+        line: Some(4),
     }
 }
 
@@ -80,6 +81,7 @@ async fn unit_resolve_link_returns_the_mocked_resolution_over_http() {
         Ok(ResolveResult {
             unit: sample_unit(),
             edges: vec![sample_edge()],
+            block: None,
         }),
     );
     let server = spawn(graph, MockSources::new()).await;

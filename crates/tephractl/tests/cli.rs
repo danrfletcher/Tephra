@@ -15,8 +15,23 @@ mod auth;
 #[path = "cli/source_commands.rs"]
 mod source_commands;
 
+#[path = "cli/ls_commands.rs"]
+mod ls_commands;
+
+#[path = "cli/search_commands.rs"]
+mod search_commands;
+
+#[path = "cli/block_id_commands.rs"]
+mod block_id_commands;
+
 #[path = "cli/link_commands.rs"]
 mod link_commands;
 
+#[path = "cli/backlinks.rs"]
+mod backlinks;
+
 #[path = "cli/transport.rs"]
 mod transport;
+
+#[path = "cli/search_in_file.rs"]
+mod search_in_file;

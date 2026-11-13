@@ -56,5 +56,17 @@
       "line": 12
     }
   ],
+  "paragraphs": [
+    {
+      "start_line": 8,
+      "end_line": 8,
+      "block_id": null
+    },
+    {
+      "start_line": 12,
+      "end_line": 12,
+      "block_id": "golden-block"
+    }
+  ],
   "diagnostics": []
 }

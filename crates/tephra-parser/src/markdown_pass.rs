@@ -1,6 +1,6 @@
 //! The one `pulldown-cmark` pass over the body text: headings,
-//! standard `[text](url)`/reference-style markdown links, and two
-//! kinds of byte ranges the hand-rolled wikilink/tag/block scanners
+//! paragraph blocks, standard `[text](url)`/reference-style markdown
+//! links, and two kinds of byte ranges the hand-rolled wikilink/tag/block scanners
 //! need to steer clear of:
 //!
 //! - `excluded_ranges`: anything "code-like" or raw HTML rather than
@@ -18,10 +18,11 @@
 
 use std::ops::Range;
 
-use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
+use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 use serde::Serialize;
 
+use crate::blocks::Paragraph;
 use crate::diagnostics::{Diagnostic, DiagnosticKind};
 use crate::line_index::LineIndex;
 
@@ -66,6 +67,13 @@ pub struct MarkdownLink {
 
 pub(crate) struct MarkdownPass {
     pub headings: Vec<Heading>,
+    /// Paragraph blocks in document order: each CommonMark paragraph,
+    /// and each list item's own text (a tight item has no paragraph
+    /// node, so its inline content is gathered here; a nested list
+    /// ends it and gets its own items). Fences, tables, frontmatter,
+    /// headings, HTML blocks and rules are not paragraphs. No
+    /// `block_id` yet: see [`crate::blocks::attach_ids`].
+    pub paragraphs: Vec<Paragraph>,
     pub links: Vec<MarkdownLink>,
     /// Byte ranges (relative to `body`), sorted ascending, that the
     /// wikilink/tag/block scanners must never scan inside: fenced
@@ -76,6 +84,26 @@ pub(crate) struct MarkdownPass {
     /// just the destination portion of every inline link or image.
     /// Consumed only by the tag scanner.
     pub link_destination_ranges: Vec<(usize, usize)>,
+    /// `(first line, last line)` of every fenced or indented code block,
+    /// absolute within the original file, in document order.
+    pub code_block_lines: Vec<(usize, usize)>,
+    /// `(first line, last line)` of every table, absolute within the
+    /// original file, in document order.
+    pub table_lines: Vec<(usize, usize)>,
+    /// `(first line, last line)` of every heading, parallel to
+    /// `headings`: a setext heading spans its title and underline.
+    pub heading_lines: Vec<(usize, usize)>,
+}
+
+/// A list item whose text is being gathered: its first line and the
+/// byte span of the inline content that belongs to the item itself
+/// (before any nested block).
+struct ItemText {
+    start: usize,
+    text_end: Option<usize>,
+    /// Cleared by the first child block: later inline events belong
+    /// to that block, not to the item.
+    open: bool,
 }
 
 /// (link text so far, destination, starting line, destination's
@@ -91,26 +119,123 @@ pub(crate) fn run(
     diagnostics: &mut Vec<Diagnostic>,
 ) -> MarkdownPass {
     let mut headings = Vec::new();
+    let mut paragraphs: Vec<Paragraph> = Vec::new();
     let mut links = Vec::new();
     let mut excluded_ranges = Vec::new();
     let mut link_destination_ranges = Vec::new();
+    let mut code_block_lines: Vec<(usize, usize)> = Vec::new();
+    let mut table_lines: Vec<(usize, usize)> = Vec::new();
+    let mut heading_lines: Vec<(usize, usize)> = Vec::new();
 
     let mut current_heading: Option<(u8, String, usize)> = None;
     let mut current_link: Option<CurrentLink> = None;
     let mut in_code_block_start: Option<usize> = None;
+    let mut paragraph_start: Option<usize> = None;
+    let mut items: Vec<ItemText> = Vec::new();
 
     let line_index = LineIndex::new(body);
     let absolute_line =
         |rel_offset: usize| body_start_line - 1 + line_index.line_number(rel_offset);
 
-    for (event, range) in Parser::new(body).into_offset_iter() {
+    // Pushes a paragraph spanning `start..end` (byte offsets in
+    // `body`); trailing line endings don't count towards its last
+    // line.
+    let push_paragraph = |paragraphs: &mut Vec<Paragraph>, start: usize, end: usize| {
+        let mut end = end.min(body.len());
+        while end > start && matches!(body.as_bytes()[end - 1], b'\n' | b'\r') {
+            end -= 1;
+        }
+        let end_line = if end > start {
+            absolute_line(end - 1)
+        } else {
+            absolute_line(start)
+        };
+        paragraphs.push(Paragraph {
+            start_line: absolute_line(start),
+            end_line,
+            block_id: None,
+        });
+    };
+
+    // `(first line, last line)` of a block's byte range: a trailing line
+    // ending belongs to no line of its own.
+    let block_lines = |range: &Range<usize>| -> (usize, usize) {
+        let start = range.start.min(body.len());
+        let mut end = range.end.min(body.len());
+        while end > start && matches!(body.as_bytes()[end - 1], b'\n' | b'\r') {
+            end -= 1;
+        }
+        let last = if end > start {
+            absolute_line(end - 1)
+        } else {
+            absolute_line(start)
+        };
+        (absolute_line(start), last)
+    };
+
+    for (event, range) in Parser::new_ext(body, Options::ENABLE_TABLES).into_offset_iter() {
+        // A tight list item's text is the inline content directly
+        // inside it. Any block-level child (nested list, paragraph,
+        // code block, quote, table, heading, HTML block, rule) ends
+        // it; inline events extend it.
+        if let Some(item) = items.last_mut() {
+            if item.open {
+                match &event {
+                    Event::Start(
+                        Tag::Emphasis
+                        | Tag::Strong
+                        | Tag::Strikethrough
+                        | Tag::Link { .. }
+                        | Tag::Image { .. },
+                    )
+                    | Event::End(
+                        TagEnd::Emphasis
+                        | TagEnd::Strong
+                        | TagEnd::Strikethrough
+                        | TagEnd::Link
+                        | TagEnd::Image,
+                    ) => {}
+                    Event::Start(_) | Event::Rule => item.open = false,
+                    Event::End(_) => {}
+                    _ => {
+                        item.text_end = Some(item.text_end.unwrap_or(0).max(range.end));
+                    }
+                }
+            }
+        }
         match event {
+            Event::Start(Tag::Item) => {
+                items.push(ItemText {
+                    start: range.start,
+                    text_end: None,
+                    open: true,
+                });
+            }
+            Event::End(TagEnd::Item) => {
+                if let Some(item) = items.pop() {
+                    if let Some(text_end) = item.text_end {
+                        push_paragraph(&mut paragraphs, item.start, text_end);
+                    }
+                }
+            }
+            Event::Start(Tag::Paragraph) => {
+                paragraph_start = Some(range.start);
+            }
+            Event::End(TagEnd::Paragraph) => {
+                if let Some(start) = paragraph_start.take() {
+                    push_paragraph(&mut paragraphs, start, range.end);
+                }
+            }
             Event::Start(Tag::Heading { level, .. }) => {
                 let level_num = heading_level_to_u8(level);
                 current_heading = Some((level_num, String::new(), range.start));
             }
+            Event::Start(Tag::Table(_)) => {
+                table_lines.push(block_lines(&range));
+            }
             Event::End(TagEnd::Heading(_)) => {
                 if let Some((level, text, start)) = current_heading.take() {
+                    heading_lines.push(block_lines(&range));
                     headings.push(Heading {
                         level,
                         text,
@@ -159,6 +284,7 @@ pub(crate) fn run(
             }
             Event::End(TagEnd::CodeBlock) => {
                 if let Some(start) = in_code_block_start.take() {
+                    code_block_lines.push(block_lines(&(start..range.end)));
                     excluded_ranges.push((start, range.end));
                 }
             }
@@ -196,12 +322,19 @@ pub(crate) fn run(
 
     excluded_ranges.sort_unstable_by_key(|r| r.0);
     link_destination_ranges.sort_unstable_by_key(|r| r.0);
+    // A nested list item closes before the item around it: document
+    // order is by first line.
+    paragraphs.sort_by_key(|p| (p.start_line, p.end_line));
 
     MarkdownPass {
         headings,
+        paragraphs,
         links,
         excluded_ranges,
         link_destination_ranges,
+        code_block_lines,
+        table_lines,
+        heading_lines,
     }
 }
 

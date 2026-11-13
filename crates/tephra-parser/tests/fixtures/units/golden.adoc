@@ -1,0 +1,21 @@
+= Golden AsciiDoc
+
+Intro with [[Project Plan]] and link:other.adoc[Other].
+
+== Section One
+
+A paragraph [[Project Plan#Goals]]
+over two lines. ^s1
+
+----
+[[Hidden]] ^hidden
+= Not a heading
+----
+
+=== Subsection
+
+====
+example block delimiters are not headings
+====
+
+Closing [text](notes/closing.md) and <<anchor>>.

@@ -149,3 +149,111 @@ fn rescan_survives_a_concurrent_edit_on_a_not_yet_walked_file() {
          fraction of rows behind"
     );
 }
+
+/// A `^^` (all_blocks) query made while a source's own `rescan()` is
+/// running (the rescan deletes the source's rows and rewrites them over
+/// several commit chunks): the query must never fail, and what it sees
+/// must be a consistent snapshot. Every hit is a whole file's own block
+/// (the row's text carries the same number as its path, so a row left
+/// over from another file or half written would show), no unit comes
+/// twice, and once the rescan is over every file is found.
+///
+/// The searcher is a real `search_all_blocks` call on its own read-only
+/// connection to the same database file, the function behind
+/// `unit.search` with `scope: "all_blocks"`.
+#[test]
+fn a_block_search_during_a_rescan_never_errors_and_sees_only_whole_files() {
+    let fixture = fixtures::empty_source();
+    for i in 0..FILE_COUNT {
+        fixture.write(
+            &format!("notes/note-{i:05}.md"),
+            &format!("# Note {i}\n\nrescanmarker paragraph {i:05}\n"),
+        );
+    }
+
+    let cache_dir = tempfile::tempdir().expect("cache tempdir");
+    let cache_path = cache_dir.path().join("cache.db");
+    let cache = Cache::open(&cache_path).expect("open cache");
+    let source_id = cache
+        .register_source(
+            "notes",
+            &fixture.root().to_string_lossy(),
+            SourceStatus::Active,
+        )
+        .expect("register_source");
+    let ignore_rules = tephrad::ignore::IgnoreRules::load(fixture.root()).expect("load ignore");
+    tephrad::scan::scan_source(&cache, source_id, fixture.root(), &ignore_rules)
+        .expect("initial scan");
+    drop(cache);
+
+    let done = Arc::new(AtomicBool::new(false));
+    let ready = Arc::new(AtomicBool::new(false));
+    let searcher = {
+        let (done, ready, cache_path) = (Arc::clone(&done), Arc::clone(&ready), cache_path.clone());
+        std::thread::spawn(move || {
+            let mut during_rescan = 0usize;
+            let mut most_seen = 0usize;
+            loop {
+                let rescan_was_over = done.load(Ordering::Relaxed);
+                let hits = tephrad::search::all_blocks::search_all_blocks(
+                    &cache_path,
+                    "rescanmarker",
+                    FILE_COUNT + 10,
+                )
+                .unwrap_or_else(|e| panic!("a search during the rescan failed: {e:?}"));
+                ready.store(true, Ordering::Relaxed);
+
+                let mut seen = HashSet::new();
+                for hit in &hits {
+                    assert!(seen.insert(hit.unit.clone()), "{} came twice", hit.unit);
+                    let number = hit
+                        .unit
+                        .trim_start_matches("@notes:notes/note-")
+                        .trim_end_matches(".md");
+                    assert!(
+                        hit.snippet
+                            .contains(&format!("rescanmarker paragraph {number}")),
+                        "{} came with another file's text: {}",
+                        hit.unit,
+                        hit.snippet
+                    );
+                }
+                most_seen = most_seen.max(hits.len());
+                if rescan_was_over {
+                    return (during_rescan, most_seen);
+                }
+                during_rescan += 1;
+            }
+        })
+    };
+
+    // Start the rescan only once the searcher has made a query, so
+    // that queries really do run alongside it.
+    while !ready.load(Ordering::Relaxed) {
+        std::thread::yield_now();
+    }
+    let rescan_cache = Cache::open(&cache_path).expect("rescan cache");
+    let rescan_result =
+        tephrad::scan::rescan_source(&rescan_cache, source_id, fixture.root(), &ignore_rules);
+    done.store(true, Ordering::Relaxed);
+    let (during_rescan, most_seen) = searcher.join().expect("searcher thread panicked");
+
+    let stats = rescan_result.expect("the rescan must finish while it is being searched");
+    assert_eq!(stats.units_written, FILE_COUNT);
+    assert!(
+        during_rescan >= 1,
+        "at least one query must have run alongside the rescan"
+    );
+    assert!(most_seen <= FILE_COUNT);
+
+    // The rescan is over: every file is found, once.
+    let hits = tephrad::search::all_blocks::search_all_blocks(
+        &cache_path,
+        "rescanmarker",
+        FILE_COUNT + 10,
+    )
+    .expect("search after the rescan");
+    assert_eq!(hits.len(), FILE_COUNT);
+    let units: HashSet<_> = hits.iter().map(|h| h.unit.as_str()).collect();
+    assert_eq!(units.len(), FILE_COUNT);
+}

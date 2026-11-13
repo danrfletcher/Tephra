@@ -1,0 +1,84 @@
+{
+  "path": "tests/fixtures/code/lua/sample.lua",
+  "content_hash": "28040644a168f472a4475926cecde309b503d7543d8f18f8e8e8e99b690cc0e1",
+  "frontmatter": null,
+  "headings": [],
+  "wikilinks": [
+    {
+      "source_prefix": null,
+      "target": "Line",
+      "anchor": null,
+      "alias": null,
+      "raw": "Line",
+      "line": 1,
+      "span": [
+        16,
+        24
+      ]
+    },
+    {
+      "source_prefix": null,
+      "target": "Block",
+      "anchor": null,
+      "alias": null,
+      "raw": "Block",
+      "line": 2,
+      "span": [
+        46,
+        55
+      ]
+    },
+    {
+      "source_prefix": null,
+      "target": "Doc",
+      "anchor": null,
+      "alias": null,
+      "raw": "Doc",
+      "line": 3,
+      "span": [
+        77,
+        84
+      ]
+    }
+  ],
+  "markdown_links": [],
+  "tags": [],
+  "blocks": [],
+  "paragraphs": [],
+  "symbols": [
+    {
+      "kind": "variable",
+      "name": "s",
+      "parent": null,
+      "line": 4,
+      "start_line": 3,
+      "end_line": 4
+    },
+    {
+      "kind": "variable",
+      "name": "l",
+      "parent": null,
+      "line": 5,
+      "start_line": 5,
+      "end_line": 5
+    }
+  ],
+  "comment_blocks": [
+    {
+      "start_line": 1,
+      "end_line": 1,
+      "text": "line comment [[Line]]"
+    },
+    {
+      "start_line": 2,
+      "end_line": 2,
+      "text": "block comment [[Block]] ]==]"
+    },
+    {
+      "start_line": 3,
+      "end_line": 3,
+      "text": "doc comment [[Doc]]"
+    }
+  ],
+  "diagnostics": []
+}

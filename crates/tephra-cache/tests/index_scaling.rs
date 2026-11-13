@@ -155,6 +155,9 @@ fn seed_units_with_rows(cache: &Cache, source_id: i64, count: usize, label: &str
         let rel_path = format!("{label}/note-{i:06}.md");
         let unit_id = cache
             .insert_unit(&NewUnit {
+                kind: "prose",
+                size: None,
+                too_large: false,
                 source_id,
                 rel_path: &rel_path,
                 mtime: Some(0),
@@ -167,6 +170,7 @@ fn seed_units_with_rows(cache: &Cache, source_id: i64, count: usize, label: &str
                 to_raw: "Somewhere",
                 to_unit_id: None,
                 kind: "wikilink",
+                line: None,
             })
             .expect("insert_link");
         cache
@@ -177,9 +181,11 @@ fn seed_units_with_rows(cache: &Cache, source_id: i64, count: usize, label: &str
             .expect("insert_tag");
         cache
             .insert_block(&NewBlock {
+                end_line: None,
                 unit_id,
-                block_id: "^blk",
+                block_id: Some("^blk"),
                 line: 1,
+                symbol_id: None,
             })
             .expect("insert_block");
         ids.push(unit_id);

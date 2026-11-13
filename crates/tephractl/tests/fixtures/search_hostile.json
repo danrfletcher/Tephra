@@ -1,0 +1,14 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": [
+    {
+      "id": "@notes:evil\u001b[2J.md",
+      "source": "notes",
+      "title": "line one\nline two\u001b]0;pwned\u0007",
+      "kind": "prose",
+      "score": 0.5,
+      "offline": false
+    }
+  ]
+}

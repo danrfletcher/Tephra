@@ -26,6 +26,19 @@ use tephrad::registry::SourceRegistry;
 const IGNORED_FILE_COUNT: usize = 120_000;
 const IGNORED_SUBDIRS: usize = 300;
 const VALID_FILE_COUNT: usize = 400;
+/// Non-Markdown files in the non-ignored subtree (G2): they are units
+/// too, so they count toward `files_seen`/`units_written`.
+const CODE_FILE_COUNT: usize = 150;
+const TEXT_FILE_COUNT: usize = 100;
+const BINARY_FILE_COUNT: usize = 50;
+/// One sparse file of 20 MiB + 1 byte (E3): a unit by name only.
+const TOO_LARGE_FILE_COUNT: usize = 1;
+/// Files under other ignored folders (G15): `.venv` and
+/// `__pycache__`, at depth 0 and deeper.
+const IGNORED_VENV_FILES: usize = 3_000;
+const IGNORED_PYCACHE_FILES: usize = 3_000;
+const MIXED_UNIT_COUNT: usize =
+    VALID_FILE_COUNT + CODE_FILE_COUNT + TEXT_FILE_COUNT + BINARY_FILE_COUNT + TOO_LARGE_FILE_COUNT;
 
 /// Current process RSS in kilobytes, via `ps -o rss=`. Returns `None`
 /// if `ps` isn't available or its output doesn't parse — the test
@@ -73,6 +86,44 @@ fn build_large_fixture() -> fixtures::TempSourceHandle {
         fixture.write(&format!("node_modules/pkg-{subdir}/file-{i}.md"), "");
     }
 
+    // Mixed kinds in the non-ignored subtree.
+    for i in 0..CODE_FILE_COUNT {
+        fixture.write(
+            &format!("src/mod-{}/file-{i}.rs", i % 10),
+            &format!(
+                "// [[link-{i}]] #not-a-tag\nfn f{i}() {{}}\nconst S: &str = \"[[decoy-{i}]]\";\n"
+            ),
+        );
+    }
+    for i in 0..TEXT_FILE_COUNT {
+        fixture.write(&format!("data/file-{i}.csv"), &format!("a,b\n{i},2\n"));
+    }
+    for i in 0..BINARY_FILE_COUNT {
+        fixture.write_bytes(
+            &format!("img/pic-{i}.png"),
+            &[0x89, b'P', b'N', b'G', 0, 1, 2],
+        );
+    }
+    // E3: sparse, so nothing big is written to disk, and a read of it
+    // would show up in the RSS check below.
+    let sparse = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(fixture.root().join("huge.log"))
+        .expect("create sparse file");
+    sparse
+        .set_len(20 * 1_048_576 + 1)
+        .expect("set sparse length");
+
+    // More ignored subtrees (G15), pruned like `node_modules`.
+    for i in 0..IGNORED_VENV_FILES {
+        fixture.write(&format!(".venv/lib/pkg-{}/mod-{i}.py", i % 50), "x = 1\n");
+    }
+    for i in 0..IGNORED_PYCACHE_FILES {
+        fixture.write(&format!("src/mod-{}/__pycache__/m-{i}.pyc", i % 10), "x");
+    }
+
     fixture
 }
 
@@ -114,14 +165,83 @@ fn a_100k_plus_ignored_subtree_is_pruned_before_the_walk_descends_into_it() {
     // being pruned at the directory level), `files_seen` would be in
     // the hundreds of thousands, not a few hundred.
     assert_eq!(
-        stats.files_seen, VALID_FILE_COUNT,
-        "the 120k ignored files under node_modules must never be counted at all"
+        stats.files_seen, MIXED_UNIT_COUNT,
+        "the 120k ignored files under node_modules, and the .venv and \
+         __pycache__ trees, must never be counted at all"
     );
-    assert_eq!(stats.units_written, VALID_FILE_COUNT);
+    assert_eq!(stats.units_written, MIXED_UNIT_COUNT);
+    assert_eq!(
+        stats.links_written, CODE_FILE_COUNT,
+        "no Markdown file here has a link; each code file gives its one \
+         comment link and never the one in its string literal"
+    );
+    assert_eq!(
+        stats.tags_written, VALID_FILE_COUNT,
+        "one tag per note, none from code"
+    );
     assert_eq!(
         stats.files_ignored, 0,
         "nothing was even seen to ignore one-by-one"
     );
+
+    // E3/G2: kinds in the cache, including the sparse over-cap file.
+    {
+        let cache = Cache::open(cache_dir.path().join("cache.db")).expect("reopen cache");
+        let source_id = cache.get_source("big-vault").unwrap().unwrap().id;
+        let by_kind = |kind: &str| -> i64 {
+            cache
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM units WHERE source_id = ?1 AND kind = ?2",
+                    rusqlite::params![source_id, kind],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(by_kind("prose") as usize, VALID_FILE_COUNT);
+        assert_eq!(by_kind("code") as usize, CODE_FILE_COUNT);
+        assert_eq!(by_kind("text-other") as usize, TEXT_FILE_COUNT);
+        assert_eq!(
+            by_kind("binary") as usize,
+            BINARY_FILE_COUNT + TOO_LARGE_FILE_COUNT,
+            "the sparse over-cap file is all NUL in its first 8 KB"
+        );
+        let huge = cache
+            .get_unit_by_rel_path(source_id, "huge.log")
+            .unwrap()
+            .expect("the over-cap file is still a unit");
+        assert!(huge.too_large);
+        assert_eq!(huge.size, Some(20 * 1_048_576 + 1));
+        assert_eq!(
+            huge.kind, "binary",
+            "real kind from its first 8 KB (NULs), though never parsed"
+        );
+        let non_prose_rows: i64 = cache
+            .connection()
+            .query_row(
+                // Only prose and code units are parsed (G3, G4), and
+                // code gives links only: text-other, document and
+                // binary units carry no extracted rows, and a code
+                // unit no blocks or headings.
+                "SELECT \
+                   (SELECT COUNT(*) FROM links l JOIN units u ON u.id = l.from_unit_id \
+                      WHERE u.kind NOT IN ('prose', 'code')) \
+                 + (SELECT COUNT(*) FROM blocks b JOIN units u ON u.id = b.unit_id \
+                      WHERE u.kind <> 'prose') \
+                 + (SELECT COUNT(*) FROM headings h JOIN units u ON u.id = h.unit_id \
+                      WHERE u.kind <> 'prose')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(non_prose_rows, 0);
+        for ignored in [".venv/lib/pkg-0/mod-0.py", "src/mod-0/__pycache__/m-0.pyc"] {
+            assert!(cache
+                .get_unit_by_rel_path(source_id, ignored)
+                .unwrap()
+                .is_none());
+        }
+    }
 
     // A generous time bound: this would not hold if the scan touched
     // (even just `stat`ed) all 120k ignored files one by one.

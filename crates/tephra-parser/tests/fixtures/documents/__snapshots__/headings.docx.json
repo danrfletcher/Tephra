@@ -1,0 +1,149 @@
+{
+  "content_hash": "f1f40453619b0e9f320cbe7855465297a2832b60cdb766a8cc531d2fd7aac348",
+  "diagnostics": [],
+  "format": "docx",
+  "headings": [
+    {
+      "level": 1,
+      "location": {
+        "paragraph": 1
+      },
+      "text": "Quarterly report"
+    },
+    {
+      "level": 1,
+      "location": {
+        "paragraph": 2
+      },
+      "text": "Overview"
+    },
+    {
+      "level": 2,
+      "location": {
+        "paragraph": 4
+      },
+      "text": "Details"
+    },
+    {
+      "level": 3,
+      "location": {
+        "paragraph": 6
+      },
+      "text": "A style known only by name"
+    }
+  ],
+  "markdown_links": [
+    {
+      "index": 3,
+      "link": {
+        "line": 3,
+        "span": [
+          27,
+          36
+        ],
+        "target": "Target.md",
+        "text": "a doc"
+      },
+      "location": {
+        "paragraph": 3
+      }
+    }
+  ],
+  "paragraphs": [
+    {
+      "index": 1,
+      "location": {
+        "paragraph": 1
+      },
+      "text": "Quarterly report"
+    },
+    {
+      "index": 2,
+      "location": {
+        "paragraph": 2
+      },
+      "text": "Overview"
+    },
+    {
+      "index": 3,
+      "location": {
+        "paragraph": 3
+      },
+      "text": "See [[Target]] and [a doc](Target.md) for more."
+    },
+    {
+      "index": 4,
+      "location": {
+        "paragraph": 4
+      },
+      "text": "Details"
+    },
+    {
+      "index": 6,
+      "location": {
+        "paragraph": 6
+      },
+      "text": "A style known only by name"
+    },
+    {
+      "index": 7,
+      "location": {
+        "paragraph": 7
+      },
+      "text": "visible text of a hyperlink"
+    },
+    {
+      "index": 8,
+      "location": {
+        "paragraph": 8
+      },
+      "text": "field result text"
+    },
+    {
+      "index": 9,
+      "location": {
+        "paragraph": 9
+      },
+      "text": "Ünï © café [[@notes:café notes|alias]] end"
+    }
+  ],
+  "path": "tests/fixtures/documents/headings.docx",
+  "wikilinks": [
+    {
+      "index": 3,
+      "link": {
+        "alias": null,
+        "anchor": null,
+        "line": 3,
+        "raw": "Target",
+        "source_prefix": null,
+        "span": [
+          4,
+          14
+        ],
+        "target": "Target"
+      },
+      "location": {
+        "paragraph": 3
+      }
+    },
+    {
+      "index": 9,
+      "link": {
+        "alias": "alias",
+        "anchor": null,
+        "line": 9,
+        "raw": "@notes:café notes|alias",
+        "source_prefix": "notes",
+        "span": [
+          15,
+          43
+        ],
+        "target": "café notes"
+      },
+      "location": {
+        "paragraph": 9
+      }
+    }
+  ]
+}

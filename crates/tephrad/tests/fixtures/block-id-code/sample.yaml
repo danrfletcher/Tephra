@@ -1,0 +1,7 @@
+name: demo
+literal: |
+  line one
+  line two
+quoted: "abc
+  def"
+plain: 1

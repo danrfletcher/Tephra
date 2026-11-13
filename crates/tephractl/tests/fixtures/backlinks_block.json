@@ -1,0 +1,46 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": [
+    {
+      "from": "@notes:Tephra test.md",
+      "to": {
+        "resolved": "@tephra:crates/tephrad/src/conflict.rs"
+      },
+      "to_raw": "@tephra:crates/tephrad/src/registry.rs#^k3f9a2",
+      "kind": "wikilink",
+      "offline": false,
+      "line": 3
+    },
+    {
+      "from": "@notes:Tephra test.md",
+      "to": {
+        "resolved": "@tephra:crates/tephrad/src/conflict.rs"
+      },
+      "to_raw": "@tephra:crates/tephrad/src/registry.rs#^k3f9a2",
+      "kind": "wikilink",
+      "offline": false,
+      "line": 9
+    },
+    {
+      "from": "@tephra:crates/tephrad/src/notes.rs",
+      "to": {
+        "resolved": "@tephra:crates/tephrad/src/conflict.rs"
+      },
+      "to_raw": "@tephra:crates/tephrad/src/conflict.rs#^k3f9a2",
+      "kind": "wikilink",
+      "offline": true,
+      "line": 42
+    },
+    {
+      "from": "@notes:Report.docx",
+      "to": {
+        "resolved": "@tephra:crates/tephrad/src/conflict.rs"
+      },
+      "to_raw": "@tephra:crates/tephrad/src/conflict.rs#^k3f9a2",
+      "kind": "wikilink",
+      "offline": false,
+      "line": null
+    }
+  ]
+}

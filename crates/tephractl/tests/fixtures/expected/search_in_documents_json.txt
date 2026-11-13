@@ -1,0 +1,36 @@
+{
+  "offline": false,
+  "results": [
+    {
+      "index": 1,
+      "kind": "document paragraph",
+      "page": 1,
+      "text": "Intro text",
+      "unit": "@docs:report.pdf"
+    },
+    {
+      "index": 3,
+      "kind": "document paragraph",
+      "slide": 2,
+      "text": "Slide body",
+      "unit": "@docs:report.pdf"
+    },
+    {
+      "index": 5,
+      "kind": "document paragraph",
+      "paragraph": 5,
+      "text": "Docx paragraph",
+      "unit": "@docs:report.pdf"
+    },
+    {
+      "kind": "heading",
+      "level": 1,
+      "page": 2,
+      "text": "Chapter",
+      "unit": "@docs:report.pdf"
+    }
+  ],
+  "scope": "blocks",
+  "text_unavailable": false,
+  "unit": "@docs:report.pdf"
+}

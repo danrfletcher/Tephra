@@ -14,7 +14,7 @@
 
 mod common;
 
-use tephra_cache::{FaultInjector, NewLink, SourceStatus};
+use tephra_cache::{Cache, FaultInjector, NewLink, SourceStatus};
 
 #[test]
 fn offline_source_survives_a_schema_rebuild_with_status_and_rows_intact() {
@@ -54,12 +54,24 @@ fn offline_source_survives_a_schema_rebuild_with_status_and_rows_intact() {
     assert_eq!(row.path, "/vault/notes");
 
     // E2: "notes" is offline, so its cached units/links/tags/blocks
-    // rows must come back exactly as they were, ids included.
+    // rows must come back, ids included. The v2 snapshot only reads the
+    // v1 column set, so a restored unit is its old self except for the
+    // three provisional fields (E10): `kind` guessed from the path
+    // (`text-other`, this plain `Cache::open` knows no extensions),
+    // `size` unknown, and `needs_rescan` set.
     let units_after = cache.units_with_status_for_source("notes").unwrap();
-    assert_eq!(
-        units_after, units_before,
-        "an offline source's cached rows must survive a schema rebuild unchanged"
-    );
+    assert_eq!(units_after.len(), units_before.len());
+    for (after, before) in units_after.iter().zip(&units_before) {
+        assert_eq!(after.source_status, before.source_status);
+        assert_eq!(after.unit.id, before.unit.id);
+        assert_eq!(after.unit.rel_path, before.unit.rel_path);
+        assert_eq!(after.unit.mtime, before.unit.mtime);
+        assert_eq!(after.unit.frontmatter_json, before.unit.frontmatter_json);
+        assert_eq!(after.unit.kind, "text-other");
+        assert_eq!(after.unit.size, None);
+        assert!(!after.unit.too_large);
+        assert!(after.unit.needs_rescan);
+    }
 
     // F2: "repo" is active (not offline), so its core-table rows were
     // genuinely wiped by the unconditional drop/recreate.
@@ -100,6 +112,7 @@ fn rebuild_nulls_a_preserved_links_to_unit_id_if_its_target_was_wiped() {
             to_raw: "[[Target]]",
             to_unit_id: Some(target_unit_id),
             kind: "wikilink",
+            line: None,
         })
         .expect("insert cross-source link");
 
@@ -226,5 +239,176 @@ fn remount_sequence_offline_to_stale_to_active_never_wipes_cached_rows() {
     assert_eq!(
         row_counts_after, row_counts_before,
         "offline -> stale -> active must never trigger a full cache wipe"
+    );
+}
+
+/// A stand-in for `tephrad`'s extension table: what `tephrad` passes to
+/// `Cache::open_with_kind_inferrer`.
+fn infer_by_extension(rel_path: &str) -> &'static str {
+    match rel_path
+        .rsplit('.')
+        .next()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("md") => "prose",
+        Some("rs") => "code",
+        _ => "text-other",
+    }
+}
+
+#[test]
+fn offline_rows_of_a_v1_cache_survive_the_v2_rebuild_with_needs_rescan() {
+    // E10: today the carry-over gate would refuse a v1 cache (it has no
+    // `kind` column). The snapshot now reads the v1 column set.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("cache.db");
+    common::write_v1_cache(&db_path);
+
+    let cache = Cache::open_with_kind_inferrer(&db_path, infer_by_extension).expect("open v1");
+    assert_eq!(
+        cache.schema_version().unwrap(),
+        Some(tephra_cache::CURRENT_SCHEMA_VERSION)
+    );
+    assert_eq!(tephra_cache::CURRENT_SCHEMA_VERSION, 2);
+
+    let offline = cache.units_with_status_for_source("offline-notes").unwrap();
+    assert_eq!(offline.len(), 2, "offline v1 units must survive");
+    let by_path = |p: &str| {
+        &offline
+            .iter()
+            .find(|u| u.unit.rel_path == p)
+            .unwrap_or_else(|| panic!("missing {p}"))
+            .unit
+    };
+    let md = by_path("Café notes.md");
+    assert_eq!((md.id, md.mtime), (1, Some(1_700_000_001)));
+    assert_eq!(md.frontmatter_json.as_deref(), Some("{\"title\":\"One\"}"));
+    assert_eq!(md.kind, "prose", "kind is inferred from the extension");
+    assert_eq!(md.size, None);
+    assert!(md.needs_rescan);
+    assert!(!md.too_large);
+    // Extension match is case-insensitive in the inferrer under test.
+    let rs = by_path("src/main.RS");
+    assert_eq!(rs.kind, "code");
+    assert!(rs.needs_rescan);
+
+    // Links, tags and blocks are carried as before.
+    assert_eq!(cache.table_row_count("links").unwrap(), 1);
+    assert_eq!(cache.table_row_count("tags").unwrap(), 1);
+    let blocks = cache.blocks_for_unit(1).unwrap();
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(
+        (blocks[0].block_id.as_deref().unwrap(), blocks[0].line),
+        ("abcd1234", 7)
+    );
+    assert_eq!(blocks[0].end_line, None);
+
+    // The online source was wiped (a rescan rebuilds it) and the
+    // offline source keeps its status.
+    assert!(cache
+        .units_with_status_for_source("online-repo")
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        cache.get_source("offline-notes").unwrap().unwrap().status,
+        SourceStatus::Offline
+    );
+}
+
+#[test]
+fn a_rebuild_flags_online_sources_for_rescan_but_not_offline_ones() {
+    // E11 + E10: the rebuild emptied every online source's rows, so each
+    // must show up as "scan unfinished"; the offline source's rows were
+    // carried across and it can't be scanned, so it must not.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("cache.db");
+    common::write_v1_cache(&db_path);
+
+    let cache = Cache::open(&db_path).expect("open v1");
+    let unfinished: Vec<String> = cache
+        .sources_with_unfinished_scan()
+        .unwrap()
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+    assert_eq!(unfinished, vec!["online-repo".to_string()]);
+}
+
+/// G13/G16: an offline source's links keep their `line` through a
+/// rebuild, and its blocks keep every occurrence of an ID (one unit
+/// holding `^abc123` twice, another unit holding it once).
+#[test]
+fn offline_rows_keep_link_lines_and_every_block_occurrence_through_a_rebuild() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut cache = common::open_temp_cache(&dir);
+    let source_id = cache
+        .register_source("notes", "/vault/notes", SourceStatus::Active)
+        .unwrap();
+    let mut unit_ids = Vec::new();
+    for rel_path in ["a.md", "b.md"] {
+        unit_ids.push(
+            cache
+                .insert_unit(&tephra_cache::NewUnit {
+                    kind: "prose",
+                    size: Some(10),
+                    too_large: false,
+                    source_id,
+                    rel_path,
+                    mtime: Some(1),
+                    frontmatter_json: None,
+                })
+                .unwrap(),
+        );
+    }
+    for (unit_id, line) in [
+        (unit_ids[0], Some(4)),
+        (unit_ids[0], Some(9)),
+        (unit_ids[1], None),
+    ] {
+        cache
+            .insert_link(&NewLink {
+                from_unit_id: unit_id,
+                to_raw: "[[x#^abc123]]",
+                to_unit_id: None,
+                kind: "wikilink",
+                line,
+            })
+            .unwrap();
+    }
+    for (unit_id, line) in [(unit_ids[0], 2), (unit_ids[0], 6), (unit_ids[1], 3)] {
+        cache
+            .insert_block(&tephra_cache::NewBlock {
+                unit_id,
+                block_id: Some("abc123"),
+                line,
+                end_line: None,
+                symbol_id: None,
+            })
+            .unwrap();
+    }
+    cache
+        .transition_source_status("notes", SourceStatus::Offline)
+        .unwrap();
+
+    cache.rebuild(&FaultInjector::none()).expect("rebuild");
+
+    let lines: Vec<Option<i64>> = unit_ids
+        .iter()
+        .flat_map(|&id| cache.links_from_unit(id).unwrap())
+        .map(|l| l.line)
+        .collect();
+    assert_eq!(lines, vec![Some(4), Some(9), None]);
+
+    let mut occurrences: Vec<(i64, i64)> = cache
+        .blocks_with_id(source_id, "abc123")
+        .unwrap()
+        .into_iter()
+        .map(|b| (b.unit_id, b.line))
+        .collect();
+    occurrences.sort();
+    assert_eq!(
+        occurrences,
+        vec![(unit_ids[0], 2), (unit_ids[0], 6), (unit_ids[1], 3)]
     );
 }

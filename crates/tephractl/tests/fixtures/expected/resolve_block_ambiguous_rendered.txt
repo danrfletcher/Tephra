@@ -1,0 +1,6 @@
+"registry.rs#^k3f9a2" is ambiguous in source "tephra"; candidates:
+  1. @tephra:crates/tephrad/src/conflict.rs
+  2. @tephra:crates/tephrad/src/other.rs
+found at:
+  @tephra:crates/tephrad/src/conflict.rs:14
+  @tephra:crates/tephrad/src/other.rs:3

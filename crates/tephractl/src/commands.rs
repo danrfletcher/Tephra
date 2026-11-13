@@ -16,7 +16,7 @@ use std::io::{BufRead, Write};
 
 use serde_json::{json, Value};
 
-use crate::cli::Command;
+use crate::cli::{BlockTarget, Command, InFileSearchScope};
 use crate::render;
 use crate::transport::{RpcCallError, RpcClient};
 
@@ -92,6 +92,21 @@ pub fn execute_with_prompt_writer<R: BufRead, W: Write>(
         Command::SourceRemove { name } => source_remove(name, json, client),
         Command::SourceList => source_list(json, client),
         Command::Status => status(json, client),
+        Command::Ls {
+            source,
+            folder,
+            recursive,
+        } => ls(source, folder, *recursive, json, client),
+        Command::Search { query, limit } => search(query, *limit, json, client),
+        Command::SearchIn {
+            unit,
+            scope,
+            query,
+            limit,
+        } => search_in(unit, *scope, query, *limit, json, client),
+        Command::SearchAllBlocks { query, limit } => search_all_blocks(query, *limit, json, client),
+        Command::BlockId { unit, target } => block_id(unit, target, json, client),
+        Command::Backlinks { id } => backlinks(id, json, client),
         Command::LinkResolve {
             target,
             default_source,
@@ -115,6 +130,19 @@ pub fn execute_with_prompt_writer<R: BufRead, W: Write>(
             stdin,
             prompt_out,
         ),
+        // `main.rs` runs these before it loads the token or builds a
+        // client and streams their output; this arm exists so
+        // `execute` still handles every `Command`, buffering the same
+        // output into an outcome.
+        Command::DaemonInstall { .. } | Command::DaemonUninstall | Command::DaemonStatus => {
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let exit_code = crate::daemon::run(command, json, &mut out, &mut err);
+            CommandOutcome {
+                exit_code,
+                stdout: String::from_utf8_lossy(&out).into_owned(),
+                stderr: String::from_utf8_lossy(&err).into_owned(),
+            }
+        }
     }
 }
 
@@ -191,6 +219,110 @@ fn source_list(json: bool, client: &RpcClient) -> CommandOutcome {
     }
 }
 
+/// `ls` (G1): one `unit.list` call. The daemon's `no such source:
+/// <name>` is the message a user sees, with a non-zero exit; every
+/// other failure (including a missing folder) is the daemon's own
+/// message.
+fn ls(
+    source: &str,
+    folder: &str,
+    recursive: bool,
+    json: bool,
+    client: &RpcClient,
+) -> CommandOutcome {
+    let params = json!({"source": source, "folder": folder, "recursive": recursive});
+    match client.call("unit.list", params) {
+        Ok(result) => {
+            CommandOutcome::ok(json_or(&result, || render::render_unit_list(&result), json))
+        }
+        Err(e) => CommandOutcome::err(describe_error(&e)),
+    }
+}
+
+/// `search` (G8): one `unit.search` call with scope `names`. The
+/// daemon's refusal of a blank query (INVALID_PARAMS) is printed as it
+/// comes, with a non-zero exit; no results is the plain line `no matches`
+/// and exit 0. `--json` is the raw result array.
+fn search(query: &str, limit: Option<u64>, json: bool, client: &RpcClient) -> CommandOutcome {
+    let mut params = json!({"query": query, "scope": "names"});
+    if let Some(limit) = limit {
+        params["limit"] = json!(limit);
+    }
+    match client.call("unit.search", params) {
+        Ok(result) => CommandOutcome::ok(json_or(
+            &result,
+            || render::render_search_results(&result),
+            json,
+        )),
+        Err(e) => CommandOutcome::err(describe_error(&e)),
+    }
+}
+
+/// `search --in` (G9): one `unit.search` call with scope `headings` or
+/// `blocks` and the file's id, `query` being what followed the sigil
+/// (empty lists everything). The daemon's refusals (an unknown unit, a
+/// bad id) are printed as they come, with a non-zero exit. `--json` is
+/// the raw result object.
+fn search_in(
+    unit: &str,
+    scope: InFileSearchScope,
+    query: &str,
+    limit: Option<u64>,
+    json: bool,
+    client: &RpcClient,
+) -> CommandOutcome {
+    let mut params = json!({"query": query, "scope": scope.as_str(), "in": unit});
+    if let Some(limit) = limit {
+        params["limit"] = json!(limit);
+    }
+    match client.call("unit.search", params) {
+        Ok(result) => CommandOutcome::ok(json_or(
+            &result,
+            || render::render_in_file_results(&result),
+            json,
+        )),
+        Err(e) => CommandOutcome::err(describe_error(&e)),
+    }
+}
+
+/// `search "^^q"` (G10): one `unit.search` call with scope `all_blocks`,
+/// `query` being what followed the `^^`. The daemon's refusal of a blank
+/// or too-long query (INVALID_PARAMS) is printed as it comes, with a
+/// non-zero exit; no results is the plain line `no matches` and exit 0.
+/// `--json` is the raw result array.
+fn search_all_blocks(
+    query: &str,
+    limit: Option<u64>,
+    json: bool,
+    client: &RpcClient,
+) -> CommandOutcome {
+    let mut params = json!({"query": query, "scope": "all_blocks"});
+    if let Some(limit) = limit {
+        params["limit"] = json!(limit);
+    }
+    match client.call("unit.search", params) {
+        Ok(result) => CommandOutcome::ok(json_or(
+            &result,
+            || render::render_all_blocks_results(&result),
+            json,
+        )),
+        Err(e) => CommandOutcome::err(describe_error(&e)),
+    }
+}
+
+fn block_id(unit: &str, target: &BlockTarget, json: bool, client: &RpcClient) -> CommandOutcome {
+    let params = match target {
+        BlockTarget::Line(line) => json!({"unit": unit, "line": line}),
+        BlockTarget::Symbol(symbol) => json!({"unit": unit, "symbol": symbol}),
+    };
+    match client.call("block.ensure_id", params) {
+        Ok(result) => {
+            CommandOutcome::ok(json_or(&result, || render::render_block_id(&result), json))
+        }
+        Err(e) => CommandOutcome::err(describe_error(&e)),
+    }
+}
+
 fn status(json: bool, client: &RpcClient) -> CommandOutcome {
     match client.call("source.list", json!({})) {
         Ok(result) => {
@@ -216,6 +348,15 @@ fn status(json: bool, client: &RpcClient) -> CommandOutcome {
 
 fn as_rows(result: &Value) -> Vec<Value> {
     result.as_array().cloned().unwrap_or_default()
+}
+
+fn backlinks(id: &str, json: bool, client: &RpcClient) -> CommandOutcome {
+    match client.call("graph.get_backlinks", json!({"id": id})) {
+        Ok(result) => {
+            CommandOutcome::ok(json_or(&result, || render::render_backlinks(&result), json))
+        }
+        Err(e) => CommandOutcome::err(describe_error(&e)),
+    }
 }
 
 fn link_resolve(

@@ -26,6 +26,9 @@ fn inserting_a_unit_with_nonexistent_source_id_is_rejected() {
     let cache = common::open_temp_cache(&dir);
 
     let result = cache.insert_unit(&NewUnit {
+        kind: "prose",
+        size: None,
+        too_large: false,
         source_id: 999_999,
         rel_path: "ghost.md",
         mtime: None,
@@ -48,6 +51,7 @@ fn inserting_a_link_with_nonexistent_from_unit_id_is_rejected() {
         to_raw: "[[Ghost]]",
         to_unit_id: None,
         kind: "wikilink",
+        line: None,
     });
     assert!(
         result.is_err(),
@@ -69,6 +73,7 @@ fn inserting_a_link_with_nonexistent_to_unit_id_is_rejected() {
         to_raw: "[[Ghost]]",
         to_unit_id: Some(999_999),
         kind: "wikilink",
+        line: None,
     });
     assert!(
         result.is_err(),
@@ -98,9 +103,11 @@ fn inserting_a_block_with_nonexistent_unit_id_is_rejected() {
     let cache = common::open_temp_cache(&dir);
 
     let result = cache.insert_block(&NewBlock {
+        end_line: None,
         unit_id: 999_999,
-        block_id: "ghost",
+        block_id: Some("ghost"),
         line: 1,
+        symbol_id: None,
     });
     assert!(
         result.is_err(),
@@ -128,6 +135,7 @@ fn valid_rows_against_real_parents_insert_cleanly() {
             to_raw: "[[Real]]",
             to_unit_id: Some(unit_id),
             kind: "wikilink",
+            line: None,
         })
         .is_ok());
     assert!(cache
@@ -138,9 +146,11 @@ fn valid_rows_against_real_parents_insert_cleanly() {
         .is_ok());
     assert!(cache
         .insert_block(&NewBlock {
+            end_line: None,
             unit_id,
-            block_id: "real-block",
+            block_id: Some("real-block"),
             line: 5,
+            symbol_id: None,
         })
         .is_ok());
 }

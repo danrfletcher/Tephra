@@ -1,0 +1,44 @@
+{
+  "path": "tests/fixtures/code/shell/sample.sh",
+  "content_hash": "cc7c75b7ae90f500411204d7492270dc6cc57ab5b7d5d56c7842ebc2bdaa8cc4",
+  "frontmatter": null,
+  "headings": [],
+  "wikilinks": [
+    {
+      "source_prefix": null,
+      "target": "Line",
+      "anchor": null,
+      "alias": null,
+      "raw": "Line",
+      "line": 2,
+      "span": [
+        27,
+        35
+      ]
+    },
+    {
+      "source_prefix": null,
+      "target": "Doc",
+      "anchor": null,
+      "alias": null,
+      "raw": "Doc",
+      "line": 3,
+      "span": [
+        50,
+        57
+      ]
+    }
+  ],
+  "markdown_links": [],
+  "tags": [],
+  "blocks": [],
+  "paragraphs": [],
+  "comment_blocks": [
+    {
+      "start_line": 1,
+      "end_line": 3,
+      "text": "bin/bash\nline comment [[Line]]\ndoc comment [[Doc]]"
+    }
+  ],
+  "diagnostics": []
+}

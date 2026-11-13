@@ -1,0 +1,3 @@
+# line comment [[Line]]
+key: "[[Decoy]]" # trailing comment [[Doc]]
+other: [[DecoyFlow]]

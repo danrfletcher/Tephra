@@ -1,0 +1,23 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "unit": {
+      "id": "@tephra:crates/tephrad/src/conflict.rs",
+      "source": "tephra",
+      "rel_path": "crates/tephrad/src/conflict.rs",
+      "frontmatter_json": null,
+      "tags": [],
+      "blocks": [
+        "k3f9a2"
+      ],
+      "offline": false
+    },
+    "edges": [],
+    "block": {
+      "id": "k3f9a2",
+      "line": 14,
+      "moved": false
+    }
+  }
+}

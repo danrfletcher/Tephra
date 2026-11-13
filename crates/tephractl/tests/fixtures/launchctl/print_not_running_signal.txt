@@ -1,0 +1,8 @@
+gui/501/com.danrfletcher.tephrad = {
+	active count = 0
+	state = not running
+
+	domain = gui/501 [100024]
+	runs = 1
+	last terminating signal = Killed: 9
+}

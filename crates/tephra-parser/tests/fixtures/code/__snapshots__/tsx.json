@@ -1,0 +1,84 @@
+{
+  "path": "tests/fixtures/code/tsx/sample.tsx",
+  "content_hash": "0425768813595b5ac975667f6c96986ef4a9ec2984297569d8d5f414d5f3d9c9",
+  "frontmatter": null,
+  "headings": [],
+  "wikilinks": [
+    {
+      "source_prefix": null,
+      "target": "Line",
+      "anchor": null,
+      "alias": null,
+      "raw": "Line",
+      "line": 1,
+      "span": [
+        16,
+        24
+      ]
+    },
+    {
+      "source_prefix": null,
+      "target": "Block",
+      "anchor": null,
+      "alias": null,
+      "raw": "Block",
+      "line": 2,
+      "span": [
+        42,
+        51
+      ]
+    },
+    {
+      "source_prefix": null,
+      "target": "Doc",
+      "anchor": null,
+      "alias": null,
+      "raw": "Doc",
+      "line": 3,
+      "span": [
+        73,
+        80
+      ]
+    }
+  ],
+  "markdown_links": [],
+  "tags": [],
+  "blocks": [],
+  "paragraphs": [],
+  "symbols": [
+    {
+      "kind": "const",
+      "name": "s",
+      "parent": null,
+      "line": 4,
+      "start_line": 3,
+      "end_line": 4
+    },
+    {
+      "kind": "const",
+      "name": "e",
+      "parent": null,
+      "line": 5,
+      "start_line": 5,
+      "end_line": 5
+    }
+  ],
+  "comment_blocks": [
+    {
+      "start_line": 1,
+      "end_line": 1,
+      "text": "line comment [[Line]]"
+    },
+    {
+      "start_line": 2,
+      "end_line": 2,
+      "text": "block comment [[Block]]"
+    },
+    {
+      "start_line": 3,
+      "end_line": 3,
+      "text": "jsdoc comment [[Doc]]"
+    }
+  ],
+  "diagnostics": []
+}

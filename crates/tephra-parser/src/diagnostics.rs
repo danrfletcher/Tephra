@@ -23,6 +23,25 @@ pub enum DiagnosticKind {
     EmptyMarkdownLink,
     /// The same `^block-id` anchor appeared more than once in this file.
     DuplicateBlockId,
+    /// A code file's parse ran past its time budget and was
+    /// abandoned: the unit carries no links (E12).
+    ParseTimeout,
+    /// A code file was larger than the parse size limit, so it was not
+    /// parsed at all (its syntax tree would cost too much memory): the
+    /// unit carries no links (E12).
+    ParseSkippedTooLarge,
+    /// A code file's grammar produced no syntax tree at all, so the
+    /// unit carries no links (E12).
+    ParseFailed,
+    /// A code file has syntax errors. The tree-sitter parse recovered
+    /// what it could, so the symbols and links around the error are
+    /// still recorded, but the symbol list may be missing the
+    /// definition that contains the error (E12). The line is the first
+    /// error.
+    SyntaxErrors,
+    /// A PDF has pages but no text layer (scanned or image-only). No
+    /// OCR is done, so the unit carries no text and no links (E4, F6).
+    NoTextLayer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

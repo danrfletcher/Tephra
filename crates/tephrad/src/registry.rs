@@ -42,22 +42,53 @@ pub enum PathProbe {
     Ok,
     Missing,
     NotADirectory,
+    /// Exists but its contents can't be listed (e.g. `chmod 000`).
     NotReadable,
+    /// Exists but the OS refused with EPERM ("Operation not permitted")
+    /// on macOS: the signature of a missing Full Disk Access grant
+    /// (TCC), as opposed to ordinary file modes, which give EACCES.
+    /// Reported with the Full Disk Access fix line (E13).
+    NotReadablePrivacy,
+}
+
+impl PathProbe {
+    /// Whether the path exists but the OS won't list it: a permission
+    /// problem, not a missing or offline source (E13).
+    pub fn is_permission_denied(self) -> bool {
+        matches!(self, PathProbe::NotReadable | PathProbe::NotReadablePrivacy)
+    }
 }
 
 /// Real-filesystem [`PathProbe`]: does `path` exist, is it a
 /// directory, and can its contents actually be listed. Used by
 /// [`SourceRegistry::register`]; unit tests below use `PathProbe`
 /// values directly instead of calling this.
+///
+/// A listing that fails with EPERM on macOS is
+/// [`PathProbe::NotReadablePrivacy`] (TCC / Full Disk Access); any
+/// other failure to list is [`PathProbe::NotReadable`].
 pub fn probe_path(path: &Path) -> PathProbe {
     match std::fs::metadata(path) {
         Ok(meta) if !meta.is_dir() => PathProbe::NotADirectory,
         Ok(_) => match std::fs::read_dir(path) {
             Ok(_) => PathProbe::Ok,
+            Err(e) if is_privacy_block(&e) => PathProbe::NotReadablePrivacy,
             Err(_) => PathProbe::NotReadable,
         },
+        // A stat the OS refuses is a permission problem, not a missing
+        // path: a source under a protected folder must never be taken
+        // for offline just because it can't be looked at (E13).
+        Err(e) if is_privacy_block(&e) => PathProbe::NotReadablePrivacy,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => PathProbe::NotReadable,
         Err(_) => PathProbe::Missing,
     }
+}
+
+/// Whether `err` is macOS's privacy block: EPERM ("Operation not
+/// permitted"), which TCC returns for a protected folder, whereas an
+/// ordinary mode/ACL denial is EACCES.
+fn is_privacy_block(err: &std::io::Error) -> bool {
+    cfg!(target_os = "macos") && err.raw_os_error() == Some(1)
 }
 
 /// An in-memory record of one registered source's name and root, the
@@ -106,6 +137,19 @@ pub enum RegisterError {
 impl fmt::Display for RegisterError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            RegisterError::InvalidPath {
+                path,
+                reason: PathProbe::NotReadablePrivacy,
+            } => {
+                // Same text as the plain NotReadable case, plus the
+                // Full Disk Access fix line (E13).
+                write!(
+                    f,
+                    "path {path:?} is invalid: {:?}. {}",
+                    PathProbe::NotReadable,
+                    crate::access::fix_line(&path.display().to_string())
+                )
+            }
             RegisterError::InvalidPath { path, reason } => {
                 write!(f, "path {path:?} is invalid: {reason:?}")
             }
@@ -189,6 +233,10 @@ pub fn validate_register<'a>(
 /// than reimplementing change detection itself. `paths` only ever
 /// contains absolute paths that were actually upserted or deleted in
 /// the cache (R5) — never a raw, unfiltered watcher event batch.
+/// `paths` is empty when no file changed but the source as a whole did
+/// (a finished startup rescan, or the source's root vanishing and the
+/// source going `offline`): the graph still has to be rebuilt, because
+/// it carries each source's offline flag.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DaemonEvent {
     SourceChanged { source: String, paths: Vec<PathBuf> },
@@ -373,7 +421,53 @@ pub struct SourceRegistry {
     runtime: tokio::runtime::Runtime,
     running: Mutex<HashMap<String, RunningSource>>,
     events_tx: tokio::sync::broadcast::Sender<DaemonEvent>,
+    /// Sources whose root exists but the OS won't list (E13: macOS
+    /// Full Disk Access not granted). A runtime status only: it is
+    /// never written to the `sources` table (whose `status` CHECK
+    /// constraint stays `active|stale|offline`), it starts empty on
+    /// every start, and it is set by the startup access sweep
+    /// ([`SourceRegistry::refresh_access`]) and by [`SourceRegistry::rescan`].
+    /// [`SourceRegistry::list_with_runtime_status`] overlays it on the
+    /// stored status, so `source.list` reports `permission_denied`.
+    permission_denied: Mutex<HashSet<String>>,
+    /// Every writer that pauses the watchers around its own writes
+    /// (`link.apply_refactor`, `block.ensure_id`) goes through this one
+    /// count, see [`SourceRegistry::pause_for_write`].
+    write_pause: Mutex<WritePause>,
 }
+
+/// The writers currently holding the watchers paused, and the paths
+/// they have finished writing so far.
+#[derive(Default)]
+struct WritePause {
+    active: usize,
+    written: HashSet<PathBuf>,
+}
+
+/// One `source.list` row: the stored row plus the runtime
+/// `permission_denied` overlay.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceListing {
+    pub row: SourceRow,
+    pub permission_denied: bool,
+}
+
+impl SourceListing {
+    /// The status shown to clients: `permission_denied` wins over the
+    /// stored `active|stale|offline` (the source's rows are kept
+    /// either way).
+    pub fn status_str(&self) -> &'static str {
+        if self.permission_denied {
+            PERMISSION_DENIED_STATUS
+        } else {
+            self.row.status.as_str()
+        }
+    }
+}
+
+/// The runtime-only `source.list` status for a source the OS won't let
+/// `tephrad` read (E13).
+pub const PERMISSION_DENIED_STATUS: &str = "permission_denied";
 
 impl SourceRegistry {
     pub fn new(cache: Cache) -> std::io::Result<Self> {
@@ -391,6 +485,8 @@ impl SourceRegistry {
             runtime,
             running: Mutex::new(HashMap::new()),
             events_tx,
+            permission_denied: Mutex::new(HashSet::new()),
+            write_pause: Mutex::new(WritePause::default()),
         })
     }
 
@@ -565,7 +661,16 @@ impl SourceRegistry {
         let blocking_handle = self.runtime.handle().clone();
         let ignore_for_batch = Arc::clone(&ignore_rules);
 
-        let on_batch = move |changed: std::collections::HashSet<PathBuf>| {
+        let on_batch = move |mut changed: std::collections::HashSet<PathBuf>| {
+            // G19: the file events of Tephra's own duplicate ID rename
+            // are not changes to react to: the file was indexed again
+            // as part of the rename. A batch made only of them stops
+            // here, so a rename never starts another batch.
+            let own = crate::dup_ids::drop_self_writes(&mut changed);
+            if own > 0 && changed.is_empty() {
+                tracing::debug!(source = %source_name, own, "debounce_fired for Tephra's own write; skipped");
+                return;
+            }
             tracing::info!(
                 source = %source_name,
                 batch_size = changed.len(),
@@ -586,22 +691,42 @@ impl SourceRegistry {
             // whole batch — doing so would stall every other
             // source's watcher sharing that runtime.
             let join_handle = blocking_handle.spawn_blocking(move || {
-                // R12: read the *current* shared rules, not a
-                // snapshot reloaded from disk independently of the
-                // watcher's own event filter — a rescan writes its
-                // freshly reloaded rules into this same lock, so the
-                // batch-apply path and the event filter always agree
-                // on what's ignored.
-                let ignore_rules = ignore_for_batch.read().unwrap().clone();
-                let cache = batch_cache.lock().unwrap();
-                match scan::apply_change_batch(&cache, source_id, &source_root, &changed, &ignore_rules) {
-                    Ok(outcome) => {
-                        // R5: report only the paths that were
-                        // actually upserted or deleted, and skip the
-                        // event entirely when nothing really changed
-                        // (e.g. a batch made entirely of
-                        // ignored/directory-only paths that the
-                        // watcher-level filter let through anyway).
+                // A file whose duplicate ID rename could not be written
+                // yet (another writer holds it, or it changed under the
+                // read) comes back as deferred and is tried again after
+                // a pause, with no lock of ours held in between: a held
+                // file lock raises no file event, so nothing else would
+                // bring the file back, and its cached rows would stay
+                // stale (`block.ensure_id` refuses against them).
+                let result = scan::settle_deferred(
+                    changed,
+                    scan::DEFER_RETRY_DELAY,
+                    |paths, can_defer| {
+                        // R12: read the *current* shared rules, not a
+                        // snapshot reloaded from disk independently of
+                        // the watcher's own event filter — a rescan
+                        // writes its freshly reloaded rules into this
+                        // same lock, so the batch-apply path and the
+                        // event filter always agree on what's ignored.
+                        let ignore_rules = ignore_for_batch.read().unwrap().clone();
+                        let cache = batch_cache.lock().unwrap();
+                        scan::apply_change_batch_deferring(
+                            &cache,
+                            source_id,
+                            &source_root,
+                            paths,
+                            &ignore_rules,
+                            &crate::refactor::RealFs,
+                            can_defer,
+                        )
+                    },
+                    |outcome| {
+                        // R5: report only the paths that were actually
+                        // upserted or deleted, and skip the event
+                        // entirely when nothing really changed (e.g. a
+                        // batch made entirely of ignored/directory-only
+                        // paths that the watcher-level filter let
+                        // through anyway).
                         if !outcome.changed_paths.is_empty() {
                             tracing::info!(
                                 source = %source_name,
@@ -609,14 +734,14 @@ impl SourceRegistry {
                                 "source_changed"
                             );
                             let _ = events_tx.send(DaemonEvent::SourceChanged {
-                                source: source_name,
-                                paths: outcome.changed_paths,
+                                source: source_name.clone(),
+                                paths: outcome.changed_paths.clone(),
                             });
                         }
-                    }
-                    Err(e) => {
-                        tracing::warn!(source = %source_name, error = %e, "failed to apply change batch");
-                    }
+                    },
+                );
+                if let Err(e) = result {
+                    tracing::warn!(source = %source_name, error = %e, "failed to apply change batch");
                 }
             });
             // Fire-and-forget: `on_batch` itself is a synchronous
@@ -633,6 +758,7 @@ impl SourceRegistry {
         let cache_for_offline = Arc::clone(&self.cache);
         let name_for_offline = name.clone();
         let gate_for_offline = Arc::clone(&self.gate);
+        let events_for_offline = self.events_tx.clone();
         let on_root_removed = move || {
             let cache = cache_for_offline.lock().unwrap();
             if let Err(e) = retry_cache_on_busy(&gate_for_offline, || {
@@ -641,6 +767,15 @@ impl SourceRegistry {
                 tracing::warn!(source = %name_for_offline, error = %e, "failed to mark source offline");
             } else {
                 tracing::warn!(source = %name_for_offline, "source root is missing; marked offline");
+                // The in-memory graph carries each source's offline flag
+                // (it is built from the cache), so a status flip has to
+                // reach it the way a file change does: announce it, and
+                // the daemon refreshes the graph and tells clients.
+                // `paths` is empty because no file changed.
+                let _ = events_for_offline.send(DaemonEvent::SourceChanged {
+                    source: name_for_offline.clone(),
+                    paths: Vec::new(),
+                });
             }
         };
 
@@ -703,6 +838,45 @@ impl SourceRegistry {
         }
     }
 
+    /// Whether any running source's watcher is currently paused.
+    pub fn watchers_paused(&self) -> bool {
+        self.running
+            .lock()
+            .unwrap()
+            .values()
+            .any(|running| running.pause.is_paused())
+    }
+
+    /// Pauses every watcher for one writer's own writes. Writers
+    /// overlap (an `ensure_id` while an `apply_refactor` is writing):
+    /// the first one in pauses, and the watchers stay paused until the
+    /// matching [`resume_after_write`](Self::resume_after_write) of the
+    /// last one out, so one writer finishing never resumes the watchers
+    /// under another that is still writing.
+    pub fn pause_for_write(&self) {
+        let mut gate = self.write_pause.lock().unwrap_or_else(|p| p.into_inner());
+        if gate.active == 0 {
+            self.pause_all_watchers();
+        }
+        gate.active += 1;
+    }
+
+    /// One writer is done: `written_paths` are the absolute paths it
+    /// wrote. The last writer out resumes the watchers, discarding
+    /// every path any of the overlapping writers wrote. Each writer
+    /// waits out the debounce window before calling this, so the
+    /// events of its own writes are already queued by then. Must pair
+    /// with a [`pause_for_write`](Self::pause_for_write).
+    pub fn resume_after_write(&self, written_paths: &HashSet<PathBuf>) {
+        let mut gate = self.write_pause.lock().unwrap_or_else(|p| p.into_inner());
+        gate.written.extend(written_paths.iter().cloned());
+        gate.active = gate.active.saturating_sub(1);
+        if gate.active == 0 {
+            let all = std::mem::take(&mut gate.written);
+            self.resume_all_watchers_except(&all);
+        }
+    }
+
     /// `source.unregister` (G1): stops the watcher task (if one is
     /// running — it may not be, e.g. for a source whose watcher
     /// failed to start) and removes the source's rows from the cache.
@@ -712,15 +886,198 @@ impl SourceRegistry {
         if let Some(running) = self.running.lock().unwrap().remove(name) {
             running.handle.stop();
         }
+        self.set_permission_denied(name, false);
         let cache = self.cache.lock().unwrap();
         retry_cache_on_busy(&self.gate, || cache.delete_source(name))?;
         Ok(())
     }
 
-    /// `source.list` (G1).
+    /// `source.list` (G1): the stored rows, with their stored status.
+    /// Clients use [`SourceRegistry::list_with_runtime_status`], which
+    /// adds the runtime `permission_denied` overlay.
     pub fn list(&self) -> Result<Vec<SourceRow>, RegistryError> {
         let cache = self.cache.lock().unwrap();
         Ok(cache.list_sources()?)
+    }
+
+    /// `source.list` as clients see it (E13): every stored row plus
+    /// whether it is currently `permission_denied`.
+    pub fn list_with_runtime_status(&self) -> Result<Vec<SourceListing>, RegistryError> {
+        let rows = self.list()?;
+        let denied = self.permission_denied.lock().unwrap();
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let permission_denied = denied.contains(&row.name);
+                SourceListing {
+                    row,
+                    permission_denied,
+                }
+            })
+            .collect())
+    }
+
+    /// `unit.list` (G1): one folder of `source`, from a fresh read-only
+    /// cache connection — it never takes the shared `self.cache` lock or
+    /// the writer gate, so a listing can't stall a scan or a register,
+    /// nor they it. See [`crate::unit_list`].
+    pub fn list_units(
+        &self,
+        source: &str,
+        folder: &str,
+        recursive: bool,
+    ) -> Result<crate::unit_list::UnitListWire, crate::unit_list::UnitListError> {
+        crate::unit_list::list_units(&self.cache_path, source, folder, recursive)
+    }
+
+    /// `unit.search` with `scope: "names"` (G8): the best `limit` units
+    /// of every source for `query`, from a fresh read-only cache
+    /// connection, like [`SourceRegistry::list_units`]: it never takes the
+    /// shared `self.cache` lock or the writer gate. See [`crate::search`].
+    pub fn search_names(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::search::SearchHitWire>, crate::search::SearchError> {
+        crate::search::search_names(&self.cache_path, query, limit)
+    }
+
+    /// `unit.search` with `scope: "headings"` or `"blocks"` (G9): the
+    /// best `limit` headings, paragraphs or symbols of the one unit
+    /// `unit_id` (`@source:path`), from a fresh read-only cache
+    /// connection, like [`SourceRegistry::search_names`]. See
+    /// [`crate::search::in_file`].
+    pub fn search_in_file(
+        &self,
+        unit_id: &str,
+        scope: tephra_cache::InFileScope,
+        query: &str,
+        limit: usize,
+    ) -> Result<crate::search::in_file::InFileSearchWire, crate::search::SearchError> {
+        crate::search::in_file::search_in_file(&self.cache_path, unit_id, scope, query, limit)
+    }
+
+    /// `unit.search` with `scope: "all_blocks"` (G10, `^^`): the best
+    /// `limit` indexed paragraphs, comment blocks, symbols, headings and
+    /// document paragraphs of every source for `query`, from a fresh
+    /// read-only cache connection, like [`SourceRegistry::search_names`]:
+    /// it never takes the shared `self.cache` lock or the writer gate.
+    /// See [`crate::search::all_blocks`].
+    pub fn search_all_blocks(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::search::all_blocks::AllBlocksHitWire>, crate::search::SearchError> {
+        crate::search::all_blocks::search_all_blocks(&self.cache_path, query, limit)
+    }
+
+    /// Whether `name` is currently marked `permission_denied`.
+    pub fn is_permission_denied(&self, name: &str) -> bool {
+        self.permission_denied.lock().unwrap().contains(name)
+    }
+
+    fn set_permission_denied(&self, name: &str, denied: bool) {
+        let mut set = self.permission_denied.lock().unwrap();
+        if denied {
+            set.insert(name.to_string());
+        } else {
+            set.remove(name);
+        }
+    }
+
+    /// The startup access sweep (E13): checks each registered source's
+    /// root once and marks the ones the OS refuses to list as
+    /// `permission_denied` (clearing the mark on the ones that list
+    /// fine). It reads nothing else and changes no cached row. A
+    /// missing root is left alone: that is `offline`, handled by the
+    /// watcher and by [`SourceRegistry::rescan`]. Returns the names
+    /// newly marked.
+    pub fn refresh_access(&self) -> Result<Vec<String>, RegistryError> {
+        let mut marked = Vec::new();
+        for row in self.list()? {
+            let probe = probe_path(Path::new(&row.path));
+            if probe.is_permission_denied() {
+                if !self.is_permission_denied(&row.name) {
+                    tracing::warn!(
+                        source = %row.name,
+                        root = %row.path,
+                        "source root can't be read (permission denied); marked permission_denied"
+                    );
+                }
+                self.set_permission_denied(&row.name, true);
+                marked.push(row.name);
+            } else if probe == PathProbe::Ok {
+                self.set_permission_denied(&row.name, false);
+            }
+        }
+        Ok(marked)
+    }
+
+    /// E11: rescans from the top every source whose last scan started
+    /// and never finished (the daemon was killed mid-scan, or a schema
+    /// rebuild emptied it). Called once at startup. There is no resume
+    /// logic: [`SourceRegistry::rescan`] clears the source's rows and
+    /// re-walks it, so the result has no duplicate `(source_id,
+    /// rel_path)` rows and the same unit count as a clean scan.
+    ///
+    /// Each source is rescanned in turn; `should_stop` is checked
+    /// before each one so a shutdown doesn't wait for sources that
+    /// haven't started (their scan stays unfinished and is redone next
+    /// start). A scan already running is not interrupted. A source
+    /// whose root is missing is handled by `rescan` (it goes
+    /// `offline`) and stays unfinished until a real scan completes.
+    /// One failed source never stops the others; every outcome is
+    /// returned. Each successful rescan also emits a `source_changed`
+    /// event so the in-memory graph is refreshed and clients are told.
+    pub fn rescan_unfinished(
+        &self,
+        should_stop: impl Fn() -> bool,
+    ) -> Vec<(String, Result<ScanStats, RegistryError>)> {
+        let unfinished = {
+            let cache = self.cache.lock().unwrap();
+            match cache.sources_with_unfinished_scan() {
+                Ok(rows) => rows,
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to list sources with an unfinished scan");
+                    return Vec::new();
+                }
+            }
+        };
+
+        let mut outcomes = Vec::new();
+        for row in unfinished {
+            if should_stop() {
+                tracing::info!(
+                    "shutdown requested; leaving the remaining unfinished scans for the next start"
+                );
+                break;
+            }
+            tracing::info!(
+                source = %row.name,
+                source_id = row.id,
+                root = %row.path,
+                "scan did not finish last time; rescanning from the top"
+            );
+            let result = self.rescan(&row.name);
+            match &result {
+                Ok(stats) => {
+                    tracing::info!(
+                        source = %row.name,
+                        units_written = stats.units_written,
+                        "interrupted scan redone"
+                    );
+                    let _ = self.events_tx.send(DaemonEvent::SourceChanged {
+                        source: row.name.clone(),
+                        paths: Vec::new(),
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(source = %row.name, error = %e, "failed to redo an interrupted scan");
+                }
+            }
+            outcomes.push((row.name, result));
+        }
+        outcomes
     }
 
     /// `source.rescan` (G1): forces a full re-walk of one source,
@@ -743,6 +1100,14 @@ impl SourceRegistry {
     /// watched root deleted out from under a running watcher"
     /// (handled live by the watcher itself) also holding for an
     /// explicit rescan of an already-offline source.
+    ///
+    /// If the root exists but the OS won't list it (E13: macOS Full
+    /// Disk Access not granted), the rescan changes no cached row and
+    /// no stored status; the source is marked `permission_denied` (a
+    /// runtime status, see [`SourceRegistry::list_with_runtime_status`])
+    /// and the call returns empty stats. Once access is granted, the
+    /// next rescan walks normally, lands on `active` and clears the
+    /// mark, with no restart needed.
     pub fn rescan(&self, name: &str) -> Result<ScanStats, RegistryError> {
         let (source_id, root, status) = {
             let cache = self.cache.lock().unwrap();
@@ -752,7 +1117,22 @@ impl SourceRegistry {
             (row.id, PathBuf::from(row.path), row.status)
         };
 
-        if probe_path(&root) != PathProbe::Ok {
+        let probe = probe_path(&root);
+
+        // E13: a root that exists but can't be listed is not empty and
+        // not offline. Keep every cached row and the stored status,
+        // mark it `permission_denied`, and scan nothing.
+        if probe.is_permission_denied() {
+            tracing::warn!(
+                source = %name,
+                root = %root.display(),
+                "source root can't be read (permission denied); keeping its cached rows"
+            );
+            self.set_permission_denied(name, true);
+            return Ok(ScanStats::default());
+        }
+
+        if probe != PathProbe::Ok {
             let cache = self.cache.lock().unwrap();
             if status != SourceStatus::Offline {
                 retry_cache_on_busy(&self.gate, || {
@@ -785,8 +1165,32 @@ impl SourceRegistry {
         }
 
         let scan_cache = Cache::open(&self.cache_path)?;
-        let stats = scan::rescan_source(&scan_cache, source_id, &root, &ignore_rules)?;
+        let stats = match scan::rescan_source(&scan_cache, source_id, &root, &ignore_rules) {
+            Ok(stats) => stats,
+            Err(ScanError::PermissionDenied(path)) => {
+                // The root listed a moment ago (the probe above) but
+                // refused the walk: nothing was cleared or written
+                // (the first chunk rolled back). Put the stored status
+                // back to what it was, and report the denial.
+                drop(scan_cache);
+                tracing::warn!(
+                    source = %name,
+                    root = %path.display(),
+                    "source root can't be read (permission denied); keeping its cached rows"
+                );
+                self.set_permission_denied(name, true);
+                let cache = self.cache.lock().unwrap();
+                if status != SourceStatus::Stale {
+                    retry_cache_on_busy(&self.gate, || {
+                        cache.transition_source_status(name, status)
+                    })?;
+                }
+                return Ok(ScanStats::default());
+            }
+            Err(e) => return Err(e.into()),
+        };
         drop(scan_cache);
+        self.set_permission_denied(name, false);
 
         tracing::info!(
             source = %name,
@@ -810,6 +1214,70 @@ impl SourceRegistry {
 
         Ok(stats)
     }
+
+    /// What `block.ensure_id` needs to know about the file `rel_path` of
+    /// `source`, from a fresh cache connection (it never takes the shared
+    /// `self.cache` lock): the source's root and state, and the cached
+    /// `units` row, if there is one. `Ok(None)` when no such source is
+    /// registered.
+    pub fn cached_unit(
+        &self,
+        source: &str,
+        rel_path: &str,
+    ) -> Result<Option<CachedUnit>, RegistryError> {
+        let cache = Cache::open_read_only(&self.cache_path)?;
+        let Some(row) = cache.get_source(source)? else {
+            return Ok(None);
+        };
+        let unit = cache.get_unit_by_rel_path(row.id, rel_path)?;
+        Ok(Some(CachedUnit {
+            source_id: row.id,
+            root: PathBuf::from(row.path),
+            status: row.status,
+            permission_denied: self.is_permission_denied(source),
+            unit,
+        }))
+    }
+
+    /// Re-indexes the one file `abs_path` of `source` now, in one
+    /// transaction (the same path the watcher's debounced batch takes), so
+    /// the cache describes the file as it is on disk before the caller
+    /// returns. Announces the change on the event stream, exactly as a
+    /// watcher batch would, so the graph refresh and the `graph:changed`
+    /// push still happen even though the caller discards the watcher's own
+    /// event for this write.
+    pub fn reindex_file(&self, source: &str, abs_path: &Path) -> Result<(), RegistryError> {
+        let cache = Cache::open(&self.cache_path)?;
+        let row = cache
+            .get_source(source)?
+            .ok_or_else(|| RegistryError::NotFound(source.to_string()))?;
+        let root = PathBuf::from(&row.path);
+        let ignore_rules = IgnoreRules::load(&root)?;
+        let changed: HashSet<PathBuf> = HashSet::from([abs_path.to_path_buf()]);
+        let outcome = scan::apply_change_batch(&cache, row.id, &root, &changed, &ignore_rules)?;
+        if !outcome.changed_paths.is_empty() {
+            let _ = self.events_tx.send(DaemonEvent::SourceChanged {
+                source: source.to_string(),
+                paths: outcome.changed_paths,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// [`SourceRegistry::cached_unit`]'s answer.
+#[derive(Debug, Clone)]
+pub struct CachedUnit {
+    pub source_id: i64,
+    /// The source's canonical root, as stored.
+    pub root: PathBuf,
+    /// The stored status (`active`, `stale` or `offline`).
+    pub status: SourceStatus,
+    /// The runtime overlay: the OS won't let `tephrad` list the root.
+    pub permission_denied: bool,
+    /// The cached row for the file; `None` for a path that is no file of
+    /// this source (or was never indexed).
+    pub unit: Option<tephra_cache::UnitRow>,
 }
 
 #[cfg(test)]
@@ -963,6 +1431,51 @@ mod tests {
             PathProbe::Ok,
         );
         assert_eq!(result, Ok(()));
+    }
+
+    // ---- E13: the Full Disk Access line on a privacy-blocked path -----
+
+    #[test]
+    fn register_error_for_a_privacy_blocked_path_carries_the_full_disk_access_line() {
+        let existing: Vec<Source> = vec![];
+        let err = validate_register(
+            &existing,
+            "notes",
+            Path::new("/Users/dan/Documents/Notes"),
+            PathProbe::NotReadablePrivacy,
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("NotReadable"), "{message}");
+        assert!(
+            message.contains(&crate::access::fix_line("/Users/dan/Documents/Notes")),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn register_error_for_other_unreadable_paths_keeps_the_plain_message() {
+        let existing: Vec<Source> = vec![];
+        let err = validate_register(
+            &existing,
+            "notes",
+            Path::new("/no/permission"),
+            PathProbe::NotReadable,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "path \"/no/permission\" is invalid: NotReadable"
+        );
+    }
+
+    #[test]
+    fn only_the_two_unreadable_probes_count_as_permission_denied() {
+        assert!(PathProbe::NotReadable.is_permission_denied());
+        assert!(PathProbe::NotReadablePrivacy.is_permission_denied());
+        assert!(!PathProbe::Ok.is_permission_denied());
+        assert!(!PathProbe::Missing.is_permission_denied());
+        assert!(!PathProbe::NotADirectory.is_permission_denied());
     }
 
     // ---- state transitions (reusing tephra-cache's validated edges) ---

@@ -1,0 +1,40 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "unit": "@docs:report.pdf",
+    "scope": "blocks",
+    "offline": false,
+    "text_unavailable": false,
+    "results": [
+      {
+        "unit": "@docs:report.pdf",
+        "kind": "document paragraph",
+        "text": "Intro text",
+        "page": 1,
+        "index": 1
+      },
+      {
+        "unit": "@docs:report.pdf",
+        "kind": "document paragraph",
+        "text": "Slide body",
+        "slide": 2,
+        "index": 3
+      },
+      {
+        "unit": "@docs:report.pdf",
+        "kind": "document paragraph",
+        "text": "Docx paragraph",
+        "paragraph": 5,
+        "index": 5
+      },
+      {
+        "unit": "@docs:report.pdf",
+        "kind": "heading",
+        "text": "Chapter",
+        "level": 1,
+        "page": 2
+      }
+    ]
+  }
+}

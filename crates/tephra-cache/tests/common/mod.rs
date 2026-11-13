@@ -40,6 +40,9 @@ pub fn seed_source_with_units(
     for (rel_path, frontmatter) in [("one.md", Some("{\"title\":\"One\"}")), ("two.md", None)] {
         let unit_id = cache
             .insert_unit(&NewUnit {
+                kind: "prose",
+                size: Some(100),
+                too_large: false,
                 source_id,
                 rel_path,
                 mtime: Some(1_700_000_000),
@@ -53,6 +56,7 @@ pub fn seed_source_with_units(
                 to_raw: "[[Other]]",
                 to_unit_id: None,
                 kind: "wikilink",
+                line: None,
             })
             .expect("insert_link");
 
@@ -65,9 +69,11 @@ pub fn seed_source_with_units(
 
         cache
             .insert_block(&NewBlock {
+                end_line: None,
                 unit_id,
-                block_id: "abcd1234",
+                block_id: Some("abcd1234"),
                 line: 1,
+                symbol_id: None,
             })
             .expect("insert_block");
 
@@ -78,4 +84,64 @@ pub fn seed_source_with_units(
         source_id,
         unit_ids,
     }
+}
+
+/// Writes a real schema-v1 `cache.db` at `db_path` — the exact DDL the
+/// v1 build created, before `kind`/`size`/`headings`/`symbols`/
+/// `block_fts`/`scan_state` existed — so a test can open it with the
+/// v2 build. Two sources: `offline-notes` (status `offline`, two
+/// units, one link/tag/block on the first) and `online-repo` (status
+/// `active`, one unit). Returns nothing; the ids are fixed (sources
+/// 1 and 2, units 1, 2 and 3).
+pub fn write_v1_cache(db_path: &std::path::Path) {
+    let conn = rusqlite::Connection::open(db_path).expect("open raw v1 db");
+    conn.execute_batch(
+        "CREATE TABLE sources (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            path TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('active', 'stale', 'offline')),
+            last_scanned_at INTEGER
+        );
+        CREATE TABLE schema_version (version INTEGER NOT NULL);
+        INSERT INTO schema_version (version) VALUES (1);
+        CREATE TABLE units (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_id INTEGER NOT NULL REFERENCES sources(id),
+            rel_path TEXT NOT NULL,
+            mtime INTEGER,
+            frontmatter_json TEXT,
+            UNIQUE(source_id, rel_path)
+        );
+        CREATE TABLE links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            from_unit_id INTEGER NOT NULL REFERENCES units(id),
+            to_raw TEXT NOT NULL,
+            to_unit_id INTEGER REFERENCES units(id),
+            kind TEXT NOT NULL
+        );
+        CREATE TABLE tags (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            unit_id INTEGER NOT NULL REFERENCES units(id),
+            tag TEXT NOT NULL
+        );
+        CREATE TABLE blocks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            unit_id INTEGER NOT NULL REFERENCES units(id),
+            block_id TEXT NOT NULL,
+            line INTEGER NOT NULL
+        );
+        INSERT INTO sources (id, name, path, status, last_scanned_at)
+            VALUES (1, 'offline-notes', '/gone/notes', 'offline', 1700000000),
+                   (2, 'online-repo', '/here/repo', 'active', 1700000000);
+        INSERT INTO units (id, source_id, rel_path, mtime, frontmatter_json)
+            VALUES (1, 1, 'Café notes.md', 1700000001, '{\"title\":\"One\"}'),
+                   (2, 1, 'src/main.RS', 1700000002, NULL),
+                   (3, 2, 'README.md', 1700000003, NULL);
+        INSERT INTO links (id, from_unit_id, to_raw, to_unit_id, kind)
+            VALUES (1, 1, '[[Other]]', 2, 'wikilink');
+        INSERT INTO tags (id, unit_id, tag) VALUES (1, 1, 'kept');
+        INSERT INTO blocks (id, unit_id, block_id, line) VALUES (1, 1, 'abcd1234', 7);",
+    )
+    .expect("seed v1 db");
 }

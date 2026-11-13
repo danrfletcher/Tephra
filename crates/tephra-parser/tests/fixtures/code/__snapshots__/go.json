@@ -1,0 +1,92 @@
+{
+  "path": "tests/fixtures/code/go/sample.go",
+  "content_hash": "f923ebdfaace8c3c9a6bf44918f12755c901508a083672a139a7a3195c7788ac",
+  "frontmatter": null,
+  "headings": [],
+  "wikilinks": [
+    {
+      "source_prefix": null,
+      "target": "Line",
+      "anchor": null,
+      "alias": null,
+      "raw": "Line",
+      "line": 3,
+      "span": [
+        32,
+        40
+      ]
+    },
+    {
+      "source_prefix": null,
+      "target": "Block",
+      "anchor": null,
+      "alias": null,
+      "raw": "Block",
+      "line": 4,
+      "span": [
+        58,
+        67
+      ]
+    },
+    {
+      "source_prefix": null,
+      "target": "Doc",
+      "anchor": null,
+      "alias": null,
+      "raw": "Doc",
+      "line": 5,
+      "span": [
+        92,
+        99
+      ]
+    }
+  ],
+  "markdown_links": [],
+  "tags": [],
+  "blocks": [],
+  "paragraphs": [],
+  "symbols": [
+    {
+      "kind": "function",
+      "name": "Doc",
+      "parent": null,
+      "line": 6,
+      "start_line": 3,
+      "end_line": 6
+    },
+    {
+      "kind": "variable",
+      "name": "s",
+      "parent": null,
+      "line": 8,
+      "start_line": 8,
+      "end_line": 8
+    },
+    {
+      "kind": "variable",
+      "name": "r",
+      "parent": null,
+      "line": 9,
+      "start_line": 9,
+      "end_line": 9
+    }
+  ],
+  "comment_blocks": [
+    {
+      "start_line": 3,
+      "end_line": 3,
+      "text": "line comment [[Line]]"
+    },
+    {
+      "start_line": 4,
+      "end_line": 4,
+      "text": "block comment [[Block]]"
+    },
+    {
+      "start_line": 5,
+      "end_line": 5,
+      "text": "Doc is documented [[Doc]]"
+    }
+  ],
+  "diagnostics": []
+}

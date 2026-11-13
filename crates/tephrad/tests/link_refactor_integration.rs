@@ -369,6 +369,95 @@ async fn preview_then_apply_rewrites_every_link_style_to_the_same_target_in_one_
     daemon.stop();
 }
 
+/// PR-13.F1: `Edge` gained `line` and a block link (`[[Doc#^id]]`) is
+/// now a block backlink too. The refactor engine still finds and
+/// rewrites *every* occurrence of a link to the renamed file: a plain
+/// link, a block link and a heading link on different lines of one
+/// file, and one link in a second file, keeping each anchor.
+#[tokio::test]
+async fn apply_refactor_rewrites_every_occurrence_including_block_links_after_the_edge_line_change()
+{
+    let daemon = TestDaemon::start().await;
+
+    let notes = fixtures::empty_source();
+    notes.write("OldDoc.md", "# Old Doc\n\nA claim. ^abc123\n");
+    notes.write(
+        "Journal.md",
+        "Plain [[OldDoc]].\n\nBlock [[OldDoc#^abc123]].\n\nHeading [[OldDoc#Old Doc]] and [t](OldDoc.md#^abc123).\n",
+    );
+    notes.write("Other.md", "Also [[OldDoc#^abc123]]\n");
+
+    let register = daemon
+        .call(
+            "source.register",
+            json!({"name": "notes", "root": notes.root().to_string_lossy()}),
+        )
+        .await;
+    assert!(register.get("error").is_none(), "{register:?}");
+
+    let backlinks = daemon
+        .call("graph.get_backlinks", json!({"id": "@notes:OldDoc.md"}))
+        .await;
+    let lines: Vec<(String, i64)> = backlinks["result"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|e| {
+            (
+                e["from"].as_str().unwrap().to_string(),
+                e["line"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        lines,
+        vec![
+            ("@notes:Journal.md".to_string(), 1),
+            ("@notes:Journal.md".to_string(), 3),
+            ("@notes:Journal.md".to_string(), 5),
+            ("@notes:Other.md".to_string(), 1),
+        ],
+        "one backlink row per line holding a link"
+    );
+
+    let preview = daemon
+        .call(
+            "link.preview_refactor",
+            json!({"source": "notes", "old_path": "OldDoc.md", "new_path": "NewDoc.md"}),
+        )
+        .await;
+    assert!(preview.get("error").is_none(), "{preview:?}");
+    assert_eq!(
+        preview["result"]["changes"]
+            .as_array()
+            .expect("changes")
+            .len(),
+        5,
+        "{preview:?}"
+    );
+
+    let apply = daemon
+        .call(
+            "link.apply_refactor",
+            json!({"source": "notes", "old_path": "OldDoc.md", "new_path": "NewDoc.md"}),
+        )
+        .await;
+    assert!(apply.get("error").is_none(), "{apply:?}");
+    assert_eq!(apply["result"]["status"], json!("applied"));
+    assert_eq!(apply["result"]["files_changed"], json!(2));
+
+    assert_eq!(
+        std::fs::read_to_string(notes.root().join("Journal.md")).unwrap(),
+        "Plain [[NewDoc]].\n\nBlock [[NewDoc#^abc123]].\n\nHeading [[NewDoc#Old Doc]] and [t](NewDoc.md#^abc123).\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(notes.root().join("Other.md")).unwrap(),
+        "Also [[NewDoc#^abc123]]\n"
+    );
+
+    daemon.stop();
+}
+
 /// T1, same bug but the spec's own unicode/space rename and three
 /// mixed link styles (bare markdown, titled markdown, wikilink) all
 /// pointing at the same target in one file — every occurrence must

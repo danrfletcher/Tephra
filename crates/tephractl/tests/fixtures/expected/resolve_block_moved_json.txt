@@ -1,0 +1,19 @@
+{
+  "block": {
+    "id": "k3f9a2",
+    "line": 14,
+    "moved": true
+  },
+  "edges": [],
+  "unit": {
+    "blocks": [
+      "k3f9a2"
+    ],
+    "frontmatter_json": null,
+    "id": "@tephra:crates/tephrad/src/conflict.rs",
+    "offline": false,
+    "rel_path": "crates/tephrad/src/conflict.rs",
+    "source": "tephra",
+    "tags": []
+  }
+}

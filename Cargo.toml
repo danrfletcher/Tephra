@@ -7,3 +7,54 @@ members = [
     "crates/tephra-graph",
     "crates/tephractl",
 ]
+
+# Debug builds hash and parse large inputs in tests (15 MB files, 2 MB
+# single-line sources). Unoptimised SHA-256 and tree-sitter C code make
+# those tests CPU-hungry enough to starve the timing-sensitive tests that
+# run beside them, so these dependencies are built optimised even in dev.
+# Only dependencies are affected; the workspace crates keep debug info
+# and overflow checks.
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.dev.package.tree-sitter]
+opt-level = 3
+
+[profile.dev.package.tree-sitter-bash]
+opt-level = 3
+
+[profile.dev.package.tree-sitter-c]
+opt-level = 3
+
+[profile.dev.package.tree-sitter-cpp]
+opt-level = 3
+
+[profile.dev.package.tree-sitter-go]
+opt-level = 3
+
+[profile.dev.package.tree-sitter-java]
+opt-level = 3
+
+[profile.dev.package.tree-sitter-javascript]
+opt-level = 3
+
+[profile.dev.package.tree-sitter-lua]
+opt-level = 3
+
+[profile.dev.package.tree-sitter-python]
+opt-level = 3
+
+[profile.dev.package.tree-sitter-rust]
+opt-level = 3
+
+[profile.dev.package.tree-sitter-swift]
+opt-level = 3
+
+[profile.dev.package.tree-sitter-toml-ng]
+opt-level = 3
+
+[profile.dev.package.tree-sitter-typescript]
+opt-level = 3
+
+[profile.dev.package.tree-sitter-yaml]
+opt-level = 3

@@ -1,0 +1,29 @@
+{
+  "offline": false,
+  "results": [
+    {
+      "kind": "heading",
+      "level": 1,
+      "line": 1,
+      "text": "Plan",
+      "unit": "@notes:plan.md"
+    },
+    {
+      "kind": "heading",
+      "level": 2,
+      "line": 9,
+      "text": "Café notes 日本語",
+      "unit": "@notes:plan.md"
+    },
+    {
+      "kind": "heading",
+      "level": 3,
+      "line": 20,
+      "text": "Evil \u001b[31mred",
+      "unit": "@notes:plan.md"
+    }
+  ],
+  "scope": "headings",
+  "text_unavailable": false,
+  "unit": "@notes:plan.md"
+}

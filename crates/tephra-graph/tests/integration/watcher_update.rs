@@ -209,6 +209,9 @@ fn applying_one_edit_in_a_large_source_recomputes_in_roughly_constant_time_not_p
             let rel_path = format!("Unit{i}.md");
             let unit_id = cache
                 .insert_unit(&NewUnit {
+                    kind: "prose",
+                    size: None,
+                    too_large: false,
                     source_id,
                     rel_path: &rel_path,
                     mtime: None,
@@ -223,6 +226,7 @@ fn applying_one_edit_in_a_large_source_recomputes_in_roughly_constant_time_not_p
                         to_raw: &target,
                         to_unit_id: None,
                         kind: tephra_parser::LINK_KIND_WIKILINK,
+                        line: None,
                     })
                     .expect("insert link");
             }
@@ -250,6 +254,9 @@ fn applying_one_edit_in_a_large_source_recomputes_in_roughly_constant_time_not_p
         cache.delete_unit(existing.id).expect("delete_unit");
         let new_unit_id = cache
             .insert_unit(&NewUnit {
+                kind: "prose",
+                size: None,
+                too_large: false,
                 source_id,
                 rel_path: "Unit0.md",
                 mtime: None,
@@ -264,6 +271,7 @@ fn applying_one_edit_in_a_large_source_recomputes_in_roughly_constant_time_not_p
                     to_raw: &target,
                     to_unit_id: None,
                     kind: tephra_parser::LINK_KIND_WIKILINK,
+                    line: None,
                 })
                 .expect("insert link");
         }
@@ -319,6 +327,9 @@ fn applying_one_edit_does_not_grow_linearly_with_total_graph_size() {
             let rel_path = format!("Unit{i}.md");
             let unit_id = cache
                 .insert_unit(&NewUnit {
+                    kind: "prose",
+                    size: None,
+                    too_large: false,
                     source_id,
                     rel_path: &rel_path,
                     mtime: None,
@@ -333,6 +344,7 @@ fn applying_one_edit_does_not_grow_linearly_with_total_graph_size() {
                         to_raw: &target,
                         to_unit_id: None,
                         kind: tephra_parser::LINK_KIND_WIKILINK,
+                        line: None,
                     })
                     .expect("insert link");
             }
@@ -356,6 +368,9 @@ fn applying_one_edit_does_not_grow_linearly_with_total_graph_size() {
         cache.delete_unit(existing.id).expect("delete_unit");
         let new_unit_id = cache
             .insert_unit(&NewUnit {
+                kind: "prose",
+                size: None,
+                too_large: false,
                 source_id,
                 rel_path: "Unit0.md",
                 mtime: None,
@@ -370,6 +385,7 @@ fn applying_one_edit_does_not_grow_linearly_with_total_graph_size() {
                     to_raw: &target,
                     to_unit_id: None,
                     kind: tephra_parser::LINK_KIND_WIKILINK,
+                    line: None,
                 })
                 .expect("insert link");
         }

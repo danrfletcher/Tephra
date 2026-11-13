@@ -1,0 +1,62 @@
+{
+  "path": "tests/fixtures/units/duplicate-blocks.org",
+  "content_hash": "7ef8b8737bb07f547d1012826ba7d45f99dd152ac7c93ba7e748a6870f1b51e9",
+  "frontmatter": null,
+  "headings": [
+    {
+      "level": 1,
+      "text": "Repeats",
+      "line": 1
+    }
+  ],
+  "wikilinks": [],
+  "markdown_links": [],
+  "tags": [],
+  "blocks": [
+    {
+      "block_id": "dup",
+      "line": 2
+    },
+    {
+      "block_id": "dup",
+      "line": 4
+    },
+    {
+      "block_id": "dup",
+      "line": 6
+    },
+    {
+      "block_id": "other",
+      "line": 7
+    }
+  ],
+  "paragraphs": [
+    {
+      "start_line": 2,
+      "end_line": 2,
+      "block_id": "dup"
+    },
+    {
+      "start_line": 4,
+      "end_line": 4,
+      "block_id": "dup"
+    },
+    {
+      "start_line": 6,
+      "end_line": 7,
+      "block_id": "other"
+    }
+  ],
+  "diagnostics": [
+    {
+      "kind": "duplicate_block_id",
+      "line": 4,
+      "message": "duplicate block id \"^dup\" (first seen on line 2)"
+    },
+    {
+      "kind": "duplicate_block_id",
+      "line": 6,
+      "message": "duplicate block id \"^dup\" (first seen on line 2)"
+    }
+  ]
+}

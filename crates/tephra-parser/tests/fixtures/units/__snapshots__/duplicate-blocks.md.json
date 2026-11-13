@@ -16,6 +16,18 @@
       "line": 3
     }
   ],
+  "paragraphs": [
+    {
+      "start_line": 1,
+      "end_line": 1,
+      "block_id": "dup-id"
+    },
+    {
+      "start_line": 3,
+      "end_line": 3,
+      "block_id": "dup-id"
+    }
+  ],
   "diagnostics": [
     {
       "kind": "duplicate_block_id",

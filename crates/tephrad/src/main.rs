@@ -152,11 +152,44 @@ fn main() -> ExitCode {
     // A failure here is a hard startup failure, same as every other
     // stage; the daemon has nothing useful to do without its cache.
     let cache_path = cfg.data_dir.join("cache.db");
-    match tephra_cache::Cache::open(&cache_path) {
+    // `infer_kind_from_path` gives any offline source's rows carried
+    // across a v1 -> v2 rebuild their provisional `kind` (E10).
+    match tephra_cache::Cache::open_with_kind_inferrer(
+        &cache_path,
+        tephrad::file_kind::infer_kind_from_path,
+    ) {
         Ok(cache) => {
+            if let Some(old) = cache.rebuilt_from_version() {
+                tracing::info!(
+                    from_version = old,
+                    to_version = tephra_cache::CURRENT_SCHEMA_VERSION,
+                    path = %cache.path().display(),
+                    "schema rebuilt from v{old} to v{}; cached rows will be rescanned",
+                    tephra_cache::CURRENT_SCHEMA_VERSION
+                );
+            }
             tracing::info!(path = %cache.path().display(), "cache ready");
         }
         Err(e) => return fail(stage::CACHE, e),
+    }
+
+    // Stage 4b: Full Disk Access probe (G20). One `read_dir` on
+    // `$HOME/Documents`, recorded in `<data_dir>/access.json` with
+    // this process's pid so `tephractl daemon install|status` can tell
+    // a launchd-run tephrad that can't read `~/Documents`. Advisory
+    // only: a failure to write it is logged, never a startup failure.
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    match tephrad::access::probe_and_record(&cfg.data_dir, home.as_deref()) {
+        Ok(report) if report.documents_readable => {
+            tracing::info!("access check: ~/Documents is readable");
+        }
+        Ok(report) => {
+            tracing::warn!(
+                error_kind = report.error_kind.as_deref().unwrap_or("unknown"),
+                "access check: ~/Documents is not readable"
+            );
+        }
+        Err(e) => tracing::warn!(error = %e, "failed to write access.json"),
     }
 
     run_server(&cfg.listen_addr, &cache_path, &cfg.data_dir.join("token"))
@@ -344,8 +377,19 @@ fn run_server(
         // serve.
         let registry_for_sweep = registry.clone();
         let sweep_outcome = tokio::task::spawn_blocking(move || {
+            // E13: before touching any source tree, mark the sources
+            // whose root the OS won't list (Full Disk Access not
+            // granted) as `permission_denied`, so `source.list` says
+            // so from the first request. This changes no cached row.
+            if let Err(e) = registry_for_sweep.refresh_access() {
+                tracing::warn!(error = %e, "failed to check source access at startup");
+            }
             let rows = registry_for_sweep.list().map_err(|e| e.to_string())?;
             for row in rows {
+                if registry_for_sweep.is_permission_denied(&row.name) {
+                    // Nothing to sweep in a tree we can't list.
+                    continue;
+                }
                 match tephrad::scan::sweep_stale_temp_files(std::path::Path::new(&row.path)) {
                     Ok(removed) if removed > 0 => {
                         tracing::info!(
@@ -403,7 +447,10 @@ fn run_server(
             )) as Arc<dyn RefactorBackend>,
             Some(graph_refresh),
             Some(shutdown_rx.clone()),
-        ));
+        )
+        .with_blocks(Arc::new(tephrad::block_id::BlockIdEngine::new(
+            registry.clone(),
+        ))));
 
         // Forwards every `DaemonEvent` the registry's watchers/rescans
         // produce (GP6) to connected WebSocket clients as a
@@ -473,6 +520,24 @@ fn run_server(
             }
         });
 
+        // E11: redo, from the top, every scan that started and never
+        // finished (a kill mid-scan, or a source emptied by a schema
+        // rebuild). Runs in the background so the daemon answers
+        // requests meanwhile, one source at a time; each success sends
+        // a `source_changed` event, which the forwarder above turns
+        // into a graph refresh. Joined at shutdown below, so no scan
+        // thread outlives the registry. A scan already running when a
+        // shutdown arrives is not interrupted, but no further source
+        // is started; whatever is left stays unfinished and is redone
+        // on the next start.
+        let rescan_registry = registry.clone();
+        let rescan_shutdown_rx = shutdown_rx.clone();
+        let rescan_handle = tokio::task::spawn_blocking(move || {
+            let outcomes = rescan_registry.rescan_unfinished(|| *rescan_shutdown_rx.borrow());
+            drop(rescan_registry);
+            outcomes.len()
+        });
+
         let socket_tasks = state.socket_tasks.clone();
         let app = build_router(state);
 
@@ -497,6 +562,9 @@ fn run_server(
         // after the same signal fired) so `forward_state` is guaranteed
         // dropped before `registry` is handed back out below.
         let _ = forwarder_handle.await;
+        if let Err(e) = rescan_handle.await {
+            tracing::warn!(error = %e, "startup rescan task panicked");
+        }
 
         // R10: `axum::serve`'s own graceful shutdown above only waits
         // on in-flight plain HTTP requests — it has no idea an

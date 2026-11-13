@@ -22,8 +22,12 @@ use serde::Serialize;
 use tephra_cache::{Cache, SourceRow, SourceStatus};
 use tephra_graph::{Edge, ResolveError, ResolveResult, UnitGraph};
 
-use crate::registry::{RegistryError, SourceRegistry};
+use crate::registry::{RegistryError, SourceListing, SourceRegistry};
 use crate::scan::ScanStats;
+pub use crate::search::all_blocks::AllBlocksHitWire;
+pub use crate::search::in_file::InFileSearchWire;
+pub use crate::search::{SearchError, SearchHitWire};
+pub use crate::unit_list::{UnitEntryWire, UnitListError, UnitListWire};
 
 /// `unit.resolve_link` / `graph.get_*` (G4), behind a trait so tests
 /// substitute a canned in-memory fixture for PR-5's real
@@ -233,7 +237,9 @@ impl From<ScanStats> for ScanStatsWire {
     }
 }
 
-/// Wire shape for one `source.list` row.
+/// Wire shape for one `source.list` row. `status` is one of `active`,
+/// `stale`, `offline`, or the runtime-only `permission_denied` (E13:
+/// the root exists but the OS won't list it).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SourceRowWire {
     pub name: String,
@@ -250,6 +256,17 @@ impl From<SourceRow> for SourceRowWire {
             status: status_str(r.status).to_string(),
             last_scanned_at: r.last_scanned_at,
         }
+    }
+}
+
+impl From<SourceListing> for SourceRowWire {
+    /// `source.list`'s row: the stored row, with `status` overridden by
+    /// the runtime `permission_denied` value when it applies (E13).
+    fn from(l: SourceListing) -> Self {
+        let status = l.status_str().to_string();
+        let mut wire = SourceRowWire::from(l.row);
+        wire.status = status;
+        wire
     }
 }
 
@@ -273,6 +290,60 @@ pub trait SourceBackend: Send + Sync {
     fn unregister(&self, name: &str) -> Result<(), String>;
     fn list(&self) -> Result<Vec<SourceRowWire>, String>;
     fn rescan(&self, name: &str) -> Result<ScanStatsWire, String>;
+    /// `unit.list` (G1): one folder of `source` (`folder` already
+    /// normalized by the dispatcher; `""` is the root). The default
+    /// refuses, so a test double that only exercises the other four
+    /// verbs needn't implement it; the real [`SourceRegistry`] does,
+    /// and tests of `unit.list` itself substitute a stub.
+    fn list_units(
+        &self,
+        _source: &str,
+        _folder: &str,
+        _recursive: bool,
+    ) -> Result<UnitListWire, UnitListError> {
+        Err(UnitListError::Source(
+            "unit.list is not supported by this source backend".to_string(),
+        ))
+    }
+    /// `unit.search` with `scope: "names"` (G8): the best `limit` units
+    /// of every source for `query`, ranked. The dispatcher has already
+    /// checked `query` and `limit`. The default refuses, like
+    /// [`SourceBackend::list_units`].
+    fn search_names(&self, _query: &str, _limit: usize) -> Result<Vec<SearchHitWire>, SearchError> {
+        Err(SearchError::Source(
+            "unit.search is not supported by this source backend".to_string(),
+        ))
+    }
+    /// `unit.search` with `scope: "headings"` or `"blocks"` (G9): the
+    /// best `limit` headings, paragraphs or symbols of the one unit
+    /// `unit` (`@source:path`) for `query`, which is empty to list them
+    /// all. The dispatcher has already checked `unit`'s presence,
+    /// `query`'s length and `limit`. The default refuses, like
+    /// [`SourceBackend::list_units`].
+    fn search_in_file(
+        &self,
+        _unit: &str,
+        _scope: tephra_cache::InFileScope,
+        _query: &str,
+        _limit: usize,
+    ) -> Result<InFileSearchWire, SearchError> {
+        Err(SearchError::Source(
+            "unit.search is not supported by this source backend".to_string(),
+        ))
+    }
+    /// `unit.search` with `scope: "all_blocks"` (G10, `^^`): the best
+    /// `limit` indexed blocks of every source for `query`, ranked. The
+    /// dispatcher has already checked `query` and `limit`. The default
+    /// refuses, like [`SourceBackend::list_units`].
+    fn search_all_blocks(
+        &self,
+        _query: &str,
+        _limit: usize,
+    ) -> Result<Vec<AllBlocksHitWire>, SearchError> {
+        Err(SearchError::Source(
+            "unit.search is not supported by this source backend".to_string(),
+        ))
+    }
 }
 
 impl SourceBackend for SourceRegistry {
@@ -285,7 +356,7 @@ impl SourceBackend for SourceRegistry {
         SourceRegistry::unregister(self, name).map_err(registry_err_to_string)
     }
     fn list(&self) -> Result<Vec<SourceRowWire>, String> {
-        SourceRegistry::list(self)
+        SourceRegistry::list_with_runtime_status(self)
             .map(|rows| rows.into_iter().map(SourceRowWire::from).collect())
             .map_err(registry_err_to_string)
     }
@@ -293,6 +364,33 @@ impl SourceBackend for SourceRegistry {
         SourceRegistry::rescan(self, name)
             .map(ScanStatsWire::from)
             .map_err(registry_err_to_string)
+    }
+    fn list_units(
+        &self,
+        source: &str,
+        folder: &str,
+        recursive: bool,
+    ) -> Result<UnitListWire, UnitListError> {
+        SourceRegistry::list_units(self, source, folder, recursive)
+    }
+    fn search_names(&self, query: &str, limit: usize) -> Result<Vec<SearchHitWire>, SearchError> {
+        SourceRegistry::search_names(self, query, limit)
+    }
+    fn search_in_file(
+        &self,
+        unit: &str,
+        scope: tephra_cache::InFileScope,
+        query: &str,
+        limit: usize,
+    ) -> Result<InFileSearchWire, SearchError> {
+        SourceRegistry::search_in_file(self, unit, scope, query, limit)
+    }
+    fn search_all_blocks(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<AllBlocksHitWire>, SearchError> {
+        SourceRegistry::search_all_blocks(self, query, limit)
     }
 }
 
@@ -499,5 +597,47 @@ impl RefactorBackend for UnsupportedRefactor {
         _new_path: &str,
     ) -> Result<RefactorApplyWire, String> {
         Err("refactor backend not configured for this test fixture".to_string())
+    }
+}
+
+/// `block.ensure_id` (G11, G12), behind a trait for the same reason as
+/// [`RefactorBackend`]: the dispatch tests can drive the verb without a
+/// real registry, cache or filesystem.
+pub trait BlockBackend: Send + Sync {
+    /// Gives the block `target` points at in the file `unit`
+    /// (`"@source:path"`) a block ID if it has none, and returns the link
+    /// to it: the paragraph or list item holding a line of a prose file,
+    /// the symbol a line or a name points at in a code file. See
+    /// [`crate::block_id::BlockIdEngine::ensure_target`].
+    fn ensure_id(
+        &self,
+        unit: &str,
+        target: &crate::block_id::BlockTarget,
+    ) -> Result<crate::block_id::EnsureIdWire, crate::block_id::BlockIdError>;
+}
+
+impl BlockBackend for crate::block_id::BlockIdEngine {
+    fn ensure_id(
+        &self,
+        unit: &str,
+        target: &crate::block_id::BlockTarget,
+    ) -> Result<crate::block_id::EnsureIdWire, crate::block_id::BlockIdError> {
+        self.ensure_target(unit, target)
+    }
+}
+
+/// A [`BlockBackend`] that always refuses, for fixtures that never write
+/// a block ID.
+pub struct UnsupportedBlockIds;
+
+impl BlockBackend for UnsupportedBlockIds {
+    fn ensure_id(
+        &self,
+        _unit: &str,
+        _target: &crate::block_id::BlockTarget,
+    ) -> Result<crate::block_id::EnsureIdWire, crate::block_id::BlockIdError> {
+        Err(crate::block_id::BlockIdError::Refused(
+            "block ID backend not configured for this test fixture".to_string(),
+        ))
     }
 }

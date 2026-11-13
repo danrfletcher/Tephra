@@ -11,12 +11,12 @@ use std::fmt;
 
 use tephra_cache::{Cache, CacheError, SourceStatus};
 
-use crate::model::{federated_id, parse_federated_id, NodeFacts};
+use crate::model::{federated_id, is_tephra_block_id, parse_federated_id, LinkFact, NodeFacts};
 use crate::resolver::{
-    basename_of, edge_target_scope_key, normalize_key, resolve_edge_target,
+    basename_of, edge_block_anchor, edge_target_scope_key, normalize_key, resolve_edge_target,
     strip_markdown_extension,
 };
-use crate::{Edge, EdgeTarget, UnitGraph};
+use crate::{BlockFact, Edge, EdgeTarget, UnitGraph};
 
 /// One unit's facts in the shape [`UnitGraph::upsert_unit`] takes:
 /// everything [`crate::UnitMetadata`] needs, plus its own outgoing
@@ -26,8 +26,17 @@ use crate::{Edge, EdgeTarget, UnitGraph};
 pub struct UnitFacts {
     pub frontmatter_json: Option<String>,
     pub tags: Vec<String>,
-    pub blocks: Vec<String>,
+    /// Every `^id` occurrence in the unit, in file order, with its
+    /// line. Nothing is deduplicated: an ID that appears twice is two
+    /// facts, each with its own line (resolving that ID is an
+    /// ambiguity error listing every line, E7).
+    pub blocks: Vec<BlockFact>,
+    /// `(to_raw, kind)` pairs, one per outgoing link, in file order.
     pub links: Vec<(String, String)>,
+    /// The line of each link in `links`, entry for entry. A list
+    /// shorter than `links` (or empty, the default) leaves the
+    /// remaining links without a line, as a document's links are.
+    pub link_lines: Vec<Option<i64>>,
 }
 
 /// A stand-in for one of PR-4's `DaemonEvent::SourceChanged`
@@ -83,21 +92,25 @@ fn load_unit_facts(
         .into_iter()
         .map(|t| t.tag)
         .collect();
+    // Paragraph rows without an ID are not facts about any ID. Every
+    // row that has one is kept, duplicates included.
     let blocks = cache
         .blocks_for_unit(unit_id)?
         .into_iter()
-        .map(|b| b.block_id)
+        .filter_map(|b| b.block_id.map(|id| BlockFact { id, line: b.line }))
         .collect();
-    let links = cache
-        .links_from_unit(unit_id)?
-        .into_iter()
-        .map(|l| (l.to_raw, l.kind))
-        .collect();
+    let mut links = Vec::new();
+    let mut link_lines = Vec::new();
+    for l in cache.links_from_unit(unit_id)? {
+        links.push((l.to_raw, l.kind));
+        link_lines.push(l.line);
+    }
     Ok(UnitFacts {
         frontmatter_json,
         tags,
         blocks,
         links,
+        link_lines,
     })
 }
 
@@ -130,6 +143,7 @@ fn insert_edge(graph: &mut UnitGraph, edge: Edge) -> usize {
     let key = edge_match_key(graph, &edge);
     let to = edge.to.clone();
     let from = edge.from.clone();
+    let anchor = edge_block_anchor(&edge.to_raw, &edge.kind);
 
     let slot = match graph.free_slots.pop() {
         Some(s) => {
@@ -150,6 +164,9 @@ fn insert_edge(graph: &mut UnitGraph, edge: Edge) -> usize {
     }
     if let Some(key) = key {
         graph.match_index.entry(key).or_default().push(slot);
+    }
+    if let Some(block_id) = anchor {
+        graph.anchor_index.entry(block_id).or_default().push(slot);
     }
     slot
 }
@@ -182,6 +199,14 @@ fn remove_edge(graph: &mut UnitGraph, slot: usize) {
     if let Some(key) = key {
         if let Some(v) = graph.match_index.get_mut(&key) {
             v.retain(|&i| i != slot);
+        }
+    }
+    if let Some(block_id) = edge_block_anchor(&edge.to_raw, &edge.kind) {
+        if let Some(v) = graph.anchor_index.get_mut(&block_id) {
+            v.retain(|&i| i != slot);
+            if v.is_empty() {
+                graph.anchor_index.remove(&block_id);
+            }
         }
     }
     graph.free_slots.push(slot);
@@ -228,6 +253,37 @@ impl UnitGraph {
             basename_bucket.push(id.clone());
         }
 
+        // A re-upsert replaces the node: drop what the old copy put in
+        // the block index before the new copy's blocks go in.
+        self.unindex_blocks(source, &id);
+        for block in &facts.blocks {
+            if !is_tephra_block_id(&block.id) {
+                continue;
+            }
+            let units = self
+                .block_index
+                .entry(source.to_string())
+                .or_default()
+                .entry(block.id.clone())
+                .or_default();
+            if !units.contains(&id) {
+                units.push(id.clone());
+            }
+        }
+
+        let UnitFacts {
+            links, link_lines, ..
+        } = &facts;
+        let links: Vec<LinkFact> = links
+            .iter()
+            .enumerate()
+            .map(|(i, (to_raw, kind))| LinkFact {
+                to_raw: to_raw.clone(),
+                kind: kind.clone(),
+                line: link_lines.get(i).copied().flatten(),
+            })
+            .collect();
+
         self.nodes.insert(
             id,
             NodeFacts {
@@ -236,15 +292,36 @@ impl UnitGraph {
                 frontmatter_json: facts.frontmatter_json,
                 tags: facts.tags,
                 blocks: facts.blocks,
-                links: facts.links,
+                links,
             },
         );
+    }
+
+    /// Removes unit `id`'s entries from [`UnitGraph::block_index`],
+    /// going by the blocks its current node holds. A no-op for an id
+    /// with no node.
+    fn unindex_blocks(&mut self, source: &str, id: &str) {
+        let Some(node) = self.nodes.get(id) else {
+            return;
+        };
+        let Some(by_id) = self.block_index.get_mut(source) else {
+            return;
+        };
+        for block in &node.blocks {
+            if let Some(units) = by_id.get_mut(&block.id) {
+                units.retain(|u| u != id);
+                if units.is_empty() {
+                    by_id.remove(&block.id);
+                }
+            }
+        }
     }
 
     /// Removes one node's facts and its stem/basename index entries
     /// (no edge rebuild — see [`UnitGraph::insert_node`]).
     fn remove_node(&mut self, source: &str, rel_path: &str) {
         let id = federated_id(source, rel_path);
+        self.unindex_blocks(source, &id);
         self.nodes.remove(&id);
         if let Some(set) = self.by_source.get_mut(source) {
             set.remove(&id);
@@ -303,17 +380,18 @@ impl UnitGraph {
         for id in ids {
             let facts = self.nodes.get(id).expect("id came from nodes.keys()");
             let index = self.index();
-            for (to_raw, kind) in &facts.links {
-                let to = resolve_edge_target(&index, id, &facts.source, to_raw, kind);
+            for link in &facts.links {
+                let to = resolve_edge_target(&index, id, &facts.source, &link.to_raw, &link.kind);
                 let target_offline = matches!(&to, EdgeTarget::Resolved(to_id)
                     if self.nodes.get(to_id).is_some_and(|n| self.offline_sources.contains(&n.source)));
                 let offline = self.offline_sources.contains(&facts.source) || target_offline;
                 edges.push(Edge {
                     from: id.clone(),
                     to,
-                    to_raw: to_raw.clone(),
-                    kind: kind.clone(),
+                    to_raw: link.to_raw.clone(),
+                    kind: link.kind.clone(),
                     offline,
+                    line: link.line,
                 });
             }
         }
@@ -333,6 +411,7 @@ impl UnitGraph {
         self.backward_index = HashMap::new();
         self.match_index = HashMap::new();
         self.edge_keys = Vec::new();
+        self.anchor_index = HashMap::new();
         for edge in edges {
             insert_edge(self, edge);
         }
@@ -410,17 +489,19 @@ impl UnitGraph {
                 // Insert or update: (re)resolve this id's own links
                 // fresh.
                 let index = self.index();
-                for (to_raw, kind) in &facts.links {
-                    let to = resolve_edge_target(&index, tid, &facts.source, to_raw, kind);
+                for link in &facts.links {
+                    let to =
+                        resolve_edge_target(&index, tid, &facts.source, &link.to_raw, &link.kind);
                     let target_offline = matches!(&to, EdgeTarget::Resolved(to_id)
                         if self.nodes.get(to_id).is_some_and(|n| self.offline_sources.contains(&n.source)));
                     let offline = self.offline_sources.contains(&facts.source) || target_offline;
                     fresh.push(Edge {
                         from: tid.clone(),
                         to,
-                        to_raw: to_raw.clone(),
-                        kind: kind.clone(),
+                        to_raw: link.to_raw.clone(),
+                        kind: link.kind.clone(),
                         offline,
+                        line: link.line,
                     });
                 }
             }
@@ -477,6 +558,7 @@ impl UnitGraph {
                             to_raw: old.to_raw,
                             kind: old.kind,
                             offline,
+                            line: old.line,
                         });
                     }
                 }

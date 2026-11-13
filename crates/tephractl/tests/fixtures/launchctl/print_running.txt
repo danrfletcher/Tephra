@@ -1,0 +1,40 @@
+gui/501/com.danrfletcher.tephrad = {
+	active count = 1
+	path = /Users/dan/Library/LaunchAgents/com.danrfletcher.tephrad.plist
+	type = LaunchAgent
+	state = running
+
+	program = /Users/dan/Library/Application Support/tephra/bin/tephrad
+	arguments = {
+		/Users/dan/Library/Application Support/tephra/bin/tephrad
+	}
+
+	stdout path = /Users/dan/Library/Logs/tephra/tephrad.out.log
+	stderr path = /Users/dan/Library/Logs/tephra/tephrad.err.log
+	default environment = {
+		PATH => /usr/bin:/bin:/usr/sbin:/sbin
+	}
+
+	environment = {
+		HOME => /Users/dan
+		OSLogRateLimit => 64
+		XPC_SERVICE_NAME => com.danrfletcher.tephrad
+	}
+
+	domain = gui/501 [100024]
+	asid = 100024
+	minimum runtime = 10
+	exit timeout = 5
+	runs = 3
+	pid = 94200
+	immediate reason = semaphore
+	forks = 1
+	execs = 1
+	initialized = 1
+	trampolined = 1
+	started suspended = 0
+	proxy started suspended = 0
+
+	spawn type = daemon (3)
+	properties = keepalive | runatload | inferred program
+}

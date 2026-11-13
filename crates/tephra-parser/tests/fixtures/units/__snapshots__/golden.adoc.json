@@ -1,0 +1,89 @@
+{
+  "path": "tests/fixtures/units/golden.adoc",
+  "content_hash": "c8c5f62a39969d548667b1fbcecb8efa284d48308527e95665d6afff62d4a758",
+  "frontmatter": null,
+  "headings": [
+    {
+      "level": 1,
+      "text": "Golden AsciiDoc",
+      "line": 1
+    },
+    {
+      "level": 2,
+      "text": "Section One",
+      "line": 5
+    },
+    {
+      "level": 3,
+      "text": "Subsection",
+      "line": 15
+    }
+  ],
+  "wikilinks": [
+    {
+      "source_prefix": null,
+      "target": "Project Plan",
+      "anchor": null,
+      "alias": null,
+      "raw": "Project Plan",
+      "line": 3,
+      "span": [
+        30,
+        46
+      ]
+    },
+    {
+      "source_prefix": null,
+      "target": "Project Plan",
+      "anchor": "Goals",
+      "alias": null,
+      "raw": "Project Plan#Goals",
+      "line": 7,
+      "span": [
+        104,
+        126
+      ]
+    }
+  ],
+  "markdown_links": [
+    {
+      "text": "text",
+      "target": "notes/closing.md",
+      "line": 21,
+      "span": [
+        278,
+        294
+      ]
+    }
+  ],
+  "tags": [],
+  "blocks": [
+    {
+      "block_id": "s1",
+      "line": 8
+    }
+  ],
+  "paragraphs": [
+    {
+      "start_line": 3,
+      "end_line": 3,
+      "block_id": null
+    },
+    {
+      "start_line": 7,
+      "end_line": 8,
+      "block_id": "s1"
+    },
+    {
+      "start_line": 18,
+      "end_line": 18,
+      "block_id": null
+    },
+    {
+      "start_line": 21,
+      "end_line": 21,
+      "block_id": null
+    }
+  ],
+  "diagnostics": []
+}

@@ -1,0 +1,12 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": [
+    {"unit": "@tephra:crates/tephra-cache/src/schema.rs", "source": "tephra", "kind": "symbol", "line": 73, "snippet": "enum ConflictReason", "offline": false},
+    {"unit": "@notes:plans/links.md", "source": "notes", "kind": "paragraph", "line": 7, "snippet": "...how a link conflict is shown\nto the user...", "block_id": "k3f9a2", "offline": false},
+    {"unit": "@notes:deck.pptx", "source": "notes", "kind": "document paragraph", "slide": 2, "index": 1, "snippet": "Conflict resolution", "offline": false},
+    {"unit": "@notes:report.docx", "source": "notes", "kind": "document paragraph", "paragraph": 4, "index": 4, "snippet": "A conflict of interest", "offline": false},
+    {"unit": "@old:b.md", "source": "old", "kind": "comment", "line": 3, "snippet": "a conflict\u0007note", "offline": true},
+    {"unit": "@old:c.md", "source": "old", "kind": "heading", "line": 1, "snippet": "", "offline": true}
+  ]
+}

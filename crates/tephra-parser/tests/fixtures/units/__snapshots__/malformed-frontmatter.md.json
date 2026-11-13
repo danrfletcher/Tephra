@@ -41,6 +41,13 @@
       "line": 8
     }
   ],
+  "paragraphs": [
+    {
+      "start_line": 8,
+      "end_line": 8,
+      "block_id": "anchor-id"
+    }
+  ],
   "diagnostics": [
     {
       "kind": "invalid_frontmatter_yaml",

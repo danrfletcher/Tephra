@@ -1,0 +1,33 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "unit": "@notes:plan.md",
+    "scope": "headings",
+    "offline": false,
+    "text_unavailable": false,
+    "results": [
+      {
+        "unit": "@notes:plan.md",
+        "kind": "heading",
+        "text": "Plan",
+        "level": 1,
+        "line": 1
+      },
+      {
+        "unit": "@notes:plan.md",
+        "kind": "heading",
+        "text": "Café notes 日本語",
+        "level": 2,
+        "line": 9
+      },
+      {
+        "unit": "@notes:plan.md",
+        "kind": "heading",
+        "text": "Evil \u001b[31mred",
+        "level": 3,
+        "line": 20
+      }
+    ]
+  }
+}

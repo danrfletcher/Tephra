@@ -139,6 +139,9 @@ fn delete_units_under_prefix_clears_only_the_nested_rel_paths() {
     // component boundary) and must survive; `top.md` is unrelated.
     let dir_a = cache
         .insert_unit(&NewUnit {
+            kind: "prose",
+            size: None,
+            too_large: false,
             source_id,
             rel_path: "dir/a.md",
             mtime: None,
@@ -151,10 +154,14 @@ fn delete_units_under_prefix_clears_only_the_nested_rel_paths() {
             to_raw: "[[Other]]",
             to_unit_id: None,
             kind: "wikilink",
+            line: None,
         })
         .expect("insert link for dir/a.md");
     let dir_sub_b = cache
         .insert_unit(&NewUnit {
+            kind: "prose",
+            size: None,
+            too_large: false,
             source_id,
             rel_path: "dir/sub/b.md",
             mtime: None,
@@ -163,6 +170,9 @@ fn delete_units_under_prefix_clears_only_the_nested_rel_paths() {
         .expect("insert dir/sub/b.md");
     let dir2_c = cache
         .insert_unit(&NewUnit {
+            kind: "prose",
+            size: None,
+            too_large: false,
             source_id,
             rel_path: "dir2/c.md",
             mtime: None,
@@ -171,6 +181,9 @@ fn delete_units_under_prefix_clears_only_the_nested_rel_paths() {
         .expect("insert dir2/c.md");
     let top = cache
         .insert_unit(&NewUnit {
+            kind: "prose",
+            size: None,
+            too_large: false,
             source_id,
             rel_path: "top.md",
             mtime: None,
@@ -218,6 +231,9 @@ fn delete_units_under_prefix_does_not_match_on_underscore_percent_or_case() {
     let insert = |rel_path: &str| {
         cache
             .insert_unit(&NewUnit {
+                kind: "prose",
+                size: None,
+                too_large: false,
                 source_id,
                 rel_path,
                 mtime: None,
@@ -292,4 +308,83 @@ fn delete_source_is_idempotent_on_an_already_removed_source() {
     cache
         .delete_source("never-existed")
         .expect("delete_source on an unknown name must not error");
+}
+
+#[test]
+fn delete_unit_removes_the_units_headings_too() {
+    // G3: prose files of every format write `headings` rows; deleting
+    // the unit (the watcher's delete path) must take them with it.
+    let dir = tempfile::tempdir().unwrap();
+    let cache = open_temp_cache(&dir);
+    let seeded = seed_source_with_units(&cache, "notes", "/vault/notes", SourceStatus::Active);
+    for unit_id in &seeded.unit_ids {
+        cache
+            .insert_heading(&tephra_cache::NewHeading {
+                unit_id: *unit_id,
+                level: 2,
+                text: "Heading",
+                line: 3,
+            })
+            .expect("insert_heading");
+    }
+
+    cache.delete_unit(seeded.unit_ids[0]).expect("delete_unit");
+
+    assert!(cache
+        .headings_for_unit(seeded.unit_ids[0])
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        cache.headings_for_unit(seeded.unit_ids[1]).unwrap().len(),
+        1,
+        "the other unit's heading survives"
+    );
+}
+
+#[test]
+fn delete_unit_removes_the_units_symbols_and_the_blocks_that_name_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = open_temp_cache(&dir);
+    let seeded = seed_source_with_units(&cache, "repo", "/repo", SourceStatus::Active);
+    let unit_id = seeded.unit_ids[0];
+    let other = seeded.unit_ids[1];
+    for unit in [unit_id, other] {
+        let symbol_id = cache
+            .insert_symbol(&tephra_cache::NewSymbol {
+                unit_id: unit,
+                kind: "function",
+                name: "f",
+                parent: None,
+                line: 2,
+                start_line: 1,
+                end_line: 3,
+            })
+            .unwrap();
+        cache
+            .insert_block(&tephra_cache::NewBlock {
+                unit_id: unit,
+                block_id: Some("k3f9a2"),
+                line: 2,
+                end_line: Some(3),
+                symbol_id: Some(symbol_id),
+            })
+            .unwrap();
+    }
+
+    cache.delete_unit(unit_id).expect("delete_unit");
+
+    let count = |table: &str, unit: i64| -> i64 {
+        cache
+            .connection()
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE unit_id = ?1"),
+                [unit],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(count("symbols", unit_id), 0, "no orphaned symbol rows");
+    assert_eq!(count("blocks", unit_id), 0);
+    assert_eq!(count("symbols", other), 1);
+    assert_eq!(count("blocks", other), 2, "seeded block plus the code one");
 }

@@ -1,0 +1,28 @@
+{
+  "offline": false,
+  "results": [
+    {
+      "block_id": "dup",
+      "kind": "paragraph",
+      "line": 7,
+      "text": "A paragraph about alpha.",
+      "unit": "@notes:plan.md"
+    },
+    {
+      "kind": "paragraph",
+      "line": 12,
+      "text": "First line\nsecond\tline",
+      "unit": "@notes:plan.md"
+    },
+    {
+      "block_id": "dup",
+      "kind": "paragraph",
+      "line": 30,
+      "text": "word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word",
+      "unit": "@notes:plan.md"
+    }
+  ],
+  "scope": "blocks",
+  "text_unavailable": false,
+  "unit": "@notes:plan.md"
+}

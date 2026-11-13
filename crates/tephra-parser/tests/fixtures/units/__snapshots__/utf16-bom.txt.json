@@ -1,0 +1,51 @@
+{
+  "path": "tests/fixtures/units/utf16-bom.txt",
+  "content_hash": "94639f155580db4a632a6d5b617c9f6c59b001af0866277b0c72d6bd6bd3cf74",
+  "frontmatter": null,
+  "headings": [],
+  "wikilinks": [
+    {
+      "source_prefix": null,
+      "target": "Café Plan",
+      "anchor": null,
+      "alias": null,
+      "raw": "Café Plan",
+      "line": 3,
+      "span": [
+        16,
+        30
+      ]
+    }
+  ],
+  "markdown_links": [
+    {
+      "text": "x",
+      "target": "a.md",
+      "line": 3,
+      "span": [
+        39,
+        43
+      ]
+    }
+  ],
+  "tags": [],
+  "blocks": [
+    {
+      "block_id": "u16-1",
+      "line": 4
+    }
+  ],
+  "paragraphs": [
+    {
+      "start_line": 1,
+      "end_line": 1,
+      "block_id": null
+    },
+    {
+      "start_line": 3,
+      "end_line": 4,
+      "block_id": "u16-1"
+    }
+  ],
+  "diagnostics": []
+}

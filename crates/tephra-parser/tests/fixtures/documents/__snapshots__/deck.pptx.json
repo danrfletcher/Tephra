@@ -1,0 +1,142 @@
+{
+  "content_hash": "ecc7378dcde9dba36c3319996765333475f0fa5f60a67b94d0dff3218f2f57d2",
+  "diagnostics": [],
+  "format": "pptx",
+  "headings": [
+    {
+      "level": 1,
+      "location": {
+        "slide": 1
+      },
+      "text": "Deck title"
+    },
+    {
+      "level": 1,
+      "location": {
+        "slide": 2
+      },
+      "text": "Agenda"
+    },
+    {
+      "level": 1,
+      "location": {
+        "slide": 3
+      },
+      "text": "Closing"
+    }
+  ],
+  "markdown_links": [
+    {
+      "index": 3,
+      "link": {
+        "line": 3,
+        "span": [
+          14,
+          23
+        ],
+        "target": "Target.md",
+        "text": "the doc"
+      },
+      "location": {
+        "slide": 2
+      }
+    }
+  ],
+  "paragraphs": [
+    {
+      "index": 1,
+      "location": {
+        "slide": 1
+      },
+      "text": "Deck title"
+    },
+    {
+      "index": 2,
+      "location": {
+        "slide": 1
+      },
+      "text": "subtitle"
+    },
+    {
+      "index": 1,
+      "location": {
+        "slide": 2
+      },
+      "text": "Agenda"
+    },
+    {
+      "index": 2,
+      "location": {
+        "slide": 2
+      },
+      "text": "Read [[Target]] first"
+    },
+    {
+      "index": 3,
+      "location": {
+        "slide": 2
+      },
+      "text": "and [the doc](Target.md)"
+    },
+    {
+      "index": 1,
+      "location": {
+        "slide": 3
+      },
+      "text": "Closing"
+    },
+    {
+      "index": 2,
+      "location": {
+        "slide": 3
+      },
+      "text": "Table below"
+    },
+    {
+      "index": 3,
+      "location": {
+        "slide": 3
+      },
+      "text": "cell link [[TableTarget]]"
+    }
+  ],
+  "path": "tests/fixtures/documents/deck.pptx",
+  "wikilinks": [
+    {
+      "index": 2,
+      "link": {
+        "alias": null,
+        "anchor": null,
+        "line": 2,
+        "raw": "Target",
+        "source_prefix": null,
+        "span": [
+          5,
+          15
+        ],
+        "target": "Target"
+      },
+      "location": {
+        "slide": 2
+      }
+    },
+    {
+      "index": 3,
+      "link": {
+        "alias": null,
+        "anchor": null,
+        "line": 3,
+        "raw": "TableTarget",
+        "source_prefix": null,
+        "span": [
+          10,
+          25
+        ],
+        "target": "TableTarget"
+      },
+      "location": {
+        "slide": 3
+      }
+    }
+  ]
+}

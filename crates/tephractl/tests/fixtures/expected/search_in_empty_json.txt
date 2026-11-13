@@ -1,0 +1,7 @@
+{
+  "offline": false,
+  "results": [],
+  "scope": "headings",
+  "text_unavailable": false,
+  "unit": "@notes:plan.md"
+}

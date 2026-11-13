@@ -1,0 +1,7 @@
+* Repeats
+First paragraph. ^dup
+
+Second paragraph. ^dup
+
+Third ^dup
+fourth line of third. ^other

@@ -29,7 +29,9 @@ use serde_json::Value;
 use tokio::sync::{broadcast, watch, Notify};
 
 use crate::rpc::auth::{self, Authenticated};
-use crate::rpc::backend::{GraphBackend, GraphRefresh, RefactorBackend, SourceBackend};
+use crate::rpc::backend::{
+    BlockBackend, GraphBackend, GraphRefresh, RefactorBackend, SourceBackend, UnsupportedBlockIds,
+};
 use crate::rpc::dispatch::{self, Backends};
 use crate::rpc::protocol;
 
@@ -67,6 +69,10 @@ const MUTATING_SOURCE_METHODS: &[&str] = &[
     // cache get rebuilt into the live in-memory graph too, on this
     // same running daemon, before the RPC response goes out (R1).
     "link.apply_refactor",
+    // `block.ensure_id` writes the file and re-indexes it itself before
+    // returning, like `link.apply_refactor`; this entry rebuilds the
+    // live graph from that fresh cache before the response goes out.
+    "block.ensure_id",
 ];
 
 /// Tracks every currently-running [`handle_socket`] task so shutdown
@@ -149,6 +155,10 @@ pub struct AppState {
     pub graph: Arc<dyn GraphBackend>,
     pub sources: Arc<dyn SourceBackend>,
     pub refactor: Arc<dyn RefactorBackend>,
+    /// `block.ensure_id`'s backend. Defaults to one that refuses every
+    /// request; production (and the tests of that verb) set the real
+    /// one with [`AppState::with_blocks`].
+    pub blocks: Arc<dyn BlockBackend>,
     events_tx: broadcast::Sender<Value>,
     /// `Some` only in production (`main.rs`'s real `SharedGraph`-backed
     /// wiring); `None` in every test that uses a canned/mocked
@@ -198,11 +208,18 @@ impl AppState {
             graph,
             sources,
             refactor,
+            blocks: Arc::new(UnsupportedBlockIds),
             events_tx,
             graph_refresh,
             shutdown_rx,
             socket_tasks: SocketTasks::new(),
         }
+    }
+
+    /// Replaces the `block.ensure_id` backend.
+    pub fn with_blocks(mut self, blocks: Arc<dyn BlockBackend>) -> Self {
+        self.blocks = blocks;
+        self
     }
 
     /// Pushes a `graph:changed` notification to every currently
@@ -292,6 +309,7 @@ async fn handle_single_request(proof: Authenticated, raw: Value, state: Arc<AppS
     let graph = state.graph.clone();
     let sources = state.sources.clone();
     let refactor = state.refactor.clone();
+    let blocks = state.blocks.clone();
     let refresh = state.graph_refresh.clone();
     let method = req.method.clone();
     let params = req.params.clone();
@@ -301,6 +319,7 @@ async fn handle_single_request(proof: Authenticated, raw: Value, state: Arc<AppS
             graph: graph.as_ref(),
             sources: sources.as_ref(),
             refactor: refactor.as_ref(),
+            blocks: blocks.as_ref(),
         };
         let result = dispatch::dispatch(&proof, &method, &params, &backends);
         if result.is_ok() && MUTATING_SOURCE_METHODS.contains(&method.as_str()) {

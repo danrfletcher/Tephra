@@ -1,7 +1,8 @@
 //! `tephra-cache`: the SQLite persistent cache layer for `tephrad`.
 //!
 //! Owns `cache.db` (WAL mode), its schema (`sources`, `units`, `links`,
-//! `tags`, `blocks`, `schema_version`), the single drop-and-rebuild
+//! `tags`, `blocks`, `headings`, `symbols`, the `block_fts` FTS5 index,
+//! `scan_state`, `schema_version`), the single drop-and-rebuild
 //! path triggered by a schema-version mismatch (F2 — no migration
 //! scripts), and per-source status bookkeeping
 //! (`active`/`stale`/`offline`) so an unmounted or offline source's
@@ -12,26 +13,49 @@
 //! typed helpers exposed here.
 
 mod cache;
+mod fts;
+mod in_file;
+mod listing;
 mod schema;
+mod search;
 mod sources;
 mod units;
 
 use std::fmt;
 
 pub use cache::{Cache, FaultInjector};
+pub use fts::{
+    make_snippet, BlockHit, NewFtsRow, FTS_ROWS_PER_UNIT, MAX_RANK_CANDIDATES, MIN_TRIGRAM_CHARS,
+};
+pub use in_file::{InFileCandidate, InFileScope};
+pub use listing::{
+    compare_entries, compare_names, FolderEntry, FolderListing, FolderState, FOLDER_KIND,
+};
+pub use schema::KindInferrer;
+pub use search::{compare_hits, file_stem, resolve_title, NameCandidate, NameHit, NAME_SEARCH_SQL};
 pub use sources::{validate_transition, InvalidTransition, SourceRow, SourceStatus};
 pub use units::{
-    BlockRow, LinkRow, NewBlock, NewLink, NewTag, NewUnit, TagRow, UnitRow, UnitWithSourceStatus,
+    BlockOccurrence, BlockRow, HeadingRow, IdBlockText, LinkRow, NewBlock, NewHeading, NewLink,
+    NewSymbol, NewTag, NewUnit, SymbolRow, TagRow, UnitRow, UnitWithSourceStatus,
 };
 
 /// The schema version this build of the crate expects. Bumping this
 /// constant is the *only* way the on-disk schema ever changes shape:
 /// on next open, [`Cache::open`] compares the stored `schema_version`
 /// row against this value and, on mismatch, drops and recreates
-/// `units`/`links`/`tags`/`blocks` (never `sources`) — see
-/// [`Cache::rebuild`]. There is no migration-file mechanism or
-/// version-ladder anywhere in this crate (F2).
-pub const CURRENT_SCHEMA_VERSION: i64 = 1;
+/// every core table (never `sources`, `schema_version` or
+/// `scan_state`) — see [`Cache::rebuild`]. There is no
+/// migration-file mechanism or version-ladder anywhere in this crate
+/// (F2).
+///
+/// Version 2 added `units.kind`/`size`/`too_large`/`needs_rescan`,
+/// the `headings` and `symbols` tables (a symbol's first line in
+/// `symbols.line`), `blocks.end_line` and `blocks.symbol_id` (the
+/// symbol that owns a code block ID) and the `block_fts` trigram FTS5
+/// index. Builds of v2 before the last two have another table shape
+/// at the same version number; the open path spots that and rebuilds
+/// (see `schema::core_shape_is_stale`).
+pub const CURRENT_SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug)]
 pub enum CacheError {
@@ -58,6 +82,9 @@ pub enum CacheError {
     /// as an error rather than letting the name reach SQL at all — see
     /// `units::count_rows`'s allow-list check.
     InvalidTableName(String),
+    /// This SQLite build has no FTS5 with the `trigram` tokenizer, which
+    /// the `^^` search needs. Carries a message saying what is missing.
+    Fts5Unavailable(String),
 }
 
 impl fmt::Display for CacheError {
@@ -84,6 +111,7 @@ impl fmt::Display for CacheError {
             CacheError::InvalidTableName(name) => {
                 write!(f, "\"{name}\" is not a recognized cache table name")
             }
+            CacheError::Fts5Unavailable(message) => write!(f, "{message}"),
         }
     }
 }

@@ -2,22 +2,77 @@
 //! (GP2/GP3), a forced rescan (`source.rescan`), and the batched
 //! change-apply path used by the debounced watcher (GP6/E5).
 //!
-//! Both entry points go through `tephra_parser::parse_unit_bytes` for
-//! extraction and write through `tephra_cache`'s typed row shapes
-//! (`NewUnit`/`NewLink`/`NewTag`/`NewBlock`), so a unit's cache row
+//! Both entry points dispatch on the file's kind: prose goes through
+//! `tephra_parser::parse_unit` (or `parse_unit_bytes`), code through
+//! `tephra_parser::parse_code_unit` (see [`parse_file`], the one
+//! dispatch). Both write through `tephra_cache`'s typed row shapes
+//! (`NewUnit`/`NewLink`/`NewTag`/`NewBlock`/`NewFtsRow`), so a unit's cache row
 //! shape here is always in sync with what the parser crate produces
 //! — there is no separate re-description of that schema in this
 //! module.
 //!
-//! Only markdown files (`.md`/`.markdown`, case-insensitive) are ever
-//! fed through the parser (GP3: "feeds every markdown file through
-//! the PR-3 parser", R3 review finding): a non-ignored non-markdown
-//! file (a `Cargo.toml`, a `main.rs`, in a code-repository source)
-//! is still walked and counted in `files_seen`, but never parsed or
-//! written as a unit row — the walk and the debounced batch-apply
-//! path both apply this filter identically, so a code-repo source
-//! never ends up with false wikilinks/tags derived from its source
-//! files.
+//! Every non-ignored file becomes a unit (G2), not just Markdown. Each
+//! file is classified by [`crate::file_kind::classify`] into `prose`,
+//! `code`, `document`, `text-other` or `binary` from its name and its
+//! first 8 KB. Every file that classifies as `prose` (`.md`,
+//! `.markdown`, `.txt`, `.org`, `.rst`, `.adoc`, any case) is fed
+//! through the prose parser (G3), which picks its rules from the
+//! extension: links, `^id` blocks, paragraphs and — for Markdown only
+//! — tags, plus headings for Markdown, org, rst and adoc. Every file
+//! that classifies as `code` (an extension with a bundled tree-sitter
+//! grammar, or a recognised shebang) is fed through the code parser
+//! (G4), which reads links only inside comments and docstrings: a
+//! `[[wikilink]]` in a string literal, a heredoc or code is never a
+//! link. The code parse also records the file's symbols (G4) in the
+//! `symbols` table and each `^id` comment as a `blocks` row owned by
+//! its symbol (G13), written in the same chunk transaction as the
+//! unit row. Nothing here writes to the file (F4) or resolves a
+//! `#name` anchor to a symbol (F3).
+//! Every file that classifies as `document` (`.docx`, `.pptx`, `.pdf`)
+//! is fed through the document parser (G5), which reads its text and
+//! links, its headings (docx heading styles, pptx slide titles, the
+//! PDF outline) and its paragraphs with their page, slide or paragraph
+//! number (stored as `blocks` rows with no `block_id`). A document that
+//! cannot be read (corrupt, encrypted) or a PDF with no text layer is
+//! kept as a `document` unit by name only, with one warning naming the
+//! path and the reason; the scan carries on. Documents are never
+//! written (F4) and never OCRed (F6).
+//! Every other file — `text-other`, `binary`, and so a
+//! `.kt`, `.rb`, `.json` or `.ini` file, which has no grammar — is
+//! written as a unit carrying name, kind, size and mtime and nothing
+//! else — no links, headings or blocks. A `.txt` or `.py` with a NUL
+//! byte (which classifies as `binary`) is never parsed. Parsing never
+//! writes to the file (F4).
+//!
+//! `^^` index (G10): the same transaction that writes a unit also
+//! writes its `block_fts` rows ([`insert_index_rows`]): headings and
+//! paragraphs of prose, symbols and comment blocks of code, paragraphs
+//! of a document, and the blank-line-separated blocks of a `text-other`
+//! file (the one kind of unit with no other rows that is still read in
+//! full). A `binary` file, a `too_large` one and a document that could
+//! not be read get none. Replacing or deleting a unit removes its rows
+//! with it, so a watcher batch keeps the index in step with the unit
+//! rows. The
+//! walk ([`walk_and_write`]), the directory-upsert path and the
+//! debounced batch-apply path ([`apply_change_batch`]) all go through
+//! the same [`write_unit`], so they classify identically.
+//!
+//! Size cap (G7): a file over [`crate::file_kind::MAX_INDEXED_BYTES`]
+//! (20 MiB) is indexed by name only. Its size comes from `metadata()`
+//! before any read of the file. It keeps its real kind: the kind comes
+//! from the same name-plus-first-8-KB classification as any other file
+//! (one bounded `read_head`, never more than the sniff window), so an
+//! unknown-extension file with a NUL in its head is `binary`, not
+//! `text-other`. It is never parsed (no links, tags or blocks), gets
+//! `too_large = 1`, and one `info` line names the path and size. A
+//! file of exactly the cap is parsed normally.
+//!
+//! Interrupted scans (E11): [`scan_source`] and [`rescan_source`]
+//! record "started" in the cache's `scan_state` table before they
+//! touch any row, and "finished" only after the walk completes. A
+//! process killed in between leaves the source "started, never
+//! finished"; `tephrad` rescans such a source from the top on its next
+//! start (see `main.rs`), with no resume logic.
 //!
 //! Transaction strategy (R11 review finding): a full scan or forced
 //! rescan commits its writes in bounded chunks ([`SCAN_COMMIT_CHUNK_SIZE`])
@@ -48,7 +103,7 @@
 //! deterministic and free when uncontended instead: see
 //! `crate::writer_gate`'s module doc comment for the full rationale.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::io;
@@ -56,10 +111,13 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rusqlite::{Transaction, TransactionBehavior};
-use tephra_cache::Cache;
+use tephra_cache::{Cache, NewFtsRow, NewUnit};
+use tephra_parser::IndexRow;
 
+use crate::dup_ids::{self, CachedId, Fixed};
+use crate::file_kind::{self, FileKind, MAX_INDEXED_BYTES};
 use crate::ignore::IgnoreRules;
-use crate::refactor;
+use crate::refactor::{self, AtomicFs, RealFs};
 use crate::writer_gate::{self, WriterGate, WriterGateGuard};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -91,10 +149,16 @@ impl ScanStats {
 /// that turned out not to need any cache write at all (R5 review
 /// finding). A caller reporting `source_changed` uses
 /// `changed_paths`, not the raw input batch.
+///
+/// `deferred` are the paths of files left alone because their duplicate
+/// block ID rename ([`Fixed::Deferred`]) could not be written yet: the
+/// file's rows are as they were. The caller tries them again
+/// ([`settle_deferred`]).
 #[derive(Debug, Default, Clone)]
 pub struct ChangeOutcome {
     pub stats: ScanStats,
     pub changed_paths: Vec<PathBuf>,
+    pub deferred: Vec<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -103,6 +167,13 @@ pub enum ScanError {
     Walk(walkdir::Error),
     Cache(tephra_cache::CacheError),
     Sqlite(rusqlite::Error),
+    /// The source's own root could not be listed because the OS
+    /// refused (E13: macOS Full Disk Access not granted, or a mode
+    /// that forbids it). The scan stops here and writes nothing: an
+    /// unreadable root is never "an empty folder", so the cached
+    /// rows must not be cleared. The caller marks the source
+    /// `permission_denied`.
+    PermissionDenied(PathBuf),
 }
 
 impl fmt::Display for ScanError {
@@ -112,6 +183,9 @@ impl fmt::Display for ScanError {
             ScanError::Walk(e) => write!(f, "{e}"),
             ScanError::Cache(e) => write!(f, "{e}"),
             ScanError::Sqlite(e) => write!(f, "{e}"),
+            ScanError::PermissionDenied(path) => {
+                write!(f, "permission denied reading {}", path.display())
+            }
         }
     }
 }
@@ -237,26 +311,59 @@ fn open_chunk<'c, 'g>(
     Ok((permit, tx))
 }
 
-/// File extensions (case-insensitive, no leading dot) treated as
-/// markdown (R3/GP3): only these are ever parsed and written as a
-/// unit row. No per-source override in v1, matching G2's "no
-/// per-source override" precedent for the ignore rules.
-const MARKDOWN_EXTENSIONS: [&str; 2] = ["md", "markdown"];
+/// A rescan's duplicate ID context: the filesystem a rename writes
+/// through, the cache's block IDs per file path from before it cleared,
+/// and where the files left for a retry are collected ([`DupCtx`]'s
+/// `can_defer`): the rescan retries them once its walk has committed.
+#[derive(Clone, Copy)]
+struct DupSource<'a> {
+    fs: &'a dyn AtomicFs,
+    cached: &'a HashMap<String, Vec<CachedId>>,
+    deferred: &'a std::cell::RefCell<Vec<PathBuf>>,
+}
 
-/// Whether `path`'s extension marks it as a markdown file this scan
-/// should actually parse. A non-ignored file with any other
-/// extension (or none) is still walked and counted as "seen", but is
-/// never handed to [`tephra_parser::parse_unit_bytes`] or written as
-/// a unit row.
-fn is_markdown_path(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| {
-            MARKDOWN_EXTENSIONS
-                .iter()
-                .any(|md_ext| ext.eq_ignore_ascii_case(md_ext))
-        })
-        .unwrap_or(false)
+/// What `write_unit` needs to rename a duplicate block ID (G19): the
+/// block IDs the cache held for the file before this write, and the
+/// filesystem the rename writes through. A file with no context (a new
+/// one, a first scan) is never written (E7).
+struct DupCtx<'a> {
+    fs: &'a dyn AtomicFs,
+    cached: &'a [CachedId],
+    /// Whether a file someone else is changing (or that another writer
+    /// holds) may be left for a retry ([`Fixed::Deferred`]) instead of
+    /// being indexed with the duplicate in it. The caller then retries
+    /// it ([`settle_deferred`]); only a caller's last try says no, so
+    /// that a file that never settles still gets indexed as it is.
+    can_defer: bool,
+    /// Set when `write_unit` left the file alone for that reason: it
+    /// wrote nothing and changed no row.
+    deferred: std::cell::Cell<bool>,
+}
+
+/// Every block ID the cache holds for `source_id`'s files, by path, with
+/// the text indexed for it: the cache as it was before a rescan clears
+/// it, so an ID that is repeated after an edit made while the daemon was
+/// stopped is told from one the file already had twice.
+fn cached_ids_of_source(
+    cache: &Cache,
+    source_id: i64,
+) -> Result<HashMap<String, Vec<CachedId>>, ScanError> {
+    let mut out: HashMap<String, Vec<CachedId>> = HashMap::new();
+    cache.for_each_id_block(source_id, None, |b| {
+        out.entry(b.rel_path.clone()).or_default().push((&b).into());
+    })?;
+    Ok(out)
+}
+
+/// The block IDs the cache holds for the one file `rel_path`.
+fn cached_ids_of_file(
+    cache: &Cache,
+    source_id: i64,
+    rel_path: &str,
+) -> Result<Vec<CachedId>, ScanError> {
+    let mut out = Vec::new();
+    cache.for_each_id_block(source_id, Some(rel_path), |b| out.push((&b).into()))?;
+    Ok(out)
 }
 
 /// Relative path, normalized to forward slashes regardless of
@@ -275,22 +382,76 @@ fn to_rel_string(root: &Path, abs: &Path) -> Option<String> {
     }
 }
 
-fn file_mtime(path: &Path) -> Option<i64> {
-    let metadata = fs::metadata(path).ok()?;
+/// Seconds since the epoch of `metadata`'s modification time.
+fn metadata_mtime(metadata: &fs::Metadata) -> Option<i64> {
     let modified = metadata.modified().ok()?;
     let since_epoch = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
     Some(since_epoch.as_secs() as i64)
 }
 
-/// Parses one markdown file and writes its unit/link/tag/block rows,
-/// under the given `source_id`. Returns `Ok(None)` (not an error) for
-/// a file that can't be read as UTF-8 text or whose bytes couldn't be
-/// read at all — a single unreadable file must not abort the rest of
-/// the scan or the whole rescan transaction (E1/E5: the walk and the
-/// change-apply batch both keep going past one bad file). Callers are
-/// responsible for only calling this on a path that has already
-/// passed [`is_markdown_path`]; this function itself does not
-/// re-check the extension.
+/// Reads at most `MAX_INDEXED_BYTES + 1` bytes of `path`: enough to
+/// tell a file that grew past the cap after its `metadata()` check
+/// without ever holding more than the cap in memory.
+fn read_capped(path: &Path) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    fs::File::open(path)?
+        .take(MAX_INDEXED_BYTES + 1)
+        .read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+/// Whether `abs`, or any directory between `root` and it, is a symlink.
+/// Checked component by component with `symlink_metadata`, so nothing
+/// is followed. A component that doesn't exist (a path that was just
+/// deleted, or lies below a deleted symlink) is not a symlink: there is
+/// nothing there to read, and the caller treats it as a removal.
+///
+/// The root itself is not checked: it is whatever path the user
+/// registered, and may legitimately be reached through a link.
+fn passes_through_symlink(root: &Path, abs: &Path) -> bool {
+    let Ok(rel) = abs.strip_prefix(root) else {
+        return false;
+    };
+    let mut current = root.to_path_buf();
+    for component in rel.components() {
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => return true,
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+/// Classifies one file and writes its unit row (and, for a prose or
+/// code file, its link/tag/block/heading rows) under the given
+/// `source_id`. Returns
+/// `Ok(None)` (not an error) for a file whose metadata or leading
+/// bytes couldn't be read at all (permission denied, deleted
+/// mid-walk) — a single unreadable file must not abort the rest of the
+/// scan or the whole rescan transaction (E1/E5: the walk and the
+/// change-apply batch both keep going past one bad file), and is
+/// skipped with a warning whatever its kind. A symlink is skipped the
+/// same way, without a warning and without being read: a unit is a
+/// regular file inside the source, so a link can never pull in content
+/// from outside the root.
+///
+/// Order of operations (G7): `metadata().len()` first, before any read.
+/// The first 8 KB are then read (one bounded read, whatever the size)
+/// and classified ([`file_kind::classify`]), so a too-large file keeps
+/// its real kind. Over [`MAX_INDEXED_BYTES`] that is all that is read:
+/// the file is stored by name only, with that kind and `too_large = 1`,
+/// and is never parsed. Otherwise only a file that classifies
+/// as `prose` or `code` is read in full and parsed (a UTF-16 prose
+/// file with a BOM is decoded first; a code file goes to the code
+/// parser, which has its own time budget — a file it gives up on is
+/// kept as a `code` unit with no links, and the timeout is logged).
+/// A prose or code file whose later bytes turn out not to be valid
+/// UTF-8 is stored as `binary`, by name only, with a warning — it is
+/// still a file in the source. Every other kind is stored with name,
+/// kind, size and mtime only.
 ///
 /// Always an upsert, never a blind insert (R15 review finding): any
 /// existing row at this `(source_id, rel_path)` is deleted first.
@@ -308,40 +469,215 @@ fn file_mtime(path: &Path) -> Option<i64> {
 /// after the clear committed but before this walk gets there,
 /// upserting a fresh row for it. Deleting any existing row here first
 /// makes every write-path in this module idempotent with respect to a
-/// pre-existing row, regardless of how it got there.
+/// pre-existing row, regardless of how it got there. (That also
+/// flips a file's kind cleanly: the old row's links/tags/blocks go
+/// with it, so a prose file overwritten with binary bytes keeps no
+/// stale link rows.)
 fn write_unit(
     cache: &Cache,
     source_id: i64,
     root: &Path,
     abs_path: &Path,
+    dup: Option<&DupCtx<'_>>,
 ) -> Result<Option<ScanStats>, ScanError> {
     let rel_path = match to_rel_string(root, abs_path) {
         Some(r) => r,
         None => return Ok(None),
     };
+    let file_name = abs_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(&rel_path);
 
-    let bytes = match fs::read(abs_path) {
-        Ok(b) => b,
+    // G7: the size comes from metadata, before any read. A symlink is
+    // never indexed (see the doc comment above), so look at the entry
+    // itself first: `fs::metadata` would follow it.
+    match fs::symlink_metadata(abs_path) {
+        Ok(m) if m.file_type().is_symlink() => return Ok(None),
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(path = %abs_path.display(), error = %e, "failed to stat file during scan; skipping");
+            return Ok(None);
+        }
+    }
+    let metadata = match fs::metadata(abs_path) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(path = %abs_path.display(), error = %e, "failed to stat file during scan; skipping");
+            return Ok(None);
+        }
+    };
+    let mtime = metadata_mtime(&metadata);
+    let mut size = metadata.len();
+    let mut too_large = size > MAX_INDEXED_BYTES;
+
+    // The kind comes from the name and the first 8 KB, for a too-large
+    // file too (G7: it keeps its real kind). `read_head` is bounded, so
+    // this never reads past the sniff window whatever the file's size.
+    let head = match file_kind::read_head(abs_path) {
+        Ok(h) => h,
         Err(e) => {
             tracing::warn!(path = %abs_path.display(), error = %e, "failed to read file during scan; skipping");
             return Ok(None);
         }
     };
-
-    let parsed = match tephra_parser::parse_unit_bytes(abs_path, &bytes) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(path = %abs_path.display(), error = %e, "file is not valid UTF-8; skipping");
-            return Ok(None);
+    let mut kind = file_kind::classify(file_name, &head);
+    let mut parsed = None;
+    let mut parsed_doc = None;
+    // G10: the rows this file adds to the `^^` index, built from the
+    // same parse (or the same text) as its other rows and written in
+    // the same transaction. Empty for a binary, a too-large or a
+    // name-only file.
+    let mut index_rows: Vec<IndexRow> = Vec::new();
+    if !too_large && kind == FileKind::Document {
+        // G5: a docx, pptx or PDF is read whole (bounded by the cap) and
+        // handed to the document parser. One that cannot be read stays
+        // a `document` unit by name only, with one warning (E4); it
+        // never fails the scan.
+        let bytes = match read_capped(abs_path) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(path = %abs_path.display(), error = %e, "failed to read file during scan; skipping");
+                return Ok(None);
+            }
+        };
+        size = bytes.len() as u64;
+        if size > MAX_INDEXED_BYTES {
+            // Grew past the cap between the stat and the read.
+            too_large = true;
+        } else {
+            parsed_doc = parse_document(abs_path, &bytes);
         }
-    };
+    }
+    // G19: size and mtime from before the read, for the check just
+    // before a duplicate ID rename. Taken only for a file the cache has
+    // block IDs for: no other file can be renamed.
+    // A file whose rename was given up on at the last try (and so was
+    // indexed with its duplicate) plans against the IDs it had before
+    // that edit, not against the cache's rows, which now hold the ID
+    // twice.
+    let given_up = dup.and_then(|_| dup_ids::given_up_ids(cache.path(), source_id, &rel_path));
+    let dup = dup.filter(|d| !d.cached.is_empty() || given_up.is_some());
+    let fingerprint = dup.as_ref().and_then(|d| d.fs.fingerprint(abs_path).ok());
+    if !too_large && matches!(kind, FileKind::Prose | FileKind::Code) {
+        let bytes = match read_capped(abs_path) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(path = %abs_path.display(), error = %e, "failed to read file during scan; skipping");
+                return Ok(None);
+            }
+        };
+        size = bytes.len() as u64;
+        if size > MAX_INDEXED_BYTES {
+            // Grew past the cap between the stat and the read.
+            too_large = true;
+        } else {
+            match parse_file(kind, abs_path, file_name, &head, &bytes) {
+                Ok(Some((unit, rows))) => {
+                    // G19: an ID the file had in the cache that an
+                    // edit made appear again is renamed on disk, and
+                    // the file is read again (once: no context the
+                    // second time) so the rows hold the new ID.
+                    if let (Some(d), Ok(text)) = (&dup, std::str::from_utf8(&bytes)) {
+                        let lang = file_kind::language_for(file_name, &head);
+                        let parse = |t: &str| match (kind, lang) {
+                            (FileKind::Code, Some(lang)) => {
+                                tephra_parser::parse_code_unit(abs_path, lang, t)
+                            }
+                            _ => tephra_parser::parse_unit(abs_path, t),
+                        };
+                        let unit_id = || {
+                            let name = cache
+                                .list_sources()
+                                .ok()
+                                .and_then(|all| all.into_iter().find(|s| s.id == source_id))
+                                .map_or_else(|| source_id.to_string(), |s| s.name);
+                            format!("@{name}:{rel_path}")
+                        };
+                        let cached = given_up.as_deref().unwrap_or(d.cached);
+                        let fixed = dup_ids::fix_file(
+                            d.fs,
+                            abs_path,
+                            &unit_id,
+                            text,
+                            fingerprint,
+                            &unit,
+                            &rows,
+                            cached,
+                            &parse,
+                            &mut rand::thread_rng(),
+                        );
+                        match fixed {
+                            Fixed::Renamed(_) => {
+                                dup_ids::forget_given_up(cache.path(), source_id, &rel_path);
+                                return write_unit(cache, source_id, root, abs_path, None);
+                            }
+                            Fixed::Deferred if d.can_defer => {
+                                d.deferred.set(true);
+                                return Ok(None);
+                            }
+                            Fixed::Deferred => {
+                                // The last try: the file is indexed with
+                                // its duplicate below, so keep what the
+                                // cache held, or the planner would take
+                                // the ID for an old duplicate (E7) and
+                                // never rename it.
+                                dup_ids::remember_given_up(
+                                    cache.path(),
+                                    source_id,
+                                    &rel_path,
+                                    cached,
+                                );
+                            }
+                            Fixed::Untouched => {
+                                dup_ids::forget_given_up(cache.path(), source_id, &rel_path);
+                            }
+                        }
+                    }
+                    parsed = Some(unit);
+                    index_rows = rows;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(path = %abs_path.display(), error = %e, kind = kind.as_str(), "file is not valid UTF-8; indexed by name only as binary");
+                    kind = FileKind::Binary;
+                }
+            }
+        }
+    }
+    if !too_large && kind == FileKind::TextOther {
+        // G6/G10: a text file of an unknown type is searched by its
+        // blocks of text, split on blank lines. It is still a
+        // `text-other` unit with no links, symbols or headings. Bytes
+        // that are not UTF-8 give no rows (the kind is the sniff's,
+        // and stays so).
+        match read_capped(abs_path) {
+            Ok(bytes) => {
+                size = bytes.len() as u64;
+                if size > MAX_INDEXED_BYTES {
+                    too_large = true;
+                } else if let Some(text) = text_of(&bytes) {
+                    index_rows = tephra_parser::text_other_rows(&text);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(path = %abs_path.display(), error = %e, "failed to read file during scan; skipping");
+                return Ok(None);
+            }
+        }
+    }
+    if too_large {
+        tracing::info!(
+            path = %abs_path.display(),
+            size_bytes = size,
+            limit_bytes = MAX_INDEXED_BYTES,
+            "file is over the size limit; indexed by name only"
+        );
+    }
 
     // R15: delete any existing row for this path before inserting the
-    // freshly parsed one, so this is always an upsert.
+    // freshly built one, so this is always an upsert.
     delete_existing_unit(cache, source_id, &rel_path)?;
-
-    let mtime = file_mtime(abs_path);
-    let unit_id = cache.insert_unit(&parsed.to_new_unit(source_id, &rel_path, mtime))?;
 
     let mut stats = ScanStats {
         files_seen: 0,
@@ -352,6 +688,56 @@ fn write_unit(
         blocks_written: 0,
     };
 
+    if let Some(doc) = &parsed_doc {
+        return write_document(cache, source_id, &rel_path, mtime, size, doc, stats).map(Some);
+    }
+
+    let Some(parsed) = parsed else {
+        let unit_id = cache.insert_unit(&NewUnit {
+            source_id,
+            rel_path: &rel_path,
+            mtime,
+            frontmatter_json: None,
+            kind: kind.as_str(),
+            size: Some(size as i64),
+            too_large,
+        })?;
+        insert_index_rows(cache, unit_id, &index_rows)?;
+        return Ok(Some(stats));
+    };
+
+    // E7: an ID that appears twice is stored twice (below) and
+    // reported here. E12: so is a code parse that was given up on.
+    // The one write a scan makes is G19's rename of an ID an edit made
+    // appear again (above, in the parse step, before this point); a
+    // duplicate that was there when the file was first scanned is never
+    // written.
+    for diag in &parsed.diagnostics {
+        match diag.kind {
+            tephra_parser::DiagnosticKind::DuplicateBlockId => tracing::warn!(
+                path = %abs_path.display(),
+                line = diag.line,
+                "{}",
+                diag.message
+            ),
+            tephra_parser::DiagnosticKind::ParseTimeout
+            | tephra_parser::DiagnosticKind::ParseSkippedTooLarge
+            | tephra_parser::DiagnosticKind::ParseFailed
+            | tephra_parser::DiagnosticKind::SyntaxErrors => tracing::warn!(
+                path = %abs_path.display(),
+                "{}",
+                diag.message
+            ),
+            _ => {}
+        }
+    }
+
+    let mut new_unit = parsed.to_new_unit(source_id, &rel_path, mtime);
+    // `to_new_unit` says `prose`; a code unit says `code`.
+    new_unit.kind = kind.as_str();
+    new_unit.size = Some(size as i64);
+    let unit_id = cache.insert_unit(&new_unit)?;
+
     for link in parsed.to_new_links(unit_id) {
         cache.insert_link(&link)?;
         stats.links_written += 1;
@@ -360,12 +746,183 @@ fn write_unit(
         cache.insert_tag(&tag)?;
         stats.tags_written += 1;
     }
-    for block in parsed.to_new_blocks(unit_id) {
+    // A code file's symbols go in first: its `^id` block rows name the
+    // symbol that owns them (G13). Prose has none.
+    let mut symbol_ids = Vec::with_capacity(parsed.symbols.len());
+    for symbol in parsed.to_new_symbols(unit_id) {
+        symbol_ids.push(cache.insert_symbol(&symbol)?);
+    }
+    for block in parsed.to_new_blocks_with_symbols(unit_id, &symbol_ids) {
         cache.insert_block(&block)?;
         stats.blocks_written += 1;
     }
+    // Headings feed the listing's prose title (first heading when the
+    // frontmatter has none). `delete_unit` removes them with the row.
+    for heading in parsed.to_new_headings(unit_id) {
+        cache.insert_heading(&heading)?;
+    }
+    insert_index_rows(cache, unit_id, &index_rows)?;
 
     Ok(Some(stats))
+}
+
+/// The text of a file's `bytes`: UTF-16 with a BOM decoded, else strict
+/// UTF-8. `None` when it is neither.
+fn text_of(bytes: &[u8]) -> Option<std::borrow::Cow<'_, str>> {
+    match file_kind::decode_utf16_with_bom(bytes) {
+        Some(text) => Some(std::borrow::Cow::Owned(text)),
+        None => std::str::from_utf8(bytes)
+            .ok()
+            .map(std::borrow::Cow::Borrowed),
+    }
+}
+
+/// Writes `rows` as `unit_id`'s `^^` index rows (G10), in the caller's
+/// transaction: the same one that wrote the unit row, so a reader never
+/// sees a unit without its rows or rows without its unit, and
+/// `delete_existing_unit` (the next write of this path) removes them
+/// with the unit.
+fn insert_index_rows(cache: &Cache, unit_id: i64, rows: &[IndexRow]) -> Result<(), ScanError> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let new_rows: Vec<NewFtsRow<'_>> = rows
+        .iter()
+        .map(|r| NewFtsRow {
+            kind: r.kind,
+            line: r.line,
+            block_id: r.block_id.as_deref(),
+            name: r.name.as_deref(),
+            label: r.label.as_deref(),
+            place: r.place,
+            place_n: r.place_n,
+            idx: r.idx,
+            text: &r.text,
+        })
+        .collect();
+    cache.insert_fts_rows(unit_id, &new_rows)?;
+    Ok(())
+}
+
+/// Parses a `document` file's bytes. `None` means the unit is kept by
+/// name only: the document could not be read (corrupt, encrypted) or
+/// has no text layer, and one warning names the path and the reason
+/// (E4). Never fails the scan and never panics.
+fn parse_document(abs_path: &Path, bytes: &[u8]) -> Option<tephra_parser::ParsedDocument> {
+    match tephra_parser::parse_document_bytes(abs_path, bytes) {
+        Ok(doc) => {
+            if let Some(diag) = doc
+                .diagnostics
+                .iter()
+                .find(|d| d.kind == tephra_parser::DiagnosticKind::NoTextLayer)
+            {
+                tracing::warn!(
+                    path = %abs_path.display(),
+                    reason = "no text layer",
+                    "{}",
+                    diag.message
+                );
+                return None;
+            }
+            Some(doc)
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %abs_path.display(),
+                reason = %e,
+                "document could not be read; indexed by name only"
+            );
+            None
+        }
+    }
+}
+
+/// Writes a parsed document's unit row with its links, headings and
+/// paragraph rows (G5), in the same transaction as every other write of
+/// the chunk. The paragraphs go into `blocks` with no `block_id`; their
+/// `line` is the page, slide or paragraph number. They also go into the
+/// `^^` index (G10) with that place and their position within it.
+/// Nothing is written to the document itself (F4).
+fn write_document(
+    cache: &Cache,
+    source_id: i64,
+    rel_path: &str,
+    mtime: Option<i64>,
+    size: u64,
+    doc: &tephra_parser::ParsedDocument,
+    mut stats: ScanStats,
+) -> Result<ScanStats, ScanError> {
+    let mut new_unit = doc.to_new_unit(source_id, rel_path, mtime);
+    new_unit.kind = FileKind::Document.as_str();
+    new_unit.size = Some(size as i64);
+    let unit_id = cache.insert_unit(&new_unit)?;
+    for link in doc.to_new_links(unit_id) {
+        cache.insert_link(&link)?;
+        stats.links_written += 1;
+    }
+    for heading in doc.to_new_headings(unit_id) {
+        cache.insert_heading(&heading)?;
+    }
+    for block in doc.to_new_blocks(unit_id) {
+        cache.insert_block(&block)?;
+        stats.blocks_written += 1;
+    }
+    insert_index_rows(cache, unit_id, &doc.index_rows())?;
+    Ok(stats)
+}
+
+/// The one dispatch from a file's kind to its parser. `bytes` is the
+/// whole file, `head` its first bytes (what [`file_kind::classify`]
+/// saw). `Ok(None)` is a kind this does not parse (or a code file with
+/// no grammar, which `classify` never produces). `Err` carries the
+/// reason the bytes are not text; the caller then stores the file as
+/// `binary`. `Ok(Some((unit, rows)))` is the parse and the `^^` index
+/// rows ([`IndexRow`]) built from it and the text it was parsed from.
+///
+/// - `Prose`: `parse_unit`, after decoding a UTF-16 file with a BOM,
+///   else on strict UTF-8.
+/// - `Code`: `parse_code_unit` in the language the name or shebang
+///   gives ([`file_kind::language_for`]), on strict UTF-8.
+///
+/// Used by every write path ([`write_unit`] is the only caller), so a
+/// file is parsed the same way in a full scan, a rescan and the
+/// watcher's batch.
+fn parse_file(
+    kind: FileKind,
+    abs_path: &Path,
+    file_name: &str,
+    head: &[u8],
+    bytes: &[u8],
+) -> Result<Option<(tephra_parser::ParsedUnit, Vec<IndexRow>)>, String> {
+    match kind {
+        FileKind::Prose => {
+            let text = match file_kind::decode_utf16_with_bom(bytes) {
+                Some(text) => std::borrow::Cow::Owned(text),
+                None => std::borrow::Cow::Borrowed(std::str::from_utf8(bytes).map_err(|e| {
+                    tephra_parser::InvalidUtf8 {
+                        valid_up_to: e.valid_up_to(),
+                    }
+                    .to_string()
+                })?),
+            };
+            let unit = tephra_parser::parse_unit(abs_path, &text);
+            let rows = unit.index_rows(&text);
+            Ok(Some((unit, rows)))
+        }
+        FileKind::Code => {
+            let Some(lang) = file_kind::language_for(file_name, head) else {
+                return Ok(None);
+            };
+            let text = std::str::from_utf8(bytes).map_err(|e| e.to_string())?;
+            let unit = tephra_parser::parse_code_unit(abs_path, lang, text);
+            let rows = unit.index_rows(text);
+            Ok(Some((unit, rows)))
+        }
+        // A document goes through `parse_document` instead: its bytes
+        // are not text, so it has no `ParsedUnit`. A `text-other` file
+        // is read for its index rows in `write_unit`.
+        FileKind::Document | FileKind::TextOther | FileKind::Binary => Ok(None),
+    }
 }
 
 /// Deletes the one unit row at `source_id`/`rel_path` (if any) and
@@ -384,13 +941,18 @@ fn delete_existing_unit(cache: &Cache, source_id: i64, rel_path: &str) -> Result
 /// `root` (streaming — see the module doc and E1), applying `ignore`
 /// before descending into any directory so an ignored subtree's files
 /// are never even listed, let alone parsed. Every non-ignored
-/// markdown file is parsed and its rows written via `cache`;
-/// non-markdown files are counted as seen but never parsed (R3).
+/// file is classified and written via `cache`; only prose files
+/// (links, tags, blocks) and code files (comment/docstring links) are
+/// parsed (G2, G4).
 ///
 /// A single unreadable directory entry (e.g. a permission-denied
 /// subdirectory) is logged and skipped rather than aborting the whole
 /// walk (R2) — the same "log and keep going" treatment
-/// [`write_unit`] already gives one unreadable file.
+/// [`write_unit`] already gives one unreadable file. The one exception
+/// is the root itself: if it cannot be listed because of a permission
+/// error the walk returns [`ScanError::PermissionDenied`] instead of
+/// finishing "empty" (E13), so a forced rescan never wipes the cached
+/// rows of a source the OS merely refuses to show it.
 ///
 /// This never collects the full file list into memory at once: the
 /// `walkdir::WalkDir` iterator yields one entry at a time, and each
@@ -413,6 +975,7 @@ fn walk_and_write(
     ignore: &IgnoreRules,
     gate: &WriterGate,
     first_chunk: (WriterGateGuard<'_>, Transaction<'_>),
+    dup: Option<DupSource<'_>>,
 ) -> Result<ScanStats, ScanError> {
     let mut stats = ScanStats::default();
     let (mut permit, mut tx) = (Some(first_chunk.0), Some(first_chunk.1));
@@ -436,6 +999,14 @@ fn walk_and_write(
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
+                // E13: the root itself refusing to be listed must not
+                // read as "the folder is empty". Stop before anything
+                // is committed past what the caller already holds in
+                // its open first chunk (dropped, so rolled back, on
+                // this return): the cached rows stay as they were.
+                if walk_error_is_root_permission_denied(&e) {
+                    return Err(ScanError::PermissionDenied(root.to_path_buf()));
+                }
                 tracing::warn!(error = %e, "failed to walk a directory entry during scan; skipping");
                 continue;
             }
@@ -480,11 +1051,24 @@ fn walk_and_write(
             stats.files_ignored += 1;
             continue;
         }
-        if !is_markdown_path(entry.path()) {
-            continue;
-        }
-
-        if let Some(file_stats) = write_unit(cache, source_id, root, entry.path())? {
+        let ctx = dup.and_then(|d| {
+            let cached = d.cached.get(&to_rel_string(root, entry.path())?)?;
+            Some(DupCtx {
+                fs: d.fs,
+                cached,
+                can_defer: true,
+                deferred: std::cell::Cell::new(false),
+            })
+        });
+        let written = write_unit(cache, source_id, root, entry.path(), ctx.as_ref())?;
+        if ctx.as_ref().is_some_and(|c| c.deferred.get()) {
+            // Not indexed: the rescan's rows for it were cleared, so
+            // the walk leaves it out and the rescan retries it after
+            // this walk commits (with the same cached IDs).
+            if let Some(d) = dup {
+                d.deferred.borrow_mut().push(entry.path().to_path_buf());
+            }
+        } else if let Some(file_stats) = written {
             stats.accumulate(file_stats);
         }
 
@@ -511,6 +1095,16 @@ fn walk_and_write(
         tx.commit()?;
     }
     Ok(stats)
+}
+
+/// Whether a walk error is the walk's own root (depth 0) failing with a
+/// permission error, as opposed to one unreadable subdirectory or file
+/// further down (which is logged and skipped, E1/R2).
+fn walk_error_is_root_permission_denied(err: &walkdir::Error) -> bool {
+    err.depth() == 0
+        && err
+            .io_error()
+            .is_some_and(|io| io.kind() == io::ErrorKind::PermissionDenied)
 }
 
 /// Sweeps every stale `.{original-file-name}.tephra-tmp-{n}` leftover
@@ -592,6 +1186,28 @@ pub fn sweep_stale_temp_files(root: &Path) -> io::Result<usize> {
     Ok(removed)
 }
 
+/// Records "scan started" for `source_id` (E11) in its own committed
+/// write, *before* the scan's first chunk opens — so a process killed
+/// at any point from here on, even before that first chunk commits,
+/// leaves the source marked unfinished. Takes the writer gate like
+/// every other write so it never races an in-process chunk.
+fn record_scan_started(cache: &Cache, gate: &WriterGate, source_id: i64) -> Result<(), ScanError> {
+    retry_on_busy(|| {
+        let _permit = gate.acquire();
+        cache.mark_scan_started(source_id).map_err(ScanError::from)
+    })
+}
+
+/// Records "scan finished" for `source_id`, only reached once the walk
+/// returned `Ok`. A failed or killed scan never gets here, which is
+/// what leaves it unfinished.
+fn record_scan_finished(cache: &Cache, gate: &WriterGate, source_id: i64) -> Result<(), ScanError> {
+    retry_on_busy(|| {
+        let _permit = gate.acquire();
+        cache.mark_scan_finished(source_id).map_err(ScanError::from)
+    })
+}
+
 /// `source.register`'s initial full scan (GP2/GP3), against a source
 /// with no pre-existing rows. Commits in bounded chunks rather than
 /// one transaction for the whole walk (R11 — see the module doc
@@ -603,8 +1219,11 @@ pub fn scan_source(
     ignore: &IgnoreRules,
 ) -> Result<ScanStats, ScanError> {
     let gate = writer_gate::for_path(cache.path());
+    record_scan_started(cache, &gate, source_id)?;
     let first_chunk = open_chunk(cache, &gate)?;
-    walk_and_write(cache, source_id, root, ignore, &gate, first_chunk)
+    let stats = walk_and_write(cache, source_id, root, ignore, &gate, first_chunk, None)?;
+    record_scan_finished(cache, &gate, source_id)?;
+    Ok(stats)
 }
 
 /// `source.rescan`'s forced full re-walk: clears this source's
@@ -618,20 +1237,132 @@ pub fn scan_source(
 /// rescan can still leave the source with only part of its rows
 /// restored until the next rescan, a deliberate trade against holding
 /// the sole SQLite writer lock for the whole walk.
+///
+/// G19: the block IDs the rows held before the clear are what tells an
+/// ID that an edit made while the daemon was stopped repeated (renamed)
+/// from one the file had twice already (left alone). A source with no
+/// rows to clear (a schema rebuild emptied it) has none, so nothing is
+/// renamed (E7).
 pub fn rescan_source(
     cache: &Cache,
     source_id: i64,
     root: &Path,
     ignore: &IgnoreRules,
 ) -> Result<ScanStats, ScanError> {
+    rescan_source_with(cache, source_id, root, ignore, &RealFs)
+}
+
+/// [`rescan_source`] with the filesystem a duplicate ID rename writes
+/// through injected (a test makes the write fail or the file change).
+pub fn rescan_source_with(
+    cache: &Cache,
+    source_id: i64,
+    root: &Path,
+    ignore: &IgnoreRules,
+    fs_ops: &dyn AtomicFs,
+) -> Result<ScanStats, ScanError> {
     let gate = writer_gate::for_path(cache.path());
+    record_scan_started(cache, &gate, source_id)?;
     let first_chunk = open_chunk(cache, &gate)?;
+    let cached = cached_ids_of_source(cache, source_id)?;
     cache.delete_units_for_source(source_id)?;
-    walk_and_write(cache, source_id, root, ignore, &gate, first_chunk)
+    let deferred = std::cell::RefCell::new(Vec::new());
+    let mut stats = walk_and_write(
+        cache,
+        source_id,
+        root,
+        ignore,
+        &gate,
+        first_chunk,
+        Some(DupSource {
+            fs: fs_ops,
+            cached: &cached,
+            deferred: &deferred,
+        }),
+    )?;
+    // A file whose rename could not be written during the walk (another
+    // writer held it, or it changed under the read) has no rows yet:
+    // try it again, with the IDs the cache held for it before the clear,
+    // until it settles. The scan is not finished until then.
+    let pending: HashSet<PathBuf> = deferred.into_inner().into_iter().collect();
+    if !pending.is_empty() {
+        let outcome = settle_deferred(
+            pending,
+            DEFER_RETRY_DELAY,
+            |paths, can_defer| {
+                retry_on_busy(|| {
+                    apply_change_batch_once(
+                        cache,
+                        source_id,
+                        root,
+                        paths,
+                        ignore,
+                        fs_ops,
+                        BatchOpts {
+                            can_defer,
+                            cached: Some(&cached),
+                        },
+                    )
+                })
+            },
+            |_| {},
+        )?;
+        stats.accumulate(outcome.stats);
+    }
+    record_scan_finished(cache, &gate, source_id)?;
+    Ok(stats)
+}
+
+/// How many times a file whose duplicate ID rename could not be written
+/// yet is tried again, and the pause between tries (about two seconds in
+/// all). After the last one the file is indexed as it is, with the
+/// duplicate; the IDs the cache held for it are kept in memory
+/// ([`dup_ids::remember_given_up`]), so its next re-parse (an edit, a
+/// rescan) renames the copy. A restart forgets them, and the file then
+/// counts as one scanned with its duplicate (E7).
+pub const DEFER_RETRIES: u32 = 8;
+pub const DEFER_RETRY_DELAY: Duration = Duration::from_millis(250);
+
+/// Runs `attempt` on `changed` and then, until none is left, on the
+/// paths it hands back as [`ChangeOutcome::deferred`], pausing `delay`
+/// between rounds. `attempt` gets the paths and whether it may defer
+/// again: the last round may not, so every file ends up indexed from
+/// what is on disk. The pause runs with no lock of the caller's held
+/// (`attempt` takes what it needs for one round only). `report` sees
+/// every round's outcome as it happens. Returns the rounds merged.
+pub fn settle_deferred(
+    changed: HashSet<PathBuf>,
+    delay: Duration,
+    mut attempt: impl FnMut(&HashSet<PathBuf>, bool) -> Result<ChangeOutcome, ScanError>,
+    mut report: impl FnMut(&ChangeOutcome),
+) -> Result<ChangeOutcome, ScanError> {
+    let mut total = ChangeOutcome::default();
+    let mut pending = changed;
+    for round in 0..=DEFER_RETRIES {
+        let can_defer = round < DEFER_RETRIES;
+        if !can_defer {
+            tracing::warn!(
+                paths = ?pending,
+                "a duplicate block ID could not be renamed after {DEFER_RETRIES} tries; indexing the file as it is"
+            );
+        }
+        let outcome = attempt(&pending, can_defer)?;
+        report(&outcome);
+        total.stats.accumulate(outcome.stats);
+        total.stats.files_seen += outcome.stats.files_seen;
+        total.stats.files_ignored += outcome.stats.files_ignored;
+        total.changed_paths.extend(outcome.changed_paths);
+        if outcome.deferred.is_empty() {
+            return Ok(total);
+        }
+        std::thread::sleep(delay);
+        pending = outcome.deferred.into_iter().collect();
+    }
+    Ok(total)
 }
 
 /// Walks an existing directory that arrived as one changed path (a
-/// create or a move-in: R4) and upserts every non-ignored markdown
+/// create or a move-in: R4) and upserts every non-ignored
 /// file under it, the same way [`walk_and_write`] does for a full
 /// scan — except scoped to this one subtree instead of the whole
 /// source, and recording every touched absolute path into
@@ -687,11 +1418,9 @@ fn upsert_directory(
         let had_existing = delete_existing_unit(cache, source_id, &rel_path)?;
         stats.files_seen += 1;
         let mut wrote_unit = false;
-        if is_markdown_path(entry.path()) {
-            if let Some(file_stats) = write_unit(cache, source_id, root, entry.path())? {
-                stats.accumulate(file_stats);
-                wrote_unit = true;
-            }
+        if let Some(file_stats) = write_unit(cache, source_id, root, entry.path(), None)? {
+            stats.accumulate(file_stats);
+            wrote_unit = true;
         }
         if had_existing || wrote_unit {
             touched_paths.push(entry.path().to_path_buf());
@@ -712,10 +1441,12 @@ fn upsert_directory(
 /// rename the project can tell apart (R4, a team lesson from the
 /// Obsidian side of this project too):
 /// - An existing regular file: its old row (if any) is replaced by a
-///   fresh parse — unless it's non-markdown, in which case any old
-///   row is still removed (R3) but nothing is reinserted.
+///   freshly classified one (and, for a prose or code file, a fresh
+///   parse, through the same [`parse_file`] as a full scan), so a
+///   file that changed kind leaves no stale rows of its old kind. A
+///   file that can't be read is removed and skipped with a warning.
 /// - An existing directory (a create or a move-in): walked and every
-///   markdown file under it is upserted ([`upsert_directory`]) — a
+///   non-ignored file under it is upserted ([`upsert_directory`]) — a
 ///   directory arriving as a single changed path is otherwise never
 ///   reconciled at all.
 /// - A path that no longer exists (a delete or a move-out): its own
@@ -739,7 +1470,65 @@ pub fn apply_change_batch(
     changed: &HashSet<PathBuf>,
     ignore: &IgnoreRules,
 ) -> Result<ChangeOutcome, ScanError> {
-    retry_on_busy(|| apply_change_batch_once(cache, source_id, root, changed, ignore))
+    apply_change_batch_with(cache, source_id, root, changed, ignore, &RealFs)
+}
+
+/// [`apply_change_batch`] with the filesystem a duplicate block ID
+/// rename (G19) writes through injected: a test makes the write fail or
+/// the file change between the read and the write. A changed file the
+/// cache already has block IDs for is parsed, and an ID it held once that
+/// the file now holds again is renamed on disk before the file's rows
+/// replace the cached ones; every other file is only read.
+pub fn apply_change_batch_with(
+    cache: &Cache,
+    source_id: i64,
+    root: &Path,
+    changed: &HashSet<PathBuf>,
+    ignore: &IgnoreRules,
+    fs_ops: &dyn AtomicFs,
+) -> Result<ChangeOutcome, ScanError> {
+    apply_change_batch_deferring(cache, source_id, root, changed, ignore, fs_ops, true)
+}
+
+/// [`apply_change_batch_with`] where the caller says whether a file whose
+/// rename cannot be written yet may be left for another try
+/// (`can_defer`, [`ChangeOutcome::deferred`]) or must be indexed as it is
+/// on disk. A caller that can try again ([`settle_deferred`]) passes
+/// `true` until its last round.
+pub fn apply_change_batch_deferring(
+    cache: &Cache,
+    source_id: i64,
+    root: &Path,
+    changed: &HashSet<PathBuf>,
+    ignore: &IgnoreRules,
+    fs_ops: &dyn AtomicFs,
+    can_defer: bool,
+) -> Result<ChangeOutcome, ScanError> {
+    retry_on_busy(|| {
+        apply_change_batch_once(
+            cache,
+            source_id,
+            root,
+            changed,
+            ignore,
+            fs_ops,
+            BatchOpts {
+                can_defer,
+                cached: None,
+            },
+        )
+    })
+}
+
+/// How one attempt at a batch treats duplicate block IDs.
+#[derive(Clone, Copy)]
+struct BatchOpts<'a> {
+    /// See [`DupCtx`]'s `can_defer`.
+    can_defer: bool,
+    /// The block IDs to take as the cache's for each file path, in place
+    /// of reading the cache: a rescan's retry of a file has no rows of
+    /// its own any more, only the IDs the cache held before the clear.
+    cached: Option<&'a HashMap<String, Vec<CachedId>>>,
 }
 
 /// One attempt at [`apply_change_batch`]'s work, run inside its own
@@ -755,9 +1544,12 @@ fn apply_change_batch_once(
     root: &Path,
     changed: &HashSet<PathBuf>,
     ignore: &IgnoreRules,
+    fs_ops: &dyn AtomicFs,
+    opts: BatchOpts<'_>,
 ) -> Result<ChangeOutcome, ScanError> {
     let mut stats = ScanStats::default();
     let mut touched_paths: Vec<PathBuf> = Vec::new();
+    let mut deferred_paths: Vec<PathBuf> = Vec::new();
 
     // Brackets the whole batch in one BEGIN IMMEDIATE/COMMIT (E5):
     // `cache`'s typed insert/delete helpers below still operate
@@ -789,6 +1581,21 @@ fn apply_change_batch_once(
             continue;
         }
 
+        // T2: never read through a symlink. A changed path that is a
+        // symlink, or lies below one, is not content of this source: a
+        // link made inside the root to /etc must not pull /etc in
+        // (`fs::metadata` and a walk's root both follow links). Drop
+        // any rows already cached for it instead, so a link that was
+        // indexed before this check existed is cleaned up too.
+        if passes_through_symlink(root, abs_path) {
+            let had_existing = delete_existing_unit(cache, source_id, &rel_path)?;
+            let nested_deleted = cache.delete_units_under_prefix(source_id, &rel_path)?;
+            if had_existing || nested_deleted > 0 {
+                touched_paths.push(abs_path.clone());
+            }
+            continue;
+        }
+
         match fs::metadata(abs_path) {
             Ok(meta) if meta.is_dir() => {
                 upsert_directory(
@@ -802,15 +1609,40 @@ fn apply_change_batch_once(
                 )?;
             }
             Ok(meta) if meta.is_file() => {
-                let had_existing = delete_existing_unit(cache, source_id, &rel_path)?;
-                stats.files_seen += 1;
-                let mut wrote_unit = false;
-                if is_markdown_path(abs_path) {
-                    if let Some(file_stats) = write_unit(cache, source_id, root, abs_path)? {
-                        stats.accumulate(file_stats);
-                        wrote_unit = true;
-                    }
+                // G19: what the cache held for the file, before its
+                // row is replaced.
+                let cached = match opts.cached {
+                    Some(map) => map.get(&rel_path).cloned().unwrap_or_default(),
+                    None => cached_ids_of_file(cache, source_id, &rel_path)?,
+                };
+                let had_existing = cache.get_unit_by_rel_path(source_id, &rel_path)?.is_some();
+                let ctx = DupCtx {
+                    fs: fs_ops,
+                    cached: &cached,
+                    can_defer: opts.can_defer,
+                    deferred: std::cell::Cell::new(false),
+                };
+                let written = write_unit(cache, source_id, root, abs_path, Some(&ctx))?;
+                if ctx.deferred.get() {
+                    // A file in flux: its rows are as they were (none,
+                    // in a rescan's retry), and the caller tries it
+                    // again.
+                    deferred_paths.push(abs_path.clone());
+                    continue;
                 }
+                stats.files_seen += 1;
+                let wrote_unit = match written {
+                    Some(file_stats) => {
+                        stats.accumulate(file_stats);
+                        true
+                    }
+                    None => {
+                        // Nothing to index (it vanished, is a symlink,
+                        // or cannot be read): its old row goes.
+                        delete_existing_unit(cache, source_id, &rel_path)?;
+                        false
+                    }
+                };
                 if had_existing || wrote_unit {
                     touched_paths.push(abs_path.clone());
                 }
@@ -832,6 +1664,8 @@ fn apply_change_batch_once(
                 // advance which one it used to be.
                 let had_existing = delete_existing_unit(cache, source_id, &rel_path)?;
                 let nested_deleted = cache.delete_units_under_prefix(source_id, &rel_path)?;
+                // A file that is gone has no rename to wait for.
+                dup_ids::forget_given_up(cache.path(), source_id, &rel_path);
                 if had_existing || nested_deleted > 0 {
                     touched_paths.push(abs_path.clone());
                 }
@@ -844,5 +1678,6 @@ fn apply_change_batch_once(
     Ok(ChangeOutcome {
         stats,
         changed_paths: touched_paths,
+        deferred: deferred_paths,
     })
 }

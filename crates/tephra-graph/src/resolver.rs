@@ -14,17 +14,40 @@ use std::fmt;
 use serde::Serialize;
 use unicode_normalization::UnicodeNormalization;
 
-use crate::model::{NodeFacts, UnitMetadata};
+use crate::model::{is_block_id, is_tephra_block_id, NodeFacts, UnitMetadata};
 use crate::EdgeTarget;
 
 /// The full result of a successful [`crate::UnitGraph::resolve_link`]
 /// call: the resolved unit's metadata plus its own outgoing edges —
 /// the exact shape GP5 freezes for PR-6's RPC handler to return
-/// unmodified.
+/// unmodified — and, for a block link, the block it points at.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ResolveResult {
     pub unit: UnitMetadata,
     pub edges: Vec<crate::Edge>,
+    /// The block a `[[path#^id]]` link resolved to (G13), `null` for
+    /// every other link: a link with no anchor, a heading anchor
+    /// (`#Heading`) or a code symbol's name (`#parse_config`, F3).
+    pub block: Option<BlockRef>,
+}
+
+/// The block a block link resolved to: its ID (without the caret),
+/// its line (1-based; for a code block the definition's first line,
+/// the one that carries the ID comment) and whether it was found in
+/// another file than the one the link names (`moved`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BlockRef {
+    pub id: String,
+    pub line: i64,
+    pub moved: bool,
+}
+
+/// One occurrence of a block ID in a unit, as an ambiguity error
+/// lists it: the unit's federated id and the line.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct BlockLine {
+    pub unit: String,
+    pub line: i64,
 }
 
 /// Why [`crate::UnitGraph::resolve_link`] failed. Distinct from
@@ -54,10 +77,18 @@ pub enum ResolveError {
     /// Two or more units in `source` tied on the shortest matching
     /// path for `target` (E4): every tied candidate's federated id,
     /// sorted, rather than guessing one.
+    ///
+    /// For a block link (`[[path#^id]]`, E7/E8) `candidates` are the
+    /// units that carry the ID (a unit once, however often it repeats
+    /// the ID) and `lines` lists every occurrence, unit and line,
+    /// sorted. `lines` is empty (and not serialized) for an ambiguous
+    /// file name.
     Ambiguous {
         source: String,
         target: String,
         candidates: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        lines: Vec<BlockLine>,
     },
     /// The link has no `@source` prefix (a same-source-relative
     /// target) and the caller gave no `default_source` to resolve it
@@ -81,16 +112,41 @@ impl fmt::Display for ResolveError {
                 write!(f, "no source named \"{source}\" is registered")
             }
             ResolveError::Unresolved { source, target } => {
-                write!(f, "no unit in source \"{source}\" matches \"{target}\"")
+                // A block link's target is `file#^id` (see
+                // `resolve_link_impl`): the file may well exist, so say
+                // the block is what is missing. Only a Tephra-format ID
+                // is searched for in other files (G13), so only then
+                // does the message say "or elsewhere".
+                match target.rsplit_once("#^") {
+                    Some((file, id)) if is_tephra_block_id(id) => write!(
+                        f,
+                        "no block ^{id} in \"{file}\" or elsewhere in source \"{source}\""
+                    ),
+                    Some((file, id)) if is_block_id(id) => {
+                        write!(f, "no block ^{id} in \"{file}\" in source \"{source}\"")
+                    }
+                    _ => write!(f, "no unit in source \"{source}\" matches \"{target}\""),
+                }
             }
             ResolveError::Ambiguous {
                 source,
                 target,
                 candidates,
-            } => write!(
-                f,
-                "\"{target}\" is ambiguous in source \"{source}\": tied candidates {candidates:?}"
-            ),
+                lines,
+            } => {
+                write!(
+                    f,
+                    "\"{target}\" is ambiguous in source \"{source}\": tied candidates {candidates:?}"
+                )?;
+                if !lines.is_empty() {
+                    let at: Vec<String> = lines
+                        .iter()
+                        .map(|l| format!("{}:{}", l.unit, l.line))
+                        .collect();
+                    write!(f, " (at {})", at.join(", "))?;
+                }
+                Ok(())
+            }
             ResolveError::NoSourceContext => {
                 write!(
                     f,
@@ -117,11 +173,11 @@ pub(crate) enum ResolveOutcome {
     NotFound,
 }
 
-/// File extensions [`strip_markdown_extension`] strips, matching
-/// `tephrad::scan`'s own `MARKDOWN_EXTENSIONS` — every unit this
-/// graph ever holds came from a markdown file (PR-4's scan pipeline
-/// never writes a non-markdown `units` row), so every `rel_path`
-/// ends in one of these, case-insensitively.
+/// File extensions [`strip_markdown_extension`] strips. Only Markdown
+/// names are matched without their extension: a bare `[[Foo]]` finds
+/// `Foo.md`. The graph also holds units of other file types (a `.txt`,
+/// `.org`, a `.py`), which are matched by their full name; making a
+/// bare name reach those is PR-13's job, not this module's.
 const MARKDOWN_EXTENSIONS: [&str; 2] = [".md", ".markdown"];
 
 /// Strips a trailing `.md`/`.markdown` (case-insensitive) from
@@ -509,12 +565,212 @@ pub(crate) fn strip_brackets(raw: &str) -> &str {
     }
 }
 
+/// Where a block link looks for its block first.
+pub(crate) enum FileRef<'a> {
+    /// The unit that holds the link itself (`[[#^id]]`, `[x](#^id)`).
+    Unit(&'a str),
+    /// A normalized match key, resolved by [`resolve_in_scope`].
+    Key { key: &'a str, allow_basename: bool },
+}
+
+/// A block found by [`resolve_block`]: the unit that holds it and the
+/// block itself.
+pub(crate) struct BlockHit {
+    pub unit: String,
+    pub block: BlockRef,
+}
+
+/// Why [`resolve_block`] found no one block.
+pub(crate) enum BlockMiss {
+    /// The file the link names is itself ambiguous (E4): the tied
+    /// candidates, sorted.
+    FileAmbiguous(Vec<String>),
+    /// The ID is in more than one place (E7/E8): the units that carry
+    /// it and every occurrence, both sorted.
+    Ambiguous {
+        candidates: Vec<String>,
+        lines: Vec<BlockLine>,
+    },
+    /// Not in the named file, and no other file in the source may
+    /// stand in for it: dangling.
+    Unresolved,
+}
+
+/// The ID of the block a link points at: the part of the link's anchor
+/// after the caret, for a `#^id` anchor (a wikilink's, or a Markdown
+/// link's `(path#^id)`). `None` for a link with no anchor, a heading
+/// anchor, or an anchor that is not a block ID (`#^`, `#^a b`): such a
+/// link is a link to the file, as it always was.
+pub(crate) fn edge_block_anchor(to_raw: &str, kind: &str) -> Option<String> {
+    let anchor: Option<String> = if kind == tephra_parser::LINK_KIND_WIKILINK {
+        tephra_parser::parse_wikilink_inner(to_raw).anchor
+    } else {
+        to_raw.split_once('#').map(|(_, a)| a.to_string())
+    };
+    let id = anchor?.strip_prefix('^')?.to_string();
+    is_block_id(&id).then_some(id)
+}
+
+/// Resolves block `id` (G13) for a link that names `file` in
+/// `scope`:
+///
+/// 1. In the named file, if it exists: exactly one occurrence is the
+///    block (`moved: false`); two or more are an ambiguity listing
+///    every line (E7), never the first one.
+/// 2. Not in the named file (or the file is gone), and `id` is a
+///    Tephra-format ID: the one other file of the *same source* that
+///    has it (`moved: true`). Two or more files, or one file with the
+///    ID twice, are an ambiguity listing every occurrence (E8);
+///    none is dangling. The search never leaves `scope` (F7).
+/// 3. Any other ID (a typed one such as `^summary`) missing from the
+///    named file is dangling, whatever other files have it.
+///
+/// A file name that is ambiguous in itself is
+/// [`BlockMiss::FileAmbiguous`] before any block is looked at.
+pub(crate) fn resolve_block(
+    graph: &crate::UnitGraph,
+    scope: &str,
+    file: FileRef<'_>,
+    id: &str,
+) -> Result<BlockHit, BlockMiss> {
+    let file_id: Option<String> = match file {
+        FileRef::Unit(unit) => Some(unit.to_string()),
+        FileRef::Key {
+            key,
+            allow_basename,
+        } => match resolve_in_scope(&graph.index(), scope, key, allow_basename) {
+            ResolveOutcome::Unique(unit) => Some(unit),
+            ResolveOutcome::Ambiguous(candidates) => {
+                return Err(BlockMiss::FileAmbiguous(candidates))
+            }
+            ResolveOutcome::NotFound => None,
+        },
+    };
+
+    let occurrences_in = |unit: &str| -> Vec<BlockLine> {
+        graph
+            .nodes
+            .get(unit)
+            .map(|n| {
+                n.blocks
+                    .iter()
+                    .filter(|b| b.id == id)
+                    .map(|b| BlockLine {
+                        unit: unit.to_string(),
+                        line: b.line,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    if let Some(unit) = &file_id {
+        let mut here = occurrences_in(unit);
+        match here.len() {
+            0 => {}
+            1 => {
+                let at = here.remove(0);
+                return Ok(BlockHit {
+                    unit: at.unit,
+                    block: BlockRef {
+                        id: id.to_string(),
+                        line: at.line,
+                        moved: false,
+                    },
+                });
+            }
+            _ => return Err(ambiguous_block(here)),
+        }
+    }
+
+    if !is_tephra_block_id(id) {
+        return Err(BlockMiss::Unresolved);
+    }
+    let mut elsewhere: Vec<BlockLine> = graph
+        .block_index
+        .get(scope)
+        .and_then(|by_id| by_id.get(id))
+        .map(|units| {
+            units
+                .iter()
+                .filter(|u| Some(*u) != file_id.as_ref())
+                .flat_map(|u| occurrences_in(u))
+                .collect()
+        })
+        .unwrap_or_default();
+    match elsewhere.len() {
+        0 => Err(BlockMiss::Unresolved),
+        1 => {
+            let at = elsewhere.remove(0);
+            Ok(BlockHit {
+                unit: at.unit,
+                block: BlockRef {
+                    id: id.to_string(),
+                    line: at.line,
+                    moved: true,
+                },
+            })
+        }
+        _ => Err(ambiguous_block(elsewhere)),
+    }
+}
+
+/// The [`BlockMiss::Ambiguous`] for these occurrences: sorted, with
+/// the units that carry them listed once each.
+fn ambiguous_block(mut lines: Vec<BlockLine>) -> BlockMiss {
+    lines.sort();
+    let mut candidates: Vec<String> = lines.iter().map(|l| l.unit.clone()).collect();
+    candidates.dedup();
+    BlockMiss::Ambiguous { candidates, lines }
+}
+
+/// The block `edge` points at, for an edge whose link anchor is a
+/// block ID (`None` for any other edge, and for one whose ID is
+/// dangling or ambiguous): [`resolve_block`] from the link's own
+/// source and the file it names. What
+/// [`crate::UnitGraph::get_backlinks`] asks to find the links to one
+/// block, including a link written to the block's old file.
+pub(crate) fn resolve_edge_block(graph: &crate::UnitGraph, edge: &crate::Edge) -> Option<BlockHit> {
+    let from = graph.nodes.get(&edge.from)?;
+    let id = edge_block_anchor(&edge.to_raw, &edge.kind)?;
+    let result = if edge.kind == tephra_parser::LINK_KIND_WIKILINK {
+        let wikilink = tephra_parser::parse_wikilink_inner(&edge.to_raw);
+        if wikilink.target.is_empty() {
+            let scope = wikilink.source_prefix.as_deref().unwrap_or(&from.source);
+            resolve_block(graph, scope, FileRef::Unit(&edge.from), &id)
+        } else {
+            let scope = wikilink.source_prefix.as_deref().unwrap_or(&from.source);
+            let key = normalize_wikilink_target(&wikilink.target);
+            let file = FileRef::Key {
+                key: &key,
+                allow_basename: true,
+            };
+            resolve_block(graph, scope, file, &id)
+        }
+    } else if markdown_target_is_self_reference(&edge.to_raw) {
+        resolve_block(graph, &from.source, FileRef::Unit(&edge.from), &id)
+    } else {
+        let key = normalize_markdown_target(&from.rel_path, &edge.to_raw)?;
+        let file = FileRef::Key {
+            key: &key,
+            allow_basename: false,
+        };
+        resolve_block(graph, &from.source, file, &id)
+    };
+    result.ok()
+}
+
 /// `unit.resolve_link` (G4/GP5): resolves `raw` (a full `[[...]]`
 /// wikilink or its bare inner text) against this graph.
 /// `default_source` is the source to resolve a non-federated
 /// (`@source`-prefix-less) target against; ignored when `raw` itself
 /// carries a `@source:` prefix, in which case that source is used
-/// instead (and must be a known source, E "unknown @source prefix").
+/// instead (and must be a known source, E \"unknown @source prefix\").
+///
+/// A block link (`[[path#^id]]`) resolves to the block ([`resolve_block`],
+/// G13) and reports it in [`ResolveResult::block`]. Any other anchor
+/// (a heading, a symbol name — F3) is not looked at: the link
+/// resolves to the file and `block` is `None`.
 pub(crate) fn resolve_link_impl(
     graph: &crate::UnitGraph,
     raw: &str,
@@ -538,6 +794,44 @@ pub(crate) fn resolve_link_impl(
     }
 
     let key = normalize_wikilink_target(&wikilink.target);
+
+    if let Some(block_id) = edge_block_anchor(inner, tephra_parser::LINK_KIND_WIKILINK) {
+        let file = FileRef::Key {
+            key: &key,
+            allow_basename: true,
+        };
+        let block_target = format!("{}#^{}", wikilink.target, block_id);
+        return match resolve_block(graph, &scope, file, &block_id) {
+            Ok(hit) => {
+                let unit = graph
+                    .unit(&hit.unit)
+                    .expect("a resolved block's unit is in the graph");
+                let edges = graph.get_forward_links(&hit.unit);
+                Ok(ResolveResult {
+                    unit,
+                    edges,
+                    block: Some(hit.block),
+                })
+            }
+            Err(BlockMiss::FileAmbiguous(candidates)) => Err(ResolveError::Ambiguous {
+                source: scope,
+                target: wikilink.target.clone(),
+                candidates,
+                lines: Vec::new(),
+            }),
+            Err(BlockMiss::Ambiguous { candidates, lines }) => Err(ResolveError::Ambiguous {
+                source: scope,
+                target: block_target,
+                candidates,
+                lines,
+            }),
+            Err(BlockMiss::Unresolved) => Err(ResolveError::Unresolved {
+                source: scope,
+                target: block_target,
+            }),
+        };
+    }
+
     let index = graph.index();
     match resolve_in_scope(&index, &scope, &key, true) {
         ResolveOutcome::Unique(id) => {
@@ -545,12 +839,17 @@ pub(crate) fn resolve_link_impl(
                 .unit(&id)
                 .expect("a resolved id always has a corresponding node");
             let edges = graph.get_forward_links(&id);
-            Ok(ResolveResult { unit, edges })
+            Ok(ResolveResult {
+                unit,
+                edges,
+                block: None,
+            })
         }
         ResolveOutcome::Ambiguous(candidates) => Err(ResolveError::Ambiguous {
             source: scope,
             target: wikilink.target.clone(),
             candidates,
+            lines: Vec::new(),
         }),
         ResolveOutcome::NotFound => Err(ResolveError::Unresolved {
             source: scope,

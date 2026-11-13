@@ -8,10 +8,17 @@
 //! binary-only (`src/main.rs`'s own module tree), since they're
 //! startup-sequence concerns with no API surface a later crate or
 //! test needs to call directly.
+pub mod access;
+pub mod block_id;
+pub mod dup_ids;
+pub mod file_kind;
+pub mod file_lock;
 pub mod ignore;
 pub mod refactor;
 pub mod registry;
 pub mod rpc;
 pub mod scan;
+pub mod search;
+pub mod unit_list;
 pub mod watcher;
 mod writer_gate;
