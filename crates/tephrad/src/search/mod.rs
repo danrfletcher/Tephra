@@ -1,6 +1,8 @@
-//! `unit.search` (G8): `[[`-style search across every registered source.
-//! Only `scope: "names"` exists so far; the other scopes are refused by
-//! the dispatcher, never answered as a name search.
+//! `unit.search` (G8): `[[`-style search across every registered source
+//! (`scope: "names"`, here), plus G9's search inside one file
+//! (`scope: "headings"` and `"blocks"`, in [`in_file`]). `all_blocks` is
+//! not built yet: the dispatcher refuses it, never answering it as
+//! another scope.
 //!
 //! A search is one read-only pass over the cache
 //! ([`tephra_cache::Cache::search_names`]) on a fresh
@@ -16,6 +18,7 @@
 //! parameter limits and the `offline` flag.
 
 pub mod fuzzy;
+pub mod in_file;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -133,6 +136,6 @@ fn root_is_missing(cache: &Cache, source: &str) -> Result<bool, SearchError> {
     })
 }
 
-fn source_error(e: impl std::fmt::Display) -> SearchError {
+pub(crate) fn source_error(e: impl std::fmt::Display) -> SearchError {
     SearchError::Source(e.to_string())
 }

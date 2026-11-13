@@ -487,6 +487,19 @@ impl Cache {
         crate::search::search_names(&self.conn, limit, score)
     }
 
+    /// What `unit` offers to an in-file search (`unit.search` with
+    /// `scope: "headings"` or `"blocks"`, G9), in file order: see
+    /// [`crate::InFileCandidate`] for the rule per file kind. Paragraph
+    /// text is not cached, so a paragraph comes back as a position.
+    /// Read-only.
+    pub fn in_file_candidates(
+        &self,
+        unit: &UnitRow,
+        scope: crate::InFileScope,
+    ) -> Result<Vec<crate::InFileCandidate>, CacheError> {
+        crate::in_file::in_file_candidates(&self.conn, unit, scope)
+    }
+
     /// Every `tags` row belonging to `unit_id`. Read counterpart to
     /// [`Cache::insert_tag`] — the typed read path a caller (e.g.
     /// `tephra-graph`'s graph-construction code, PR-5) uses instead of

@@ -136,6 +136,108 @@ pub fn render_search_results(result: &Value) -> String {
     out
 }
 
+/// The longest paragraph text [`render_in_file_results`] shows, in
+/// characters; a longer one is cut with `...`. `--json` is never cut.
+const MAX_SHOWN_TEXT_CHARS: usize = 120;
+
+/// `search --in`'s output (G9): one row per result, in the daemon's
+/// order, as `<what>  <where>  <text>`:
+///
+/// ```text
+/// heading h2  line 9  Second café
+/// symbol enum  line 73  ConflictReason  ^abc
+/// paragraph  line 7  A paragraph about alpha.  ^dup
+/// document paragraph  page 2 #3  Some text
+/// ```
+///
+/// `<where>` is `line N`, or `page N`, `slide N` or `paragraph N` for a
+/// document, with `#<index>` for a paragraph's place on its page or
+/// slide. A `^id` the block already has follows the text; a row has no
+/// trailing spaces (a paragraph with no text is just its place). Runs of
+/// whitespace (a paragraph over several lines) become one space, and
+/// control characters are shown as `?`, as in [`render_search_results`].
+/// A leading note says when the file's source is offline or when the
+/// paragraph text could not be read. No results prints `no matches`.
+pub fn render_in_file_results(result: &Value) -> String {
+    let mut out = String::new();
+    if bool_field(result, "offline") {
+        out.push_str(&format!(
+            "{} is offline (cached results)\n",
+            printable(str_field(result, "unit"))
+        ));
+    }
+    if bool_field(result, "text_unavailable") {
+        out.push_str("paragraph text could not be read; only an empty query lists paragraphs\n");
+    }
+    let hits = result
+        .get("results")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if hits.is_empty() {
+        out.push_str("no matches\n");
+        return out;
+    }
+    for hit in hits {
+        let kind = str_field(hit, "kind");
+        let what = match kind {
+            "heading" => match hit.get("level").and_then(Value::as_i64) {
+                Some(level) => format!("heading h{level}"),
+                None => "heading".to_string(),
+            },
+            "symbol" => match str_field(hit, "symbol_kind") {
+                "" => "symbol".to_string(),
+                symbol_kind => format!("symbol {}", printable(symbol_kind)),
+            },
+            other => printable(other),
+        };
+        let place = ["line", "page", "slide", "paragraph"]
+            .into_iter()
+            .find_map(|key| {
+                hit.get(key)
+                    .and_then(Value::as_i64)
+                    .map(|n| format!("{key} {n}"))
+            })
+            .unwrap_or_else(|| "-".to_string());
+        // The index within a page or slide; a docx paragraph's equals
+        // its number, so it is left out there.
+        let place = match (
+            hit.get("index").and_then(Value::as_i64),
+            hit.get("paragraph"),
+        ) {
+            (Some(index), None) => format!("{place} #{index}"),
+            _ => place,
+        };
+        let text = hit
+            .get("text")
+            .or_else(|| hit.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let id = match hit.get("block_id").and_then(Value::as_str) {
+            Some(id) => format!("  ^{}", printable(id)),
+            None => String::new(),
+        };
+        let row = format!("{what}  {place}  {}{id}", shown_text(text));
+        out.push_str(row.trim_end());
+        out.push('\n');
+    }
+    out
+}
+
+/// `text` on one line: whitespace runs are one space, control
+/// characters are `?`, and a long text is cut at
+/// [`MAX_SHOWN_TEXT_CHARS`] characters.
+fn shown_text(text: &str) -> String {
+    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let one_line = printable(&one_line);
+    if one_line.chars().count() > MAX_SHOWN_TEXT_CHARS {
+        let cut: String = one_line.chars().take(MAX_SHOWN_TEXT_CHARS).collect();
+        format!("{}...", cut.trim_end())
+    } else {
+        one_line
+    }
+}
+
 /// Number of components in a source-relative path (`""` is 0).
 fn path_depth(rel: &str) -> usize {
     rel.split('/').filter(|s| !s.is_empty()).count()

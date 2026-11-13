@@ -1,0 +1,32 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "unit": "@notes:plan.md",
+    "scope": "blocks",
+    "offline": false,
+    "text_unavailable": false,
+    "results": [
+      {
+        "unit": "@notes:plan.md",
+        "kind": "paragraph",
+        "text": "A paragraph about alpha.",
+        "line": 7,
+        "block_id": "dup"
+      },
+      {
+        "unit": "@notes:plan.md",
+        "kind": "paragraph",
+        "text": "First line\nsecond\tline",
+        "line": 12
+      },
+      {
+        "unit": "@notes:plan.md",
+        "kind": "paragraph",
+        "text": "word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word",
+        "line": 30,
+        "block_id": "dup"
+      }
+    ]
+  }
+}

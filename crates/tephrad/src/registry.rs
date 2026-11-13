@@ -847,6 +847,21 @@ impl SourceRegistry {
         crate::search::search_names(&self.cache_path, query, limit)
     }
 
+    /// `unit.search` with `scope: "headings"` or `"blocks"` (G9): the
+    /// best `limit` headings, paragraphs or symbols of the one unit
+    /// `unit_id` (`@source:path`), from a fresh read-only cache
+    /// connection, like [`SourceRegistry::search_names`]. See
+    /// [`crate::search::in_file`].
+    pub fn search_in_file(
+        &self,
+        unit_id: &str,
+        scope: tephra_cache::InFileScope,
+        query: &str,
+        limit: usize,
+    ) -> Result<crate::search::in_file::InFileSearchWire, crate::search::SearchError> {
+        crate::search::in_file::search_in_file(&self.cache_path, unit_id, scope, query, limit)
+    }
+
     /// Whether `name` is currently marked `permission_denied`.
     pub fn is_permission_denied(&self, name: &str) -> bool {
         self.permission_denied.lock().unwrap().contains(name)

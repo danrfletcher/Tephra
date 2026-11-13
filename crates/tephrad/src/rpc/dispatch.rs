@@ -12,6 +12,7 @@
 //! F5-adjacent without a per-method opt-in.
 
 use serde_json::Value;
+use tephra_cache::InFileScope;
 
 use crate::rpc::auth::Authenticated;
 use crate::rpc::backend::{
@@ -190,35 +191,78 @@ fn unit_list(params: &Value, sources: &dyn SourceBackend) -> DispatchResult {
         })
 }
 
-/// `unit.search {query, scope?, limit?}` (G8). `query` is a string with
-/// at least one non-blank character, at most
-/// [`crate::search::fuzzy::MAX_QUERY_CHARS`] long. `scope` (default
-/// `names`; `null` counts as absent) must be `names`: the `headings`,
-/// `blocks` and `all_blocks` scopes are not built yet, and any other
-/// value is unknown, and both are refused naming the scope; a search
-/// is never quietly run as a name search instead. `limit` (default
+/// `unit.search {query, scope?, in?, limit?}` (G8, G9). `query` is a
+/// string, at most [`crate::search::fuzzy::MAX_QUERY_CHARS`] long.
+/// `scope` (default `names`; `null` counts as absent) is one of:
+///
+/// - `names`: a search across every source. `query` needs at least one
+///   non-blank character, and `in` is refused.
+/// - `headings` or `blocks` (G9): a search inside the one file `in`
+///   (`@source:path`), which is required: without it the error is
+///   "pick a file first". `query` may be empty or blank, which lists
+///   everything in the file in file order.
+/// - `all_blocks` is not built yet and is refused naming the scope, and
+///   `in` is refused with it too.
+///
+/// Any other value is unknown. A search is never quietly run as another
+/// scope, and an `in` is never quietly ignored. `limit` (default
 /// [`crate::search::DEFAULT_LIMIT`]; `null` counts as absent) is an
 /// integer from 1 to [`crate::search::MAX_LIMIT`]. Every check happens
 /// here, before the backend is called and so before any cache read.
 fn unit_search(params: &Value, sources: &dyn SourceBackend) -> DispatchResult {
     let query = match params.get("query") {
         Some(Value::String(s)) => s.as_str(),
-        _ => return Err(invalid_params("\"query\" (non-empty string) is required")),
+        _ => return Err(invalid_params("\"query\" (string) is required")),
     };
-    crate::search::parse_query(query).map_err(invalid_params)?;
 
-    match params.get("scope") {
-        None | Some(Value::Null) => {}
-        Some(Value::String(scope)) if scope == "names" => {}
-        Some(Value::String(scope)) => {
-            return Err(invalid_params(match scope.as_str() {
-                "headings" | "blocks" | "all_blocks" => {
-                    format!("scope \"{scope}\" is not supported yet; only \"names\" is")
-                }
-                _ => format!("unknown scope \"{scope}\"; only \"names\" is supported"),
-            }))
-        }
+    let scope = match params.get("scope") {
+        None | Some(Value::Null) => "names",
+        Some(Value::String(scope)) => scope.as_str(),
         Some(_) => return Err(invalid_params("\"scope\" must be a string")),
+    };
+    let in_file_scope = match scope {
+        "headings" => Some(InFileScope::Headings),
+        "blocks" => Some(InFileScope::Blocks),
+        _ => None,
+    };
+    let unit = match params.get("in") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(unit)) => Some(unit.as_str()),
+        Some(_) => return Err(invalid_params("\"in\" must be a string")),
+    };
+
+    match (scope, in_file_scope, unit) {
+        ("names", _, None) => {
+            crate::search::parse_query(query).map_err(invalid_params)?;
+        }
+        ("names" | "all_blocks", _, Some(_)) => {
+            return Err(invalid_params(format!(
+                "\"in\" only goes with scope \"headings\" or \"blocks\", not \"{scope}\""
+            )))
+        }
+        ("all_blocks", _, None) => {
+            return Err(invalid_params(
+                "scope \"all_blocks\" is not supported yet; \"names\", \"headings\" and \"blocks\" are",
+            ))
+        }
+        (_, Some(_), None) => {
+            return Err(invalid_params(format!(
+                "pick a file first: scope \"{scope}\" searches inside one file, so \"in\" (a unit id like \"@source:path\") is required"
+            )))
+        }
+        (_, Some(_), Some(unit)) => {
+            if crate::search::in_file::split_unit_id(unit).is_none() {
+                return Err(invalid_params(format!(
+                    "\"in\" must be a unit id like \"@source:path\", got \"{unit}\""
+                )));
+            }
+            crate::search::in_file::parse_in_file_query(query).map_err(invalid_params)?;
+        }
+        _ => {
+            return Err(invalid_params(format!(
+                "unknown scope \"{scope}\"; \"names\", \"headings\" and \"blocks\" are supported"
+            )))
+        }
     }
 
     let limit = match params.get("limit") {
@@ -241,13 +285,20 @@ fn unit_search(params: &Value, sources: &dyn SourceBackend) -> DispatchResult {
         }
     };
 
-    sources
-        .search_names(query, limit)
-        .map(|hits| serde_json::to_value(hits).expect("Vec<SearchHitWire> always serializes"))
-        .map_err(|e| match e {
-            SearchError::InvalidParams(message) => invalid_params(message),
-            SearchError::Source(message) => (SOURCE_ERROR, message, None),
-        })
+    let to_error = |e| match e {
+        SearchError::InvalidParams(message) => invalid_params(message),
+        SearchError::Source(message) => (SOURCE_ERROR, message, None),
+    };
+    match (in_file_scope, unit) {
+        (Some(scope), Some(unit)) => sources
+            .search_in_file(unit, scope, query, limit)
+            .map(|wire| serde_json::to_value(wire).expect("InFileSearchWire always serializes"))
+            .map_err(to_error),
+        _ => sources
+            .search_names(query, limit)
+            .map(|hits| serde_json::to_value(hits).expect("Vec<SearchHitWire> always serializes"))
+            .map_err(to_error),
+    }
 }
 
 fn link_preview_refactor(params: &Value, refactor: &dyn RefactorBackend) -> DispatchResult {
@@ -573,12 +624,11 @@ mod tests {
     }
 
     #[test]
-    fn unit_search_refuses_every_scope_but_names_and_names_the_scope() {
-        for scope in ["headings", "blocks", "all_blocks"] {
-            let message = search_invalid(json!({"query": "a", "scope": scope}));
-            assert!(message.contains(scope), "{message}");
-            assert!(message.contains("not supported yet"), "{message}");
-        }
+    fn unit_search_refuses_every_unknown_or_unbuilt_scope_and_names_the_scope() {
+        // `headings` and `blocks` need `in` (tests/unit/search_in_file.rs).
+        let message = search_invalid(json!({"query": "a", "scope": "all_blocks"}));
+        assert!(message.contains("all_blocks"), "{message}");
+        assert!(message.contains("not supported yet"), "{message}");
         for scope in ["", "Names", "NAMES", "name", "files", "names "] {
             let message = search_invalid(json!({"query": "a", "scope": scope}));
             assert!(message.contains("unknown scope"), "{scope:?}: {message}");

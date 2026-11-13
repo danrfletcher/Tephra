@@ -1,0 +1,3 @@
+symbol enum  line 73  ConflictReason
+symbol impl  line 83  ConflictReason  ^abc123
+symbol fn  line 120  detect_conflict

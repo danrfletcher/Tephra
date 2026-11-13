@@ -16,7 +16,7 @@ use std::io::{BufRead, Write};
 
 use serde_json::{json, Value};
 
-use crate::cli::Command;
+use crate::cli::{Command, InFileSearchScope};
 use crate::render;
 use crate::transport::{RpcCallError, RpcClient};
 
@@ -98,6 +98,12 @@ pub fn execute_with_prompt_writer<R: BufRead, W: Write>(
             recursive,
         } => ls(source, folder, *recursive, json, client),
         Command::Search { query, limit } => search(query, *limit, json, client),
+        Command::SearchIn {
+            unit,
+            scope,
+            query,
+            limit,
+        } => search_in(unit, *scope, query, *limit, json, client),
         Command::LinkResolve {
             target,
             default_source,
@@ -243,6 +249,33 @@ fn search(query: &str, limit: Option<u64>, json: bool, client: &RpcClient) -> Co
         Ok(result) => CommandOutcome::ok(json_or(
             &result,
             || render::render_search_results(&result),
+            json,
+        )),
+        Err(e) => CommandOutcome::err(describe_error(&e)),
+    }
+}
+
+/// `search --in` (G9): one `unit.search` call with scope `headings` or
+/// `blocks` and the file's id, `query` being what followed the sigil
+/// (empty lists everything). The daemon's refusals (an unknown unit, a
+/// bad id) are printed as they come, with a non-zero exit. `--json` is
+/// the raw result object.
+fn search_in(
+    unit: &str,
+    scope: InFileSearchScope,
+    query: &str,
+    limit: Option<u64>,
+    json: bool,
+    client: &RpcClient,
+) -> CommandOutcome {
+    let mut params = json!({"query": query, "scope": scope.as_str(), "in": unit});
+    if let Some(limit) = limit {
+        params["limit"] = json!(limit);
+    }
+    match client.call("unit.search", params) {
+        Ok(result) => CommandOutcome::ok(json_or(
+            &result,
+            || render::render_in_file_results(&result),
             json,
         )),
         Err(e) => CommandOutcome::err(describe_error(&e)),

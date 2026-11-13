@@ -26,3 +26,6 @@ mod link_commands;
 
 #[path = "cli/transport.rs"]
 mod transport;
+
+#[path = "cli/search_in_file.rs"]
+mod search_in_file;

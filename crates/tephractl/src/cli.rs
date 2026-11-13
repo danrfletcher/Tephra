@@ -21,6 +21,7 @@ USAGE:
     tephractl status [--json]
     tephractl ls <source> [folder] [-r] [--json]
     tephractl search <query> [--limit <n>] [--json]
+    tephractl search --in <id> \"#<query>\" | \"^<query>\" [--limit <n>] [--json]
     tephractl link resolve [--source <name>] <target> [--json]
     tephractl link refactor --source <name> --old <path> --new <path> [--apply] [--yes] [--json]
     tephractl daemon install [--from <path>] [--json]
@@ -39,8 +40,15 @@ SEARCH:
                           fuzzy match on file name, title and path, best match first.
                           One row per result: id, kind, title. Quote a query with spaces.
     --limit <n>           Show at most <n> results (default 50)
-                          A query starting with '#' or '^' needs a file; use `--` before a
-                          query that starts with '-'.
+                          Use `--` before a query that starts with '-'.
+    search --in <id> \"#q\"  Find headings of one file (<id> is @source:path/to/file); a bare
+                          \"#\" lists them all, in file order. A document has headings by
+                          page, slide or paragraph.
+    search --in <id> \"^q\"  Find blocks of one file: paragraphs of a note, symbols of a code
+                          file, paragraphs of a document by page, slide or paragraph. A bare
+                          \"^\" lists them all, in file order. One row per result: kind,
+                          line (or page/slide) and text or name; a ^id shows after it.
+                          A '#' or '^' query needs --in: pick a file first.
 
 DAEMON (macOS only; need no token and no running daemon):
     daemon install    Copy tephrad to ~/Library/Application Support/tephra/bin, sign it
@@ -54,6 +62,24 @@ GLOBAL OPTIONS:
     --addr <addr>   Daemon address to connect to (default: 127.0.0.1:4812)
     -h, --help      Print this help and exit
 ";
+
+/// Which in-file search a sigil asks for: `#` is `headings`, `^` is
+/// `blocks`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InFileSearchScope {
+    Headings,
+    Blocks,
+}
+
+impl InFileSearchScope {
+    /// The `scope` value `unit.search` takes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InFileSearchScope::Headings => "headings",
+            InFileSearchScope::Blocks => "blocks",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -77,6 +103,16 @@ pub enum Command {
     /// source (`unit.search`, scope `names`). `limit` is `None` for the
     /// daemon's default of 50.
     Search {
+        query: String,
+        limit: Option<u64>,
+    },
+    /// `search --in <id> "#q"` or `"^q"`: a search inside one file
+    /// (`unit.search`, scope `headings` or `blocks`, G9). `query` is what
+    /// follows the sigil, which is empty for a bare `#` or `^` (list
+    /// everything); the sigil itself is never sent.
+    SearchIn {
+        unit: String,
+        scope: InFileSearchScope,
         query: String,
         limit: Option<u64>,
     },
@@ -332,22 +368,28 @@ fn parse_ls<'a>(
     ))
 }
 
-/// `search <query> [--limit <n>] [--json] [--addr <addr>]`, flags
-/// anywhere after `search`. Exactly one positional, the query: it may be
-/// empty or blank (the daemon refuses that, and its message is what the
-/// user sees). A query that starts with `-` can follow a `--`.
+/// `search [--in <id>] <query> [--limit <n>] [--json] [--addr <addr>]`,
+/// flags anywhere after `search`. Exactly one positional, the query: it
+/// may be empty or blank (the daemon refuses that for a name search, and
+/// its message is what the user sees). A query that starts with `-` can
+/// follow a `--`.
 ///
-/// Two kinds of query can't be a name search, and are refused here, with
-/// no RPC round-trip (like the source-name check above): a query that
-/// starts with a single `#` or `^` is a search inside one file, which
-/// needs the file picked first (`--in`, a later PR), and one that starts
-/// with `^^` is a block search across every file (also later). Neither
-/// is ever sent as a names search.
+/// Without `--in`, a query that starts with a single `#` or `^` is a
+/// search inside one file, which needs the file picked first, and one
+/// that starts with `^^` is a block search across every file (a later
+/// PR). Both are refused here, with no RPC round-trip (like the
+/// source-name check above), and neither is ever sent as a names search.
+///
+/// With `--in <id>` the query must start with `#` (headings) or `^`
+/// (blocks), and what follows the sigil is the query sent: a bare `#` or
+/// `^` sends an empty one, which lists everything. A query without a
+/// sigil is refused, never guessed at, and `^^` stays refused.
 fn parse_search<'a>(
     iter: &mut impl Iterator<Item = &'a str>,
 ) -> Result<(Command, bool, Option<String>), ArgsError> {
     let mut query: Option<String> = None;
     let mut limit: Option<u64> = None;
+    let mut in_unit: Option<String> = None;
     let mut json = false;
     let mut addr = None;
     let mut only_positionals = false;
@@ -364,6 +406,18 @@ fn parse_search<'a>(
             "--" => only_positionals = true,
             "--json" => json = true,
             "--addr" => addr = Some(take_value(iter, "--addr")?),
+            "--in" => {
+                let unit = take_value(iter, "--in")?;
+                match unit.strip_prefix('@').and_then(|rest| rest.split_once(':')) {
+                    Some((source, path)) if !source.is_empty() && !path.is_empty() => {}
+                    _ => {
+                        return Err(ArgsError(format!(
+                            "--in needs a unit id like \"@source:path/to/file\", got \"{unit}\""
+                        )))
+                    }
+                }
+                in_unit = Some(unit);
+            }
             "--limit" => {
                 let raw = take_value(iter, "--limit")?;
                 limit = Some(match raw.parse::<u64>() {
@@ -393,10 +447,34 @@ fn parse_search<'a>(
                 .to_string(),
         ));
     }
+    if let Some(unit) = in_unit {
+        let (scope, rest) = if let Some(rest) = query.strip_prefix('#') {
+            (InFileSearchScope::Headings, rest)
+        } else if let Some(rest) = query.strip_prefix('^') {
+            (InFileSearchScope::Blocks, rest)
+        } else {
+            return Err(ArgsError(
+                "with --in, start the query with '#' to search headings or '^' to search \
+                 blocks (a bare '#' or '^' lists them all)"
+                    .to_string(),
+            ));
+        };
+        let query = rest.to_string();
+        return Ok((
+            Command::SearchIn {
+                unit,
+                scope,
+                query,
+                limit,
+            },
+            json,
+            addr,
+        ));
+    }
     if query.starts_with('#') || query.starts_with('^') {
         return Err(ArgsError(format!(
-            "pick a file first: a query starting with '{}' searches inside one file, \
-             which is not available yet; drop the '{}' to search by name",
+            "pick a file first: a query starting with '{}' searches inside one file; add \
+             --in <id> (an id like \"@source:path\") or drop the '{}' to search by name",
             &query[..1],
             &query[..1]
         )));

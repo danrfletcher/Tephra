@@ -9,3 +9,6 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 
 [dev-dependencies]
 tempfile = "3"
+# The scan lives in tephrad, which depends on this crate: integration
+# tests (not the lib) may use it to build a cache the way the daemon does.
+tephrad = { path = "../tephrad" }

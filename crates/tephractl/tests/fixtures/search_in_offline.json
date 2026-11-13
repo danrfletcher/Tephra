@@ -1,0 +1,18 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "unit": "@notes:plan.md",
+    "scope": "blocks",
+    "offline": true,
+    "text_unavailable": true,
+    "results": [
+      {
+        "unit": "@notes:plan.md",
+        "kind": "paragraph",
+        "text": "",
+        "line": 3
+      }
+    ]
+  }
+}

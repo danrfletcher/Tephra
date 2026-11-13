@@ -6,3 +6,5 @@
 mod rpc_auth;
 #[path = "unit/rpc_envelope.rs"]
 mod rpc_envelope;
+#[path = "unit/search_in_file.rs"]
+mod search_in_file;

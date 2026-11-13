@@ -1,0 +1,3 @@
+@notes:plan.md is offline (cached results)
+paragraph text could not be read; only an empty query lists paragraphs
+paragraph  line 3

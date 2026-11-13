@@ -13,6 +13,7 @@
 //! typed helpers exposed here.
 
 mod cache;
+mod in_file;
 mod listing;
 mod schema;
 mod search;
@@ -22,6 +23,7 @@ mod units;
 use std::fmt;
 
 pub use cache::{Cache, FaultInjector};
+pub use in_file::{InFileCandidate, InFileScope};
 pub use listing::{
     compare_entries, compare_names, FolderEntry, FolderListing, FolderState, FOLDER_KIND,
 };

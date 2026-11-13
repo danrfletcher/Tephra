@@ -1,0 +1,30 @@
+{
+  "offline": false,
+  "results": [
+    {
+      "kind": "symbol",
+      "line": 73,
+      "name": "ConflictReason",
+      "symbol_kind": "enum",
+      "unit": "@tephra:crates/tephrad/src/registry.rs"
+    },
+    {
+      "block_id": "abc123",
+      "kind": "symbol",
+      "line": 83,
+      "name": "ConflictReason",
+      "symbol_kind": "impl",
+      "unit": "@tephra:crates/tephrad/src/registry.rs"
+    },
+    {
+      "kind": "symbol",
+      "line": 120,
+      "name": "detect_conflict",
+      "symbol_kind": "fn",
+      "unit": "@tephra:crates/tephrad/src/registry.rs"
+    }
+  ],
+  "scope": "blocks",
+  "text_unavailable": false,
+  "unit": "@tephra:crates/tephrad/src/registry.rs"
+}
