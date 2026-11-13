@@ -24,6 +24,7 @@ USAGE:
     tephractl search --in <id> \"#<query>\" | \"^<query>\" [--limit <n>] [--json]
     tephractl search \"^^<query>\" [--limit <n>] [--json]
     tephractl block-id <unit-id> --line <n> | --symbol <name> [--json]
+    tephractl backlinks <id> [--json]
     tephractl link resolve [--source <name>] <target> [--json]
     tephractl link refactor --source <name> --old <path> --new <path> [--apply] [--yes] [--json]
     tephractl daemon install [--from <path>] [--json]
@@ -57,6 +58,21 @@ SEARCH:
                           result: file:line, kind, the text around the match (a document hit
                           shows page/slide instead of :line); a ^id shows after it. Quote it:
                           ^ is special to some shells.
+
+BACKLINKS:
+    backlinks <id>        List the links to one file or one block (graph.get_backlinks). <id> is
+                          @source:path/to/file for a file, or @source:path/to/file#^blockid for a
+                          block. One row per link: the file that holds it and its line,
+                          file:line, then the link text. A link to a block that now sits in
+                          another file (it moved) still counts, once it finds the block there.
+                          An id nothing links to prints \"no backlinks\" and exits 0.
+
+LINK RESOLVE:
+    link resolve <target> A block link [[@source:path#^blockid]] prints the block: its id, its
+                          line, and \"moved\" when it was found in another file of the source.
+                          An ID found in two or more files, or twice in one file, is an error
+                          that lists every place. A heading or a code symbol name after the '#'
+                          resolves to the file, with no block.
 
 BLOCK-ID:
     block-id <unit-id> --line <n>
@@ -168,6 +184,12 @@ pub enum Command {
     BlockId {
         unit: String,
         target: BlockTarget,
+    },
+    /// `backlinks <id>`: `graph.get_backlinks`. `id` is a unit id
+    /// (`@source:path`) or a block id (`@source:path#^blockid`); the
+    /// parser refuses anything else before any request.
+    Backlinks {
+        id: String,
     },
     LinkResolve {
         target: String,
@@ -305,6 +327,7 @@ where
         "search" => parse_search(&mut iter)?,
         "link" => parse_link(&mut iter)?,
         "block-id" => parse_block_id(&mut iter)?,
+        "backlinks" => parse_backlinks(&mut iter)?,
         "daemon" => parse_daemon(&mut iter)?,
         other => return Err(ArgsError(format!("unrecognized command: {other}"))),
     };
@@ -688,6 +711,72 @@ fn parse_block_id<'a>(
         }
     };
     Ok((Command::BlockId { unit, target }, json, addr))
+}
+
+/// Checks `id` is a unit id (`@source:path`) or a block id
+/// (`@source:path#^blockid`, the ID being letters, digits and hyphens).
+/// Anything else is refused with a message that says what is expected,
+/// so a typo is an error and not an empty list. A '#' elsewhere in the
+/// path is part of the file name (`@s:C# notes.md` is a unit), exactly
+/// as the daemon reads it; only a `#^` suffix is taken as a block.
+fn validate_backlinks_id(id: &str) -> Result<(), ArgsError> {
+    let bad = |why: &str| {
+        ArgsError(format!(
+            "backlinks needs an id like \"@source:path/to/file\" or \
+             \"@source:path/to/file#^blockid\", got \"{id}\": {why}"
+        ))
+    };
+    let Some((source, rest)) = id.strip_prefix('@').and_then(|r| r.split_once(':')) else {
+        return Err(bad("it must start with @source:"));
+    };
+    if source.is_empty() {
+        return Err(bad("the source name is empty"));
+    }
+    let (path, block) = match rest.rsplit_once("#^") {
+        Some((path, block)) => (path, Some(block)),
+        None => (rest, None),
+    };
+    if path.is_empty() {
+        return Err(bad("the path is empty"));
+    }
+    if let Some(block) = block {
+        if block.is_empty() || !block.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return Err(bad(
+                "a block id is letters, digits and hyphens after \"#^\"",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parse_backlinks<'a>(
+    iter: &mut impl Iterator<Item = &'a str>,
+) -> Result<(Command, bool, Option<String>), ArgsError> {
+    let mut id: Option<String> = None;
+    let mut json = false;
+    let mut addr = None;
+
+    while let Some(arg) = iter.next() {
+        match arg {
+            "--json" => json = true,
+            "--addr" => addr = Some(take_value(iter, "--addr")?),
+            other if other.starts_with('-') && other.len() > 1 => {
+                return Err(ArgsError(format!("unrecognized argument: {other}")))
+            }
+            other if id.is_none() => id = Some(other.to_string()),
+            other => {
+                return Err(ArgsError(format!(
+                    "backlinks takes one id; unexpected extra argument: {other}"
+                )))
+            }
+        }
+    }
+
+    let id = id.ok_or_else(|| {
+        ArgsError("backlinks requires an <id> like \"@source:path/to/file\"".to_string())
+    })?;
+    validate_backlinks_id(&id)?;
+    Ok((Command::Backlinks { id }, json, addr))
 }
 
 fn parse_link<'a>(

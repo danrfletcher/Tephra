@@ -323,8 +323,9 @@ impl ParsedDocument {
 
     /// One `NewLink` per wikilink and Markdown link, wikilinks first,
     /// each in document order. Same shape as
-    /// [`crate::ParsedUnit::to_new_links`]; `links` has no column for a
-    /// location, so a link's page/slide/paragraph stays on this struct.
+    /// [`crate::ParsedUnit::to_new_links`]; `links.line` is NULL for a
+    /// document (it has pages and slides, not lines), so a link's
+    /// page/slide/paragraph stays on this struct.
     pub fn to_new_links(&self, from_unit_id: i64) -> Vec<NewLink<'_>> {
         let mut out: Vec<NewLink<'_>> = self
             .wikilinks
@@ -334,6 +335,7 @@ impl ParsedDocument {
                 to_raw: &w.link.raw,
                 to_unit_id: None,
                 kind: crate::LINK_KIND_WIKILINK,
+                line: None,
             })
             .collect();
         out.extend(self.markdown_links.iter().map(|m| NewLink {
@@ -341,6 +343,7 @@ impl ParsedDocument {
             to_raw: &m.link.target,
             to_unit_id: None,
             kind: crate::LINK_KIND_MARKDOWN,
+            line: None,
         }));
         out
     }

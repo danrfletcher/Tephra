@@ -51,6 +51,7 @@ fn inserting_a_link_with_nonexistent_from_unit_id_is_rejected() {
         to_raw: "[[Ghost]]",
         to_unit_id: None,
         kind: "wikilink",
+        line: None,
     });
     assert!(
         result.is_err(),
@@ -72,6 +73,7 @@ fn inserting_a_link_with_nonexistent_to_unit_id_is_rejected() {
         to_raw: "[[Ghost]]",
         to_unit_id: Some(999_999),
         kind: "wikilink",
+        line: None,
     });
     assert!(
         result.is_err(),
@@ -133,6 +135,7 @@ fn valid_rows_against_real_parents_insert_cleanly() {
             to_raw: "[[Real]]",
             to_unit_id: Some(unit_id),
             kind: "wikilink",
+            line: None,
         })
         .is_ok());
     assert!(cache

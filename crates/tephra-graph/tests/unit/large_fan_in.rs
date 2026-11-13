@@ -65,6 +65,7 @@ fn five_thousand_edges_resolve_and_get_backlinks_stays_bounded_time() {
                     to_raw: "@hub-source:Hub",
                     to_unit_id: None,
                     kind: tephra_parser::LINK_KIND_WIKILINK,
+                    line: None,
                 })
                 .expect("insert spoke -> hub link");
         }

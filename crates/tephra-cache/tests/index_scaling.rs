@@ -170,6 +170,7 @@ fn seed_units_with_rows(cache: &Cache, source_id: i64, count: usize, label: &str
                 to_raw: "Somewhere",
                 to_unit_id: None,
                 kind: "wikilink",
+                line: None,
             })
             .expect("insert_link");
         cache

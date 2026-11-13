@@ -525,6 +525,21 @@ pub fn render_resolve_result(result: &Value, requested_default_source: Option<&s
         }
     ));
 
+    // A block link (G13): the block it points at. A link to a file, a
+    // heading or a symbol name has `block: null` and prints nothing.
+    if let Some(block) = result.get("block").filter(|b| b.is_object()) {
+        let moved = if bool_field(block, "moved") {
+            " (moved: found in another file of the source)"
+        } else {
+            ""
+        };
+        out.push_str(&format!(
+            "Block: ^{} at line {}{moved}\n",
+            printable(str_field(block, "id")),
+            block.get("line").and_then(Value::as_i64).unwrap_or(0),
+        ));
+    }
+
     out.push_str(&format!("Outgoing edges ({}):\n", edges.len()));
     let shown = edges.iter().take(MAX_EDGES_DISPLAYED);
     for edge in shown {
@@ -565,12 +580,63 @@ pub fn render_resolve_error(err: &RpcCallError) -> String {
                 for (i, candidate) in candidates.iter().enumerate() {
                     out.push_str(&format!("  {}. {candidate}\n", i + 1));
                 }
+                // A block ID found in more than one place (E7/E8) also
+                // lists every occurrence, one unit:line each.
+                let lines = inner
+                    .get("lines")
+                    .and_then(Value::as_array)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                if !lines.is_empty() {
+                    out.push_str("found at:\n");
+                    for place in lines {
+                        out.push_str(&format!(
+                            "  {}:{}\n",
+                            printable(str_field(place, "unit")),
+                            place.get("line").and_then(Value::as_i64).unwrap_or(0)
+                        ));
+                    }
+                }
                 return out;
             }
         }
         return format!("{message}\n");
     }
     format!("{err}\n")
+}
+
+// ---- graph.get_backlinks ----------------------------------------------
+
+/// `backlinks`' output (G16): one row per link occurrence, in the
+/// daemon's order: `from:line  [kind] to_raw`, with `(offline)` after
+/// a link of an offline source. A link with no line (one in a document)
+/// shows the unit alone. An empty list prints `no backlinks`.
+///
+/// Unit ids and link text come from file names and file contents, so
+/// control characters in them are shown as `?`.
+pub fn render_backlinks(result: &Value) -> String {
+    let edges = result.as_array().map(Vec::as_slice).unwrap_or_default();
+    if edges.is_empty() {
+        return "no backlinks\n".to_string();
+    }
+    let mut out = String::new();
+    for edge in edges {
+        let mut place = printable(str_field(edge, "from"));
+        if let Some(line) = edge.get("line").and_then(Value::as_i64) {
+            place = format!("{place}:{line}");
+        }
+        let mut row = format!(
+            "{place}  [{}] {}",
+            printable(str_field(edge, "kind")),
+            printable(str_field(edge, "to_raw"))
+        );
+        if bool_field(edge, "offline") {
+            row.push_str("  (offline)");
+        }
+        out.push_str(&row);
+        out.push('\n');
+    }
+    out
 }
 
 // ---- link.preview_refactor / link.apply_refactor ----------------------

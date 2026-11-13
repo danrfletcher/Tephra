@@ -280,7 +280,9 @@ impl ParsedUnit {
     /// a link against the registry (`to_unit_id`) is PR-5's job, not
     /// this crate's. `to_raw` is the wikilink's full raw inner text
     /// (so source-prefix/anchor/alias survive for later resolution)
-    /// or the markdown link's raw destination.
+    /// or the markdown link's raw destination. `line` is the link's
+    /// 1-based line in the file (a code file's links sit in comments,
+    /// and report the comment line they are on).
     pub fn to_new_links(&self, from_unit_id: i64) -> Vec<NewLink<'_>> {
         let mut out: Vec<NewLink<'_>> = self
             .wikilinks
@@ -290,6 +292,7 @@ impl ParsedUnit {
                 to_raw: &w.raw,
                 to_unit_id: None,
                 kind: LINK_KIND_WIKILINK,
+                line: Some(w.line as i64),
             })
             .collect();
         out.extend(self.markdown_links.iter().map(|m| NewLink {
@@ -297,6 +300,7 @@ impl ParsedUnit {
             to_raw: &m.target,
             to_unit_id: None,
             kind: LINK_KIND_MARKDOWN,
+            line: Some(m.line as i64),
         }));
         out
     }

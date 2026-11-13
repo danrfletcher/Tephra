@@ -62,6 +62,7 @@ fn main() {
                 to_raw: "[[Other]]",
                 to_unit_id: None,
                 kind: "wikilink",
+                line: None,
             })
             .expect("insert_link");
         cache

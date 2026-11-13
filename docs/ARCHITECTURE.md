@@ -37,6 +37,8 @@ Sources are independent: a missing or broken source does not corrupt another.
 - `[[Note]]` (no prefix) resolves within the note's own source, by file name or path, shortest path first. If two files tie, the resolver returns an error listing every candidate rather than guessing.
 - `[[@atlas-repo:README]]` resolves in the named source. Reaching across sources needs the explicit `@source:` prefix; there is no search across all sources for an unprefixed link.
 - A target that matches nothing is reported as unresolved, which is a different result from ambiguous.
+- `[[@source:path#^id]]` links to a block. The named file is looked at first (`block {id, line, moved: false}`; for a code file `line` is the definition's first line, the one that carries the ID comment). If the ID is not there and is a Tephra ID (exactly 6 characters of `a-z0-9`), the one other file of the same source that has it is the answer, with `moved: true`; two or more files, or one file with the ID twice, is an ambiguity error that lists every file and line, never a guess. A typed ID such as `^summary` missing from its file is unresolved, whatever other files hold, and the search for a moved ID never leaves the source. `#Heading` and `#symbol_name` anchors resolve to the file and carry `block: null`. `[[path^id]]` (no `#`) is never a block link.
+- `graph.get_backlinks` takes a unit id (`@s:path`, every link to the file, anchored or not) or a block id (`@s:path#^id`, only links to that block, including links written to the block's old file that find it here as `moved`). Each row has the `line` of the link (1-based; `null` for a link in a document, which has pages, not lines), and there is one row per `(from, line)`. The cache keeps the line in `links.line`; a cache without it is rebuilt, and an offline source's links come back with `line` null until its next scan. `tephractl backlinks <id>` prints it.
 
 ## The RPC surface
 
@@ -51,7 +53,7 @@ JSON-RPC 2.0 over HTTP (`POST /rpc`) and WebSocket (`GET /rpc`) on `127.0.0.1:48
 ## Not built yet
 
 - **Link refactoring on disk** (`link.preview_refactor`, `link.apply_refactor`): pull request 8, still in review. `tephractl link refactor` exists as a client and reports a clean "unknown method" error against this daemon.
-- Links to anything inside non-Markdown files, for example a function in a Python file.
+- Links to a symbol by name inside non-Markdown files, for example `#parse_config` in a Python file (code is linked by block ID only).
 - Remote sources.
 - Clients for Obsidian, VSCode and Chrome.
 - A published benchmark.

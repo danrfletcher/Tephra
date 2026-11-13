@@ -154,6 +154,7 @@ fn delete_units_under_prefix_clears_only_the_nested_rel_paths() {
             to_raw: "[[Other]]",
             to_unit_id: None,
             kind: "wikilink",
+            line: None,
         })
         .expect("insert link for dir/a.md");
     let dir_sub_b = cache

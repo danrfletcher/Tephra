@@ -27,6 +27,9 @@ mod block_id_commands;
 #[path = "cli/link_commands.rs"]
 mod link_commands;
 
+#[path = "cli/backlinks.rs"]
+mod backlinks;
+
 #[path = "cli/transport.rs"]
 mod transport;
 

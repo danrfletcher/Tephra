@@ -233,6 +233,10 @@ pub fn validate_register<'a>(
 /// than reimplementing change detection itself. `paths` only ever
 /// contains absolute paths that were actually upserted or deleted in
 /// the cache (R5) — never a raw, unfiltered watcher event batch.
+/// `paths` is empty when no file changed but the source as a whole did
+/// (a finished startup rescan, or the source's root vanishing and the
+/// source going `offline`): the graph still has to be rebuilt, because
+/// it carries each source's offline flag.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DaemonEvent {
     SourceChanged { source: String, paths: Vec<PathBuf> },
@@ -725,6 +729,7 @@ impl SourceRegistry {
         let cache_for_offline = Arc::clone(&self.cache);
         let name_for_offline = name.clone();
         let gate_for_offline = Arc::clone(&self.gate);
+        let events_for_offline = self.events_tx.clone();
         let on_root_removed = move || {
             let cache = cache_for_offline.lock().unwrap();
             if let Err(e) = retry_cache_on_busy(&gate_for_offline, || {
@@ -733,6 +738,15 @@ impl SourceRegistry {
                 tracing::warn!(source = %name_for_offline, error = %e, "failed to mark source offline");
             } else {
                 tracing::warn!(source = %name_for_offline, "source root is missing; marked offline");
+                // The in-memory graph carries each source's offline flag
+                // (it is built from the cache), so a status flip has to
+                // reach it the way a file change does: announce it, and
+                // the daemon refreshes the graph and tells clients.
+                // `paths` is empty because no file changed.
+                let _ = events_for_offline.send(DaemonEvent::SourceChanged {
+                    source: name_for_offline.clone(),
+                    paths: Vec::new(),
+                });
             }
         };
 

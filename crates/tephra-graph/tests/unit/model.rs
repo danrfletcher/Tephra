@@ -23,6 +23,7 @@ fn facts(links: &[(&str, &str)], tags: &[&str], blocks: &[&str]) -> UnitFacts {
             .iter()
             .map(|(raw, kind)| (raw.to_string(), kind.to_string()))
             .collect(),
+        link_lines: Vec::new(),
     }
 }
 
@@ -484,4 +485,130 @@ fn a_stale_id_lookup_after_remove_and_slot_reuse_never_returns_an_unrelated_edge
     let y_backlinks = graph.get_backlinks("@notes:Other.md");
     assert_eq!(y_backlinks.len(), 1);
     assert_eq!(y_backlinks[0].from, "@notes:Y.md");
+}
+
+// ---- G13 code-ID ownership (PR-13.F1) -------------------------------
+//
+// Real code files, parsed by `tephra-parser` and written through
+// `tephra-cache` (see `fixtures::write_file_into_cache`); the graph
+// then reports the line, the cache says which symbol owns the ID.
+
+mod code_id_ownership {
+    use crate::fixtures::{load_files_into_cache, open_temp_cache};
+    use tephra_graph::UnitGraph;
+
+    /// `(owning symbol's name, block line)` for the unit's block `id`.
+    fn owner_of(files: &[(&str, &str)], rel_path: &str, id: &str) -> Option<(String, i64)> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = open_temp_cache(&dir);
+        let source_id = load_files_into_cache(&cache, "s", files);
+        let unit = cache
+            .get_unit_by_rel_path(source_id, rel_path)
+            .expect("get_unit_by_rel_path")
+            .expect("unit exists");
+        let blocks = cache.blocks_for_unit(unit.id).expect("blocks_for_unit");
+        let block = blocks.iter().find(|b| b.block_id.as_deref() == Some(id))?;
+        let symbol = block.symbol_id.map(|sid| {
+            cache
+                .symbols_for_unit(unit.id)
+                .expect("symbols_for_unit")
+                .into_iter()
+                .find(|s| s.id == sid)
+                .expect("the owning symbol row exists")
+                .name
+        });
+        // The graph agrees on the line.
+        let graph = UnitGraph::build_from_cache(&cache).expect("build_from_cache");
+        let graph_lines: Vec<i64> = graph
+            .block_occurrences(&format!("@s:{rel_path}"))
+            .into_iter()
+            .filter(|b| b.id == id)
+            .map(|b| b.line)
+            .collect();
+        assert_eq!(graph_lines, vec![block.line]);
+        symbol.map(|name| (name, block.line))
+    }
+
+    const RUST: &str = "\
+/// Why two sources conflict.
+#[derive(Debug, Clone)]
+pub enum ConflictReason { // ^k3f9a2
+    A,
+}
+
+// ^above1
+/// Docs for the function.
+pub fn parse_config() {}
+
+// ^gap123
+
+pub fn unattached() {}
+";
+
+    #[test]
+    fn a_trailing_rust_id_belongs_to_its_symbol_at_the_definition_line_not_the_attribute() {
+        assert_eq!(
+            owner_of(&[("a.rs", RUST)], "a.rs", "k3f9a2"),
+            Some(("ConflictReason".to_string(), 3))
+        );
+    }
+
+    #[test]
+    fn a_rust_id_comment_directly_above_a_symbol_with_a_doc_comment_between_belongs_to_it() {
+        // The ID is on its own line (7); the block is reported at the
+        // symbol's definition line, the `pub fn` (9), the one a link
+        // resolves to.
+        let (name, line) = owner_of(&[("a.rs", RUST)], "a.rs", "above1").expect("owned");
+        assert_eq!(name, "parse_config");
+        assert_eq!(line, 9);
+    }
+
+    #[test]
+    fn a_rust_id_after_a_blank_line_above_a_symbol_is_not_attached() {
+        assert_eq!(owner_of(&[("a.rs", RUST)], "a.rs", "gap123"), None);
+    }
+
+    const PYTHON: &str = "\
+import functools
+
+
+@functools.cache
+def build_index(root):  # ^b7c4d9
+    return root
+
+
+@functools.cache
+# ^above2
+def other(root):
+    return root
+
+
+# ^gap456
+
+def unattached():
+    pass
+";
+
+    #[test]
+    fn a_python_id_after_a_decorator_reports_the_def_line_and_owns_the_function() {
+        assert_eq!(
+            owner_of(&[("t.py", PYTHON)], "t.py", "b7c4d9"),
+            Some(("build_index".to_string(), 5))
+        );
+    }
+
+    #[test]
+    fn a_python_id_after_a_blank_line_above_a_def_is_not_attached() {
+        assert_eq!(owner_of(&[("t.py", PYTHON)], "t.py", "gap456"), None);
+    }
+
+    #[test]
+    fn an_id_comment_inside_a_string_literal_is_not_a_block() {
+        let src = "const S: &str = \"x // ^str123\";\n\npub fn f() {} // ^real12\n";
+        assert_eq!(owner_of(&[("s.rs", src)], "s.rs", "str123"), None);
+        assert_eq!(
+            owner_of(&[("s.rs", src)], "s.rs", "real12"),
+            Some(("f".to_string(), 3))
+        );
+    }
 }

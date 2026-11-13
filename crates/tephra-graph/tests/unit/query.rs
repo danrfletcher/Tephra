@@ -13,6 +13,7 @@ fn facts_with_links(links: &[&str]) -> UnitFacts {
             .iter()
             .map(|raw| (raw.to_string(), "wikilink".to_string()))
             .collect(),
+        link_lines: Vec::new(),
     }
 }
 
@@ -159,6 +160,7 @@ fn get_backlinks_all_does_not_collapse_different_kinds_to_the_same_target() {
                 ("Hub".to_string(), "wikilink".to_string()),
                 ("Hub.md".to_string(), "markdown".to_string()),
             ],
+            link_lines: Vec::new(),
         },
     );
     graph.upsert_unit("notes", "Hub.md", empty_facts());
@@ -188,4 +190,54 @@ fn get_backlinks_all_still_returns_both_records_of_an_exact_repeated_raw_link() 
 
     assert_eq!(graph.get_backlinks("@notes:B.md").len(), 1);
     assert_eq!(graph.get_backlinks_all("@notes:B.md").len(), 2);
+}
+
+/// PR-13.F1 (G16): every edge carries the line of its link, and a
+/// backlink query is one row per occurrence `(from, line)`, sorted by
+/// referring unit and then line, whatever order the files were
+/// ingested in.
+#[test]
+fn backlinks_carry_a_line_each_one_row_per_occurrence_sorted_by_unit_then_line() {
+    let mut graph = UnitGraph::new();
+    graph.upsert_unit("notes", "Target.md", empty_facts());
+    let linking = |lines: &[i64]| UnitFacts {
+        links: lines
+            .iter()
+            .map(|_| ("Target".to_string(), "wikilink".to_string()))
+            .collect(),
+        link_lines: lines.iter().map(|&l| Some(l)).collect(),
+        ..empty_facts()
+    };
+    // Ingested out of order on purpose.
+    graph.upsert_unit("notes", "Z.md", linking(&[8]));
+    graph.upsert_unit("notes", "A.md", linking(&[12, 3, 3]));
+    graph.upsert_unit(
+        "notes",
+        "M.md",
+        UnitFacts {
+            // A link with no line (one in a document).
+            links: vec![("Target".to_string(), "wikilink".to_string())],
+            ..empty_facts()
+        },
+    );
+
+    let rows: Vec<(String, Option<i64>)> = graph
+        .get_backlinks("@notes:Target.md")
+        .into_iter()
+        .map(|e| (e.from, e.line))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("@notes:A.md".to_string(), Some(3)),
+            ("@notes:A.md".to_string(), Some(12)),
+            ("@notes:M.md".to_string(), None),
+            ("@notes:Z.md".to_string(), Some(8)),
+        ],
+        "A.md's two links on line 3 are one row; the line is on every row"
+    );
+
+    // `get_backlinks_all` is for the refactor engine: every raw
+    // occurrence, so the repeated line-3 link is still there.
+    assert_eq!(graph.get_backlinks_all("@notes:Target.md").len(), 5);
 }

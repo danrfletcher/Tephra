@@ -72,6 +72,7 @@ fn sample_edge() -> Edge {
         to_raw: "[[one]]".to_string(),
         kind: "wikilink".to_string(),
         offline: false,
+        line: Some(4),
     }
 }
 
@@ -91,6 +92,7 @@ async fn http_and_ws_produce_byte_identical_responses_across_every_standard_outc
                     offline: false,
                 },
                 edges: vec![sample_edge()],
+                block: None,
             }),
         )
         .with_resolve(

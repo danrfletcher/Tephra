@@ -2,6 +2,11 @@
 //! `mod` includes, the same convention `tephra-parser`'s
 //! `tests/unit.rs` uses.
 
+#[path = "fixtures/mod.rs"]
+mod fixtures;
+
+#[path = "unit/block_links.rs"]
+mod block_links;
 #[path = "unit/large_fan_in.rs"]
 mod large_fan_in;
 #[path = "unit/markdown_links.rs"]

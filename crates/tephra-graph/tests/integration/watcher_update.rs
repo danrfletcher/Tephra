@@ -226,6 +226,7 @@ fn applying_one_edit_in_a_large_source_recomputes_in_roughly_constant_time_not_p
                         to_raw: &target,
                         to_unit_id: None,
                         kind: tephra_parser::LINK_KIND_WIKILINK,
+                        line: None,
                     })
                     .expect("insert link");
             }
@@ -270,6 +271,7 @@ fn applying_one_edit_in_a_large_source_recomputes_in_roughly_constant_time_not_p
                     to_raw: &target,
                     to_unit_id: None,
                     kind: tephra_parser::LINK_KIND_WIKILINK,
+                    line: None,
                 })
                 .expect("insert link");
         }
@@ -342,6 +344,7 @@ fn applying_one_edit_does_not_grow_linearly_with_total_graph_size() {
                         to_raw: &target,
                         to_unit_id: None,
                         kind: tephra_parser::LINK_KIND_WIKILINK,
+                        line: None,
                     })
                     .expect("insert link");
             }
@@ -382,6 +385,7 @@ fn applying_one_edit_does_not_grow_linearly_with_total_graph_size() {
                     to_raw: &target,
                     to_unit_id: None,
                     kind: tephra_parser::LINK_KIND_WIKILINK,
+                    line: None,
                 })
                 .expect("insert link");
         }

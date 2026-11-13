@@ -32,6 +32,7 @@ async fn n_concurrent_websocket_clients_each_get_their_own_correct_response() {
                     to_raw: "[[link]]".to_string(),
                     kind: "wikilink".to_string(),
                     offline: false,
+                    line: Some(4),
                 }],
             );
         }

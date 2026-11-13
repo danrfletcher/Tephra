@@ -1338,6 +1338,7 @@ mod tests {
             to_raw: to_raw.to_string(),
             kind: kind.to_string(),
             offline: false,
+            line: None,
         }
     }
 

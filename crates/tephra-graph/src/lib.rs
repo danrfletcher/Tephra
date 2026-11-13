@@ -40,7 +40,7 @@ mod resolver;
 
 pub use ingest::{ChangeNotification, GraphError, UnitFacts};
 pub use model::{BlockFact, Edge, EdgeTarget, UnitGraph, UnitMetadata};
-pub use resolver::{ResolveError, ResolveResult};
+pub use resolver::{BlockLine, BlockRef, ResolveError, ResolveResult};
 
 impl UnitGraph {
     /// `unit.resolve_link` (G4/GP5): resolves `raw` (a full

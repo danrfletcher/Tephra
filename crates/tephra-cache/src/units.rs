@@ -71,6 +71,11 @@ pub struct LinkRow {
     pub to_raw: String,
     pub to_unit_id: Option<i64>,
     pub kind: String,
+    /// 1-based line of the link in its file. `None` for a link in a
+    /// document (a docx, pptx or PDF has pages and slides, not lines)
+    /// and for a row carried over from a cache written before this
+    /// column existed.
+    pub line: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -79,6 +84,9 @@ pub struct NewLink<'a> {
     pub to_raw: &'a str,
     pub to_unit_id: Option<i64>,
     pub kind: &'a str,
+    /// 1-based line of the link in its file; `None` for a link in a
+    /// document, which has no lines.
+    pub line: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -223,8 +231,15 @@ pub(crate) fn insert_unit(conn: &Connection, new: &NewUnit) -> Result<i64, Cache
 
 pub(crate) fn insert_link(conn: &Connection, new: &NewLink) -> Result<i64, CacheError> {
     conn.execute(
-        "INSERT INTO links (from_unit_id, to_raw, to_unit_id, kind) VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![new.from_unit_id, new.to_raw, new.to_unit_id, new.kind],
+        "INSERT INTO links (from_unit_id, to_raw, to_unit_id, kind, line) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![
+            new.from_unit_id,
+            new.to_raw,
+            new.to_unit_id,
+            new.kind,
+            new.line
+        ],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -628,7 +643,7 @@ pub(crate) fn links_from_unit(
     from_unit_id: i64,
 ) -> Result<Vec<LinkRow>, CacheError> {
     let mut stmt = conn.prepare(
-        "SELECT id, from_unit_id, to_raw, to_unit_id, kind FROM links \
+        "SELECT id, from_unit_id, to_raw, to_unit_id, kind, line FROM links \
          WHERE from_unit_id = ?1 ORDER BY id",
     )?;
     let mut rows = stmt.query([from_unit_id])?;
@@ -640,6 +655,7 @@ pub(crate) fn links_from_unit(
             to_raw: row.get(2)?,
             to_unit_id: row.get(3)?,
             kind: row.get(4)?,
+            line: row.get(5)?,
         });
     }
     Ok(out)

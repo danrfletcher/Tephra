@@ -56,6 +56,7 @@ pub fn seed_source_with_units(
                 to_raw: "[[Other]]",
                 to_unit_id: None,
                 kind: "wikilink",
+                line: None,
             })
             .expect("insert_link");
 

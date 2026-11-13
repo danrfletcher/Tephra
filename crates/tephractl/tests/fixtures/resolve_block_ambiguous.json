@@ -1,0 +1,29 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "error": {
+    "code": -32010,
+    "message": "\"registry.rs#^k3f9a2\" is ambiguous in source \"tephra\": tied candidates [\"@tephra:crates/tephrad/src/conflict.rs\", \"@tephra:crates/tephrad/src/other.rs\"] (at @tephra:crates/tephrad/src/conflict.rs:14, @tephra:crates/tephrad/src/other.rs:3)",
+    "data": {
+      "error": "ambiguous",
+      "data": {
+        "source": "tephra",
+        "target": "registry.rs#^k3f9a2",
+        "candidates": [
+          "@tephra:crates/tephrad/src/conflict.rs",
+          "@tephra:crates/tephrad/src/other.rs"
+        ],
+        "lines": [
+          {
+            "unit": "@tephra:crates/tephrad/src/conflict.rs",
+            "line": 14
+          },
+          {
+            "unit": "@tephra:crates/tephrad/src/other.rs",
+            "line": 3
+          }
+        ]
+      }
+    }
+  }
+}

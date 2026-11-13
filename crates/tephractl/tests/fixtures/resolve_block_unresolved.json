@@ -1,0 +1,15 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "error": {
+    "code": -32010,
+    "message": "no block ^k3f9a2 in \"registry.rs\" or elsewhere in source \"tephra\"",
+    "data": {
+      "error": "unresolved",
+      "data": {
+        "source": "tephra",
+        "target": "registry.rs#^k3f9a2"
+      }
+    }
+  }
+}

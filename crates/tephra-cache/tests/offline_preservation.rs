@@ -112,6 +112,7 @@ fn rebuild_nulls_a_preserved_links_to_unit_id_if_its_target_was_wiped() {
             to_raw: "[[Target]]",
             to_unit_id: Some(target_unit_id),
             kind: "wikilink",
+            line: None,
         })
         .expect("insert cross-source link");
 
@@ -332,4 +333,82 @@ fn a_rebuild_flags_online_sources_for_rescan_but_not_offline_ones() {
         .map(|s| s.name)
         .collect();
     assert_eq!(unfinished, vec!["online-repo".to_string()]);
+}
+
+/// G13/G16: an offline source's links keep their `line` through a
+/// rebuild, and its blocks keep every occurrence of an ID (one unit
+/// holding `^abc123` twice, another unit holding it once).
+#[test]
+fn offline_rows_keep_link_lines_and_every_block_occurrence_through_a_rebuild() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut cache = common::open_temp_cache(&dir);
+    let source_id = cache
+        .register_source("notes", "/vault/notes", SourceStatus::Active)
+        .unwrap();
+    let mut unit_ids = Vec::new();
+    for rel_path in ["a.md", "b.md"] {
+        unit_ids.push(
+            cache
+                .insert_unit(&tephra_cache::NewUnit {
+                    kind: "prose",
+                    size: Some(10),
+                    too_large: false,
+                    source_id,
+                    rel_path,
+                    mtime: Some(1),
+                    frontmatter_json: None,
+                })
+                .unwrap(),
+        );
+    }
+    for (unit_id, line) in [
+        (unit_ids[0], Some(4)),
+        (unit_ids[0], Some(9)),
+        (unit_ids[1], None),
+    ] {
+        cache
+            .insert_link(&NewLink {
+                from_unit_id: unit_id,
+                to_raw: "[[x#^abc123]]",
+                to_unit_id: None,
+                kind: "wikilink",
+                line,
+            })
+            .unwrap();
+    }
+    for (unit_id, line) in [(unit_ids[0], 2), (unit_ids[0], 6), (unit_ids[1], 3)] {
+        cache
+            .insert_block(&tephra_cache::NewBlock {
+                unit_id,
+                block_id: Some("abc123"),
+                line,
+                end_line: None,
+                symbol_id: None,
+            })
+            .unwrap();
+    }
+    cache
+        .transition_source_status("notes", SourceStatus::Offline)
+        .unwrap();
+
+    cache.rebuild(&FaultInjector::none()).expect("rebuild");
+
+    let lines: Vec<Option<i64>> = unit_ids
+        .iter()
+        .flat_map(|&id| cache.links_from_unit(id).unwrap())
+        .map(|l| l.line)
+        .collect();
+    assert_eq!(lines, vec![Some(4), Some(9), None]);
+
+    let mut occurrences: Vec<(i64, i64)> = cache
+        .blocks_with_id(source_id, "abc123")
+        .unwrap()
+        .into_iter()
+        .map(|b| (b.unit_id, b.line))
+        .collect();
+    occurrences.sort();
+    assert_eq!(
+        occurrences,
+        vec![(unit_ids[0], 2), (unit_ids[0], 6), (unit_ids[1], 3)]
+    );
 }

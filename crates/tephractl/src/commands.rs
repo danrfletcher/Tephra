@@ -106,6 +106,7 @@ pub fn execute_with_prompt_writer<R: BufRead, W: Write>(
         } => search_in(unit, *scope, query, *limit, json, client),
         Command::SearchAllBlocks { query, limit } => search_all_blocks(query, *limit, json, client),
         Command::BlockId { unit, target } => block_id(unit, target, json, client),
+        Command::Backlinks { id } => backlinks(id, json, client),
         Command::LinkResolve {
             target,
             default_source,
@@ -347,6 +348,15 @@ fn status(json: bool, client: &RpcClient) -> CommandOutcome {
 
 fn as_rows(result: &Value) -> Vec<Value> {
     result.as_array().cloned().unwrap_or_default()
+}
+
+fn backlinks(id: &str, json: bool, client: &RpcClient) -> CommandOutcome {
+    match client.call("graph.get_backlinks", json!({"id": id})) {
+        Ok(result) => {
+            CommandOutcome::ok(json_or(&result, || render::render_backlinks(&result), json))
+        }
+        Err(e) => CommandOutcome::err(describe_error(&e)),
+    }
 }
 
 fn link_resolve(

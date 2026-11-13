@@ -433,3 +433,85 @@ fn reopen_after_a_clean_mismatch_rebuild_still_carries_offline_rows() {
     assert_eq!(cache.table_row_count("tags").unwrap(), 2);
     assert_eq!(cache.table_row_count("blocks").unwrap(), 2);
 }
+
+/// PR-13.F1 (G16): a cache written before `links.line` existed has the
+/// current schema version and every other column, so only the shape
+/// check can notice. It is rebuilt (so the new column exists and a
+/// rescan can fill it), and an offline source's links come back with a
+/// NULL line instead of failing the snapshot.
+#[test]
+fn a_cache_without_links_line_is_rebuilt_and_offline_links_keep_a_null_line() {
+    use tephra_cache::{NewLink, NewUnit, SourceStatus};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("cache.db");
+    let unit_id;
+    {
+        let cache = Cache::open(&db).expect("open");
+        let source_id = cache
+            .register_source("notes", "/vault/notes", SourceStatus::Active)
+            .unwrap();
+        unit_id = cache
+            .insert_unit(&NewUnit {
+                kind: "prose",
+                size: Some(10),
+                too_large: false,
+                source_id,
+                rel_path: "a.md",
+                mtime: Some(1),
+                frontmatter_json: None,
+            })
+            .unwrap();
+        cache
+            .insert_link(&NewLink {
+                from_unit_id: unit_id,
+                to_raw: "[[B]]",
+                to_unit_id: None,
+                kind: "wikilink",
+                line: Some(3),
+            })
+            .unwrap();
+        cache
+            .connection()
+            .execute_batch(
+                // What the build before block links left behind: the
+                // `links` table without `line`, nothing else different.
+                "DROP TABLE links;
+                 CREATE TABLE links (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     from_unit_id INTEGER NOT NULL REFERENCES units(id),
+                     to_raw TEXT NOT NULL,
+                     to_unit_id INTEGER REFERENCES units(id),
+                     kind TEXT NOT NULL
+                 );
+                 INSERT INTO links (from_unit_id, to_raw, kind) VALUES (1, '[[B]]', 'wikilink');
+                 UPDATE sources SET status = 'offline' WHERE name = 'notes';",
+            )
+            .unwrap();
+    }
+
+    let cache = Cache::open(&db).expect("a cache without links.line must open");
+    assert_eq!(cache.rebuilt_from_version(), Some(CURRENT_SCHEMA_VERSION));
+    let links = cache.links_from_unit(unit_id).unwrap();
+    assert_eq!(links.len(), 1, "the offline source's link is carried over");
+    assert_eq!(links[0].to_raw, "[[B]]");
+    assert_eq!(links[0].line, None);
+
+    // The rebuilt table takes a line.
+    cache
+        .insert_link(&NewLink {
+            from_unit_id: unit_id,
+            to_raw: "[[C]]",
+            to_unit_id: None,
+            kind: "wikilink",
+            line: Some(7),
+        })
+        .unwrap();
+    let lines: Vec<Option<i64>> = cache
+        .links_from_unit(unit_id)
+        .unwrap()
+        .into_iter()
+        .map(|l| l.line)
+        .collect();
+    assert_eq!(lines, vec![None, Some(7)]);
+}

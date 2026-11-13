@@ -99,13 +99,17 @@ const CREATE_UNITS: &str = "\
         UNIQUE(source_id, rel_path) \
     )";
 
+/// One row per link occurrence. `line` is the link's 1-based line in
+/// its file (what a backlink reports); NULL for a link in a document
+/// and for a row carried over from a cache that had no such column.
 const CREATE_LINKS: &str = "\
     CREATE TABLE links (\
         id INTEGER PRIMARY KEY AUTOINCREMENT, \
         from_unit_id INTEGER NOT NULL REFERENCES units(id), \
         to_raw TEXT NOT NULL, \
         to_unit_id INTEGER REFERENCES units(id), \
-        kind TEXT NOT NULL \
+        kind TEXT NOT NULL, \
+        line INTEGER \
     )";
 
 const CREATE_TAGS: &str = "\
@@ -507,7 +511,9 @@ fn blocks_block_id_is_not_null(conn: &Connection) -> Result<bool, CacheError> {
 ///   `unit_id`, `line` and `text`, and nothing wrote to it;
 /// - the build before the bounded `^^` search had a `block_fts` and no
 ///   `block_names`, so the symbols and headings named like a query could
-///   not be found from the index.
+///   not be found from the index;
+/// - the build before block links (G13, G16) had no `links.line`, the
+///   line a backlink reports.
 ///
 /// A missing table is not stale (the matching-version `CREATE ... IF
 /// NOT EXISTS` makes it).
@@ -516,7 +522,8 @@ pub(crate) fn core_shape_is_stale(conn: &Connection) -> Result<bool, CacheError>
         || table_lacks_column(conn, "symbols", "line")?
         || table_lacks_column(conn, "blocks", "symbol_id")?
         || table_lacks_column(conn, "block_fts", "kind")?
-        || block_names_missing_beside_block_fts(conn)?)
+        || block_names_missing_beside_block_fts(conn)?
+        || table_lacks_column(conn, "links", "line")?)
 }
 
 /// Fails with [`CacheError::Fts5Unavailable`] when this SQLite has no
@@ -610,13 +617,21 @@ pub(crate) fn snapshot_offline_rows(conn: &Connection) -> Result<OfflineRows, Ca
         });
     }
 
-    let mut links_stmt = conn.prepare(
-        "SELECT l.id, l.from_unit_id, l.to_raw, l.to_unit_id, l.kind \
+    // A cache written before `links.line` existed has no such column:
+    // its rows are carried over with a NULL line (the next online
+    // rescan of the source fills it in).
+    let line_column = if table_has_columns(conn, "links", &["line"])? {
+        "l.line"
+    } else {
+        "NULL"
+    };
+    let mut links_stmt = conn.prepare(&format!(
+        "SELECT l.id, l.from_unit_id, l.to_raw, l.to_unit_id, l.kind, {line_column} \
          FROM links l \
          JOIN units u ON u.id = l.from_unit_id \
          JOIN sources s ON s.id = u.source_id \
-         WHERE s.status = 'offline'",
-    )?;
+         WHERE s.status = 'offline'"
+    ))?;
     let mut rows = links_stmt.query([])?;
     while let Some(row) = rows.next()? {
         out.links.push(LinkRow {
@@ -625,6 +640,7 @@ pub(crate) fn snapshot_offline_rows(conn: &Connection) -> Result<OfflineRows, Ca
             to_raw: row.get(2)?,
             to_unit_id: row.get(3)?,
             kind: row.get(4)?,
+            line: row.get(5)?,
         });
     }
 
@@ -715,9 +731,9 @@ pub(crate) fn restore_offline_rows(
     for l in &rows.links {
         let to_unit_id = l.to_unit_id.filter(|id| preserved_unit_ids.contains(id));
         conn.execute(
-            "INSERT INTO links (id, from_unit_id, to_raw, to_unit_id, kind) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![l.id, l.from_unit_id, l.to_raw, to_unit_id, l.kind],
+            "INSERT INTO links (id, from_unit_id, to_raw, to_unit_id, kind, line) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![l.id, l.from_unit_id, l.to_raw, to_unit_id, l.kind, l.line],
         )?;
     }
 
