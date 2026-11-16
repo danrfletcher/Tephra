@@ -13,6 +13,8 @@ mod large_fan_in;
 mod markdown_links;
 #[path = "unit/model.rs"]
 mod model;
+#[path = "unit/multibyte_names.rs"]
+mod multibyte_names;
 #[path = "unit/query.rs"]
 mod query;
 #[path = "unit/resolver.rs"]

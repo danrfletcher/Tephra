@@ -182,6 +182,11 @@ const MARKDOWN_EXTENSIONS: [&str; 2] = [".md", ".markdown"];
 
 /// Strips a trailing `.md`/`.markdown` (case-insensitive) from
 /// `rel_path`, if present; returns `rel_path` unchanged otherwise.
+/// Never panics, whatever the string: the extensions are ASCII, so a
+/// name that ends in one has a char boundary exactly `ext.len()` bytes
+/// from its end. When that offset falls inside a multi-byte character
+/// (`Todo…ab`, `Résumé—v2.docx`) the name cannot end in the extension
+/// and is returned unchanged.
 /// Applied to both sides of every match (R1): a stored unit's own
 /// path *and* an incoming link's target, since a standard markdown
 /// link (`[x](B.md)`) or an extension-qualified wikilink (`[[B.md]]`)
@@ -190,7 +195,11 @@ const MARKDOWN_EXTENSIONS: [&str; 2] = [".md", ".markdown"];
 pub(crate) fn strip_markdown_extension(rel_path: &str) -> &str {
     for ext in MARKDOWN_EXTENSIONS {
         if rel_path.len() > ext.len() {
-            let (base, suffix) = rel_path.split_at(rel_path.len() - ext.len());
+            let cut = rel_path.len() - ext.len();
+            if !rel_path.is_char_boundary(cut) {
+                continue;
+            }
+            let (base, suffix) = rel_path.split_at(cut);
             if suffix.eq_ignore_ascii_case(ext) {
                 return base;
             }
@@ -855,5 +864,191 @@ pub(crate) fn resolve_link_impl(
             source: scope,
             target: wikilink.target.clone(),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One character of each UTF-8 width the fix has to survive: 2
+    /// bytes (`é`), 3 bytes (`—`, `…`, a CJK character) and 4 bytes
+    /// (an emoji).
+    const MULTIBYTE: [&str; 5] = ["é", "—", "…", "日", "😀"];
+
+    /// The expected result computed a different way from the code under
+    /// test: lower-case the name (ASCII only, so every byte offset is
+    /// kept) and let `strip_suffix`, which is boundary-safe by
+    /// construction, find the extension. The stem must be non-empty
+    /// (`.md` alone stays as it is).
+    fn oracle(name: &str) -> &str {
+        let lower = name.to_ascii_lowercase();
+        for ext in [".md", ".markdown"] {
+            if let Some(stem) = lower.strip_suffix(ext) {
+                if !stem.is_empty() {
+                    return &name[..stem.len()];
+                }
+            }
+        }
+        name
+    }
+
+    #[test]
+    fn markdown_extensions_are_stripped_exactly_as_before() {
+        let cases = [
+            ("Plan.md", "Plan"),
+            ("Plan.MD", "Plan"),
+            ("Plan.Md", "Plan"),
+            ("Plan.markdown", "Plan"),
+            ("Plan.MARKDOWN", "Plan"),
+            ("Plan.MarkDown", "Plan"),
+            ("dir/Plan.md", "dir/Plan"),
+            ("Plan.md.md", "Plan.md"),
+            ("Plan.txt", "Plan.txt"),
+            ("Plan", "Plan"),
+            // An extension with no stem in front of it stays as it is.
+            (".md", ".md"),
+            (".markdown", ".markdown"),
+            ("md", "md"),
+            ("markdown", "markdown"),
+            ("", ""),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(strip_markdown_extension(input), expected, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn a_name_ending_in_a_multibyte_char_and_ascii_letters_is_returned_unchanged() {
+        for c in MULTIBYTE {
+            for letters in 1..=8 {
+                let name = format!("Todo{c}{}", "a".repeat(letters));
+                assert_eq!(strip_markdown_extension(&name), name, "{name:?}");
+                let name = format!("Résumé—v2{c}{}", "z".repeat(letters));
+                assert_eq!(strip_markdown_extension(&name), name, "{name:?}");
+            }
+        }
+        // The names from the bug report.
+        for name in ["Résumé—v2.docx", "Todo…ab", "日本x", "Résumé—v2.markdowñ"] {
+            assert_eq!(strip_markdown_extension(name), name);
+        }
+    }
+
+    #[test]
+    fn multibyte_names_with_a_real_markdown_extension_are_still_stripped() {
+        let cases = [
+            ("Plan…ab.md", "Plan…ab"),
+            ("Résumé—v2.MD", "Résumé—v2"),
+            ("日本.markdown", "日本"),
+            ("😀.Markdown", "😀"),
+            ("dé/日本/Plan—.md", "dé/日本/Plan—"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(strip_markdown_extension(input), expected, "{input:?}");
+        }
+    }
+
+    /// Each of a 2-, 3- and 4-byte character at every distance from 0 to
+    /// 12 bytes before the end of the name (so the 3-byte `.md` cut and
+    /// the 9-byte `.markdown` cut each land inside the character, on
+    /// either side of it, and on a boundary), alone, at the start and
+    /// doubled. Nothing may panic and the result must be the oracle's.
+    #[test]
+    fn cut_position_table_never_panics() {
+        let mut checked = 0;
+        for c in MULTIBYTE {
+            for pad in 0..=12 {
+                let ascii = "a".repeat(pad);
+                let names = [
+                    format!("{c}{ascii}"),
+                    format!("x{c}{ascii}"),
+                    format!("{c}{c}{ascii}"),
+                    format!("ab{c}{ascii}"),
+                    // The extension itself sitting `pad` bytes before the end.
+                    format!("{c}.md{ascii}"),
+                    format!("{c}.markdown{ascii}"),
+                    format!("{c}{ascii}.md"),
+                    format!("{c}{ascii}.markdown"),
+                ];
+                for name in names {
+                    assert_eq!(strip_markdown_extension(&name), oracle(&name), "{name:?}");
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 5 * 13 * 8);
+    }
+
+    #[test]
+    fn a_name_exactly_as_long_as_the_extension_empty_or_only_multibyte_does_not_panic() {
+        for name in [
+            "",
+            ".md",
+            ".MD",
+            ".markdown",
+            ".MARKDOWN",
+            // Exactly 3 and 9 bytes, but not the extension.
+            "日",
+            "é—",
+            "…ab",
+            "日本語",
+            "😀😀😀😀😀😀",
+            "ééééé—",
+            "é",
+            "—",
+            "😀",
+        ] {
+            assert_eq!(strip_markdown_extension(name), name, "{name:?}");
+        }
+    }
+
+    /// Every string of up to six tokens over a small alphabet that mixes
+    /// the extension's own letters with characters of every width:
+    /// 8^6 strings, none may panic, and each must give the oracle's
+    /// answer.
+    #[test]
+    fn exhaustive_short_strings_never_panic() {
+        const TOKENS: [&str; 8] = ["a", ".", "md", "MD", "markdown", "é", "—", "😀"];
+        fn walk(prefix: &mut String, depth: usize, count: &mut usize) {
+            assert_eq!(
+                strip_markdown_extension(prefix),
+                oracle(prefix),
+                "{prefix:?}"
+            );
+            *count += 1;
+            if depth == 0 {
+                return;
+            }
+            for t in TOKENS {
+                let len = prefix.len();
+                prefix.push_str(t);
+                walk(prefix, depth - 1, count);
+                prefix.truncate(len);
+            }
+        }
+        let mut count = 0;
+        walk(&mut String::new(), 6, &mut count);
+        assert_eq!(count, (0..=6).map(|n| 8usize.pow(n)).sum::<usize>());
+    }
+
+    #[test]
+    fn normalize_wikilink_target_handles_multibyte_input() {
+        let nfc = "Résumé—v2.docx";
+        let nfd = "Re\u{301}sume\u{301}—v2.docx";
+        assert_ne!(nfc, nfd);
+        let cases = [
+            (nfc, nfc),
+            (nfd, nfc),
+            ("Todo…ab", "Todo…ab"),
+            ("日本x", "日本x"),
+            ("Plan…ab.md", "Plan…ab"),
+            ("caf\u{e9}\u{2014}v2.MD", "caf\u{e9}\u{2014}v2"),
+            ("cafe\u{301}—v2.markdown", "caf\u{e9}—v2"),
+            ("dé/日本/Todo…ab", "dé/日本/Todo…ab"),
+            ("", ""),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(normalize_wikilink_target(input), expected, "{input:?}");
+        }
     }
 }

@@ -1681,3 +1681,49 @@ fn apply_change_batch_once(
         deferred: deferred_paths,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    /// E26 (pinned, unchanged by the char-boundary fix): a path component
+    /// that is not valid UTF-8 is dropped by `to_rel_string`, not
+    /// repaired, so a file whose own name is invalid has no relative path
+    /// (it is skipped) and one under an invalid directory is stored
+    /// without that directory. Valid multi-byte names pass through as
+    /// they are.
+    #[test]
+    fn to_rel_string_pins_todays_handling_of_a_non_utf8_name() {
+        let root = Path::new("/vault");
+        let join = |parts: &[&[u8]]| {
+            let mut p = root.to_path_buf();
+            for part in parts {
+                p.push(OsStr::from_bytes(part));
+            }
+            p
+        };
+        assert_eq!(
+            to_rel_string(root, &join(&["Résumé—v2.docx".as_bytes()])),
+            Some("Résumé—v2.docx".to_string())
+        );
+        assert_eq!(
+            to_rel_string(root, &join(&[b"bad\xff.md"])),
+            None,
+            "a file whose own name is not UTF-8 is skipped"
+        );
+        assert_eq!(
+            to_rel_string(root, &join(&[b"d\xff", b"inner.md"])),
+            Some("inner.md".to_string()),
+            "an invalid directory component is dropped from the stored path"
+        );
+        assert_eq!(
+            to_rel_string(
+                root,
+                &join(&["日本".as_bytes(), b"d\xff", "Todo…ab".as_bytes()])
+            ),
+            Some("日本/Todo…ab".to_string())
+        );
+    }
+}

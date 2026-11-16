@@ -510,10 +510,18 @@ fn split_federated_id(id: &str) -> Option<(&str, &str)> {
 /// returning `(stem, Some(extension_as_written))` if present or
 /// `(p, None)` if not. The extension is returned with its original
 /// case so a replacement can restore exactly what the user typed.
+/// Never panics, whatever the string: the extensions are ASCII, so a
+/// name that ends in one has a char boundary exactly `ext.len()` bytes
+/// from its end. When that offset falls inside a multi-byte character
+/// (`Todo…ab`, `Résumé—v2.docx`) the name cannot end in the extension
+/// and comes back as `(p, None)`.
 fn strip_md_ext(p: &str) -> (&str, Option<&str>) {
     for ext in [".md", ".markdown"] {
         if p.len() > ext.len() {
             let idx = p.len() - ext.len();
+            if !p.is_char_boundary(idx) {
+                continue;
+            }
             if p[idx..].eq_ignore_ascii_case(ext) {
                 return (&p[..idx], Some(&p[idx..]));
             }
@@ -2501,5 +2509,311 @@ mod tests {
         let encoded = percent_encode_path("Caf\u{e9} Notes (2).md");
         let decoded = percent_decode(&encoded);
         assert_eq!(decoded, "Caf\u{e9} Notes (2).md");
+    }
+
+    // --- multi-byte names (E26) ---------------------------------------------
+
+    /// A 2-, 3- and 4-byte character each, plus a second 3-byte one and
+    /// a CJK character.
+    const MULTIBYTE: [&str; 5] = ["é", "—", "…", "日", "😀"];
+
+    /// The expected `strip_md_ext` result, worked out a different way
+    /// from the code under test: `strip_suffix` on an ASCII-lower-cased
+    /// copy (same byte offsets) is boundary-safe by construction.
+    fn md_ext_oracle(name: &str) -> (&str, Option<&str>) {
+        let lower = name.to_ascii_lowercase();
+        for ext in [".md", ".markdown"] {
+            if let Some(stem) = lower.strip_suffix(ext) {
+                if !stem.is_empty() {
+                    return (&name[..stem.len()], Some(&name[stem.len()..]));
+                }
+            }
+        }
+        (name, None)
+    }
+
+    #[test]
+    fn strip_md_ext_keeps_todays_results() {
+        let cases: [(&str, (&str, Option<&str>)); 12] = [
+            ("Plan.md", ("Plan", Some(".md"))),
+            ("Plan.MD", ("Plan", Some(".MD"))),
+            ("Plan.Md", ("Plan", Some(".Md"))),
+            ("Plan.markdown", ("Plan", Some(".markdown"))),
+            ("Plan.MarkDown", ("Plan", Some(".MarkDown"))),
+            ("dir/Plan.md", ("dir/Plan", Some(".md"))),
+            ("Plan.txt", ("Plan.txt", None)),
+            ("Plan", ("Plan", None)),
+            (".md", (".md", None)),
+            (".markdown", (".markdown", None)),
+            ("md", ("md", None)),
+            ("", ("", None)),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(strip_md_ext(input), expected, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn strip_md_ext_returns_the_input_when_the_cut_is_not_a_char_boundary() {
+        for name in ["Résumé—v2.docx", "Todo…ab", "日本x", "Résumé—v2.markdowñ"] {
+            assert_eq!(strip_md_ext(name), (name, None), "{name:?}");
+        }
+        for c in MULTIBYTE {
+            for letters in 1..=8 {
+                let name = format!("Todo{c}{}", "a".repeat(letters));
+                assert_eq!(strip_md_ext(&name), (name.as_str(), None), "{name:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn strip_md_ext_keeps_the_extension_as_written_after_a_multibyte_stem() {
+        assert_eq!(strip_md_ext("Plan…ab.md"), ("Plan…ab", Some(".md")));
+        assert_eq!(strip_md_ext("Résumé—v2.MD"), ("Résumé—v2", Some(".MD")));
+        assert_eq!(strip_md_ext("日本.Markdown"), ("日本", Some(".Markdown")));
+        assert_eq!(strip_md_ext("😀.MARKDOWN"), ("😀", Some(".MARKDOWN")));
+    }
+
+    /// Each multi-byte character at every distance from 0 to 12 bytes
+    /// before the end, around both the 3-byte `.md` cut and the 9-byte
+    /// `.markdown` cut: no case panics, each gives the oracle's answer.
+    #[test]
+    fn strip_md_ext_cut_position_table_never_panics() {
+        let mut checked = 0;
+        for c in MULTIBYTE {
+            for pad in 0..=12 {
+                let ascii = "a".repeat(pad);
+                for name in [
+                    format!("{c}{ascii}"),
+                    format!("x{c}{ascii}"),
+                    format!("{c}{c}{ascii}"),
+                    format!("ab{c}{ascii}"),
+                    format!("{c}.md{ascii}"),
+                    format!("{c}.markdown{ascii}"),
+                    format!("{c}{ascii}.md"),
+                    format!("{c}{ascii}.markdown"),
+                ] {
+                    assert_eq!(strip_md_ext(&name), md_ext_oracle(&name), "{name:?}");
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 5 * 13 * 8);
+    }
+
+    #[test]
+    fn strip_md_ext_name_as_long_as_the_extension_empty_or_only_multibyte() {
+        for name in [
+            "",
+            ".md",
+            ".MD",
+            ".markdown",
+            "日",
+            "é—",
+            "…ab",
+            "日本語",
+            "😀😀😀😀😀😀",
+            "ééééé—",
+            "é",
+            "—",
+            "😀",
+        ] {
+            assert_eq!(strip_md_ext(name), (name, None), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn strip_md_ext_exhaustive_short_strings_never_panic() {
+        const TOKENS: [&str; 8] = ["a", ".", "md", "MD", "markdown", "é", "—", "😀"];
+        fn walk(prefix: &mut String, depth: usize, count: &mut usize) {
+            assert_eq!(strip_md_ext(prefix), md_ext_oracle(prefix), "{prefix:?}");
+            *count += 1;
+            if depth == 0 {
+                return;
+            }
+            for t in TOKENS {
+                let len = prefix.len();
+                prefix.push_str(t);
+                walk(prefix, depth - 1, count);
+                prefix.truncate(len);
+            }
+        }
+        let mut count = 0;
+        walk(&mut String::new(), 6, &mut count);
+        assert_eq!(count, (0..=6).map(|n| 8usize.pow(n)).sum::<usize>());
+    }
+
+    #[test]
+    fn rewrite_target_component_on_multibyte_names() {
+        let cases = [
+            // A non-Markdown target: no extension convention to keep.
+            ("Résumé—v2.docx", "Résumé—v3.docx", "Résumé—v3.docx"),
+            ("Todo…ab", "Todo…ac", "Todo…ac"),
+            ("日本x", "日本y", "日本y"),
+            // A bare target takes the new basename, a full one the full stem.
+            ("Plan…ab", "dé/日本/Plan…ac.md", "Plan…ac"),
+            ("dé/日本/Plan…ab", "dé/日本/Plan…ac.md", "dé/日本/Plan…ac"),
+            // The extension the user typed is kept as typed.
+            ("Plan…ab.MD", "Plan…ac.md", "Plan…ac.MD"),
+            ("Plan…ab.markdown", "日本/Plan…ac.md", "Plan…ac.markdown"),
+            // Typed with no extension, renamed to a name that has one.
+            ("Plan—", "Plan—2.md", "Plan—2"),
+        ];
+        for (target, new_path, expected) in cases {
+            assert_eq!(
+                rewrite_target_component(target, new_path),
+                expected,
+                "{target:?} -> {new_path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_markdown_raw_on_a_percent_encoded_multibyte_destination() {
+        // `café—v2`, percent-encoded as an editor writes it.
+        let encoded = "caf%C3%A9%E2%80%94v2";
+        assert_eq!(percent_decode(encoded), "café—v2");
+        let cases = [
+            // (from, to_raw, new_path, decoded result)
+            ("@notes:Journal.md", encoded, "café—v3", "café—v3"),
+            ("@notes:Journal.md", encoded, "café—v3.docx", "café—v3.docx"),
+            ("@notes:日本/Journal.md", encoded, "café—v3", "../café—v3"),
+            (
+                "@notes:日本/Journal.md",
+                "caf%C3%A9%E2%80%94v2#^k3f9a2",
+                "日本/café—v3",
+                "café—v3#^k3f9a2",
+            ),
+            // With a Markdown extension the user typed, in either case.
+            (
+                "@notes:Journal.md",
+                "caf%C3%A9%E2%80%94v2.md",
+                "café—v3.md",
+                "café—v3.md",
+            ),
+            (
+                "@notes:Journal.md",
+                "caf%C3%A9%E2%80%94v2.MD",
+                "café—v3.md",
+                "café—v3.MD",
+            ),
+            // Root-absolute.
+            (
+                "@notes:日本/Journal.md",
+                "/caf%C3%A9%E2%80%94v2",
+                "dé/café—v3",
+                "/dé/café—v3",
+            ),
+        ];
+        for (from, to_raw, new_path, expected) in cases {
+            let out = rewrite_markdown_raw(from, to_raw, new_path)
+                .unwrap_or_else(|| panic!("no rewrite for {to_raw:?}"));
+            assert_eq!(
+                percent_decode(&out),
+                expected,
+                "{from} {to_raw:?} -> {new_path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compute_changes_rewrites_a_non_markdown_multibyte_target() {
+        let edges = vec![edge(
+            "@notes:Journal.md",
+            "@notes:Résumé—v2.docx",
+            "Résumé—v2.docx",
+            tephra_parser::LINK_KIND_WIKILINK,
+        )];
+        let content = "CV: [[Résumé—v2.docx]] and more.\n";
+        let mut files = HashMap::new();
+        files.insert("@notes:Journal.md".to_string(), content.to_string());
+        let changes = compute_changes(&edges, &files, "Résumé—v2.docx", "Résumé—v3.docx");
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].before, "[[Résumé—v2.docx]]");
+        assert_eq!(changes[0].after, "[[Résumé—v3.docx]]");
+        let refs: Vec<&LinkChange> = changes.iter().collect();
+        assert_eq!(
+            apply_changes_to_content(content, &refs).unwrap(),
+            "CV: [[Résumé—v3.docx]] and more.\n"
+        );
+    }
+
+    #[test]
+    fn compute_changes_keeps_anchor_and_alias_on_a_bare_multibyte_target() {
+        let edges = vec![edge(
+            "@notes:Journal.md",
+            "@notes:Todo…ab",
+            "Todo…ab#^k3f9a2|plan",
+            tephra_parser::LINK_KIND_WIKILINK,
+        )];
+        let content = "Start [[Todo…ab#^k3f9a2|plan]] end\n";
+        let mut files = HashMap::new();
+        files.insert("@notes:Journal.md".to_string(), content.to_string());
+        let changes = compute_changes(&edges, &files, "Todo…ab", "Todo…ac");
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].after, "[[Todo…ac#^k3f9a2|plan]]");
+        let refs: Vec<&LinkChange> = changes.iter().collect();
+        assert_eq!(
+            apply_changes_to_content(content, &refs).unwrap(),
+            "Start [[Todo…ac#^k3f9a2|plan]] end\n"
+        );
+    }
+
+    #[test]
+    fn compute_changes_in_a_nested_multibyte_path_changes_link_text_only() {
+        let edges = vec![
+            edge(
+                "@notes:dé/日本/Journal—.md",
+                "@notes:dé/日本/Plan…ab.md",
+                "dé/日本/Plan…ab",
+                tephra_parser::LINK_KIND_WIKILINK,
+            ),
+            edge(
+                "@notes:dé/日本/Journal—.md",
+                "@notes:dé/日本/Plan…ab.md",
+                "Plan…ab.MD|the plan",
+                tephra_parser::LINK_KIND_WIKILINK,
+            ),
+        ];
+        let content = "# Journal—\n\nplan…ab.md [[dé/日本/Plan…ab]] and [[Plan…ab.MD|the plan]]\n";
+        let mut files = HashMap::new();
+        files.insert(
+            "@notes:dé/日本/Journal—.md".to_string(),
+            content.to_string(),
+        );
+        let changes = compute_changes(&edges, &files, "dé/日本/Plan…ab.md", "dé/日本/Plan…ac.md");
+        assert_eq!(changes.len(), 2, "{changes:?}");
+        let refs: Vec<&LinkChange> = changes.iter().collect();
+        assert_eq!(
+            apply_changes_to_content(content, &refs).unwrap(),
+            "# Journal—\n\nplan…ab.md [[dé/日本/Plan…ac]] and [[Plan…ac.MD|the plan]]\n"
+        );
+    }
+
+    #[test]
+    fn compute_changes_rewrites_a_percent_encoded_multibyte_markdown_link() {
+        let edges = vec![edge(
+            "@notes:日本/Journal.md",
+            "@notes:café—v2",
+            "../caf%C3%A9%E2%80%94v2",
+            tephra_parser::LINK_KIND_MARKDOWN,
+        )];
+        let content = "See [x](../caf%C3%A9%E2%80%94v2) now.\n";
+        let mut files = HashMap::new();
+        files.insert("@notes:日本/Journal.md".to_string(), content.to_string());
+        let changes = compute_changes(&edges, &files, "café—v2", "café—v3");
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        let refs: Vec<&LinkChange> = changes.iter().collect();
+        let result = apply_changes_to_content(content, &refs).expect("span matches");
+        assert!(
+            result.starts_with("See [x](") && result.ends_with(") now.\n"),
+            "only the destination changes: {result:?}"
+        );
+        let reparsed = tephra_parser::parse_unit(Path::new("@notes:日本/Journal.md"), &result);
+        assert_eq!(reparsed.markdown_links.len(), 1);
+        assert_eq!(
+            percent_decode(&reparsed.markdown_links[0].target),
+            "../café—v3"
+        );
     }
 }

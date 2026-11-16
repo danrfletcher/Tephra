@@ -453,3 +453,42 @@ pub fn expected_rows(e: &ProseExpect) -> UnitRows {
             .collect(),
     }
 }
+
+/// E26: file names whose multi-byte characters sit close to the
+/// extension, the kind `strip_markdown_extension` / `strip_md_ext` used
+/// to cut in the middle of a character. The first entry is a real
+/// `.docx`, the rest are text. Each is also linked from
+/// `Linker—.md` by the link text in the second column.
+pub const MULTIBYTE_NAMES: [(&str, &str); 7] = [
+    ("Résumé—v2.docx", "Résumé—v2.docx"),
+    ("Todo…ab", "Todo…ab"),
+    ("日本x", "日本x"),
+    ("Plan…ab.md", "Plan…ab"),
+    ("dé/日本/Notes—.txt", "dé/日本/Notes—.txt"),
+    ("Notes😀ab.txt", "Notes😀ab.txt"),
+    ("Plan—.markdown", "Plan—"),
+];
+
+/// A source holding every [`MULTIBYTE_NAMES`] file plus `Linker—.md`,
+/// which links to each of them: the one shared helper that builds the
+/// crash-class names for the E26 tests. Real files in a temp dir, no
+/// mocks; cleaned up on drop.
+pub fn multibyte_source() -> TempSource {
+    let src = empty_source();
+    let docx = fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tephra-parser/tests/fixtures/documents/headings.docx"),
+    )
+    .expect("read the docx fixture");
+    let mut linker = String::from("# Linker\n\n");
+    for (name, link) in MULTIBYTE_NAMES {
+        if name.ends_with(".docx") {
+            src.write_bytes(name, &docx);
+        } else {
+            src.write(name, "# Heading\n\nA line of text.\n");
+        }
+        linker.push_str(&format!("- [[{link}]]\n"));
+    }
+    src.write("Linker—.md", &linker);
+    src
+}
