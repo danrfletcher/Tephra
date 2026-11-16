@@ -112,7 +112,7 @@ fn dispatch_methods() -> Vec<String> {
 }
 
 #[test]
-fn f2_the_rpc_method_list_is_the_one_before_this_pr() {
+fn f2_the_rpc_method_list_is_the_one_before_this_pr_plus_fix_list() {
     let mut expected: Vec<String> = [
         "unit.resolve_link",
         "graph.get_backlinks",
@@ -127,6 +127,8 @@ fn f2_the_rpc_method_list_is_the_one_before_this_pr() {
         "unit.list",
         "unit.search",
         "block.ensure_id",
+        // atlas-25 PR-5 (G18, F12): the one method that PR adds.
+        "fix.list",
     ]
     .iter()
     .map(|s| s.to_string())

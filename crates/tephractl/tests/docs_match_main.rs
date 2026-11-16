@@ -49,8 +49,8 @@ fn subcommands() -> Vec<Vec<String>> {
 }
 
 #[test]
-fn the_dispatch_closed_list_is_thirteen_and_every_method_is_in_architecture() {
-    assert_eq!(METHOD_NAMES.len(), 13);
+fn the_dispatch_closed_list_is_fourteen_and_every_method_is_in_architecture() {
+    assert_eq!(METHOD_NAMES.len(), 14);
     let architecture = doc("docs/ARCHITECTURE.md");
     for method in METHOD_NAMES {
         assert!(
@@ -74,6 +74,7 @@ fn every_tephractl_subcommand_is_in_the_readme() {
         vec!["search"],
         vec!["block-id"],
         vec!["backlinks"],
+        vec!["fixes"],
         vec!["daemon", "install"],
         vec!["daemon", "uninstall"],
         vec!["daemon", "status"],
@@ -92,6 +93,18 @@ fn every_tephractl_subcommand_is_in_the_readme() {
     for form in ["#<query>", "^<query>", "^^<query>"] {
         assert!(readme.contains(form), "README.md never shows {form}");
     }
+}
+
+/// atlas-25 PR-5 (G18): the fix log verb and its command are named in
+/// both docs, and the README says the command only reads (F9).
+#[test]
+fn fix_list_and_tephractl_fixes_are_named_in_the_readme_and_architecture() {
+    let readme = doc("README.md");
+    let architecture = doc("docs/ARCHITECTURE.md");
+    assert!(readme.contains("`fixes ") && readme.contains("fix.list"));
+    assert!(readme.contains("only reads"));
+    assert!(architecture.contains("`fix.list`") && architecture.contains("`tephractl fixes`"));
+    assert!(architecture.contains("record only"));
 }
 
 #[test]

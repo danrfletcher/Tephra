@@ -12,11 +12,12 @@
 //! F5-adjacent without a per-method opt-in.
 
 use serde_json::Value;
-use tephra_cache::InFileScope;
+use tephra_cache::{InFileScope, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT};
 
 use crate::rpc::auth::Authenticated;
 use crate::rpc::backend::{
-    BlockBackend, GraphBackend, RefactorBackend, SearchError, SourceBackend, UnitListError,
+    BlockBackend, FixBackend, GraphBackend, RefactorBackend, SearchError, SourceBackend,
+    UnitListError,
 };
 use crate::rpc::protocol::{
     BLOCK_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND, REFACTOR_ERROR, RESOLVE_ERROR, SOURCE_ERROR,
@@ -42,6 +43,7 @@ pub const METHOD_NAMES: &[&str] = &[
     "unit.list",
     "unit.search",
     "block.ensure_id",
+    "fix.list",
 ];
 
 /// The three backends one `dispatch` call reads through, bundled so
@@ -52,6 +54,7 @@ pub struct Backends<'a> {
     pub sources: &'a dyn SourceBackend,
     pub refactor: &'a dyn RefactorBackend,
     pub blocks: &'a dyn BlockBackend,
+    pub fixes: &'a dyn FixBackend,
 }
 
 /// `(code, message, optional structured data)` — the shape every
@@ -101,6 +104,7 @@ pub fn dispatch(
         "unit.list" => unit_list(params, backends.sources),
         "unit.search" => unit_search(params, backends.sources),
         "block.ensure_id" => block_ensure_id(params, backends.blocks),
+        "fix.list" => fix_list(params, backends.fixes),
         other => Err((
             METHOD_NOT_FOUND,
             format!("unknown method \"{other}\""),
@@ -374,6 +378,37 @@ fn block_ensure_id(params: &Value, blocks: &dyn BlockBackend) -> DispatchResult 
         })
 }
 
+/// `fix.list {since?, limit?}` (G18). `since` is epoch seconds from the
+/// client: a non-negative integer. `limit` is an integer from 1, default
+/// [`DEFAULT_LIST_LIMIT`], clamped to [`MAX_LIST_LIMIT`]. `null` counts
+/// as absent; anything else (zero, negative, fraction, string) is
+/// refused here as `invalid_params`.
+fn fix_list(params: &Value, fixes: &dyn FixBackend) -> DispatchResult {
+    let given = |key: &str| params.get(key).filter(|v| !v.is_null());
+    let since = match given("since") {
+        None => None,
+        Some(v) => Some(
+            v.as_u64()
+                .and_then(|n| i64::try_from(n).ok())
+                .ok_or_else(|| {
+                    invalid_params("\"since\" must be epoch seconds (an integer, 0 or more)")
+                })?,
+        ),
+    };
+    let limit = match given("limit") {
+        None => DEFAULT_LIST_LIMIT,
+        Some(v) => v
+            .as_u64()
+            .filter(|n| *n >= 1)
+            .map(|n| usize::try_from(n).unwrap_or(usize::MAX).min(MAX_LIST_LIMIT))
+            .ok_or_else(|| invalid_params("\"limit\" must be an integer, 1 or more"))?,
+    };
+    fixes
+        .list(since, limit)
+        .map(|entries| serde_json::to_value(entries).expect("FixEntryWire always serializes"))
+        .map_err(|e| (SOURCE_ERROR, e, None))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,6 +439,7 @@ mod tests {
                 "unit.list",
                 "unit.search",
                 "block.ensure_id",
+                "fix.list",
             ]
         );
     }

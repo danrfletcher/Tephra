@@ -11,6 +11,8 @@
 
 use std::fmt;
 
+use crate::since::Since;
+
 pub const USAGE: &str = "\
 tephractl - command-line client for the tephrad daemon
 
@@ -25,6 +27,7 @@ USAGE:
     tephractl search \"^^<query>\" [--limit <n>] [--json]
     tephractl block-id <unit-id> --line <n> | --symbol <name> [--json]
     tephractl backlinks <id> [--json]
+    tephractl fixes [--since <30m|2h|7d|date>] [--json]
     tephractl link resolve [--source <name>] <target> [--json]
     tephractl link refactor --source <name> --old <path> --new <path> [--apply] [--yes] [--json]
     tephractl daemon install [--from <path>] [--json]
@@ -67,6 +70,16 @@ BACKLINKS:
                           another file (it moved) still counts, once it finds the block there.
                           An id nothing links to prints \"no backlinks\" and exits 0.
 
+FIXES:
+    fixes                 The log of automatic link fixes (fix.list), newest first, one line per
+                          fix: time kind old -> new (n files) status. status is applied, partial,
+                          needs_manual_fix or uncertain. An uncertain line has no new name: the
+                          file vanished with no certain pair and its links are broken. Shows the
+                          newest 50. It only reads: nothing is undone or replayed.
+    --since <when>        Only fixes from <when> on: 30m, 2h or 7d ago, or a date such as
+                          2026-11-16 or 2026-11-16T09:30 (your local time; add Z or +hh:mm for
+                          another zone).
+
 LINK RESOLVE:
     link resolve <target> A block link [[@source:path#^blockid]] prints the block: its id, its
                           line, and \"moved\" when it was found in another file of the source.
@@ -104,6 +117,9 @@ GLOBAL OPTIONS:
     --json          Print raw structured JSON instead of human-readable text
     --addr <addr>   Daemon address to connect to (default: 127.0.0.1:4812)
     -h, --help      Print this help and exit
+
+EXIT CODES:
+    0 done, 1 the command ran and failed, 2 a usage error (nothing was sent)
 ";
 
 /// Which in-file search a sigil asks for: `#` is `headings`, `^` is
@@ -190,6 +206,10 @@ pub enum Command {
     /// parser refuses anything else before any request.
     Backlinks {
         id: String,
+    },
+    /// `fixes [--since <when>]`: `fix.list`. Read-only (F9).
+    Fixes {
+        since: Option<Since>,
     },
     LinkResolve {
         target: String,
@@ -328,6 +348,7 @@ where
         "link" => parse_link(&mut iter)?,
         "block-id" => parse_block_id(&mut iter)?,
         "backlinks" => parse_backlinks(&mut iter)?,
+        "fixes" => parse_fixes(&mut iter)?,
         "daemon" => parse_daemon(&mut iter)?,
         other => return Err(ArgsError(format!("unrecognized command: {other}"))),
     };
@@ -777,6 +798,36 @@ fn parse_backlinks<'a>(
     })?;
     validate_backlinks_id(&id)?;
     Ok((Command::Backlinks { id }, json, addr))
+}
+
+/// `fixes [--since <when>] [--json] [--addr <addr>]`. A bad `--since` is
+/// a usage error, decided here, before any request.
+fn parse_fixes<'a>(
+    iter: &mut impl Iterator<Item = &'a str>,
+) -> Result<(Command, bool, Option<String>), ArgsError> {
+    let mut since: Option<Since> = None;
+    let mut json = false;
+    let mut addr = None;
+
+    while let Some(arg) = iter.next() {
+        match arg {
+            "--json" => json = true,
+            "--addr" => addr = Some(take_value(iter, "--addr")?),
+            "--since" => {
+                if since.is_some() {
+                    return Err(ArgsError("--since was given twice".to_string()));
+                }
+                let value = take_value(iter, "--since")?;
+                since = Some(Since::parse(&value).map_err(|e| ArgsError(e.0))?);
+            }
+            other => {
+                return Err(ArgsError(format!(
+                "fixes takes no arguments besides --since, --json and --addr; unexpected: {other}"
+            )))
+            }
+        }
+    }
+    Ok((Command::Fixes { since }, json, addr))
 }
 
 fn parse_link<'a>(

@@ -436,21 +436,34 @@ fn run_server(
             cache_path.to_path_buf(),
         );
 
-        let state = Arc::new(AppState::with_shutdown(
-            token_path.to_path_buf(),
+        let refactor_engine = Arc::new(tephrad::refactor::RefactorEngine::new(
             shared_graph.clone() as Arc<dyn GraphBackend>,
             registry.clone() as Arc<dyn SourceBackend>,
-            Arc::new(tephrad::refactor::RefactorEngine::new(
-                shared_graph as Arc<dyn GraphBackend>,
+            registry.clone() as Arc<dyn tephrad::refactor::WatcherPauseControl>,
+        ));
+        // G9/G10: the fix log and the pending-fixes engine, over the
+        // same cache file, writing through PR-4's write loop.
+        let fix_engine = Arc::new(tephrad::fixes::FixEngine::new(
+            cache_path.to_path_buf(),
+            Arc::new(tephrad::refactor::fix_write::FixWriter::new(
+                &refactor_engine,
+            )),
+        ));
+
+        let state = Arc::new(
+            AppState::with_shutdown(
+                token_path.to_path_buf(),
+                shared_graph.clone() as Arc<dyn GraphBackend>,
                 registry.clone() as Arc<dyn SourceBackend>,
-                registry.clone() as Arc<dyn tephrad::refactor::WatcherPauseControl>,
-            )) as Arc<dyn RefactorBackend>,
-            Some(graph_refresh),
-            Some(shutdown_rx.clone()),
-        )
-        .with_blocks(Arc::new(tephrad::block_id::BlockIdEngine::new(
-            registry.clone(),
-        ))));
+                refactor_engine as Arc<dyn RefactorBackend>,
+                Some(graph_refresh),
+                Some(shutdown_rx.clone()),
+            )
+            .with_blocks(Arc::new(tephrad::block_id::BlockIdEngine::new(
+                registry.clone(),
+            )))
+            .with_fixes(fix_engine.clone()),
+        );
 
         // Forwards every `DaemonEvent` the registry's watchers/rescans
         // produce (GP6) to connected WebSocket clients as a
@@ -480,6 +493,7 @@ fn run_server(
         // reference this block is about to hand out, while still
         // inside `block_on` — never during `runtime`'s own shutdown.
         let forward_state = state.clone();
+        let forward_fixes = fix_engine.clone();
         let mut events = registry.subscribe();
         let mut forwarder_shutdown_rx = shutdown_rx.clone();
         let forwarder_handle = tokio::spawn(async move {
@@ -511,6 +525,24 @@ fn run_server(
                                         .collect::<Vec<_>>(),
                                 });
                                 forward_state.broadcast_graph_changed(payload);
+                                // G9: a watcher batch retries the pending
+                                // fixes of that source whose backoff has
+                                // passed, and any that need a person whose
+                                // file is in the batch.
+                                let fixes = forward_fixes.clone();
+                                let retried = tokio::task::spawn_blocking(move || {
+                                    fixes.after_batch(&source, &paths)
+                                })
+                                .await;
+                                match retried {
+                                    Ok(Ok(_)) => {}
+                                    Ok(Err(e)) => {
+                                        tracing::warn!(error = %e, "retrying pending fixes after a watcher event failed");
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "pending-fixes retry task panicked");
+                                    }
+                                }
                             }
                             Err(RecvError::Lagged(_)) => continue,
                             Err(RecvError::Closed) => break,
@@ -532,9 +564,17 @@ fn run_server(
         // on the next start.
         let rescan_registry = registry.clone();
         let rescan_shutdown_rx = shutdown_rx.clone();
+        let resume_fixes = fix_engine.clone();
         let rescan_handle = tokio::task::spawn_blocking(move || {
             let outcomes = rescan_registry.rescan_unfinished(|| *rescan_shutdown_rx.borrow());
             drop(rescan_registry);
+            // G9: with the scans done, retry every pending fix of every
+            // source. Rows of an offline source wait.
+            if !*rescan_shutdown_rx.borrow() {
+                if let Err(e) = resume_fixes.resume() {
+                    tracing::warn!(error = %e, "retrying pending fixes at startup failed");
+                }
+            }
             outcomes.len()
         });
 

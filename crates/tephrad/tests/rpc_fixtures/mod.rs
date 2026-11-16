@@ -457,6 +457,25 @@ pub async fn spawn_with_token_sources_and_blocks(
     blocks: impl BlockBackend + 'static,
     token: &str,
 ) -> TestServer {
+    spawn_with_token_sources_blocks_and_fixes(
+        graph,
+        sources,
+        blocks,
+        tephrad::rpc::backend::UnsupportedFixes,
+        token,
+    )
+    .await
+}
+
+/// [`spawn_with_token_sources_and_blocks`] with a chosen `fix.list`
+/// backend.
+pub async fn spawn_with_token_sources_blocks_and_fixes(
+    graph: MockGraph,
+    sources: impl SourceBackend + 'static,
+    blocks: impl BlockBackend + 'static,
+    fixes: impl tephrad::rpc::backend::FixBackend + 'static,
+    token: &str,
+) -> TestServer {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let token_path = tempdir.path().join("token");
     write_token_file(&token_path, token);
@@ -488,7 +507,8 @@ pub async fn spawn_with_token_sources_and_blocks(
             // `tests/rpc_live_graph.rs`).
             None,
         )
-        .with_blocks(Arc::new(blocks) as Arc<dyn BlockBackend>),
+        .with_blocks(Arc::new(blocks) as Arc<dyn BlockBackend>)
+        .with_fixes(Arc::new(fixes)),
     );
     let router = build_router(state.clone());
 

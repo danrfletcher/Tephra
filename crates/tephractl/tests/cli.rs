@@ -30,6 +30,9 @@ mod link_commands;
 #[path = "cli/backlinks.rs"]
 mod backlinks;
 
+#[path = "cli/fixes_commands.rs"]
+mod fixes_commands;
+
 #[path = "cli/transport.rs"]
 mod transport;
 

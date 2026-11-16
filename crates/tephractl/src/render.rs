@@ -639,6 +639,68 @@ pub fn render_backlinks(result: &Value) -> String {
     out
 }
 
+// ---- fix.list ---------------------------------------------------------
+
+/// `fixes`' output (G18): one line per entry, in the daemon's order
+/// (newest first): `time kind old -> new (n files) status`, where `time`
+/// is local `YYYY-MM-DD HH:MM`. An `uncertain` entry has no new name:
+/// its line is `time kind old (no pair) (n files) status`. An entry that
+/// touched files of two sources names them as `@source:path`. An empty
+/// log prints `no fixes`.
+///
+/// Paths come from file names, so control characters in them are shown
+/// as `?`.
+pub fn render_fixes(result: &Value) -> String {
+    let entries = result.as_array().map(Vec::as_slice).unwrap_or_default();
+    if entries.is_empty() {
+        return "no fixes\n".to_string();
+    }
+    let mut out = String::new();
+    for entry in entries {
+        let time = entry
+            .get("time")
+            .and_then(Value::as_i64)
+            .map(local_time)
+            .unwrap_or_default();
+        let sources: Vec<&str> = entry
+            .get("sources")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        let name = |field: &str| {
+            entry.get(field).and_then(Value::as_str).map(|path| {
+                if sources.len() > 1 {
+                    printable(&format!("@{}:{path}", sources[0]))
+                } else {
+                    printable(path)
+                }
+            })
+        };
+        let old = name("old").unwrap_or_else(|| "?".to_string());
+        let pair = match entry.get("new").and_then(Value::as_str) {
+            Some(new) if sources.len() > 1 => {
+                format!(
+                    "{old} -> {}",
+                    printable(&format!("@{}:{new}", sources[sources.len() - 1]))
+                )
+            }
+            Some(new) => format!("{old} -> {}", printable(new)),
+            None => format!("{old} (no pair)"),
+        };
+        let files = entry
+            .get("files_changed")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        out.push_str(&format!(
+            "{time} {} {pair} ({files} {}) {}\n",
+            printable(str_field(entry, "kind")),
+            if files == 1 { "file" } else { "files" },
+            printable(str_field(entry, "status")),
+        ));
+    }
+    out
+}
+
 // ---- link.preview_refactor / link.apply_refactor ----------------------
 
 /// `link refactor` preview rendering: a diff-style list of every

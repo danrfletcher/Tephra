@@ -641,3 +641,52 @@ impl BlockBackend for UnsupportedBlockIds {
         ))
     }
 }
+
+/// `fix.list` (G18), and the one non-RPC call the server makes after a
+/// `source.rescan`: pending fixes are retried then (G9). Behind a trait
+/// for the same reason as [`BlockBackend`].
+pub trait FixBackend: Send + Sync {
+    /// The fix log, newest first: the entries logged at or after
+    /// `since` (epoch seconds), at most `limit` of them. The caller has
+    /// already validated and clamped both.
+    fn list(
+        &self,
+        since: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<crate::fixes::FixEntryWire>, String>;
+
+    /// `source` was just rescanned: retry its pending fixes. Has no
+    /// answer to give; a failure is logged, never raised to the caller
+    /// of `source.rescan`.
+    fn after_rescan(&self, _source: &str) {}
+}
+
+impl FixBackend for crate::fixes::FixEngine {
+    fn list(
+        &self,
+        since: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<crate::fixes::FixEntryWire>, String> {
+        crate::fixes::FixEngine::list(self, since, limit).map_err(|e| e.to_string())
+    }
+
+    fn after_rescan(&self, source: &str) {
+        if let Err(e) = crate::fixes::FixEngine::after_rescan(self, source) {
+            tracing::warn!(source, error = %e, "retrying pending fixes after a rescan failed");
+        }
+    }
+}
+
+/// A [`FixBackend`] that always refuses, for fixtures that never read
+/// the fix log.
+pub struct UnsupportedFixes;
+
+impl FixBackend for UnsupportedFixes {
+    fn list(
+        &self,
+        _since: Option<i64>,
+        _limit: usize,
+    ) -> Result<Vec<crate::fixes::FixEntryWire>, String> {
+        Err("fix log backend not configured for this test fixture".to_string())
+    }
+}

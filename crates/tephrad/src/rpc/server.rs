@@ -30,7 +30,8 @@ use tokio::sync::{broadcast, watch, Notify};
 
 use crate::rpc::auth::{self, Authenticated};
 use crate::rpc::backend::{
-    BlockBackend, GraphBackend, GraphRefresh, RefactorBackend, SourceBackend, UnsupportedBlockIds,
+    BlockBackend, FixBackend, GraphBackend, GraphRefresh, RefactorBackend, SourceBackend,
+    UnsupportedBlockIds, UnsupportedFixes,
 };
 use crate::rpc::dispatch::{self, Backends};
 use crate::rpc::protocol;
@@ -159,6 +160,11 @@ pub struct AppState {
     /// request; production (and the tests of that verb) set the real
     /// one with [`AppState::with_blocks`].
     pub blocks: Arc<dyn BlockBackend>,
+    /// `fix.list`'s backend, and the retry of pending fixes after a
+    /// `source.rescan`. Defaults to one that refuses every request;
+    /// production (and the tests of that verb) set the real one with
+    /// [`AppState::with_fixes`].
+    pub fixes: Arc<dyn FixBackend>,
     events_tx: broadcast::Sender<Value>,
     /// `Some` only in production (`main.rs`'s real `SharedGraph`-backed
     /// wiring); `None` in every test that uses a canned/mocked
@@ -209,6 +215,7 @@ impl AppState {
             sources,
             refactor,
             blocks: Arc::new(UnsupportedBlockIds),
+            fixes: Arc::new(UnsupportedFixes),
             events_tx,
             graph_refresh,
             shutdown_rx,
@@ -219,6 +226,12 @@ impl AppState {
     /// Replaces the `block.ensure_id` backend.
     pub fn with_blocks(mut self, blocks: Arc<dyn BlockBackend>) -> Self {
         self.blocks = blocks;
+        self
+    }
+
+    /// Replaces the `fix.list` backend.
+    pub fn with_fixes(mut self, fixes: Arc<dyn FixBackend>) -> Self {
+        self.fixes = fixes;
         self
     }
 
@@ -310,6 +323,7 @@ async fn handle_single_request(proof: Authenticated, raw: Value, state: Arc<AppS
     let sources = state.sources.clone();
     let refactor = state.refactor.clone();
     let blocks = state.blocks.clone();
+    let fixes = state.fixes.clone();
     let refresh = state.graph_refresh.clone();
     let method = req.method.clone();
     let params = req.params.clone();
@@ -320,6 +334,7 @@ async fn handle_single_request(proof: Authenticated, raw: Value, state: Arc<AppS
             sources: sources.as_ref(),
             refactor: refactor.as_ref(),
             blocks: blocks.as_ref(),
+            fixes: fixes.as_ref(),
         };
         let result = dispatch::dispatch(&proof, &method, &params, &backends);
         if result.is_ok() && MUTATING_SOURCE_METHODS.contains(&method.as_str()) {
@@ -331,6 +346,13 @@ async fn handle_single_request(proof: Authenticated, raw: Value, state: Arc<AppS
                         "failed to refresh the in-memory graph after a source mutation"
                     );
                 }
+            }
+        }
+        // G9: a successful `source.rescan` is a trigger to retry the
+        // pending fixes of that source.
+        if result.is_ok() && method == "source.rescan" {
+            if let Some(source) = params.get("name").and_then(Value::as_str) {
+                fixes.after_rescan(source);
             }
         }
         result

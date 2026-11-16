@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 
 use crate::cli::{BlockTarget, Command, InFileSearchScope};
 use crate::render;
+use crate::since::Since;
 use crate::transport::{RpcCallError, RpcClient};
 
 /// Everything `execute` produced: what to print to stdout/stderr and
@@ -107,6 +108,7 @@ pub fn execute_with_prompt_writer<R: BufRead, W: Write>(
         Command::SearchAllBlocks { query, limit } => search_all_blocks(query, *limit, json, client),
         Command::BlockId { unit, target } => block_id(unit, target, json, client),
         Command::Backlinks { id } => backlinks(id, json, client),
+        Command::Fixes { since } => fixes(*since, json, client),
         Command::LinkResolve {
             target,
             default_source,
@@ -357,6 +359,27 @@ fn backlinks(id: &str, json: bool, client: &RpcClient) -> CommandOutcome {
         }
         Err(e) => CommandOutcome::err(describe_error(&e)),
     }
+}
+
+/// `fixes`: `fix.list {since?}`, one request, read-only. `since` is
+/// worked out from the clock here (epoch seconds, as the verb takes).
+/// No `limit` is sent: the daemon's default (50, newest first) applies.
+fn fixes(since: Option<Since>, json: bool, client: &RpcClient) -> CommandOutcome {
+    let mut params = json!({});
+    if let Some(since) = since {
+        params["since"] = json!(since.epoch(now_epoch()));
+    }
+    match client.call("fix.list", params) {
+        Ok(result) => CommandOutcome::ok(json_or(&result, || render::render_fixes(&result), json)),
+        Err(e) => CommandOutcome::err(describe_error(&e)),
+    }
+}
+
+fn now_epoch() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn link_resolve(

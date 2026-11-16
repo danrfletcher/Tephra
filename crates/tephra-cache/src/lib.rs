@@ -14,9 +14,11 @@
 //! typed helpers exposed here.
 
 mod cache;
+mod fix_log;
 mod fts;
 mod in_file;
 mod listing;
+mod pending_fixes;
 mod schema;
 mod search;
 mod sources;
@@ -25,12 +27,16 @@ mod units;
 use std::fmt;
 
 pub use cache::{Cache, FaultInjector};
+pub use fix_log::{FixLogChange, FixLogRow, NewFixLog, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT};
 pub use fts::{
     make_snippet, BlockHit, NewFtsRow, FTS_ROWS_PER_UNIT, MAX_RANK_CANDIDATES, MIN_TRIGRAM_CHARS,
 };
 pub use in_file::{InFileCandidate, InFileScope};
 pub use listing::{
     compare_entries, compare_names, FolderEntry, FolderListing, FolderState, FOLDER_KIND,
+};
+pub use pending_fixes::{
+    NewPendingFix, PendingFixRow, PendingOp, STATE_NEEDS_MANUAL_FIX, STATE_PENDING,
 };
 pub use schema::KindInferrer;
 pub use search::{compare_hits, file_stem, resolve_title, NameCandidate, NameHit, NAME_SEARCH_SQL};
