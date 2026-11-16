@@ -514,3 +514,148 @@ mod block_resolution {
         ));
     }
 }
+
+// ---------------------------------------------------------------
+// Shortest unique target (the rename fix's G8/E19 rule)
+// ---------------------------------------------------------------
+
+/// What each case in [`shortest_unique_target_cases`] expects: the
+/// target text for the unit `renamed` in source `notes`.
+struct Shortest {
+    name: &'static str,
+    /// Every unit of `notes` after the rename, the renamed one included.
+    units: &'static [&'static str],
+    /// The renamed unit (a member of `units`).
+    renamed: &'static str,
+    /// The link text to write for it.
+    want: &'static str,
+}
+
+const SHORTEST: &[Shortest] = &[
+    Shortest {
+        name: "a unique name stays bare (no needless path)",
+        units: &["Plan.md", "Weekly Review.md"],
+        renamed: "Plan.md",
+        want: "Plan",
+    },
+    Shortest {
+        name: "a unique name in a folder stays bare",
+        units: &["Archive/Plan.md", "Weekly Review.md"],
+        renamed: "Archive/Plan.md",
+        want: "Plan",
+    },
+    Shortest {
+        name: "E19: a/Plan.md and b/Plan.md tie, so the full stem",
+        units: &["a/Plan.md", "b/Plan.md"],
+        renamed: "a/Plan.md",
+        want: "a/Plan",
+    },
+    Shortest {
+        name: "E19: the other one of the tie gets its own stem",
+        units: &["a/Plan.md", "b/Plan.md"],
+        renamed: "b/Plan.md",
+        want: "b/Plan",
+    },
+    Shortest {
+        name: "E19: a shorter stem exists (root Plan.md beats Archive/Plan.md)",
+        units: &["Plan.md", "Archive/Plan.md"],
+        renamed: "Archive/Plan.md",
+        want: "Archive/Plan",
+    },
+    Shortest {
+        name: "the root file keeps its bare name when a deeper one shares it",
+        units: &["Plan.md", "Archive/Plan.md"],
+        renamed: "Plan.md",
+        want: "Plan",
+    },
+    Shortest {
+        name: "a longer tie-mate deeper down does not matter: the winner stays bare",
+        units: &["a/Plan.md", "b/c/Plan.md"],
+        renamed: "a/Plan.md",
+        want: "Plan",
+    },
+    Shortest {
+        name: "the loser of that comparison gets its full stem",
+        units: &["a/Plan.md", "b/c/Plan.md"],
+        renamed: "b/c/Plan.md",
+        want: "b/c/Plan",
+    },
+    Shortest {
+        name: "the extension of a Markdown file is not part of the target",
+        units: &["Notes/Plan.markdown", "Plan.md"],
+        renamed: "Notes/Plan.markdown",
+        want: "Notes/Plan",
+    },
+    Shortest {
+        name: "a non-Markdown file is named with its extension",
+        units: &["docs/plan.txt", "Plan.md"],
+        renamed: "docs/plan.txt",
+        want: "plan.txt",
+    },
+    Shortest {
+        name: "case differs: Plan and plan are different names, so bare is unique",
+        units: &["Plan.md", "Archive/plan.md"],
+        renamed: "Archive/plan.md",
+        want: "plan",
+    },
+    Shortest {
+        name: "Unicode: an NFD file name is found by its NFC spelling",
+        units: &["cafe\u{301} notes.md", "Other.md"],
+        renamed: "cafe\u{301} notes.md",
+        want: "cafe\u{301} notes",
+    },
+];
+
+#[test]
+fn shortest_unique_target_cases() {
+    for case in SHORTEST {
+        let mut graph = UnitGraph::new();
+        graph.register_source("notes");
+        for rel in case.units {
+            graph.upsert_unit("notes", rel, empty_facts());
+        }
+        let id = format!("@notes:{}", case.renamed);
+        let got = graph
+            .shortest_unique_target(&id)
+            .unwrap_or_else(|| panic!("{}: unit not in graph", case.name));
+        assert_eq!(got, case.want, "{}", case.name);
+
+        // The round trip: the written target, as a link written in the
+        // unit's own source and as one with the `@notes:` prefix, must
+        // resolve to the renamed unit and to nothing else.
+        for link in [got.clone(), format!("@notes:{got}")] {
+            let from_other = link.starts_with('@');
+            let resolved = graph
+                .resolve_link(&link, if from_other { None } else { Some("notes") })
+                .unwrap_or_else(|e| panic!("{}: {link:?} did not resolve: {e}", case.name));
+            assert_eq!(
+                resolved.unit.id, id,
+                "{}: {link:?} must resolve to the renamed unit",
+                case.name
+            );
+        }
+    }
+}
+
+#[test]
+fn a_name_that_exists_only_in_another_source_does_not_force_a_path() {
+    // E19: `Plan.md` in `other` is not in `notes`'s scope, so the bare
+    // name still reaches the renamed file.
+    let mut graph = UnitGraph::new();
+    graph.register_source("notes");
+    graph.register_source("other");
+    graph.upsert_unit("notes", "Archive/Plan.md", empty_facts());
+    graph.upsert_unit("other", "Plan.md", empty_facts());
+    assert_eq!(
+        graph.shortest_unique_target("@notes:Archive/Plan.md"),
+        Some("Plan".to_string())
+    );
+}
+
+#[test]
+fn shortest_unique_target_of_a_unit_that_is_not_in_the_graph_is_none() {
+    let mut graph = UnitGraph::new();
+    graph.upsert_unit("notes", "Plan.md", empty_facts());
+    assert_eq!(graph.shortest_unique_target("@notes:Missing.md"), None);
+    assert_eq!(graph.shortest_unique_target("not an id"), None);
+}

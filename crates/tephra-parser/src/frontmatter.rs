@@ -33,6 +33,56 @@ pub struct Frontmatter {
     pub start_line: usize,
     /// 1-indexed line number of the closing `---`.
     pub end_line: usize,
+    /// Absolute byte offset of `raw`'s first byte within the original
+    /// file content, a leading BOM and the opening `---` line (with its
+    /// own line ending) included. What a link found in `raw` adds to its
+    /// own offset to get an exact span in the file. Not part of the
+    /// serialized form.
+    #[serde(skip)]
+    pub raw_start_byte: usize,
+}
+
+/// Byte ranges of `raw` that are YAML comments (`# ...` to the end of
+/// the line, the `#` at the start of the line or after whitespace and
+/// outside a quoted scalar). A link-looking text inside one is not a
+/// property value, so it is not a link.
+pub(crate) fn comment_ranges(raw: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut line_start = 0usize;
+    for line in raw.split_inclusive('\n') {
+        let mut quote: Option<char> = None;
+        let mut prev: Option<char> = None;
+        let mut escaped = false;
+        for (i, c) in line.char_indices() {
+            match quote {
+                Some(q) => {
+                    if q == '"' && escaped {
+                        escaped = false;
+                    } else if q == '"' && c == '\\' {
+                        escaped = true;
+                    } else if c == q {
+                        quote = None;
+                    }
+                }
+                None => {
+                    // A quote opens a quoted scalar only where a value
+                    // can start, so the apostrophe in `don't` does not.
+                    let opens = matches!(c, '"' | '\'')
+                        && prev.is_none_or(|p| p.is_whitespace() || "[{,:-".contains(p));
+                    if opens {
+                        quote = Some(c);
+                    } else if c == '#' && prev.is_none_or(|p| p.is_whitespace()) {
+                        let end = line.trim_end_matches(['\n', '\r']).len();
+                        out.push((line_start + i, line_start + end.max(i)));
+                        break;
+                    }
+                }
+            }
+            prev = Some(c);
+        }
+        line_start += line.len();
+    }
+    out
 }
 
 /// Splits `content` into an optional frontmatter block plus the
@@ -152,6 +202,7 @@ pub(crate) fn extract<'a>(
             json,
             start_line,
             end_line,
+            raw_start_byte: bom_len + first_line_end + 1,
         }),
         body,
         body_start_line,

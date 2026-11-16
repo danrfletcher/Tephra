@@ -138,12 +138,57 @@ pub fn compute_changes(
     old_path: &str,
     new_path: &str,
 ) -> Vec<LinkChange> {
+    compute_changes_impl(edges, file_contents, old_path, new_path, None)
+}
+
+/// [`compute_changes`] for the automatic fix after a rename
+/// ([`crate::fix::fix_rename`]), which differs in two ways:
+///
+/// - Only wikilink edges are rewritten. A plain Markdown link
+///   (`[text](Old.md)`) is never touched by the fix; only the manual
+///   `link.apply_refactor` rewrites those (F7).
+/// - A bare wikilink target is written as the new file name only when
+///   `bare_resolves` is `true` (the caller asked the graph whether that
+///   bare name reaches the renamed file). Otherwise it is written as the
+///   full source-relative stem, the shortest form that does. A target
+///   already written with a `/` always gets the full new stem.
+pub fn compute_fix_changes(
+    edges: &[Edge],
+    file_contents: &HashMap<String, String>,
+    old_path: &str,
+    new_path: &str,
+    bare_resolves: bool,
+) -> Vec<LinkChange> {
+    compute_changes_impl(
+        edges,
+        file_contents,
+        old_path,
+        new_path,
+        Some(bare_resolves),
+    )
+}
+
+/// The one body behind [`compute_changes`] and [`compute_fix_changes`].
+/// `fix` is `None` for the manual refactor (every kind, a bare target
+/// always rewritten to the new basename) and `Some(bare_resolves)` for
+/// the automatic fix.
+fn compute_changes_impl(
+    edges: &[Edge],
+    file_contents: &HashMap<String, String>,
+    old_path: &str,
+    new_path: &str,
+    fix: Option<bool>,
+) -> Vec<LinkChange> {
     if old_path == new_path {
         return Vec::new();
     }
+    let bare_ok = fix.unwrap_or(true);
     let mut seen: HashSet<(String, String, String)> = HashSet::new();
     let mut out = Vec::new();
     for edge in edges {
+        if fix.is_some() && edge.kind.as_str() != tephra_parser::LINK_KIND_WIKILINK {
+            continue;
+        }
         let Some(content) = file_contents.get(&edge.from) else {
             continue;
         };
@@ -155,7 +200,7 @@ pub fn compute_changes(
             continue;
         }
         let new_raw = if edge.kind.as_str() == tephra_parser::LINK_KIND_WIKILINK {
-            rewrite_wikilink_raw(&edge.to_raw, new_path)
+            rewrite_wikilink_raw(&edge.to_raw, new_path, bare_ok)
         } else {
             rewrite_markdown_raw(&edge.from, &edge.to_raw, new_path)
         };
@@ -199,7 +244,7 @@ fn locate_and_diff(
     old_raw: &str,
     new_raw: &str,
 ) -> Vec<LinkChange> {
-    let parsed = tephra_parser::parse_unit(Path::new(file_id), content);
+    let parsed = parse_for_links(file_id, content);
     let mut out = Vec::new();
     if kind == tephra_parser::LINK_KIND_WIKILINK {
         for w in &parsed.wikilinks {
@@ -271,6 +316,22 @@ fn locate_and_diff(
         }
     }
     out
+}
+
+/// Parses `content` the way the scan did when it indexed the file, so
+/// the spans found here are the ones the cache's edges came from: a
+/// code file (by its name, or its `#!` line) through
+/// `parse_code_unit`, which reports only links inside comments, and
+/// every other file as Markdown/prose. Parsing a `.rs` or `.py` file as
+/// Markdown would report a `[[...]]` inside a string literal as a link
+/// and rewrite it.
+fn parse_for_links(file_id: &str, content: &str) -> tephra_parser::ParsedUnit {
+    let rel = split_federated_id(file_id).map_or(file_id, |(_, rel)| rel);
+    let file_name = rel.rsplit('/').next().unwrap_or(rel);
+    match crate::file_kind::language_for(file_name, content.as_bytes()) {
+        Some(lang) => tephra_parser::parse_code_unit(Path::new(file_id), lang, content),
+        None => tephra_parser::parse_unit(Path::new(file_id), content),
+    }
 }
 
 /// Builds the exact raw replacement text for one markdown-link
@@ -393,12 +454,12 @@ fn is_safe_bare_destination(path: &str) -> bool {
 /// to rewrite, and this should not occur for an edge this function is
 /// ever called with (such a link never resolves to a *different*
 /// unit), but is handled rather than panicking.
-fn rewrite_wikilink_raw(to_raw: &str, new_path: &str) -> Option<String> {
+fn rewrite_wikilink_raw(to_raw: &str, new_path: &str, bare_ok: bool) -> Option<String> {
     let w = tephra_parser::parse_wikilink_inner(to_raw);
     if w.target.is_empty() {
         return None;
     }
-    let new_target = rewrite_target_component(&w.target, new_path);
+    let new_target = rewrite_target_component(&w.target, new_path, bare_ok);
     let mut out = String::new();
     if let Some(prefix) = &w.source_prefix {
         out.push('@');
@@ -425,13 +486,26 @@ fn rewrite_wikilink_raw(to_raw: &str, new_path: &str) -> Option<String> {
 /// original included a `.md`/`.markdown` extension (a rename never
 /// adds or removes the extension convention the user originally
 /// typed).
-fn rewrite_target_component(target: &str, new_path: &str) -> String {
+///
+/// `bare_ok` is whether the basename still resolves to the renamed
+/// file. When it does not (the automatic fix asked the graph), a bare
+/// target also becomes the full stem, the shortest form that resolves.
+/// A target typed in Unicode NFC stays NFC even when the new path is
+/// spelled NFD on disk (macOS), so the fix does not change how the
+/// name looks in the user's bytes; the resolver compares both forms
+/// as equal either way.
+fn rewrite_target_component(target: &str, new_path: &str, bare_ok: bool) -> String {
     let (_, ext) = strip_md_ext(target);
     let (new_stem, _) = strip_md_ext(new_path);
-    let core = if target.contains('/') {
+    let core = if target.contains('/') || !bare_ok {
         new_stem.to_string()
     } else {
         basename(new_stem).to_string()
+    };
+    let core = if unicode_normalization::is_nfc(target) {
+        unicode_normalization::UnicodeNormalization::nfc(core.chars()).collect()
+    } else {
+        core
     };
     match ext {
         Some(e) => format!("{core}{e}"),
@@ -2661,7 +2735,7 @@ mod tests {
         ];
         for (target, new_path, expected) in cases {
             assert_eq!(
-                rewrite_target_component(target, new_path),
+                rewrite_target_component(target, new_path, true),
                 expected,
                 "{target:?} -> {new_path:?}"
             );
@@ -2815,5 +2889,147 @@ mod tests {
             percent_decode(&reparsed.markdown_links[0].target),
             "../café—v3"
         );
+    }
+
+    // --- compute_fix_changes (the automatic fix's variant) ---------------
+
+    /// One in-memory referring file for the fix tests below.
+    fn one_file(id: &str, content: &str) -> HashMap<String, String> {
+        HashMap::from([(id.to_string(), content.to_string())])
+    }
+
+    /// Applies `changes` to `content`, as the writer does.
+    fn applied(content: &str, changes: &[LinkChange]) -> String {
+        let refs: Vec<&LinkChange> = changes.iter().collect();
+        apply_changes_to_content(content, &refs).expect("spans match")
+    }
+
+    #[test]
+    fn fix_changes_are_per_kind_wikilinks_are_rewritten_and_markdown_links_are_not() {
+        let from = "@notes:Ref.md";
+        let content = "w [[Old]] m [t](Old.md) e ![[Old|a]]\n";
+        let edges = vec![
+            edge(from, "@notes:New.md", "Old", "wikilink"),
+            edge(from, "@notes:New.md", "Old|a", "wikilink"),
+            edge(from, "@notes:New.md", "Old.md", "markdown"),
+        ];
+        let files = one_file(from, content);
+
+        let fix = compute_fix_changes(&edges, &files, "Old.md", "New.md", true);
+        let kinds: Vec<(&str, &str)> = fix
+            .iter()
+            .map(|c| (c.before.as_str(), c.after.as_str()))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![("[[Old]]", "[[New]]"), ("[[Old|a]]", "[[New|a]]")],
+            "no markdown change, the embed's `!` is outside its span"
+        );
+        assert_eq!(
+            applied(content, &fix),
+            "w [[New]] m [t](Old.md) e ![[New|a]]\n"
+        );
+
+        // The manual refactor, with the same edges, still rewrites the
+        // markdown link too.
+        let manual = compute_changes(&edges, &files, "Old.md", "New.md");
+        assert_eq!(manual.len(), 3, "{manual:?}");
+        assert_eq!(
+            applied(content, &manual),
+            "w [[New]] m [t](New.md) e ![[New|a]]\n"
+        );
+    }
+
+    #[test]
+    fn fix_changes_write_the_full_stem_for_a_bare_link_only_when_the_bare_name_does_not_resolve() {
+        let from = "@notes:Ref.md";
+        let content = "[[Old]] [[Old.md]] [[@notes:Old#^k3f9a2]] [[dir/Old]]\n";
+        let edges = vec![
+            edge(from, "@notes:a/New.md", "Old", "wikilink"),
+            edge(from, "@notes:a/New.md", "Old.md", "wikilink"),
+            edge(from, "@notes:a/New.md", "@notes:Old#^k3f9a2", "wikilink"),
+            edge(from, "@notes:a/New.md", "dir/Old", "wikilink"),
+        ];
+        let files = one_file(from, content);
+
+        let bare = compute_fix_changes(&edges, &files, "dir/Old.md", "a/New.md", true);
+        assert_eq!(
+            applied(content, &bare),
+            "[[New]] [[New.md]] [[@notes:New#^k3f9a2]] [[a/New]]\n",
+            "a bare link stays bare, a path link gets the full stem"
+        );
+        let qualified = compute_fix_changes(&edges, &files, "dir/Old.md", "a/New.md", false);
+        assert_eq!(
+            applied(content, &qualified),
+            "[[a/New]] [[a/New.md]] [[@notes:a/New#^k3f9a2]] [[a/New]]\n",
+            "extension, prefix and anchor are kept, every target is the full stem"
+        );
+    }
+
+    #[test]
+    fn fix_changes_leave_a_nfc_target_nfc_when_the_new_path_is_nfd() {
+        let from = "@notes:Ref.md";
+        let content = "[[caf\u{e9} old]]\n";
+        let edges = vec![edge(from, "@notes:x.md", "caf\u{e9} old", "wikilink")];
+        let changes = compute_fix_changes(
+            &edges,
+            &one_file(from, content),
+            "cafe\u{301} old.md",
+            "cafe\u{301} new.md",
+            true,
+        );
+        assert_eq!(applied(content, &changes), "[[caf\u{e9} new]]\n");
+    }
+
+    #[test]
+    fn fix_changes_in_frontmatter_have_exact_spans() {
+        let from = "@notes:Ref.md";
+        let content = "---\nup: [[Old]]\nlist:\n  - \"[[Old|a]]\"\n# [[Old]]\n---\nbody\n";
+        let edges = vec![
+            edge(from, "@notes:New.md", "Old", "wikilink"),
+            edge(from, "@notes:New.md", "Old|a", "wikilink"),
+        ];
+        let changes =
+            compute_fix_changes(&edges, &one_file(from, content), "Old.md", "New.md", true);
+        assert_eq!(changes.len(), 2, "{changes:?}");
+        for c in &changes {
+            assert_eq!(&content[c.byte_start..c.byte_end], c.before);
+        }
+        assert_eq!(
+            applied(content, &changes),
+            "---\nup: [[New]]\nlist:\n  - \"[[New|a]]\"\n# [[Old]]\n---\nbody\n",
+            "the YAML comment is not a link"
+        );
+    }
+
+    #[test]
+    fn a_code_file_is_parsed_as_code_so_only_a_comment_link_gets_a_change() {
+        let from = "@notes:tool.py";
+        let content = "# see [[Old]]\nDECOY = \"[[Old]]\"\n";
+        let edges = vec![edge(from, "@notes:New.md", "Old", "wikilink")];
+        let changes = compute_changes(&edges, &one_file(from, content), "Old.md", "New.md");
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert_eq!(
+            applied(content, &changes),
+            "# see [[New]]\nDECOY = \"[[Old]]\"\n"
+        );
+        // The same text in a prose file would find both.
+        let prose = compute_changes(
+            &[edge("@notes:tool.md", "@notes:New.md", "Old", "wikilink")],
+            &one_file("@notes:tool.md", content),
+            "Old.md",
+            "New.md",
+        );
+        assert_eq!(prose.len(), 2);
+    }
+
+    #[test]
+    fn a_shebang_script_with_no_extension_is_parsed_as_code() {
+        let from = "@notes:bin/run";
+        let content = "#!/usr/bin/env python3\n# see [[Old]]\nx = \"[[Old]]\"\n";
+        let edges = vec![edge(from, "@notes:New.md", "Old", "wikilink")];
+        let changes = compute_changes(&edges, &one_file(from, content), "Old.md", "New.md");
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert_eq!(changes[0].line, 2);
     }
 }

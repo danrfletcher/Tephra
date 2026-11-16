@@ -559,6 +559,80 @@ pub(crate) fn resolve_edge_target(
     }
 }
 
+/// The shortest wikilink target that resolves to the unit `id`, written
+/// the way a user would type it (no extension for a Markdown file, the
+/// file's own case): the bare name when [`resolve_in_scope`] maps it to
+/// `id`, otherwise the full source-relative stem. Nothing in between is
+/// tried: the resolver matches a bare name or a full stem and does no
+/// suffix matching. `None` when `id` is not in the graph.
+///
+/// Every target this returns resolves, through [`resolve_in_scope`] in
+/// the unit's own source, to `id` (checked by the round trip in
+/// `tests/unit/resolver.rs`). A full stem that two units share (`Plan.md`
+/// and `Plan.markdown` in one folder) cannot be told apart by any link
+/// text, so for those the stem is returned and does not resolve uniquely.
+pub(crate) fn shortest_unique_target(graph: &crate::UnitGraph, id: &str) -> Option<String> {
+    let facts = graph.nodes.get(id)?;
+    let stem = strip_markdown_extension(&facts.rel_path);
+    let base = basename_of(stem);
+    let key = normalize_key(base);
+    match resolve_in_scope(&graph.index(), &facts.source, &key, true) {
+        ResolveOutcome::Unique(found) if found == id => Some(base.to_string()),
+        _ => Some(stem.to_string()),
+    }
+}
+
+/// Whether a wikilink whose normalized match key is `key` (in scope
+/// `source`) resolved to the file at `old_rel_path` *before* it was
+/// renamed to `new_id`, judged from the graph as it is after the rename.
+///
+/// It replays [`resolve_in_scope`]'s rule on the pre-rename file set:
+/// the candidates now indexed under `key` (a full stem when `key`
+/// contains `/`, else a basename), without `new_id` (that is the old
+/// file under its new name), plus the old file when its stem (or
+/// basename) is `key`. The old file won when it has the one shortest
+/// stem; a tie with another file means the link was ambiguous and never
+/// resolved to it.
+pub(crate) fn old_path_won_before_rename(
+    graph: &crate::UnitGraph,
+    source: &str,
+    old_rel_path: &str,
+    new_id: &str,
+    key: &str,
+) -> bool {
+    let old_stem = normalize_key(strip_markdown_extension(old_rel_path));
+    let by_stem = key.contains('/');
+    let old_matches = if by_stem {
+        old_stem == key
+    } else {
+        basename_of(&old_stem) == key
+    };
+    if !old_matches {
+        return false;
+    }
+    let index = if by_stem {
+        &graph.stem_index
+    } else {
+        &graph.basename_index
+    };
+    let old_len = old_stem.chars().count();
+    let others = index
+        .get(source)
+        .and_then(|m| m.get(key))
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
+    others
+        .iter()
+        .filter(|id| id.as_str() != new_id)
+        .filter_map(|id| graph.nodes.get(id))
+        .all(|facts| {
+            normalize_key(strip_markdown_extension(&facts.rel_path))
+                .chars()
+                .count()
+                > old_len
+        })
+}
+
 /// Strips one optional surrounding `[[`/`]]` pair from `raw`, so
 /// [`crate::UnitGraph::resolve_link`] accepts both the full wikilink
 /// syntax GP5's example uses (`"[[@atlas-repo:README]]"`) and the bare

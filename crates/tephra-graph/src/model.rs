@@ -489,6 +489,83 @@ impl UnitGraph {
         out
     }
 
+    /// Every wikilink a rename of `old_id` to `new_id` (both in this
+    /// graph's *after* state: `old_id` is no longer a unit, `new_id` is)
+    /// has to look at: [`UnitGraph::get_backlinks_all`] for `old_id`
+    /// (links that now dangle, or are still recorded against `old_id`),
+    /// plus the links that named the old file before the rename but now
+    /// resolve to a *different* unit. The second kind exists because the
+    /// rename can hand a bare name over to another file: with
+    /// `Training Plan.md` and `Archive/Training Plan.md`, `[[Training
+    /// Plan]]` reached the root file; once the root file is renamed it
+    /// resolves, uniquely, to the archive one and never dangles, so no
+    /// backlink lookup by `old_id` finds it.
+    ///
+    /// Those are found through [`UnitGraph::match_index`] under the old
+    /// stem and basename, and kept only when the old file would have won
+    /// the resolver's choice before the rename (see
+    /// `resolver::old_path_won_before_rename`): a link that already
+    /// pointed at the other file is not a link to the renamed one. Only
+    /// wikilinks; a Markdown link is matched by exact path and never
+    /// falls back to a basename. A link that now resolves to `new_id`
+    /// is already right and is left out.
+    pub fn get_rename_backlinks(&self, old_id: &str, new_id: &str) -> Vec<Edge> {
+        let mut out = self.get_backlinks_all(old_id);
+        if self.nodes.contains_key(old_id) {
+            return out;
+        }
+        let Some((source, rel_path)) = parse_federated_id(old_id) else {
+            return out;
+        };
+        let stem = normalize_key(strip_markdown_extension(rel_path));
+        let basename = basename_of(&stem).to_string();
+        let mut keys = vec![stem.clone()];
+        if basename != stem {
+            keys.push(basename);
+        }
+        let mut idxs: Vec<usize> = Vec::new();
+        for key in &keys {
+            let Some(slots) = self.match_index.get(&(source.to_string(), key.clone())) else {
+                continue;
+            };
+            for &i in slots {
+                let Some(edge) = self.edges[i].as_ref() else {
+                    continue;
+                };
+                let EdgeTarget::Resolved(target) = &edge.to else {
+                    continue;
+                };
+                if edge.kind != tephra_parser::LINK_KIND_WIKILINK
+                    || target == old_id
+                    || target == new_id
+                {
+                    continue;
+                }
+                if crate::resolver::old_path_won_before_rename(self, source, rel_path, new_id, key)
+                {
+                    idxs.push(i);
+                }
+            }
+        }
+        idxs.sort_unstable();
+        idxs.dedup();
+        out.extend(idxs.iter().filter_map(|&i| self.edges[i].clone()));
+        out.sort_by(edge_sort_key);
+        out
+    }
+
+    /// The shortest wikilink target text that resolves to unit `id`
+    /// (for a link written in that unit's own source, or with its
+    /// `@source:` prefix): the bare file name when the resolver maps it
+    /// to `id`, else the full source-relative path without a Markdown
+    /// extension. `None` when `id` is not a unit in the graph. A
+    /// rename fix writes this where the old bare name would no longer
+    /// reach the renamed file (another file shares the name, or a
+    /// shorter path wins the tie-break).
+    pub fn shortest_unique_target(&self, id: &str) -> Option<String> {
+        crate::resolver::shortest_unique_target(self, id)
+    }
+
     /// The raw, not-yet-deduplicated edge set [`UnitGraph::get_backlinks`]
     /// and [`UnitGraph::get_backlinks_all`] both start from. For a
     /// block id, the edges anchored on that block that resolve to it

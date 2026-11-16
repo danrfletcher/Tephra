@@ -367,13 +367,19 @@ fn parse_markdown(path: &Path, content: &str) -> ParsedUnit {
         frontmatter::extract(content, &mut diagnostics);
 
     let pass = markdown_pass::run(body, body_start_line, body_start_byte, &mut diagnostics);
-    let (wikilinks, wikilink_spans) = wikilinks::scan(
+    let (mut wikilinks, wikilink_spans) = wikilinks::scan(
         body,
         body_start_line,
         body_start_byte,
         &pass.excluded_ranges,
         &mut diagnostics,
     );
+    // Links in frontmatter properties come first, in file order.
+    if let Some(fm) = &frontmatter {
+        let mut all = wikilinks::scan_frontmatter(fm);
+        all.append(&mut wikilinks);
+        wikilinks = all;
+    }
     let tags = tags::scan(
         body,
         body_start_line,

@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use tephra_cache::Cache;
 use tephra_graph::{Edge, EdgeTarget, UnitGraph};
+use tephrad::fix::{fix_rename, FixStatus};
 use tephrad::registry::SourceRegistry;
 
 /// Polls `check` until it is true or `timeout` passes (the pattern in
@@ -505,5 +506,51 @@ fn a_file_flipping_between_prose_and_code_is_reparsed_by_the_new_kind() {
     );
     assert!(backlinks(&w.cache_path, id).is_empty());
     let _ = &w.vault;
+    w.finish();
+}
+
+// ------------------------------------------------- the rename fix (G7)
+
+#[test]
+fn g7_a_rename_fix_rewrites_the_comment_link_in_a_code_file_and_leaves_the_string_decoy_alone() {
+    let original = concat!(
+        "// see [[@notes:Tephra test]]\n",
+        "fn walk_and_write() {}\n",
+        "const DECOY: &str = \"[[@notes:Tephra test]]\";\n",
+        "const OTHER: &str = \"[[@notes:Decoy]]\";\n",
+    );
+    let w = world(|repo| repo.write(SCAN_RS, original));
+    let abs = w.repo.root().join(SCAN_RS);
+
+    // Rename the note on disk, then index it as the watcher will.
+    std::fs::rename(
+        w.vault.root().join("Tephra test.md"),
+        w.vault.root().join("Tephra renamed.md"),
+    )
+    .unwrap();
+    w.registry.rescan("notes").expect("rescan notes");
+
+    let result = fix_rename(
+        &graph(&w.cache_path),
+        &w.registry,
+        "notes",
+        "Tephra test.md",
+        "Tephra renamed.md",
+    )
+    .expect("fix_rename");
+
+    assert_eq!(result.files_changed, 1, "{result:?}");
+    assert_eq!(result.files[0].file, scan_unit());
+    assert_eq!(result.files[0].status, FixStatus::Changed);
+    // Only the comment changed; both string literals are byte for byte.
+    assert_eq!(
+        std::fs::read_to_string(&abs).unwrap(),
+        concat!(
+            "// see [[@notes:Tephra renamed]]\n",
+            "fn walk_and_write() {}\n",
+            "const DECOY: &str = \"[[@notes:Tephra test]]\";\n",
+            "const OTHER: &str = \"[[@notes:Decoy]]\";\n",
+        )
+    );
     w.finish();
 }

@@ -13,6 +13,7 @@ pub mod block_id;
 pub mod dup_ids;
 pub mod file_kind;
 pub mod file_lock;
+pub mod fix;
 pub mod ignore;
 pub mod refactor;
 pub mod registry;
