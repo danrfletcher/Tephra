@@ -34,6 +34,11 @@
 //!   lock, and the real file reads/writes and source-root lookups
 //!   preview/apply need.
 //!
+//! - [`fix_write`] — the automatic fix's per-file writer. It shares
+//!   [`compute_changes`], [`apply_changes_to_content`], [`AtomicFs`],
+//!   this engine's apply lock ([`RefactorEngine::writer_gate`]) and the
+//!   per-file lock, but not [`RefactorEngine`]'s preview/apply flow.
+//!
 //! Does not implement link *resolution* (PR-5's `tephra_graph`) or
 //! ambiguous-path tie-breaking (also PR-5) — this module only ever
 //! rewrites a link whose `to_raw`/`kind` the graph already told it
@@ -53,6 +58,8 @@ use tephra_graph::Edge;
 use crate::registry::SourceRegistry;
 use crate::rpc::backend::{GraphBackend, SourceBackend};
 use crate::watcher;
+
+pub mod fix_write;
 
 // ---------------------------------------------------------------
 // Pure diff computation
@@ -1079,10 +1086,19 @@ pub struct RefactorEngine {
     sources: std::sync::Arc<dyn SourceBackend>,
     watcher: std::sync::Arc<dyn WatcherPauseControl>,
     previews: Mutex<HashMap<(String, String, String), StoredPreview>>,
-    apply_lock: Mutex<()>,
+    apply_lock: std::sync::Arc<Mutex<()>>,
 }
 
 impl RefactorEngine {
+    /// The lock `apply` holds for its whole body, shared so the
+    /// automatic fix's per-file writer ([`fix_write::FixWriter`]) takes
+    /// the very same one: a fix and a `link.apply_refactor` never write
+    /// at the same time. Lock order everywhere is this gate first, then
+    /// the file's [`crate::file_lock`].
+    pub fn writer_gate(&self) -> std::sync::Arc<Mutex<()>> {
+        std::sync::Arc::clone(&self.apply_lock)
+    }
+
     pub fn new(
         graph: std::sync::Arc<dyn GraphBackend>,
         sources: std::sync::Arc<dyn SourceBackend>,
@@ -1093,7 +1109,7 @@ impl RefactorEngine {
             sources,
             watcher,
             previews: Mutex::new(HashMap::new()),
-            apply_lock: Mutex::new(()),
+            apply_lock: std::sync::Arc::new(Mutex::new(())),
         }
     }
 
