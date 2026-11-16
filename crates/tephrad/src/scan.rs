@@ -389,6 +389,54 @@ fn metadata_mtime(metadata: &fs::Metadata) -> Option<i64> {
     Some(since_epoch.as_secs() as i64)
 }
 
+/// What a scan records about a file besides its parse: the SHA-256 of
+/// its bytes and its identity on disk (inode and volume), the two facts
+/// a rename can later be recognised by. Read from the local filesystem
+/// only (`std::fs` metadata and the file's own bytes).
+///
+/// The hash is `None` for a file over [`MAX_INDEXED_BYTES`] (identity
+/// only, never read) and for one whose bytes could not be read. The
+/// identity is `None` on a platform with no inode and device numbers
+/// (anything not Unix).
+#[derive(Debug, Default)]
+struct ContentStamp {
+    hash: Option<String>,
+    inode: Option<u64>,
+    device: Option<u64>,
+}
+
+impl ContentStamp {
+    /// The identity half, from a `stat` of the file.
+    #[cfg(unix)]
+    fn of(metadata: &fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        ContentStamp {
+            hash: None,
+            inode: Some(metadata.ino()),
+            device: Some(metadata.dev()),
+        }
+    }
+
+    /// No inode or device number to read: identity stays `None`.
+    #[cfg(not(unix))]
+    fn of(_metadata: &fs::Metadata) -> Self {
+        ContentStamp::default()
+    }
+
+    /// The hash half: SHA-256 of the file's raw bytes, with no text
+    /// conversion, so a non-UTF-8 file and a binary hash like any other.
+    /// For a UTF-8 file this is the parser's `ParsedUnit::content_hash`.
+    fn set_hash(&mut self, bytes: &[u8]) {
+        self.hash = Some(tephra_parser::content_hash_bytes(bytes));
+    }
+
+    fn apply<'a>(&'a self, unit: &mut NewUnit<'a>) {
+        unit.hash = self.hash.as_deref();
+        unit.inode = self.inode;
+        unit.device = self.device;
+    }
+}
+
 /// Reads at most `MAX_INDEXED_BYTES + 1` bytes of `path`: enough to
 /// tell a file that grew past the cap after its `metadata()` check
 /// without ever holding more than the cap in memory.
@@ -510,6 +558,10 @@ fn write_unit(
     let mtime = metadata_mtime(&metadata);
     let mut size = metadata.len();
     let mut too_large = size > MAX_INDEXED_BYTES;
+    // The file's identity (inode and volume) comes from the same `stat`
+    // as its size, so it is there even for a file over the cap. The hash
+    // is filled in below, from the bytes each branch reads.
+    let mut stamp = ContentStamp::of(&metadata);
 
     // The kind comes from the name and the first 8 KB, for a too-large
     // file too (G7: it keeps its real kind). `read_head` is bounded, so
@@ -546,6 +598,7 @@ fn write_unit(
             // Grew past the cap between the stat and the read.
             too_large = true;
         } else {
+            stamp.set_hash(&bytes);
             parsed_doc = parse_document(abs_path, &bytes);
         }
     }
@@ -572,6 +625,7 @@ fn write_unit(
             // Grew past the cap between the stat and the read.
             too_large = true;
         } else {
+            stamp.set_hash(&bytes);
             match parse_file(kind, abs_path, file_name, &head, &bytes) {
                 Ok(Some((unit, rows))) => {
                     // G19: an ID the file had in the cache that an
@@ -656,13 +710,37 @@ fn write_unit(
                 size = bytes.len() as u64;
                 if size > MAX_INDEXED_BYTES {
                     too_large = true;
-                } else if let Some(text) = text_of(&bytes) {
-                    index_rows = tephra_parser::text_other_rows(&text);
+                } else {
+                    stamp.set_hash(&bytes);
+                    if let Some(text) = text_of(&bytes) {
+                        index_rows = tephra_parser::text_other_rows(&text);
+                    }
                 }
             }
             Err(e) => {
                 tracing::warn!(path = %abs_path.display(), error = %e, "failed to read file during scan; skipping");
                 return Ok(None);
+            }
+        }
+    }
+    if !too_large && stamp.hash.is_none() {
+        // No branch above read this file (a binary: it is indexed by
+        // name only, so nothing parsed it). Read it for its hash alone. A
+        // prose or code file found not to be UTF-8 was hashed already,
+        // from the bytes it was read as. A read that fails costs the hash
+        // and nothing else: the file is still indexed by name.
+        match read_capped(abs_path) {
+            Ok(bytes) if bytes.len() as u64 > MAX_INDEXED_BYTES => {
+                // Grew past the cap between the stat and the read.
+                size = bytes.len() as u64;
+                too_large = true;
+            }
+            Ok(bytes) => {
+                size = bytes.len() as u64;
+                stamp.set_hash(&bytes);
+            }
+            Err(e) => {
+                tracing::warn!(path = %abs_path.display(), error = %e, "failed to read file for its content hash; indexed without one");
             }
         }
     }
@@ -689,7 +767,8 @@ fn write_unit(
     };
 
     if let Some(doc) = &parsed_doc {
-        return write_document(cache, source_id, &rel_path, mtime, size, doc, stats).map(Some);
+        return write_document(cache, source_id, &rel_path, mtime, size, &stamp, doc, stats)
+            .map(Some);
     }
 
     let Some(parsed) = parsed else {
@@ -701,6 +780,9 @@ fn write_unit(
             kind: kind.as_str(),
             size: Some(size as i64),
             too_large,
+            hash: stamp.hash.as_deref(),
+            inode: stamp.inode,
+            device: stamp.device,
         })?;
         insert_index_rows(cache, unit_id, &index_rows)?;
         return Ok(Some(stats));
@@ -736,6 +818,7 @@ fn write_unit(
     // `to_new_unit` says `prose`; a code unit says `code`.
     new_unit.kind = kind.as_str();
     new_unit.size = Some(size as i64);
+    stamp.apply(&mut new_unit);
     let unit_id = cache.insert_unit(&new_unit)?;
 
     for link in parsed.to_new_links(unit_id) {
@@ -843,18 +926,21 @@ fn parse_document(abs_path: &Path, bytes: &[u8]) -> Option<tephra_parser::Parsed
 /// `line` is the page, slide or paragraph number. They also go into the
 /// `^^` index (G10) with that place and their position within it.
 /// Nothing is written to the document itself (F4).
+#[allow(clippy::too_many_arguments)]
 fn write_document(
     cache: &Cache,
     source_id: i64,
     rel_path: &str,
     mtime: Option<i64>,
     size: u64,
+    stamp: &ContentStamp,
     doc: &tephra_parser::ParsedDocument,
     mut stats: ScanStats,
 ) -> Result<ScanStats, ScanError> {
     let mut new_unit = doc.to_new_unit(source_id, rel_path, mtime);
     new_unit.kind = FileKind::Document.as_str();
     new_unit.size = Some(size as i64);
+    stamp.apply(&mut new_unit);
     let unit_id = cache.insert_unit(&new_unit)?;
     for link in doc.to_new_links(unit_id) {
         cache.insert_link(&link)?;

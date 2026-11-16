@@ -162,6 +162,9 @@ fn seed_units_with_rows(cache: &Cache, source_id: i64, count: usize, label: &str
                 rel_path: &rel_path,
                 mtime: Some(0),
                 frontmatter_json: None,
+                hash: None,
+                inode: None,
+                device: None,
             })
             .expect("insert_unit");
         cache

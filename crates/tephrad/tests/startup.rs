@@ -406,7 +406,12 @@ fn older_schema_cache_logs_the_rebuild_with_both_versions() {
     let lines = process.captured_stderr_lines();
     let rebuild_idx = lines
         .iter()
-        .position(|l| l.contains("schema rebuilt from v1 to v2"))
+        .position(|l| {
+            l.contains(&format!(
+                "schema rebuilt from v1 to v{}",
+                tephra_cache::CURRENT_SCHEMA_VERSION
+            ))
+        })
         .unwrap_or_else(|| panic!("no rebuild log line in: {lines:?}"));
     let ready_idx = lines
         .iter()
@@ -421,7 +426,7 @@ fn older_schema_cache_logs_the_rebuild_with_both_versions() {
     let v: i64 = conn
         .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(v, 2);
+    assert_eq!(v, tephra_cache::CURRENT_SCHEMA_VERSION);
 }
 
 /// A current-version cache logs no rebuild line.

@@ -460,6 +460,9 @@ fn a_cache_without_links_line_is_rebuilt_and_offline_links_keep_a_null_line() {
                 rel_path: "a.md",
                 mtime: Some(1),
                 frontmatter_json: None,
+                hash: None,
+                inode: None,
+                device: None,
             })
             .unwrap();
         cache

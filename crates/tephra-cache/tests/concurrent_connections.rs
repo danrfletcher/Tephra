@@ -28,6 +28,9 @@ fn a_reader_can_read_while_a_writer_holds_a_transaction_open() {
             rel_path: "committed.md",
             mtime: None,
             frontmatter_json: None,
+            hash: None,
+            inode: None,
+            device: None,
         })
         .expect("insert committed unit");
 
@@ -107,6 +110,9 @@ fn a_writer_with_a_short_busy_timeout_does_not_get_sqlite_busy_against_a_concurr
         rel_path: "written-while-reader-open.md",
         mtime: None,
         frontmatter_json: None,
+        hash: None,
+        inode: None,
+        device: None,
     });
     assert!(
         result.is_ok(),

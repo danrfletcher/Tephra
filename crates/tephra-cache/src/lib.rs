@@ -2,7 +2,8 @@
 //!
 //! Owns `cache.db` (WAL mode), its schema (`sources`, `units`, `links`,
 //! `tags`, `blocks`, `headings`, `symbols`, the `block_fts` FTS5 index,
-//! `scan_state`, `schema_version`), the single drop-and-rebuild
+//! `scan_state`, `schema_version`, and the durable `fix_log`,
+//! `pending_fixes` and `promoted_roots`), the single drop-and-rebuild
 //! path triggered by a schema-version mismatch (F2 — no migration
 //! scripts), and per-source status bookkeeping
 //! (`active`/`stale`/`offline`) so an unmounted or offline source's
@@ -43,8 +44,8 @@ pub use units::{
 /// constant is the *only* way the on-disk schema ever changes shape:
 /// on next open, [`Cache::open`] compares the stored `schema_version`
 /// row against this value and, on mismatch, drops and recreates
-/// every core table (never `sources`, `schema_version` or
-/// `scan_state`) — see [`Cache::rebuild`]. There is no
+/// every core table (never `sources`, `schema_version`,
+/// `scan_state`, `fix_log`, `pending_fixes` or `promoted_roots`) — see [`Cache::rebuild`]. There is no
 /// migration-file mechanism or version-ladder anywhere in this crate
 /// (F2).
 ///
@@ -55,7 +56,14 @@ pub use units::{
 /// index. Builds of v2 before the last two have another table shape
 /// at the same version number; the open path spots that and rebuilds
 /// (see `schema::core_shape_is_stale`).
-pub const CURRENT_SCHEMA_VERSION: i64 = 2;
+///
+/// Version 3 added `units.hash` (SHA-256 of the file's bytes),
+/// `units.inode` and `units.device` (the file's identity on disk), and
+/// the durable `fix_log`, `pending_fixes` and `promoted_roots` tables,
+/// which a rebuild never drops. The first start after the upgrade
+/// rebuilds the core tables and rescans every source, filling the hashes
+/// and identities.
+pub const CURRENT_SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug)]
 pub enum CacheError {

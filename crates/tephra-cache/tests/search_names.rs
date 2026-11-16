@@ -26,6 +26,9 @@ fn add(
             kind,
             size: Some(10),
             too_large: false,
+            hash: None,
+            inode: None,
+            device: None,
         })
         .expect("insert_unit")
 }
@@ -169,6 +172,9 @@ fn every_indexed_kind_is_a_candidate_including_a_too_large_file() {
             kind: "binary",
             size: Some(30_000_000),
             too_large: true,
+            hash: None,
+            inode: None,
+            device: None,
         })
         .unwrap();
 

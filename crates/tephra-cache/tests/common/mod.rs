@@ -47,6 +47,9 @@ pub fn seed_source_with_units(
                 rel_path,
                 mtime: Some(1_700_000_000),
                 frontmatter_json: frontmatter,
+                hash: None,
+                inode: None,
+                device: None,
             })
             .expect("insert_unit");
 
@@ -144,4 +147,151 @@ pub fn write_v1_cache(db_path: &std::path::Path) {
         INSERT INTO blocks (id, unit_id, block_id, line) VALUES (1, 1, 'abcd1234', 7);",
     )
     .expect("seed v1 db");
+}
+
+/// Writes a real schema-v2 `cache.db` at `db_path` — the exact DDL the
+/// v2 build created, before `units.hash`/`inode`/`device` and the
+/// durable `fix_log`/`pending_fixes`/`promoted_roots` tables existed —
+/// so a test can open it with the v3 build. Built like
+/// [`write_v1_cache`]. Two sources: `offline-notes` (status `offline`,
+/// two units, one link/tag/block on the first) and `online-repo`
+/// (status `active`, one unit), each with a finished `scan_state` row.
+/// The ids are fixed (sources 1 and 2, units 1, 2 and 3).
+pub fn write_v2_cache(db_path: &std::path::Path) {
+    let conn = rusqlite::Connection::open(db_path).expect("open raw v2 db");
+    conn.execute_batch(
+        "CREATE TABLE sources (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            path TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('active', 'stale', 'offline')),
+            last_scanned_at INTEGER
+        );
+        CREATE TABLE schema_version (version INTEGER NOT NULL);
+        INSERT INTO schema_version (version) VALUES (2);
+        CREATE TABLE scan_state (
+            source_id INTEGER PRIMARY KEY REFERENCES sources(id),
+            started_at INTEGER NOT NULL,
+            finished_at INTEGER
+        );
+        CREATE TABLE units (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_id INTEGER NOT NULL REFERENCES sources(id),
+            rel_path TEXT NOT NULL,
+            mtime INTEGER,
+            frontmatter_json TEXT,
+            kind TEXT NOT NULL CHECK (kind IN ('prose','code','document','text-other','binary')),
+            size INTEGER,
+            too_large INTEGER NOT NULL DEFAULT 0,
+            needs_rescan INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(source_id, rel_path)
+        );
+        CREATE TABLE links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            from_unit_id INTEGER NOT NULL REFERENCES units(id),
+            to_raw TEXT NOT NULL,
+            to_unit_id INTEGER REFERENCES units(id),
+            kind TEXT NOT NULL,
+            line INTEGER
+        );
+        CREATE TABLE tags (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            unit_id INTEGER NOT NULL REFERENCES units(id),
+            tag TEXT NOT NULL
+        );
+        CREATE TABLE symbols (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            unit_id INTEGER NOT NULL REFERENCES units(id),
+            kind TEXT NOT NULL,
+            name TEXT NOT NULL,
+            parent TEXT,
+            line INTEGER NOT NULL,
+            start_line INTEGER NOT NULL,
+            end_line INTEGER NOT NULL
+        );
+        CREATE TABLE blocks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            unit_id INTEGER NOT NULL REFERENCES units(id),
+            block_id TEXT,
+            line INTEGER NOT NULL,
+            end_line INTEGER,
+            symbol_id INTEGER REFERENCES symbols(id)
+        );
+        CREATE TABLE headings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            unit_id INTEGER NOT NULL REFERENCES units(id),
+            level INTEGER NOT NULL,
+            text TEXT NOT NULL,
+            line INTEGER NOT NULL
+        );
+        CREATE VIRTUAL TABLE block_fts USING fts5(
+            unit_id UNINDEXED, line UNINDEXED, kind UNINDEXED, block_id UNINDEXED,
+            name UNINDEXED, label UNINDEXED, place UNINDEXED, place_n UNINDEXED,
+            idx UNINDEXED, text, tokenize = 'trigram'
+        );
+        CREATE TABLE block_names (
+            fts_rowid INTEGER PRIMARY KEY,
+            name_lower TEXT NOT NULL
+        );
+        INSERT INTO sources (id, name, path, status, last_scanned_at)
+            VALUES (1, 'offline-notes', '/gone/notes', 'offline', 1700000000),
+                   (2, 'online-repo', '/here/repo', 'active', 1700000000);
+        INSERT INTO scan_state (source_id, started_at, finished_at)
+            VALUES (1, 1700000000, 1700000005), (2, 1700000000, 1700000006);
+        INSERT INTO units (id, source_id, rel_path, mtime, frontmatter_json, kind, size,
+                           too_large, needs_rescan)
+            VALUES (1, 1, 'Café notes.md', 1700000001, '{\"title\":\"One\"}', 'prose', 120, 0, 0),
+                   (2, 1, 'src/main.RS', 1700000002, NULL, 'code', 40, 0, 0),
+                   (3, 2, 'README.md', 1700000003, NULL, 'prose', 80, 0, 0);
+        INSERT INTO links (id, from_unit_id, to_raw, to_unit_id, kind, line)
+            VALUES (1, 1, '[[Other]]', 2, 'wikilink', 3);
+        INSERT INTO tags (id, unit_id, tag) VALUES (1, 1, 'kept');
+        INSERT INTO blocks (id, unit_id, block_id, line) VALUES (1, 1, 'abcd1234', 7);",
+    )
+    .expect("seed v2 db");
+}
+
+/// Every row of `table` (`SELECT *`, by the first column) as raw SQLite values, so a
+/// test can compare a table before and after and mean "byte for byte".
+pub fn dump_table(conn: &rusqlite::Connection, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
+    let mut stmt = conn
+        .prepare(&format!("SELECT * FROM {table} ORDER BY 1"))
+        .expect("prepare dump");
+    let cols = stmt.column_count();
+    let rows = stmt
+        .query_map([], |r| {
+            (0..cols)
+                .map(|i| r.get::<_, rusqlite::types::Value>(i))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .expect("dump rows");
+    rows.map(|r| r.expect("row")).collect()
+}
+
+/// The three durable tables, in the order [`seed_durable_rows`] fills them.
+pub const DURABLE_TABLES: [&str; 3] = ["fix_log", "pending_fixes", "promoted_roots"];
+
+/// Puts two rows in each durable table (`fix_log`, `pending_fixes`,
+/// `promoted_roots`), naming sources (`notes`, `repo`) that may or may
+/// not be registered. Non-ASCII and empty-string values are included on
+/// purpose.
+pub fn seed_durable_rows(conn: &rusqlite::Connection) {
+    conn.execute_batch(
+        "INSERT INTO fix_log (created_at, kind, status, old_source, old_path, new_source,
+                              new_path, files_changed, detail_json)
+            VALUES (1700000100, 'rename', 'applied', 'notes', 'Training Plan.md', 'notes',
+                    'Plan.md', 3, '[{\"file\":\"Goals.md\",\"status\":\"applied\"}]'),
+                   (1700000200, 'uncertain', 'uncertain', 'repo', 'Café—old.md', NULL, NULL, 0,
+                    NULL);
+         INSERT INTO pending_fixes (fix_id, source, file_path, old_source, old_path, new_source,
+                                    new_path, state, reason, attempts, created_at, updated_at)
+            VALUES (1, 'notes', 'Weekly Review.md', 'notes', 'Training Plan.md', 'notes',
+                    'Plan.md', 'pending', 'changed', 2, 1700000100, 1700000150),
+                   (NULL, 'repo', 'docs/a.md', NULL, 'x.md', NULL, 'y.md', 'pending', NULL, 0,
+                    1700000300, 1700000300);
+         INSERT INTO promoted_roots (parent, rel_path, source, created_at)
+            VALUES ('repo', 'crates/tephrad', 'tephrad', 1700000400),
+                   ('notes', 'Ideas', 'ideas', 1700000500);",
+    )
+    .expect("seed durable rows");
 }

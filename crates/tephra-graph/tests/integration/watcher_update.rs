@@ -216,6 +216,9 @@ fn applying_one_edit_in_a_large_source_recomputes_in_roughly_constant_time_not_p
                     rel_path: &rel_path,
                     mtime: None,
                     frontmatter_json: None,
+                    hash: None,
+                    inode: None,
+                    device: None,
                 })
                 .expect("insert unit");
             for k in 1..=5 {
@@ -261,6 +264,9 @@ fn applying_one_edit_in_a_large_source_recomputes_in_roughly_constant_time_not_p
                 rel_path: "Unit0.md",
                 mtime: None,
                 frontmatter_json: None,
+                hash: None,
+                inode: None,
+                device: None,
             })
             .expect("re-insert unit");
         for k in 1..=5 {
@@ -334,6 +340,9 @@ fn applying_one_edit_does_not_grow_linearly_with_total_graph_size() {
                     rel_path: &rel_path,
                     mtime: None,
                     frontmatter_json: None,
+                    hash: None,
+                    inode: None,
+                    device: None,
                 })
                 .expect("insert unit");
             for k in 1..=5 {
@@ -375,6 +384,9 @@ fn applying_one_edit_does_not_grow_linearly_with_total_graph_size() {
                 rel_path: "Unit0.md",
                 mtime: None,
                 frontmatter_json: None,
+                hash: None,
+                inode: None,
+                device: None,
             })
             .expect("re-insert unit");
         for k in 1..=5 {

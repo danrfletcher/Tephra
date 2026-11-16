@@ -64,6 +64,7 @@ pub use documents::{
     DocumentError, DocumentFormat, ParsedDocument, MAX_PART_BYTES,
 };
 pub use frontmatter::Frontmatter;
+pub use hash::content_hash_bytes;
 pub use index::{text_other_rows, IndexRow, MAX_ROW_CHARS};
 pub use markdown_pass::{Heading, MarkdownLink};
 pub use prose::ProseFormat;
@@ -145,7 +146,11 @@ pub struct ParsedUnit {
 impl ParsedUnit {
     /// This unit's row for `tephra-cache`'s `units` table, given the
     /// `source_id`, vault/repo-relative path, and mtime a caller
-    /// resolves separately (none of which this crate knows).
+    /// resolves separately (none of which this crate knows). `hash`,
+    /// `inode` and `device` are `None`: the hash is of the file's raw
+    /// bytes (which can differ from `content_hash` for a UTF-16 file
+    /// that was decoded first) and the identity comes from `stat`, so
+    /// the scan fills them in.
     pub fn to_new_unit<'a>(
         &'a self,
         source_id: i64,
@@ -163,6 +168,9 @@ impl ParsedUnit {
             kind: "prose",
             size: None,
             too_large: false,
+            hash: None,
+            inode: None,
+            device: None,
         }
     }
 

@@ -183,6 +183,9 @@ fn rewriting_a_unit_leaves_exactly_its_new_rows_no_duplicates() {
             kind: "prose",
             size: Some(10),
             too_large: false,
+            hash: None,
+            inode: None,
+            device: None,
         })
         .unwrap();
     cache.insert_fts_rows(new, &[row("fresh")]).unwrap();
@@ -235,6 +238,9 @@ fn delete_units_under_prefix_removes_the_rows_of_those_units_only() {
                 kind: "prose",
                 size: Some(1),
                 too_large: false,
+                hash: None,
+                inode: None,
+                device: None,
             })
             .unwrap();
         cache.insert_fts_rows(id, &[row("inside")]).unwrap();
@@ -358,6 +364,9 @@ fn a_populated_index_or_an_empty_cache_or_only_unindexable_files_do_not_flag_any
                     kind,
                     size: Some(size),
                     too_large,
+                    hash: None,
+                    inode: None,
+                    device: None,
                 })
                 .unwrap();
         }
@@ -430,6 +439,9 @@ fn block_names_follows_a_prefix_delete_and_a_rebuild() {
             kind: "prose",
             size: Some(1),
             too_large: false,
+            hash: None,
+            inode: None,
+            device: None,
         })
         .unwrap();
     cache
@@ -464,7 +476,10 @@ fn a_cache_with_block_fts_but_no_block_names_is_rebuilt_so_exact_names_are_found
             .unwrap();
     }
     let cache = Cache::open(&db).unwrap();
-    assert_eq!(cache.rebuilt_from_version(), Some(2));
+    assert_eq!(
+        cache.rebuilt_from_version(),
+        Some(tephra_cache::CURRENT_SCHEMA_VERSION)
+    );
     assert_eq!(names_count(&cache), 0);
     assert_eq!(fts_count(&cache), 0);
     // The source is flagged for a rescan, which refills both.

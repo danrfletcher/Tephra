@@ -350,7 +350,8 @@ impl Cache {
 
     /// Row count for one of the fixed internal table names (`sources`,
     /// `units`, `links`, `tags`, `blocks`, `schema_version`,
-    /// `headings`, `symbols`, `block_fts`, `scan_state`). `table`
+    /// `headings`, `symbols`, `block_fts`, `scan_state`, and the durable
+    /// `fix_log`, `pending_fixes`, `promoted_roots`). `table`
     /// is checked against that closed allow-list and rejected with
     /// [`CacheError::InvalidTableName`] for anything else — this
     /// method is `pub` (tests and a future RPC layer call it), so the
@@ -426,6 +427,23 @@ impl Cache {
         rel_path: &str,
     ) -> Result<Option<UnitRow>, CacheError> {
         units::get_unit_by_rel_path(&self.conn, source_id, rel_path)
+    }
+
+    /// Every row, in every source, whose content hash is `hash` (lower-case
+    /// hex SHA-256 of the file's bytes), ordered by source then path. Rows
+    /// of every source come back, not just one; two files with the same
+    /// bytes (an empty pair included) both do. Files over the size cap
+    /// have no hash and are never found here.
+    pub fn units_by_hash(&self, hash: &str) -> Result<Vec<UnitRow>, CacheError> {
+        units::units_by_hash(&self.conn, hash)
+    }
+
+    /// Every row whose stored file identity is `(device, inode)`, found
+    /// by identity alone: the path and the source play no part. A rename
+    /// keeps its identity, so this is how a vanished row's file is
+    /// recognised at its new path. More than one row only for hard links.
+    pub fn units_by_identity(&self, device: u64, inode: u64) -> Result<Vec<UnitRow>, CacheError> {
+        units::units_by_identity(&self.conn, device, inode)
     }
 
     /// Deletes one `units` row and its cascading `links`/`tags`/

@@ -103,6 +103,15 @@ fn injected_failure_mid_rebuild_leaves_every_v2_table_and_row_intact() {
     }
     cache.mark_scan_started(seeded.source_id).unwrap();
     cache.mark_scan_finished(seeded.source_id).unwrap();
+    // v3: the durable tables hold rows, and a unit has a hash and identity.
+    common::seed_durable_rows(cache.connection());
+    cache
+        .connection()
+        .execute(
+            "UPDATE units SET hash = 'abc', inode = 5, device = 6 WHERE id = ?1",
+            [unit],
+        )
+        .unwrap();
 
     let result = cache.rebuild(&FaultInjector {
         fail_after_drop: true,
@@ -122,9 +131,18 @@ fn injected_failure_mid_rebuild_leaves_every_v2_table_and_row_intact() {
         ("symbols", 1),
         ("block_fts", 1),
         ("scan_state", 1),
+        ("fix_log", 2),
+        ("pending_fixes", 2),
+        ("promoted_roots", 2),
     ] {
         assert_eq!(cache.table_row_count(table).unwrap(), rows, "{table}");
     }
+    let row = cache.get_unit(unit).unwrap().unwrap();
+    assert_eq!(
+        (row.hash.as_deref(), row.inode, row.device),
+        (Some("abc"), Some(5), Some(6)),
+        "the rolled-back units table still has its v3 columns and values"
+    );
     let hit: i64 = cache
         .connection()
         .query_row(

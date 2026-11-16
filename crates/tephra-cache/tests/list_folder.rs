@@ -42,6 +42,9 @@ fn seed(cache: &Cache, name: &str, status: SourceStatus, units: &[Seed]) -> Vec<
                     kind: u.kind,
                     size: u.size,
                     too_large: false,
+                    hash: None,
+                    inode: None,
+                    device: None,
                 })
                 .expect("insert_unit")
         })
@@ -181,6 +184,9 @@ fn recursive_listing_of_a_subfolder_stays_inside_it() {
             kind: "code",
             size: Some(1),
             too_large: false,
+            hash: None,
+            inode: None,
+            device: None,
         })
         .unwrap();
     cache
@@ -192,6 +198,9 @@ fn recursive_listing_of_a_subfolder_stays_inside_it() {
             kind: "prose",
             size: Some(1),
             too_large: false,
+            hash: None,
+            inode: None,
+            device: None,
         })
         .unwrap();
 
@@ -522,6 +531,9 @@ fn a_read_only_connection_lists_and_cannot_write() {
             kind: "code",
             size: Some(1),
             too_large: false,
+            hash: None,
+            inode: None,
+            device: None,
         })
         .unwrap();
     assert_eq!(
