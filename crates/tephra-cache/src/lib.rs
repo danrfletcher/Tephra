@@ -27,7 +27,9 @@ mod units;
 use std::fmt;
 
 pub use cache::{Cache, FaultInjector};
-pub use fix_log::{FixLogChange, FixLogRow, NewFixLog, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT};
+pub use fix_log::{
+    FixLogChange, FixLogRow, FixLogSummary, NewFixLog, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT,
+};
 pub use fts::{
     make_snippet, BlockHit, NewFtsRow, FTS_ROWS_PER_UNIT, MAX_RANK_CANDIDATES, MIN_TRIGRAM_CHARS,
 };

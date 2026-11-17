@@ -26,7 +26,7 @@ use tephrad::refactor::fix_write::{FixWriter, Sleeper};
 use tephrad::refactor::{AtomicFs, RealFs, RefactorEngine};
 use tephrad::registry::SourceRegistry;
 use tephrad::rpc::backend::{
-    GraphBackend, GraphRefresh, RefactorBackend, SharedGraph, SourceBackend,
+    FixService, GraphBackend, GraphRefresh, RefactorBackend, SharedGraph, SourceBackend,
 };
 use tephrad::rpc::server::{build_router, AppState};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -113,6 +113,8 @@ pub struct Daemon {
     pub cache_path: PathBuf,
     pub registry: Arc<SourceRegistry>,
     pub engine: Arc<FixEngine>,
+    /// What the server answers `fix.list` and `link.rename_event` with.
+    pub service: Arc<FixService>,
     pub shared: Arc<SharedGraph>,
     pub state: Arc<AppState>,
     pub addr: SocketAddr,
@@ -200,13 +202,17 @@ impl Daemon {
             registry.clone() as Arc<dyn SourceBackend>,
             registry.clone() as Arc<dyn tephrad::refactor::WatcherPauseControl>,
         ));
-        let state = Arc::new(AppState::new(
-            token_path,
-            shared.clone() as Arc<dyn GraphBackend>,
-            registry.clone() as Arc<dyn SourceBackend>,
-            refactor as Arc<dyn RefactorBackend>,
-            Some(refresh),
-        ));
+        let service = Arc::new(FixService::new(engine.clone(), registry.clone()));
+        let state = Arc::new(
+            AppState::new(
+                token_path,
+                shared.clone() as Arc<dyn GraphBackend>,
+                registry.clone() as Arc<dyn SourceBackend>,
+                refactor as Arc<dyn RefactorBackend>,
+                Some(refresh),
+            )
+            .with_fixes(service.clone()),
+        );
 
         let rt = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
@@ -236,6 +242,7 @@ impl Daemon {
             cache_path,
             registry,
             engine,
+            service,
             shared,
             state,
             addr,
@@ -327,6 +334,22 @@ impl Daemon {
         self.registry.rescan("notes").expect("rescan");
     }
 
+    /// `link.rename_event` for `old` to `new` in `notes`, called on the
+    /// service directly (no socket), as the RPC handler calls it.
+    pub fn event(
+        &self,
+        old: &str,
+        new: &str,
+    ) -> Result<tephrad::fixes::event::RenameEventWire, tephrad::fixes::event::RenameEventError>
+    {
+        use tephrad::rpc::backend::FixBackend;
+        let root = self.notes_root();
+        self.service.rename_event(
+            &root.join(old).display().to_string(),
+            &root.join(new).display().to_string(),
+        )
+    }
+
     pub fn text(&self, rel: &str) -> String {
         std::fs::read_to_string(self.notes.root().join(rel)).expect("read notes file")
     }
@@ -394,6 +417,24 @@ impl Client {
             let (frame, _) = self.frame(WAIT).expect("a reply");
             if frame.get("id") == Some(&json!(id)) {
                 return frame["result"].clone();
+            }
+            self.backlog.push_back(frame);
+        }
+    }
+
+    /// Calls `method` and returns the whole reply frame (`result` or
+    /// `error`).
+    pub fn call(&mut self, method: &str, params: Value) -> Value {
+        let id = self.next_id;
+        self.next_id += 1;
+        let body = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        self.rt
+            .block_on(self.ws.send(Message::Text(body.to_string().into())))
+            .expect("send");
+        loop {
+            let (frame, _) = self.frame(WAIT).expect("a reply");
+            if frame.get("id") == Some(&json!(id)) {
+                return frame;
             }
             self.backlog.push_back(frame);
         }

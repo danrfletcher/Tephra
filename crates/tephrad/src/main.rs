@@ -473,7 +473,10 @@ fn run_server(
             .with_blocks(Arc::new(tephrad::block_id::BlockIdEngine::new(
                 registry.clone(),
             )))
-            .with_fixes(fix_engine.clone()),
+            .with_fixes(Arc::new(tephrad::rpc::backend::FixService::new(
+                fix_engine.clone(),
+                registry.clone(),
+            ))),
         );
 
         // Forwards every `DaemonEvent` the registry's watchers/rescans

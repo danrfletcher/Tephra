@@ -211,9 +211,10 @@ fn unknown_method_returns_method_not_found() {
 
 /// The closed set: the ten verbs before the file-types ticket, then
 /// `unit.list` (PR-3.F1), `unit.search` (PR-8.F1) and `block.ensure_id`
-/// (PR-11.F1), then `fix.list` (atlas-25 PR-5, G18). Adding a method
+/// (PR-11.F1), then `fix.list` (atlas-25 PR-5, G18) and `link.rename_event`
+/// (atlas-25 PR-8, G3). Adding a method
 /// means changing this list on purpose.
-const EXPECTED_METHODS: [&str; 14] = [
+const EXPECTED_METHODS: [&str; 15] = [
     "unit.resolve_link",
     "graph.get_backlinks",
     "graph.get_forward_links",
@@ -228,10 +229,11 @@ const EXPECTED_METHODS: [&str; 14] = [
     "unit.search",
     "block.ensure_id",
     "fix.list",
+    "link.rename_event",
 ];
 
 #[test]
-fn method_table_is_exactly_the_fourteen_named_verbs() {
+fn method_table_is_exactly_the_fifteen_named_verbs() {
     assert_eq!(METHOD_NAMES, EXPECTED_METHODS);
     // No duplicates either.
     let mut sorted = METHOD_NAMES.to_vec();

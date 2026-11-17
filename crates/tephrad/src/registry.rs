@@ -1357,14 +1357,47 @@ impl SourceRegistry {
         source: &str,
         abs_path: &Path,
     ) -> Result<Vec<PathBuf>, RegistryError> {
+        self.reindex_paths(source, &[abs_path.to_path_buf()])
+    }
+
+    /// Brings the cache up to date with `paths` of `source` (files or
+    /// folders, still there or gone) in one batch, as a watcher batch
+    /// does, and announces nothing: the paths upserted or deleted, for a
+    /// caller that announces them itself. What `link.rename_event` uses
+    /// so the graph it fixes from already shows the rename.
+    pub fn reindex_paths(
+        &self,
+        source: &str,
+        paths: &[PathBuf],
+    ) -> Result<Vec<PathBuf>, RegistryError> {
         let cache = Cache::open(&self.cache_path)?;
         let row = cache
             .get_source(source)?
             .ok_or_else(|| RegistryError::NotFound(source.to_string()))?;
         let root = PathBuf::from(&row.path);
         let ignore_rules = IgnoreRules::load(&root)?;
-        let changed: HashSet<PathBuf> = HashSet::from([abs_path.to_path_buf()]);
+        let changed: HashSet<PathBuf> = paths.iter().cloned().collect();
         Ok(scan::apply_change_batch(&cache, row.id, &root, &changed, &ignore_rules)?.changed_paths)
+    }
+
+    /// Drops the cached rows of the files at `rels` (source-relative,
+    /// exactly as spelled) and of everything below them. For a name the
+    /// disk no longer has but still answers to: on a case-insensitive
+    /// disk `Plan.md` stats fine after a rename to `plan.md`, so
+    /// [`SourceRegistry::reindex_paths`] would index the old spelling
+    /// again instead of removing it.
+    pub fn forget_spellings(&self, source: &str, rels: &[String]) -> Result<(), RegistryError> {
+        let cache = Cache::open(&self.cache_path)?;
+        let row = cache
+            .get_source(source)?
+            .ok_or_else(|| RegistryError::NotFound(source.to_string()))?;
+        for rel in rels {
+            if let Some(unit) = cache.get_unit_by_rel_path(row.id, rel)? {
+                cache.delete_unit(unit.id)?;
+            }
+            cache.delete_units_under_prefix(row.id, rel)?;
+        }
+        Ok(())
     }
 }
 

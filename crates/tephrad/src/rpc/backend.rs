@@ -659,6 +659,59 @@ pub trait FixBackend: Send + Sync {
     /// answer to give; a failure is logged, never raised to the caller
     /// of `source.rescan`.
     fn after_rescan(&self, _source: &str) {}
+
+    /// `link.rename_event` (G3): Obsidian renamed `old_path` to
+    /// `new_path` (absolute paths). Fixes the links and answers with
+    /// what came of it. Blocking: it writes files.
+    fn rename_event(
+        &self,
+        _old_path: &str,
+        _new_path: &str,
+    ) -> Result<crate::fixes::event::RenameEventWire, crate::fixes::event::RenameEventError> {
+        Err(crate::fixes::event::RenameEventError::Failed(
+            "rename events are not configured for this test fixture".to_string(),
+        ))
+    }
+}
+
+/// The fix log and the engine of `link.rename_event` as one backend: the
+/// log and the retry are the engine's, the event handler is the one that
+/// also knows the sources.
+pub struct FixService {
+    engine: std::sync::Arc<crate::fixes::FixEngine>,
+    events: crate::fixes::event::RenameEvents,
+}
+
+impl FixService {
+    pub fn new(
+        engine: std::sync::Arc<crate::fixes::FixEngine>,
+        registry: std::sync::Arc<crate::registry::SourceRegistry>,
+    ) -> Self {
+        let events = crate::fixes::event::RenameEvents::new(registry, engine.clone());
+        FixService { engine, events }
+    }
+}
+
+impl FixBackend for FixService {
+    fn list(
+        &self,
+        since: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<crate::fixes::FixEntryWire>, String> {
+        FixBackend::list(&*self.engine, since, limit)
+    }
+
+    fn after_rescan(&self, source: &str) {
+        FixBackend::after_rescan(&*self.engine, source)
+    }
+
+    fn rename_event(
+        &self,
+        old_path: &str,
+        new_path: &str,
+    ) -> Result<crate::fixes::event::RenameEventWire, crate::fixes::event::RenameEventError> {
+        self.events.handle(old_path, new_path)
+    }
 }
 
 impl FixBackend for crate::fixes::FixEngine {

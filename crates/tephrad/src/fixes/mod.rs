@@ -24,9 +24,11 @@
 //!
 //! The log is a record only (F9): there is no undo or replay here.
 
+pub mod event;
 pub mod log;
 pub mod pending;
 pub mod retry;
+pub mod state;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
@@ -53,6 +55,25 @@ use log::{
     overall_status, FileEntry, FILE_NEEDS_MANUAL_FIX, FILE_NOTHING_TO_FIX, FILE_PENDING,
     FILE_WRITTEN, KIND_RENAME, KIND_UNCERTAIN, STATUS_UNCERTAIN,
 };
+
+/// What an uncertain entry says when the watcher logs it.
+const MSG_UNCERTAIN: &str = "vanished, no certain pair: links broken";
+
+/// How long a second report of the same vanished file can be the first one
+/// again.
+pub const UNCERTAIN_DEDUPE_SECS: i64 = 120;
+
+/// What makes a second "vanished" entry for one path, inside
+/// [`UNCERTAIN_DEDUPE_SECS`], the same vanishing seen twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Dedupe {
+    /// Nothing: every call logs an entry.
+    Never,
+    /// Any recent entry for the path.
+    AnyRecent,
+    /// A recent entry an exact event logged as "moved outside sources".
+    AfterOutsideEvent,
+}
 
 // ---------------------------------------------------------------
 // Errors, seams
@@ -311,6 +332,11 @@ pub struct FixEngine {
     clock: Arc<dyn Clock>,
     stop_after_writes: Option<usize>,
     run_lock: Mutex<()>,
+    /// Held from the question "is this rename in the log already?" to
+    /// the entry that answers it (G4): the exact event and the watcher's
+    /// pairing of one rename, arriving together, never both start a fix.
+    /// Always taken before `run_lock`, never after it.
+    decision_lock: Mutex<()>,
     /// Where a retry's announcement goes ([`FixSink`]). Unset in tests
     /// that read the log only; then nothing is announced and the writer
     /// does not record its writes as its own.
@@ -329,6 +355,7 @@ impl FixEngine {
             clock: Arc::new(SystemClock),
             stop_after_writes: None,
             run_lock: Mutex::new(()),
+            decision_lock: Mutex::new(()),
             sink: RwLock::new(None),
             batches: Mutex::new(HashMap::new()),
         }
@@ -405,16 +432,64 @@ impl FixEngine {
     }
 
     /// Logs a file that vanished with no certain pair: its links are
-    /// broken. No pending work is created for it (G10).
+    /// broken. No pending work is created for it (G10). Every call logs
+    /// an entry.
     pub fn record_uncertain(&self, source: &str, path: &str) -> Result<FixEntryWire, FixError> {
+        let _decision = self.decision_guard();
+        self.record_uncertain_inner(source, path, MSG_UNCERTAIN, Dedupe::Never)
+    }
+
+    /// [`FixEngine::record_uncertain`] for a caller that holds the
+    /// [`FixEngine::decision_guard`] already, with its own message and
+    /// its own idea of what counts as the same vanishing seen twice.
+    pub(crate) fn record_uncertain_inner(
+        &self,
+        source: &str,
+        path: &str,
+        message: &str,
+        dedupe: Dedupe,
+    ) -> Result<FixEntryWire, FixError> {
         let _guard = self.lock();
         let cache = self.open()?;
+        let now = self.clock.now();
+        let same = cache
+            .fix_log_summaries(source)?
+            .into_iter()
+            .rev()
+            .find(|e| {
+                e.kind == KIND_UNCERTAIN
+                    && e.old_source.as_deref() == Some(source)
+                    && e.old_path.as_deref() == Some(path)
+            })
+            .filter(|e| now - e.created_at <= UNCERTAIN_DEDUPE_SECS);
+        if let Some(existing) = same {
+            let repeat = match dedupe {
+                Dedupe::Never => false,
+                // An exact event saying "moved outside" for a path that
+                // already has a recent entry: the same vanishing.
+                Dedupe::AnyRecent => true,
+                // The watcher's report of a path an exact event already
+                // logged as moved outside.
+                Dedupe::AfterOutsideEvent => cache
+                    .get_fix_log(existing.id)?
+                    .map(|row| {
+                        FixDetail::parse(row.detail_json.as_deref())
+                            .message
+                            .as_deref()
+                            == Some(event::MSG_MOVED_OUTSIDE)
+                    })
+                    .unwrap_or(false),
+            };
+            if repeat {
+                return entry(&cache, existing.id);
+            }
+        }
         let detail = FixDetail {
-            message: Some("vanished, no certain pair: links broken".to_string()),
+            message: Some(message.to_string()),
             ..FixDetail::default()
         };
         let id = cache.insert_fix_log(&NewFixLog {
-            created_at: self.clock.now(),
+            created_at: now,
             kind: KIND_UNCERTAIN.to_string(),
             status: STATUS_UNCERTAIN.to_string(),
             old_source: Some(source.to_string()),
@@ -425,6 +500,12 @@ impl FixEngine {
             detail_json: Some(detail.to_json()),
         })?;
         entry(&cache, id)
+    }
+
+    /// Takes the lock that makes "is this rename in the log?" and the
+    /// entry that answers it one step ([`FixEngine::decision_lock`]).
+    pub(crate) fn decision_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.decision_lock.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     // -- starting a fix ---------------------------------------------
@@ -1060,7 +1141,15 @@ impl crate::rename_detect::RenameFixer for FixEngine {
     }
 
     fn fix_rename(&self, source: &str, old: &str, new: &str) -> Result<(), String> {
-        self.begin_rename_announced(source, old, new)
+        // G4: the same rename may be in the log already (an exact event
+        // got there first). The pairing then does nothing.
+        let _decision = self.decision_guard();
+        let target = match self.decide_for_watcher(source, old, new) {
+            Ok(Some(target)) => target,
+            Ok(None) => return Ok(()),
+            Err(e) => return Err(e.to_string()),
+        };
+        self.begin_rename_announced(source, old, &target)
             .map(|(e, a)| {
                 log_entry(&e);
                 self.announce_or_collect(a);
@@ -1075,7 +1164,13 @@ impl crate::rename_detect::RenameFixer for FixEngine {
         new_dir: &str,
         moves: &[(String, String)],
     ) -> Result<(), String> {
-        self.begin_folder_rename_announced(source, old_dir, new_dir, moves)
+        let _decision = self.decision_guard();
+        let moves = match self.watcher_folder_moves(source, old_dir, new_dir, moves) {
+            Ok(Some(moves)) => moves,
+            Ok(None) => return Ok(()),
+            Err(e) => return Err(e.to_string()),
+        };
+        self.begin_folder_rename_announced(source, old_dir, new_dir, &moves)
             .map(|(e, a)| {
                 log_entry(&e);
                 self.announce_or_collect(a);
@@ -1084,7 +1179,16 @@ impl crate::rename_detect::RenameFixer for FixEngine {
     }
 
     fn record_uncertain(&self, source: &str, path: &str) -> Result<(), String> {
-        FixEngine::record_uncertain(self, source, path)
+        // An exact event moved this file already: its links were fixed
+        // (or reported), so the vanishing is no news (G4).
+        let _decision = self.decision_guard();
+        if self
+            .log_says_departed(source, path)
+            .map_err(|e| e.to_string())?
+        {
+            return Ok(());
+        }
+        self.record_uncertain_inner(source, path, MSG_UNCERTAIN, Dedupe::AfterOutsideEvent)
             .map(|e| log_entry(&e))
             .map_err(|e| e.to_string())
     }

@@ -165,6 +165,47 @@ pub(crate) fn renames_from(
     Ok(rows)
 }
 
+/// What an exact rename event needs of one log entry to tell whether it
+/// was already fixed: who, what and when, with none of the per-file
+/// detail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixLogSummary {
+    pub id: i64,
+    pub created_at: i64,
+    pub kind: String,
+    pub old_source: Option<String>,
+    pub old_path: Option<String>,
+    pub new_source: Option<String>,
+    pub new_path: Option<String>,
+}
+
+/// The `rename` and `uncertain` entries that name `source` on either
+/// side, oldest first (id order).
+pub(crate) fn summaries_for_source(
+    conn: &Connection,
+    source: &str,
+) -> Result<Vec<FixLogSummary>, CacheError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, created_at, kind, old_source, old_path, new_source, new_path \
+         FROM fix_log WHERE kind IN ('rename', 'uncertain') \
+         AND (old_source = ?1 OR new_source = ?1) ORDER BY id ASC",
+    )?;
+    let rows = stmt
+        .query_map([source], |row| {
+            Ok(FixLogSummary {
+                id: row.get(0)?,
+                created_at: row.get(1)?,
+                kind: row.get(2)?,
+                old_source: row.get(3)?,
+                old_path: row.get(4)?,
+                new_source: row.get(5)?,
+                new_path: row.get(6)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 // ---------------------------------------------------------------
 // On the cache
 // ---------------------------------------------------------------
@@ -214,6 +255,12 @@ impl Cache {
         limit: usize,
     ) -> Result<Vec<FixLogRow>, CacheError> {
         list(self.connection(), since, limit)
+    }
+
+    /// The `rename` and `uncertain` entries that name `source`, oldest
+    /// first, without their detail.
+    pub fn fix_log_summaries(&self, source: &str) -> Result<Vec<FixLogSummary>, CacheError> {
+        summaries_for_source(self.connection(), source)
     }
 
     /// Renames logged after entry `after_id` that start at `(source,

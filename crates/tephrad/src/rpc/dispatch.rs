@@ -44,6 +44,7 @@ pub const METHOD_NAMES: &[&str] = &[
     "unit.search",
     "block.ensure_id",
     "fix.list",
+    "link.rename_event",
 ];
 
 /// The three backends one `dispatch` call reads through, bundled so
@@ -105,6 +106,7 @@ pub fn dispatch(
         "unit.search" => unit_search(params, backends.sources),
         "block.ensure_id" => block_ensure_id(params, backends.blocks),
         "fix.list" => fix_list(params, backends.fixes),
+        "link.rename_event" => link_rename_event(params, backends.fixes),
         other => Err((
             METHOD_NOT_FOUND,
             format!("unknown method \"{other}\""),
@@ -409,6 +411,27 @@ fn fix_list(params: &Value, fixes: &dyn FixBackend) -> DispatchResult {
         .map_err(|e| (SOURCE_ERROR, e, None))
 }
 
+/// `link.rename_event {old_path, new_path}` (G3, G4, G21). Both are
+/// non-empty absolute paths; anything else is `invalid_params`. A path in
+/// no source is a `SOURCE_ERROR` whose `data.reason` is
+/// `not_inside_a_source`, never an acknowledgement.
+fn link_rename_event(params: &Value, fixes: &dyn FixBackend) -> DispatchResult {
+    use crate::fixes::event::RenameEventError;
+
+    let old_path = require_str(params, "old_path")?;
+    let new_path = require_str(params, "new_path")?;
+    match fixes.rename_event(old_path, new_path) {
+        Ok(reply) => Ok(serde_json::to_value(reply).expect("RenameEventWire always serializes")),
+        Err(RenameEventError::InvalidParams(m)) => Err(invalid_params(m)),
+        Err(e) => {
+            let data = e
+                .reason()
+                .map(|reason| serde_json::json!({ "reason": reason }));
+            Err((SOURCE_ERROR, e.to_string(), data))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,6 +463,7 @@ mod tests {
                 "unit.search",
                 "block.ensure_id",
                 "fix.list",
+                "link.rename_event",
             ]
         );
     }

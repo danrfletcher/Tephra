@@ -1,11 +1,15 @@
 //! Aggregates `tests/integration/*.rs` into one test binary, the
 //! same convention `tephra-graph`'s `tests/integration.rs` uses.
 
+#[path = "fixtures/mod.rs"]
+mod fixtures;
 #[path = "rpc_fixtures/mod.rs"]
 mod rpc_fixtures;
 
 #[path = "integration/rpc_concurrency.rs"]
 mod rpc_concurrency;
+#[path = "integration/rpc_rename_event.rs"]
+mod rpc_rename_event;
 #[path = "integration/rpc_search.rs"]
 mod rpc_search;
 #[path = "integration/rpc_server_http.rs"]
