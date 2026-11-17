@@ -66,6 +66,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -372,6 +373,9 @@ pub struct FixWriter {
     fs: Arc<dyn AtomicFs>,
     sleeper: Arc<dyn Sleeper>,
     gate: Arc<Mutex<()>>,
+    /// Whether a file written is recorded as Tephra's own write
+    /// ([`FixWriter::record_own_writes`]).
+    own_writes: AtomicBool,
 }
 
 impl FixWriter {
@@ -391,7 +395,23 @@ impl FixWriter {
         fs: Arc<dyn AtomicFs>,
         sleeper: Arc<dyn Sleeper>,
     ) -> Self {
-        FixWriter { fs, sleeper, gate }
+        FixWriter {
+            fs,
+            sleeper,
+            gate,
+            own_writes: AtomicBool::new(false),
+        }
+    }
+
+    /// With `on`, every file this writer writes is recorded as Tephra's
+    /// own write ([`crate::dup_ids::note_self_write`], the path + size +
+    /// mtime record the duplicate ID rename uses), so the watcher drops
+    /// that file's event and the write never starts another batch or fix
+    /// (E17). Only for a caller that indexes the written files itself:
+    /// the record makes the watcher skip them. A write that fails is
+    /// never recorded, so no stale record can hide a later real edit.
+    pub fn record_own_writes(&self, on: bool) {
+        self.own_writes.store(on, Ordering::SeqCst);
     }
 
     /// Every request in order. A permanent failure in one leaves the
@@ -412,6 +432,9 @@ impl FixWriter {
             attempts = n;
             match self.attempt(req) {
                 Attempt::Written { links } => {
+                    if self.own_writes.load(Ordering::SeqCst) {
+                        crate::dup_ids::note_self_write(&req.abs_path);
+                    }
                     log_recovered(req, changed_attempts, attempts);
                     return result(
                         req,

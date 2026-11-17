@@ -28,11 +28,11 @@ pub mod log;
 pub mod pending;
 pub mod retry;
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tephra_cache::{
@@ -45,7 +45,7 @@ use crate::refactor::fix_write::{
     FileFixRequest, FileWriteResult, FixWriter, RewriteMode, WriteStatus,
 };
 
-pub use log::{FixDetail, FixEntryWire};
+pub use log::{FixDetail, FixEntryWire, FixNotice};
 pub use pending::Verdict;
 pub use retry::Trigger;
 
@@ -101,12 +101,75 @@ impl From<tephra_graph::GraphError> for FixError {
 /// its results given directly (no filesystem flags needed).
 pub trait FileWriter: Send + Sync {
     fn write_file(&self, req: &FileFixRequest) -> FileWriteResult;
+
+    /// Asks the writer to record each file it writes as Tephra's own
+    /// write ([`crate::dup_ids::note_self_write`]), so the watcher drops
+    /// the file's event. Called by [`FixEngine::set_sink`]: the sink is
+    /// what indexes the written files again, so the watcher need not.
+    /// A writer that has no such record ignores it.
+    fn record_own_writes(&self, _on: bool) {}
 }
 
 impl FileWriter for FixWriter {
     fn write_file(&self, req: &FileFixRequest) -> FileWriteResult {
         FixWriter::write_file(self, req)
     }
+
+    fn record_own_writes(&self, on: bool) {
+        FixWriter::record_own_writes(self, on)
+    }
+}
+
+// ---------------------------------------------------------------
+// What a fix tells the clients
+// ---------------------------------------------------------------
+
+/// A linking file a fix rewrote: the source it is in and where it is on
+/// disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WrittenFile {
+    pub source: String,
+    pub path: PathBuf,
+}
+
+/// What one batch of fixes has to announce (G17): the entries of the
+/// `fixes` list, and every file rewritten (which has to be indexed again,
+/// and is what the push's `paths` lists). Several renames fixed together
+/// are merged into one, so they make one push.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FixAnnouncement {
+    pub notices: Vec<FixNotice>,
+    pub written: Vec<WrittenFile>,
+}
+
+impl FixAnnouncement {
+    pub fn is_empty(&self) -> bool {
+        self.notices.is_empty() && self.written.is_empty()
+    }
+
+    /// Adds `other`: its entries after this one's, its files the ones
+    /// this one does not hold yet.
+    pub fn merge(&mut self, other: FixAnnouncement) {
+        self.notices.extend(other.notices);
+        for file in other.written {
+            if !self.written.contains(&file) {
+                self.written.push(file);
+            }
+        }
+    }
+}
+
+/// Where the engine hands what it announces when no caller collects it:
+/// a retry (startup, `source.rescan`, a watcher batch) has no caller to
+/// return it to. The daemon's implementation is
+/// [`crate::registry::Announcer`]: it indexes the written files, then
+/// sends one event, which the forwarder turns into the `graph:changed`
+/// push after refreshing the in-memory graph.
+///
+/// The engine never waits for a client: it hands the announcement over
+/// and goes on (F13).
+pub trait FixSink: Send + Sync {
+    fn announce(&self, announcement: FixAnnouncement);
 }
 
 /// The time, in epoch seconds, behind a trait so a test can move it.
@@ -197,6 +260,44 @@ pub struct RunSummary {
     pub skipped_offline: usize,
 }
 
+/// What one run of the write loop leaves for an announcement.
+#[derive(Default)]
+struct Report {
+    /// Each entry the run worked on, as it stood before.
+    before: HashMap<i64, FixNotice>,
+    written: Vec<WrittenFile>,
+}
+
+impl Report {
+    /// The announcement for this run. `fresh` are the entries the run
+    /// itself began: one is announced when it wrote a file or left one
+    /// behind (a rename with nothing to rewrite is no news). Any other
+    /// entry (a retry's) is announced when the run changed it.
+    fn announcement(&self, cache: &Cache, fresh: &[i64]) -> Result<FixAnnouncement, FixError> {
+        let mut ids: Vec<i64> = self.before.keys().copied().collect();
+        ids.sort_unstable();
+        let mut notices = Vec::new();
+        for id in ids {
+            let Some(row) = cache.get_fix_log(id)? else {
+                continue;
+            };
+            let now = FixNotice::from_row(&row);
+            let news = if fresh.contains(&id) {
+                now.files_changed > 0 || now.deferred > 0
+            } else {
+                self.before.get(&id) != Some(&now)
+            };
+            if news {
+                notices.push(now);
+            }
+        }
+        Ok(FixAnnouncement {
+            notices,
+            written: self.written.clone(),
+        })
+    }
+}
+
 // ---------------------------------------------------------------
 // The engine
 // ---------------------------------------------------------------
@@ -210,6 +311,14 @@ pub struct FixEngine {
     clock: Arc<dyn Clock>,
     stop_after_writes: Option<usize>,
     run_lock: Mutex<()>,
+    /// Where a retry's announcement goes ([`FixSink`]). Unset in tests
+    /// that read the log only; then nothing is announced and the writer
+    /// does not record its writes as its own.
+    sink: RwLock<Option<Arc<dyn FixSink>>>,
+    /// The announcement each thread inside [`RenameFixer::start_batch`]
+    /// has so far: the renames of one watcher batch are fixed one after
+    /// the other on one thread, and make one push.
+    batches: Mutex<HashMap<std::thread::ThreadId, FixAnnouncement>>,
 }
 
 impl FixEngine {
@@ -220,6 +329,43 @@ impl FixEngine {
             clock: Arc::new(SystemClock),
             stop_after_writes: None,
             run_lock: Mutex::new(()),
+            sink: RwLock::new(None),
+            batches: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Sets where announcements go, and has the writer record each file
+    /// it writes as Tephra's own, so the watcher does not read that write
+    /// as a change (E17): the sink indexes the written files itself.
+    pub fn set_sink(&self, sink: Arc<dyn FixSink>) {
+        self.writer.record_own_writes(true);
+        *self.sink.write().unwrap_or_else(|p| p.into_inner()) = Some(sink);
+    }
+
+    /// What a fix started by the rename detector does with its
+    /// announcement: adds it to this thread's batch if one is open, and
+    /// otherwise announces it at once.
+    fn announce_or_collect(&self, announcement: FixAnnouncement) {
+        let mut batches = self.batches.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(open) = batches.get_mut(&std::thread::current().id()) {
+            open.merge(announcement);
+            return;
+        }
+        drop(batches);
+        self.announce(announcement);
+    }
+
+    /// Hands `announcement` to the sink, if there is one. A retry calls
+    /// this itself; a fix a caller starts returns its announcement
+    /// instead, so the caller can merge it with the push it is already
+    /// making.
+    pub fn announce(&self, announcement: FixAnnouncement) {
+        if announcement.is_empty() {
+            return;
+        }
+        let sink = self.sink.read().unwrap_or_else(|p| p.into_inner()).clone();
+        if let Some(sink) = sink {
+            sink.announce(announcement);
         }
     }
 
@@ -293,12 +439,23 @@ impl FixEngine {
         old_path: &str,
         new_path: &str,
     ) -> Result<FixEntryWire, FixError> {
+        self.begin_rename_announced(source, old_path, new_path)
+            .map(|(entry, _)| entry)
+    }
+
+    /// [`FixEngine::begin_rename`], and what the fix has to announce.
+    pub fn begin_rename_announced(
+        &self,
+        source: &str,
+        old_path: &str,
+        new_path: &str,
+    ) -> Result<(FixEntryWire, FixAnnouncement), FixError> {
         let files = {
             let cache = self.open()?;
             let graph = UnitGraph::build_from_cache(&cache)?;
             linking_files(&graph, source, old_path, new_path)?
         };
-        self.begin_fix(&FixSpec {
+        self.begin_fix_announced(&FixSpec {
             old_source: source.to_string(),
             old_path: old_path.to_string(),
             new_source: source.to_string(),
@@ -323,6 +480,19 @@ impl FixEngine {
         new_dir: &str,
         moves: &[(String, String)],
     ) -> Result<FixEntryWire, FixError> {
+        self.begin_folder_rename_announced(source, old_dir, new_dir, moves)
+            .map(|(entry, _)| entry)
+    }
+
+    /// [`FixEngine::begin_folder_rename`], and what the fix has to
+    /// announce.
+    pub fn begin_folder_rename_announced(
+        &self,
+        source: &str,
+        old_dir: &str,
+        new_dir: &str,
+        moves: &[(String, String)],
+    ) -> Result<(FixEntryWire, FixAnnouncement), FixError> {
         let rows = {
             let cache = self.open()?;
             let graph = UnitGraph::build_from_cache(&cache)?;
@@ -358,6 +528,14 @@ impl FixEngine {
     /// Then works through the list. Returns the entry as it stands at
     /// the end (`partial` while work is left).
     pub fn begin_fix(&self, spec: &FixSpec) -> Result<FixEntryWire, FixError> {
+        self.begin_fix_announced(spec).map(|(entry, _)| entry)
+    }
+
+    /// [`FixEngine::begin_fix`], and what the fix has to announce.
+    pub fn begin_fix_announced(
+        &self,
+        spec: &FixSpec,
+    ) -> Result<(FixEntryWire, FixAnnouncement), FixError> {
         let files: BTreeSet<&(String, String)> = spec.files.iter().collect();
         self.begin_plan(&Plan {
             old_source: spec.old_source.clone(),
@@ -375,10 +553,12 @@ impl FixEngine {
         })
     }
 
-    /// The body of [`FixEngine::begin_fix`] and
-    /// [`FixEngine::begin_folder_rename`]: the entry and the work list
-    /// in one transaction, then the work.
-    fn begin_plan(&self, plan: &Plan) -> Result<FixEntryWire, FixError> {
+    /// The body of [`FixEngine::begin_fix_announced`] and
+    /// [`FixEngine::begin_folder_rename_announced`]: the entry and the
+    /// work list in one transaction, then the work. The log entry is
+    /// complete before this returns, so whoever announces it does so
+    /// after the entry is in `fix.list`.
+    fn begin_plan(&self, plan: &Plan) -> Result<(FixEntryWire, FixAnnouncement), FixError> {
         let _guard = self.lock();
         let cache = self.open()?;
         let now = self.clock.now();
@@ -426,8 +606,19 @@ impl FixEngine {
                 prior_rounds: 0,
             })
             .collect();
-        self.run_picks(&cache, picks)?;
-        entry(&cache, fix_id)
+        let mut report = Report::default();
+        let run = self.run_picks(&cache, picks, &mut report);
+        let announcement = report.announcement(&cache, &[fix_id]);
+        if let Err(e) = run {
+            // A caller that gets an error has no announcement to merge
+            // into its own: whatever was written is announced now, so
+            // the files are indexed again.
+            if let Ok(a) = announcement {
+                self.announce(a);
+            }
+            return Err(e);
+        }
+        Ok((entry(&cache, fix_id)?, announcement?))
     }
 
     // -- retrying ---------------------------------------------------
@@ -464,21 +655,45 @@ impl FixEngine {
         let cache = self.open()?;
         let rows = cache.pending_fixes(None, None)?;
         let picks = retry::select(rows, trigger, self.clock.now());
-        self.run_picks(&cache, picks)
+        let mut report = Report::default();
+        let run = self.run_picks(&cache, picks, &mut report);
+        // A retry has no caller to return the announcement to (G25):
+        // what it finished goes out through the sink, as its own entry.
+        if let Ok(a) = report.announcement(&cache, &[]) {
+            self.announce(a);
+        }
+        run
     }
 
     // -- the work ---------------------------------------------------
 
-    fn run_picks(&self, cache: &Cache, picks: Vec<retry::Pick>) -> Result<RunSummary, FixError> {
+    fn run_picks(
+        &self,
+        cache: &Cache,
+        picks: Vec<retry::Pick>,
+        report: &mut Report,
+    ) -> Result<RunSummary, FixError> {
         let mut summary = RunSummary::default();
         if picks.is_empty() {
             return Ok(summary);
+        }
+        // Each entry as it stands before this pass, to tell afterwards
+        // which ones it changed.
+        for pick in &picks {
+            if let Some(id) = pick.row.fix_id {
+                if let std::collections::hash_map::Entry::Vacant(slot) = report.before.entry(id) {
+                    if let Some(row) = cache.get_fix_log(id)? {
+                        slot.insert(FixNotice::from_row(&row));
+                    }
+                }
+            }
         }
         let graph = UnitGraph::build_from_cache(cache)?;
         let mut writes = 0usize;
         for pick in picks {
             let wrote = self.process(cache, &graph, pick, &mut summary)?;
-            if wrote {
+            if let Some(file) = wrote {
+                report.written.push(file);
                 writes += 1;
                 if self.stop_after_writes == Some(writes) {
                     return Err(FixError::Stopped);
@@ -488,14 +703,14 @@ impl FixEngine {
         Ok(summary)
     }
 
-    /// One row, start to end. `true` when the file was written.
+    /// One row, start to end. The file, when it was written.
     fn process(
         &self,
         cache: &Cache,
         graph: &UnitGraph,
         pick: retry::Pick,
         summary: &mut RunSummary,
-    ) -> Result<bool, FixError> {
+    ) -> Result<Option<WrittenFile>, FixError> {
         let retry::Pick {
             mut row,
             prior_rounds,
@@ -509,13 +724,13 @@ impl FixEngine {
                 Outcome::done(FILE_NOTHING_TO_FIX, why),
                 summary,
             )?;
-            return Ok(false);
+            return Ok(None);
         };
         if source.status == SourceStatus::Offline {
             // Its files cannot be written, and a retry now would only
             // burn attempts: the row waits for the source.
             summary.skipped_offline += 1;
-            return Ok(false);
+            return Ok(None);
         }
 
         let (target_source, target_path, chain) = match pending::recheck(cache, graph, &row)? {
@@ -526,7 +741,7 @@ impl FixEngine {
                     Outcome::done(status, reason)
                 };
                 self.finish(cache, &row, outcome, summary)?;
-                return Ok(false);
+                return Ok(None);
             }
             Verdict::Proceed {
                 source,
@@ -567,15 +782,16 @@ impl FixEngine {
                 Outcome::done(FILE_NOTHING_TO_FIX, "the file has no link left to rewrite"),
                 summary,
             )?;
-            return Ok(false);
+            return Ok(None);
         }
 
         let bare_resolves = graph
             .shortest_unique_target(&new_id)
             .is_some_and(|t| !t.contains('/'));
+        let abs_path = Path::new(&source.path).join(&row.file_path);
         let mut req = FileFixRequest::new(
             file_id,
-            Path::new(&source.path).join(&row.file_path),
+            abs_path.clone(),
             edges,
             old_path,
             target_path,
@@ -588,7 +804,10 @@ impl FixEngine {
         let wrote = result.status == WriteStatus::Written;
         let outcome = Outcome::from_write(&result, chain);
         self.finish(cache, &row, outcome, summary)?;
-        Ok(wrote)
+        Ok(wrote.then(|| WrittenFile {
+            source: row.source.clone(),
+            path: abs_path,
+        }))
     }
 
     /// Records one row's outcome: the row and the entry in one
@@ -822,9 +1041,30 @@ fn relative_paths(
 }
 
 impl crate::rename_detect::RenameFixer for FixEngine {
+    fn start_batch(&self) {
+        self.batches
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(std::thread::current().id(), FixAnnouncement::default());
+    }
+
+    fn finish_batch(&self) {
+        let open = self
+            .batches
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&std::thread::current().id());
+        if let Some(open) = open {
+            self.announce(open);
+        }
+    }
+
     fn fix_rename(&self, source: &str, old: &str, new: &str) -> Result<(), String> {
-        self.begin_rename(source, old, new)
-            .map(|e| log_entry(&e))
+        self.begin_rename_announced(source, old, new)
+            .map(|(e, a)| {
+                log_entry(&e);
+                self.announce_or_collect(a);
+            })
             .map_err(|e| e.to_string())
     }
 
@@ -835,8 +1075,11 @@ impl crate::rename_detect::RenameFixer for FixEngine {
         new_dir: &str,
         moves: &[(String, String)],
     ) -> Result<(), String> {
-        self.begin_folder_rename(source, old_dir, new_dir, moves)
-            .map(|e| log_entry(&e))
+        self.begin_folder_rename_announced(source, old_dir, new_dir, moves)
+            .map(|(e, a)| {
+                log_entry(&e);
+                self.announce_or_collect(a);
+            })
             .map_err(|e| e.to_string())
     }
 

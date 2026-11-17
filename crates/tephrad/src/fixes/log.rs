@@ -144,6 +144,54 @@ pub fn overall_status(files: &[FileEntry]) -> &'static str {
     }
 }
 
+/// One entry of the `fixes` list a `graph:changed` push carries (G17,
+/// G25): data only, naming the rename and what came of it. `new_source`
+/// is present only when the move crosses sources. `deferred` counts the
+/// linking files left for a retry or for a person (0 when every file was
+/// written); `files_changed` counts only files actually rewritten.
+///
+/// It is the same fact as the fix log's entry, so it is built from the
+/// log row ([`FixNotice::from_row`]) and cannot disagree with `fix.list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FixNotice {
+    pub kind: String,
+    pub source: String,
+    pub old: String,
+    pub new: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_source: Option<String>,
+    pub files_changed: i64,
+    pub status: String,
+    pub deferred: i64,
+}
+
+impl FixNotice {
+    /// The notice for the log entry `row`, as the entry stands now.
+    pub fn from_row(row: &FixLogRow) -> Self {
+        let detail = FixDetail::parse(row.detail_json.as_deref());
+        let deferred = detail
+            .files
+            .iter()
+            .filter(|f| f.status == FILE_PENDING || f.status == FILE_NEEDS_MANUAL_FIX)
+            .count() as i64;
+        let source = row.old_source.clone().unwrap_or_default();
+        let new_source = row
+            .new_source
+            .clone()
+            .filter(|s| !s.is_empty() && *s != source);
+        FixNotice {
+            kind: row.kind.clone(),
+            source,
+            old: row.old_path.clone().unwrap_or_default(),
+            new: row.new_path.clone().unwrap_or_default(),
+            new_source,
+            files_changed: row.files_changed,
+            status: row.status.clone(),
+            deferred,
+        }
+    }
+}
+
 /// One entry of `fix.list`'s answer: time, kind, source(s), old, new,
 /// files changed and status (G18). `new` is `null` for an uncertain
 /// entry, which has no pair.

@@ -161,6 +161,94 @@ async fn an_authenticated_connection_receives_a_graph_changed_push_with_no_reque
     assert_eq!(body["params"]["source"], json!("vault"));
 }
 
+/// What a client reads of a `graph:changed` push. `fixes` is the only
+/// field that did not exist before G17: a push without it must still
+/// read, as an empty list (G17: a client that ignores `fixes` is
+/// unaffected).
+#[derive(serde::Deserialize, Debug)]
+struct PushParams {
+    source: String,
+    paths: Vec<String>,
+    #[serde(default)]
+    fixes: Vec<tephrad::fixes::FixNotice>,
+}
+
+async fn next_push(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> serde_json::Value {
+    let pushed = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
+        .await
+        .expect("must receive the push within the timeout, not hang")
+        .expect("stream not closed")
+        .expect("not a transport error");
+    serde_json::from_str(&pushed.into_text().unwrap()).unwrap()
+}
+
+/// G17: a push carrying `fixes` (built by the forwarder's own payload
+/// function from a real event) reaches an authenticated client as a
+/// notification with no `id`, with `fixes` as data, and an old-shape
+/// push (no `fixes`) still deserialises on the same connection.
+#[tokio::test]
+async fn a_push_carrying_fixes_reaches_a_client_as_a_notification_and_an_old_shape_push_still_reads(
+) {
+    use tephrad::fixes::FixNotice;
+    use tephrad::registry::DaemonEvent;
+
+    let server = spawn(MockGraph::new(), MockSources::new()).await;
+    let mut ws = connect_ws(&server.ws_url(), &server.token).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let notice = FixNotice {
+        kind: "rename".into(),
+        source: "notes".into(),
+        old: "Training Plan.md".into(),
+        new: "Plan.md".into(),
+        new_source: None,
+        files_changed: 3,
+        status: "applied".into(),
+        deferred: 0,
+    };
+    server.broadcast_graph_changed(tephrad::forward::payload(&DaemonEvent::SourceChanged {
+        source: "notes".into(),
+        paths: vec!["/tmp/notes/Goals.md".into()],
+        fixes: vec![notice.clone()],
+    }));
+    server.broadcast_graph_changed(tephrad::forward::payload(&DaemonEvent::SourceChanged {
+        source: "notes".into(),
+        paths: vec!["/tmp/notes/Ideas.md".into()],
+        fixes: vec![],
+    }));
+
+    let with_fixes = next_push(&mut ws).await;
+    assert!(with_fixes.get("id").is_none(), "a notification has no id");
+    assert_eq!(with_fixes["method"], json!("graph:changed"));
+    assert_eq!(
+        with_fixes["params"]["fixes"],
+        json!([{
+            "kind": "rename", "source": "notes", "old": "Training Plan.md",
+            "new": "Plan.md", "files_changed": 3, "status": "applied", "deferred": 0
+        }]),
+        "no new_source unless the move crosses sources"
+    );
+    let params: PushParams = serde_json::from_value(with_fixes["params"].clone()).unwrap();
+    assert_eq!(params.source, "notes");
+    assert_eq!(params.paths, vec!["/tmp/notes/Goals.md".to_string()]);
+    assert_eq!(params.fixes, vec![notice]);
+
+    let old_shape = next_push(&mut ws).await;
+    assert!(old_shape.get("id").is_none());
+    assert_eq!(
+        old_shape["params"],
+        json!({ "source": "notes", "paths": ["/tmp/notes/Ideas.md"] }),
+        "an ordinary push has no fixes key"
+    );
+    let params: PushParams = serde_json::from_value(old_shape["params"].clone()).unwrap();
+    assert!(params.fixes.is_empty());
+    assert_eq!(params.source, "notes");
+}
+
 /// R3/E9: the WebSocket transport must enforce the same body-size cap
 /// as `POST /rpc` (`MAX_BODY_BYTES`), not axum/tungstenite's own much
 /// larger defaults (64 MiB message / 16 MiB frame) — otherwise a WS

@@ -674,6 +674,21 @@ pub trait RenameFixer: Send + Sync {
     ) -> Result<(), String>;
     /// Logs a file that vanished with no certain pair (G10).
     fn record_uncertain(&self, source: &str, path: &str) -> Result<(), String>;
+    /// [`dispatch`] calls this before the first fix of a batch and
+    /// [`RenameFixer::finish_batch`] after the last, on the same thread,
+    /// so a fixer can tell the clients of the whole batch at once.
+    fn start_batch(&self) {}
+    /// See [`RenameFixer::start_batch`].
+    fn finish_batch(&self) {}
+}
+
+/// Ends the batch [`dispatch`] opened, however it returns.
+struct BatchGuard<'a>(&'a dyn RenameFixer);
+
+impl Drop for BatchGuard<'_> {
+    fn drop(&mut self) {
+        self.0.finish_batch();
+    }
 }
 
 /// Fixes every certain rename in `decisions` and logs every vanished
@@ -687,6 +702,8 @@ pub trait RenameFixer: Send + Sync {
 /// path is gone from disk it is logged `uncertain` like any vanished
 /// file with no pair.
 pub fn dispatch(fixer: &dyn RenameFixer, source: &str, root: &Path, decisions: Decisions) {
+    fixer.start_batch();
+    let _batch = BatchGuard(fixer);
     let (selfs, renames): (Vec<Rename>, Vec<Rename>) =
         decisions.renames.into_iter().partition(|r| r.from == r.to);
     for r in selfs {

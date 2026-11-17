@@ -240,7 +240,17 @@ pub fn validate_register<'a>(
 /// it carries each source's offline flag.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DaemonEvent {
-    SourceChanged { source: String, paths: Vec<PathBuf> },
+    /// `fixes` is empty for every event but Tephra's own link fix (G17):
+    /// then `paths` are the files it rewrote, already indexed again, and
+    /// `fixes` the log entries of the renames fixed. The forwarder
+    /// refreshes the graph and sends ONE `graph:changed`; the entries
+    /// were written to the fix log before the event was sent. `paths` is
+    /// empty when no file could be written.
+    SourceChanged {
+        source: String,
+        paths: Vec<PathBuf>,
+        fixes: Vec<crate::fixes::FixNotice>,
+    },
 }
 
 #[derive(Debug)]
@@ -775,6 +785,7 @@ impl SourceRegistry {
                             let _ = events_tx.send(DaemonEvent::SourceChanged {
                                 source: source_name.clone(),
                                 paths: outcome.changed_paths.clone(),
+                                fixes: Vec::new(),
                             });
                         }
                     },
@@ -827,6 +838,7 @@ impl SourceRegistry {
                 let _ = events_for_offline.send(DaemonEvent::SourceChanged {
                     source: name_for_offline.clone(),
                     paths: Vec::new(),
+                    fixes: Vec::new(),
                 });
             }
         };
@@ -1147,6 +1159,7 @@ impl SourceRegistry {
                     let _ = self.events_tx.send(DaemonEvent::SourceChanged {
                         source: row.name.clone(),
                         paths: Vec::new(),
+                        fixes: Vec::new(),
                     });
                 }
                 Err(e) => {
@@ -1325,6 +1338,25 @@ impl SourceRegistry {
     /// push still happen even though the caller discards the watcher's own
     /// event for this write.
     pub fn reindex_file(&self, source: &str, abs_path: &Path) -> Result<(), RegistryError> {
+        let changed_paths = self.reindex_quietly(source, abs_path)?;
+        if !changed_paths.is_empty() {
+            let _ = self.events_tx.send(DaemonEvent::SourceChanged {
+                source: source.to_string(),
+                paths: changed_paths,
+                fixes: Vec::new(),
+            });
+        }
+        Ok(())
+    }
+
+    /// [`SourceRegistry::reindex_file`] without the event: the paths
+    /// that were upserted or deleted, for a caller that announces them
+    /// itself.
+    fn reindex_quietly(
+        &self,
+        source: &str,
+        abs_path: &Path,
+    ) -> Result<Vec<PathBuf>, RegistryError> {
         let cache = Cache::open(&self.cache_path)?;
         let row = cache
             .get_source(source)?
@@ -1332,14 +1364,54 @@ impl SourceRegistry {
         let root = PathBuf::from(&row.path);
         let ignore_rules = IgnoreRules::load(&root)?;
         let changed: HashSet<PathBuf> = HashSet::from([abs_path.to_path_buf()]);
-        let outcome = scan::apply_change_batch(&cache, row.id, &root, &changed, &ignore_rules)?;
-        if !outcome.changed_paths.is_empty() {
+        Ok(scan::apply_change_batch(&cache, row.id, &root, &changed, &ignore_rules)?.changed_paths)
+    }
+}
+
+/// The fix engine's announcements (G17): every file it rewrote is indexed
+/// again here (its watcher event is dropped as Tephra's own, so nothing
+/// else would), then ONE event per source goes out, carrying the files
+/// and the entries. A batch whose files and entries are all in one
+/// source, which is every rename within one source, makes one event.
+impl crate::fixes::FixSink for SourceRegistry {
+    fn announce(&self, announcement: crate::fixes::FixAnnouncement) {
+        use std::collections::BTreeMap;
+        let mut by_source: BTreeMap<String, (Vec<PathBuf>, Vec<crate::fixes::FixNotice>)> =
+            BTreeMap::new();
+        for file in &announcement.written {
+            match self.reindex_quietly(&file.source, &file.path) {
+                Ok(paths) => {
+                    let slot = by_source.entry(file.source.clone()).or_default();
+                    for p in paths {
+                        if !slot.0.contains(&p) {
+                            slot.0.push(p);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(source = %file.source, path = %file.path.display(), error = %e, "could not index a file the fix rewrote");
+                    // Still named: the file did change on disk.
+                    let slot = by_source.entry(file.source.clone()).or_default();
+                    if !slot.0.contains(&file.path) {
+                        slot.0.push(file.path.clone());
+                    }
+                }
+            }
+        }
+        for notice in announcement.notices {
+            by_source
+                .entry(notice.source.clone())
+                .or_default()
+                .1
+                .push(notice);
+        }
+        for (source, (paths, fixes)) in by_source {
             let _ = self.events_tx.send(DaemonEvent::SourceChanged {
-                source: source.to_string(),
-                paths: outcome.changed_paths,
+                source,
+                paths,
+                fixes,
             });
         }
-        Ok(())
     }
 }
 

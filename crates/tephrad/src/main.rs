@@ -19,11 +19,9 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use cli::Action;
-use serde_json::json;
-use tephrad::registry::{DaemonEvent, SourceRegistry};
+use tephrad::registry::SourceRegistry;
 use tephrad::rpc::backend::{GraphBackend, RefactorBackend, SourceBackend};
 use tephrad::rpc::server::{build_router, AppState};
-use tokio::sync::broadcast::error::RecvError;
 
 /// Startup stage names used in `tephrad: <stage> failed: <reason>`
 /// messages, so failures are unambiguous about where they occurred.
@@ -457,6 +455,11 @@ fn run_server(
         // G1: a rename a watcher sees is fixed by this engine, with no
         // client involved.
         registry.set_rename_fixer(fix_engine.clone());
+        // G17/E17: what a fix writes is indexed again by the registry and
+        // announced as one `graph:changed` with the `fixes` list; the
+        // engine's writes are recorded as Tephra's own, so the watcher
+        // does not see them as changes.
+        fix_engine.set_sink(registry.clone());
 
         let state = Arc::new(
             AppState::with_shutdown(
@@ -500,65 +503,15 @@ fn run_server(
         // and `registry`'s refcount already back down to the single
         // reference this block is about to hand out, while still
         // inside `block_on` — never during `runtime`'s own shutdown.
-        let forward_state = state.clone();
-        let forward_fixes = fix_engine.clone();
-        let mut events = registry.subscribe();
-        let mut forwarder_shutdown_rx = shutdown_rx.clone();
-        let forwarder_handle = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = forwarder_shutdown_rx.changed() => {
-                        break;
-                    }
-                    recv = events.recv() => {
-                        match recv {
-                            Ok(DaemonEvent::SourceChanged { source, paths }) => {
-                                if let Some(refresh) = forward_state.graph_refresh.clone() {
-                                    let refreshed = tokio::task::spawn_blocking(move || refresh.refresh()).await;
-                                    match refreshed {
-                                        Ok(Ok(())) => {}
-                                        Ok(Err(e)) => {
-                                            tracing::warn!(error = %e, "failed to refresh the in-memory graph after a watcher event");
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(error = %e, "graph refresh task panicked");
-                                        }
-                                    }
-                                }
-                                let payload = json!({
-                                    "source": source,
-                                    "paths": paths
-                                        .iter()
-                                        .map(|p| p.display().to_string())
-                                        .collect::<Vec<_>>(),
-                                });
-                                forward_state.broadcast_graph_changed(payload);
-                                // G9: a watcher batch retries the pending
-                                // fixes of that source whose backoff has
-                                // passed, and any that need a person whose
-                                // file is in the batch.
-                                let fixes = forward_fixes.clone();
-                                let retried = tokio::task::spawn_blocking(move || {
-                                    fixes.after_batch(&source, &paths)
-                                })
-                                .await;
-                                match retried {
-                                    Ok(Ok(_)) => {}
-                                    Ok(Err(e)) => {
-                                        tracing::warn!(error = %e, "retrying pending fixes after a watcher event failed");
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(error = %e, "pending-fixes retry task panicked");
-                                    }
-                                }
-                            }
-                            Err(RecvError::Lagged(_)) => continue,
-                            Err(RecvError::Closed) => break,
-                        }
-                    }
-                }
-            }
-        });
+        // The forwarder (`tephrad::forward::run`) is a task this
+        // function waits for below, before it hands the registry back.
+        let events = registry.subscribe();
+        let forwarder_handle = tokio::spawn(tephrad::forward::run(
+            state.clone(),
+            fix_engine.clone(),
+            events,
+            shutdown_rx.clone(),
+        ));
 
         // E11: redo, from the top, every scan that started and never
         // finished (a kill mid-scan, or a source emptied by a schema
