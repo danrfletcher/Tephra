@@ -375,6 +375,28 @@ pub(crate) fn units_by_hash(conn: &Connection, hash: &str) -> Result<Vec<UnitRow
     Ok(rows)
 }
 
+/// Every `units` row of `source_id` nested under the folder
+/// `rel_prefix` (`rel_path` starts with `rel_prefix/`), ordered by path.
+/// The folder's own path is not a row. The range is the same one
+/// [`delete_units_under_prefix`] deletes, so what this lists is exactly
+/// what that would remove.
+pub(crate) fn units_under_prefix(
+    conn: &Connection,
+    source_id: i64,
+    rel_prefix: &str,
+) -> Result<Vec<UnitRow>, CacheError> {
+    let lower = format!("{rel_prefix}/");
+    let upper = format!("{rel_prefix}0");
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {UNIT_COLUMNS} FROM units \
+         WHERE source_id = ?1 AND rel_path >= ?2 AND rel_path < ?3 ORDER BY rel_path"
+    ))?;
+    let rows = stmt
+        .query_map(rusqlite::params![source_id, lower, upper], unit_from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// Every `units` row whose stored file identity is `(device, inode)`,
 /// whatever its path or source, ordered by source then path. More than
 /// one row only for hard links to one file.

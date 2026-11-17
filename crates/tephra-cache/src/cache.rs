@@ -438,6 +438,18 @@ impl Cache {
         units::units_by_hash(&self.conn, hash)
     }
 
+    /// Every row of `source_id` nested under the folder `rel_prefix`,
+    /// ordered by path (the folder itself is never a row). What a folder
+    /// that vanished from disk held, to be read before
+    /// [`Cache::delete_units_under_prefix`] removes it.
+    pub fn units_under_prefix(
+        &self,
+        source_id: i64,
+        rel_prefix: &str,
+    ) -> Result<Vec<UnitRow>, CacheError> {
+        units::units_under_prefix(&self.conn, source_id, rel_prefix)
+    }
+
     /// Every row whose stored file identity is `(device, inode)`, found
     /// by identity alone: the path and the source play no part. A rename
     /// keeps its identity, so this is how a vanished row's file is

@@ -159,6 +159,15 @@ pub struct ChangeOutcome {
     pub stats: ScanStats,
     pub changed_paths: Vec<PathBuf>,
     pub deferred: Vec<PathBuf>,
+    /// The tracked files this batch found gone, as their cached rows
+    /// held them before the batch deleted them (the file itself, or
+    /// every file under a folder that is gone). `os` is unset: the
+    /// caller adds what the OS said about the path. Only the rename
+    /// detector reads this ([`crate::rename_detect`]).
+    pub vanished: Vec<crate::rename_detect::Vanished>,
+    /// The files this batch found that had no cached row, as they were
+    /// indexed. Same reader, same unset `os`.
+    pub appeared: Vec<crate::rename_detect::Appeared>,
 }
 
 #[derive(Debug)]
@@ -1438,6 +1447,8 @@ pub fn settle_deferred(
         total.stats.files_seen += outcome.stats.files_seen;
         total.stats.files_ignored += outcome.stats.files_ignored;
         total.changed_paths.extend(outcome.changed_paths);
+        total.vanished.extend(outcome.vanished);
+        total.appeared.extend(outcome.appeared);
         if outcome.deferred.is_empty() {
             return Ok(total);
         }
@@ -1460,7 +1471,7 @@ fn upsert_directory(
     abs_dir: &Path,
     ignore: &IgnoreRules,
     stats: &mut ScanStats,
-    touched_paths: &mut Vec<PathBuf>,
+    found: &mut DirFound<'_>,
 ) -> Result<(), ScanError> {
     let walker = walkdir::WalkDir::new(abs_dir)
         .follow_links(false)
@@ -1509,11 +1520,68 @@ fn upsert_directory(
             wrote_unit = true;
         }
         if had_existing || wrote_unit {
-            touched_paths.push(entry.path().to_path_buf());
+            found.touched.push(entry.path().to_path_buf());
+        }
+        if wrote_unit && !had_existing {
+            note_appeared(cache, source_id, &rel_path, found.appeared)?;
         }
     }
 
     Ok(())
+}
+
+/// What [`upsert_directory`] reports back to its batch: the paths it
+/// changed, and the files that had no row before.
+struct DirFound<'a> {
+    touched: &'a mut Vec<PathBuf>,
+    appeared: &'a mut Vec<crate::rename_detect::Appeared>,
+}
+
+/// Records the file at `rel_path` as new to the index, from the row
+/// that was just written for it.
+fn note_appeared(
+    cache: &Cache,
+    source_id: i64,
+    rel_path: &str,
+    appeared: &mut Vec<crate::rename_detect::Appeared>,
+) -> Result<(), ScanError> {
+    if let Some(row) = cache.get_unit_by_rel_path(source_id, rel_path)? {
+        appeared.push(crate::rename_detect::Appeared {
+            path: rel_path.to_string(),
+            identity: identity_of(&row),
+            hash: row.hash,
+            os: None,
+        });
+    }
+    Ok(())
+}
+
+/// Records the cached rows of what is about to be deleted: `rel_path`
+/// itself, and everything under it when it was a folder.
+fn note_vanished(
+    cache: &Cache,
+    source_id: i64,
+    rel_path: &str,
+    vanished: &mut Vec<crate::rename_detect::Vanished>,
+) -> Result<(), ScanError> {
+    let mut rows = cache.units_under_prefix(source_id, rel_path)?;
+    if let Some(own) = cache.get_unit_by_rel_path(source_id, rel_path)? {
+        rows.insert(0, own);
+    }
+    vanished.extend(rows.into_iter().map(|row| crate::rename_detect::Vanished {
+        identity: identity_of(&row),
+        path: row.rel_path,
+        hash: row.hash,
+        os: None,
+    }));
+    Ok(())
+}
+
+fn identity_of(row: &tephra_cache::UnitRow) -> Option<crate::rename_detect::Identity> {
+    match (row.device, row.inode) {
+        (Some(device), Some(inode)) => Some(crate::rename_detect::Identity { device, inode }),
+        _ => None,
+    }
 }
 
 /// Applies one debounce-coalesced batch of changed absolute paths
@@ -1636,6 +1704,8 @@ fn apply_change_batch_once(
     let mut stats = ScanStats::default();
     let mut touched_paths: Vec<PathBuf> = Vec::new();
     let mut deferred_paths: Vec<PathBuf> = Vec::new();
+    let mut vanished: Vec<crate::rename_detect::Vanished> = Vec::new();
+    let mut appeared: Vec<crate::rename_detect::Appeared> = Vec::new();
 
     // Brackets the whole batch in one BEGIN IMMEDIATE/COMMIT (E5):
     // `cache`'s typed insert/delete helpers below still operate
@@ -1691,7 +1761,10 @@ fn apply_change_batch_once(
                     abs_path,
                     ignore,
                     &mut stats,
-                    &mut touched_paths,
+                    &mut DirFound {
+                        touched: &mut touched_paths,
+                        appeared: &mut appeared,
+                    },
                 )?;
             }
             Ok(meta) if meta.is_file() => {
@@ -1725,12 +1798,16 @@ fn apply_change_batch_once(
                     None => {
                         // Nothing to index (it vanished, is a symlink,
                         // or cannot be read): its old row goes.
+                        note_vanished(cache, source_id, &rel_path, &mut vanished)?;
                         delete_existing_unit(cache, source_id, &rel_path)?;
                         false
                     }
                 };
                 if had_existing || wrote_unit {
                     touched_paths.push(abs_path.clone());
+                }
+                if wrote_unit && !had_existing {
+                    note_appeared(cache, source_id, &rel_path, &mut appeared)?;
                 }
             }
             Ok(_) => {
@@ -1748,6 +1825,7 @@ fn apply_change_batch_once(
                 // trying both means a directory's full subtree is
                 // reliably reclaimed without having to know in
                 // advance which one it used to be.
+                note_vanished(cache, source_id, &rel_path, &mut vanished)?;
                 let had_existing = delete_existing_unit(cache, source_id, &rel_path)?;
                 let nested_deleted = cache.delete_units_under_prefix(source_id, &rel_path)?;
                 // A file that is gone has no rename to wait for.
@@ -1765,6 +1843,8 @@ fn apply_change_batch_once(
         stats,
         changed_paths: touched_paths,
         deferred: deferred_paths,
+        vanished,
+        appeared,
     })
 }
 

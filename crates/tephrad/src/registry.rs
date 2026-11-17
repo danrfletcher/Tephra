@@ -28,6 +28,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tephra_cache::{Cache, CacheError, SourceRow, SourceStatus};
 
 use crate::ignore::IgnoreRules;
+use crate::rename_detect::{self, RenameFixer, SourceRenames};
 use crate::scan::{self, ScanError, ScanStats};
 use crate::watcher::{self, WatchError, WatcherHandle};
 use crate::writer_gate::{self, WriterGate};
@@ -308,6 +309,19 @@ struct RunningSource {
     /// reflects the rescan's rules immediately, rather than only the
     /// stale rules captured when the watcher was first started.
     ignore_rules: Arc<RwLock<IgnoreRules>>,
+    /// The task that wakes this source's rename detector when a hold
+    /// ends ([`rename_detect::run_holds`]). Ends with the source.
+    _hold_task: AbortOnDrop,
+}
+
+/// Aborts its task when dropped, so the task cannot outlive the source
+/// that owns it however the source is removed.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 fn now_unix() -> i64 {
@@ -434,6 +448,10 @@ pub struct SourceRegistry {
     /// (`link.apply_refactor`, `block.ensure_id`) goes through this one
     /// count, see [`SourceRegistry::pause_for_write`].
     write_pause: Mutex<WritePause>,
+    /// What a certain rename seen by a watcher is handed to (G1): the
+    /// fix engine, set once by the daemon. While unset, watchers index
+    /// a rename as a delete and a create, as before.
+    rename_fixer: Arc<RwLock<Option<Arc<dyn RenameFixer>>>>,
 }
 
 /// The writers currently holding the watchers paused, and the paths
@@ -487,6 +505,7 @@ impl SourceRegistry {
             events_tx,
             permission_denied: Mutex::new(HashSet::new()),
             write_pause: Mutex::new(WritePause::default()),
+            rename_fixer: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -640,6 +659,12 @@ impl SourceRegistry {
         Ok(stats)
     }
 
+    /// Hands every certain rename a watcher sees to `fixer` from now
+    /// on, in every running source and every one started later (G1).
+    pub fn set_rename_fixer(&self, fixer: Arc<dyn RenameFixer>) {
+        *self.rename_fixer.write().unwrap_or_else(|p| p.into_inner()) = Some(fixer);
+    }
+
     fn start_watcher(
         &self,
         name: String,
@@ -660,8 +685,20 @@ impl SourceRegistry {
         let source_root = root.clone();
         let blocking_handle = self.runtime.handle().clone();
         let ignore_for_batch = Arc::clone(&ignore_rules);
+        let hints = tap.hints();
+        let renames = Arc::new(SourceRenames::new(
+            name.clone(),
+            root.clone(),
+            watcher::RENAME_HOLD,
+        ));
+        let renames_for_batch = Arc::clone(&renames);
+        let fixer_for_batch = Arc::clone(&self.rename_fixer);
 
         let on_batch = move |mut changed: std::collections::HashSet<PathBuf>| {
+            // What the OS said about the paths of this batch, taken now
+            // so an event that arrives while it is applied belongs to
+            // the next one.
+            let os_marks = hints.take();
             // G19: the file events of Tephra's own duplicate ID rename
             // are not changes to react to: the file was indexed again
             // as part of the rename. A batch made only of them stops
@@ -682,6 +719,8 @@ impl SourceRegistry {
             let source_name = source_name.clone();
             let source_root = source_root.clone();
             let ignore_for_batch = Arc::clone(&ignore_for_batch);
+            let renames = Arc::clone(&renames_for_batch);
+            let fixer_slot = Arc::clone(&fixer_for_batch);
 
             // Offloaded to tokio's dedicated blocking thread pool
             // (R8): this closure is invoked synchronously from the
@@ -740,8 +779,21 @@ impl SourceRegistry {
                         }
                     },
                 );
-                if let Err(e) = result {
-                    tracing::warn!(source = %source_name, error = %e, "failed to apply change batch");
+                match result {
+                    Ok(total) => {
+                        // G1: what this batch found gone and new is
+                        // matched up, and a certain rename fixed.
+                        let fixer = fixer_slot
+                            .read()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .clone();
+                        if let Some(fixer) = fixer {
+                            renames.on_batch(&*fixer, &os_marks, total.vanished, total.appeared);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(source = %source_name, error = %e, "failed to apply change batch");
+                    }
                 }
             });
             // Fire-and-forget: `on_batch` itself is a synchronous
@@ -789,6 +841,31 @@ impl SourceRegistry {
         let pause = watcher::WatcherPause::new(on_batch);
         let pause_for_handler = pause.clone();
 
+        // G2: a rename the OS did not identify waits a hold. The task
+        // that ends it runs on the registry's runtime and hands the
+        // fix to the blocking pool, like a batch. Its clock stands
+        // still while a pause or the writer gate is active.
+        let hold_task = {
+            let renames = Arc::clone(&renames);
+            let fixer_slot = Arc::clone(&self.rename_fixer);
+            let blocking = self.runtime.handle().clone();
+            let pause = pause.clone();
+            let gate = Arc::clone(&self.gate);
+            self.runtime.spawn(rename_detect::run_holds(
+                Arc::clone(&renames.detector),
+                Arc::clone(&renames.wake),
+                move || pause.is_paused() || gate.is_busy(),
+                move |decisions| {
+                    let fixer = fixer_slot.read().unwrap_or_else(|p| p.into_inner()).clone();
+                    let Some(fixer) = fixer else { return };
+                    let renames = Arc::clone(&renames);
+                    drop(blocking.spawn_blocking(move || {
+                        rename_detect::dispatch(&*fixer, &renames.source, &renames.root, decisions);
+                    }));
+                },
+            ))
+        };
+
         let handle = watcher::spawn_debounce(
             tap,
             root,
@@ -802,6 +879,7 @@ impl SourceRegistry {
                 handle,
                 pause,
                 ignore_rules,
+                _hold_task: AbortOnDrop(hold_task),
             },
         );
         Ok(())

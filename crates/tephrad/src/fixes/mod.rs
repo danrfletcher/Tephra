@@ -164,6 +164,26 @@ pub struct FixSpec {
     pub files: Vec<(String, String)>,
 }
 
+/// What [`FixEngine::begin_plan`] stores: the entry's own old and new
+/// path (a file's, or a folder's), and the work, one row per linking
+/// file per moved file.
+struct Plan {
+    old_source: String,
+    new_source: String,
+    entry_old: String,
+    entry_new: String,
+    rows: Vec<PlanRow>,
+}
+
+/// One pending row: `file` is `(source, path)` of the linking file, and
+/// `old` to `new` the rename it is to be fixed for.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PlanRow {
+    file: (String, String),
+    old: String,
+    new: String,
+}
+
 /// What one pass over the pending rows did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunSummary {
@@ -287,15 +307,84 @@ impl FixEngine {
         })
     }
 
+    /// Fixes the links to every file of a folder renamed from `old_dir`
+    /// to `new_dir` inside `source` (G1): `moves` are the `(old, new)`
+    /// paths of the files that moved. ONE entry is logged, with the
+    /// folder's own old and new path; each linking file is stored once
+    /// per moved file it links to, each row naming that file's old and
+    /// new path, because the write loop fixes one rename at a time.
+    /// `files_changed` counts the linking files written, not the files
+    /// that moved. A moved file that is not a unit, or that nothing
+    /// links to, adds no work.
+    pub fn begin_folder_rename(
+        &self,
+        source: &str,
+        old_dir: &str,
+        new_dir: &str,
+        moves: &[(String, String)],
+    ) -> Result<FixEntryWire, FixError> {
+        let rows = {
+            let cache = self.open()?;
+            let graph = UnitGraph::build_from_cache(&cache)?;
+            let mut rows: BTreeSet<PlanRow> = BTreeSet::new();
+            for (old, new) in moves {
+                // A moved file that cannot be fixed (not a unit now, or
+                // its old path is one again) is left out; the rest
+                // still are.
+                let Ok(files) = linking_files(&graph, source, old, new) else {
+                    continue;
+                };
+                for file in files {
+                    rows.insert(PlanRow {
+                        file,
+                        old: old.clone(),
+                        new: new.clone(),
+                    });
+                }
+            }
+            rows.into_iter().collect::<Vec<_>>()
+        };
+        self.begin_plan(&Plan {
+            old_source: source.to_string(),
+            new_source: source.to_string(),
+            entry_old: old_dir.to_string(),
+            entry_new: new_dir.to_string(),
+            rows,
+        })
+    }
+
     /// Logs ONE entry for the rename and stores every linking file in
     /// the pending list, in one transaction, before the first write.
     /// Then works through the list. Returns the entry as it stands at
     /// the end (`partial` while work is left).
     pub fn begin_fix(&self, spec: &FixSpec) -> Result<FixEntryWire, FixError> {
+        let files: BTreeSet<&(String, String)> = spec.files.iter().collect();
+        self.begin_plan(&Plan {
+            old_source: spec.old_source.clone(),
+            new_source: spec.new_source.clone(),
+            entry_old: spec.old_path.clone(),
+            entry_new: spec.new_path.clone(),
+            rows: files
+                .into_iter()
+                .map(|file| PlanRow {
+                    file: file.clone(),
+                    old: spec.old_path.clone(),
+                    new: spec.new_path.clone(),
+                })
+                .collect(),
+        })
+    }
+
+    /// The body of [`FixEngine::begin_fix`] and
+    /// [`FixEngine::begin_folder_rename`]: the entry and the work list
+    /// in one transaction, then the work.
+    fn begin_plan(&self, plan: &Plan) -> Result<FixEntryWire, FixError> {
         let _guard = self.lock();
         let cache = self.open()?;
         let now = self.clock.now();
-        let files: BTreeSet<&(String, String)> = spec.files.iter().collect();
+        // One entry per linking file, however many moved files it links
+        // to.
+        let files: BTreeSet<&(String, String)> = plan.rows.iter().map(|r| &r.file).collect();
         let detail = FixDetail {
             files: files
                 .iter()
@@ -303,15 +392,16 @@ impl FixEngine {
                 .collect(),
             ..FixDetail::default()
         };
-        let pending: Vec<NewPendingFix> = files
+        let pending: Vec<NewPendingFix> = plan
+            .rows
             .iter()
-            .map(|(s, p)| NewPendingFix {
-                source: s.clone(),
-                file_path: p.clone(),
-                old_source: Some(spec.old_source.clone()),
-                old_path: Some(spec.old_path.clone()),
-                new_source: Some(spec.new_source.clone()),
-                new_path: Some(spec.new_path.clone()),
+            .map(|r| NewPendingFix {
+                source: r.file.0.clone(),
+                file_path: r.file.1.clone(),
+                old_source: Some(plan.old_source.clone()),
+                old_path: Some(r.old.clone()),
+                new_source: Some(plan.new_source.clone()),
+                new_path: Some(r.new.clone()),
             })
             .collect();
         let (fix_id, _) = cache.start_fix(
@@ -319,10 +409,10 @@ impl FixEngine {
                 created_at: now,
                 kind: KIND_RENAME.to_string(),
                 status: overall_status(&detail.files).to_string(),
-                old_source: Some(spec.old_source.clone()),
-                old_path: Some(spec.old_path.clone()),
-                new_source: Some(spec.new_source.clone()),
-                new_path: Some(spec.new_path.clone()),
+                old_source: Some(plan.old_source.clone()),
+                old_path: Some(plan.entry_old.clone()),
+                new_source: Some(plan.new_source.clone()),
+                new_path: Some(plan.entry_new.clone()),
                 files_changed: 0,
                 detail_json: Some(detail.to_json()),
             },
@@ -729,4 +819,44 @@ fn relative_paths(
             })
         })
         .collect())
+}
+
+impl crate::rename_detect::RenameFixer for FixEngine {
+    fn fix_rename(&self, source: &str, old: &str, new: &str) -> Result<(), String> {
+        self.begin_rename(source, old, new)
+            .map(|e| log_entry(&e))
+            .map_err(|e| e.to_string())
+    }
+
+    fn fix_folder_rename(
+        &self,
+        source: &str,
+        old_dir: &str,
+        new_dir: &str,
+        moves: &[(String, String)],
+    ) -> Result<(), String> {
+        self.begin_folder_rename(source, old_dir, new_dir, moves)
+            .map(|e| log_entry(&e))
+            .map_err(|e| e.to_string())
+    }
+
+    fn record_uncertain(&self, source: &str, path: &str) -> Result<(), String> {
+        FixEngine::record_uncertain(self, source, path)
+            .map(|e| log_entry(&e))
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// One info line in the daemon log for a fix-log entry the automatic
+/// fix just wrote (the entry itself is in `fix.list`).
+fn log_entry(e: &FixEntryWire) {
+    tracing::info!(
+        fix_id = e.id,
+        kind = %e.kind,
+        old = e.old.as_deref().unwrap_or(""),
+        new = e.new.as_deref().unwrap_or(""),
+        files_changed = e.files_changed,
+        status = %e.status,
+        "fix"
+    );
 }

@@ -270,7 +270,12 @@ fn main() -> ExitCode {
 ///    `socket_tasks.wait_until_idle(..)` (bounded, in case some client
 ///    never acknowledges the close) immediately after joining the
 ///    forwarder above and before constructing the tuple handed back
-///    out, for the same reason as point 4.
+///    out, for the same reason as point 4. A connection is counted
+///    from the HTTP handler (`ws_rpc_handler`), before axum spawns its
+///    upgrade task, not from when that task first runs (T8): a task
+///    that started late, after a SIGTERM, had its `Arc<AppState>` in
+///    no count, so it was the last owner of the registry when
+///    `drop(runtime)` tore it down on a worker thread.
 fn run_server(
     listen_addr: &str,
     cache_path: &std::path::Path,
@@ -449,6 +454,9 @@ fn run_server(
                 &refactor_engine,
             )),
         ));
+        // G1: a rename a watcher sees is fixed by this engine, with no
+        // client involved.
+        registry.set_rename_fixer(fix_engine.clone());
 
         let state = Arc::new(
             AppState::with_shutdown(

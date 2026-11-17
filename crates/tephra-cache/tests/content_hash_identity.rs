@@ -294,3 +294,34 @@ fn both_lookups_use_an_index() {
     let by_identity = plan("SELECT id FROM units WHERE device = 1 AND inode = 2");
     assert!(by_identity.contains("idx_units_identity"), "{by_identity}");
 }
+
+#[test]
+fn units_under_prefix_lists_exactly_the_rows_nested_under_a_folder_in_one_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = common::open_temp_cache(&dir);
+    let (notes, repo) = two_sources(&cache);
+    for (source, rel) in [
+        (notes, "Proj/a.md"),
+        (notes, "Proj/sub/b.md"),
+        (notes, "Proj.md"),
+        (notes, "Proj0/c.md"),
+        (notes, "Projx/d.md"),
+        (notes, "Other/e.md"),
+        (repo, "Proj/f.md"),
+    ] {
+        cache.insert_unit(&unit(source, rel)).unwrap();
+    }
+    let rows = cache.units_under_prefix(notes, "Proj").unwrap();
+    assert_eq!(
+        paths(&rows),
+        vec![(notes, "Proj/a.md"), (notes, "Proj/sub/b.md")],
+        "the folder's own name, a sibling that merely starts with it and another source are not nested under it"
+    );
+    assert!(cache
+        .units_under_prefix(notes, "Nothing")
+        .unwrap()
+        .is_empty());
+    // It lists what delete_units_under_prefix removes.
+    let removed = cache.delete_units_under_prefix(notes, "Proj").unwrap();
+    assert_eq!(removed, rows.len());
+}

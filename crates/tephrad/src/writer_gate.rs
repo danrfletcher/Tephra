@@ -94,6 +94,15 @@ impl WriterGate {
         state.held = true;
         WriterGateGuard { gate: self }
     }
+
+    /// Whether a writer holds the gate or is queued for it right now.
+    /// A snapshot: it can change the moment it is read. The rename
+    /// detector's hold timers stand still while it is true
+    /// ([`crate::rename_detect::run_holds`]).
+    pub fn is_busy(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        state.held || state.serving != state.next_ticket
+    }
 }
 
 /// Held for exactly as long as this writer's own transaction is open

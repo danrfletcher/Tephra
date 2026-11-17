@@ -18,6 +18,7 @@ pub mod fixes;
 pub mod ignore;
 pub mod refactor;
 pub mod registry;
+pub mod rename_detect;
 pub mod rpc;
 pub mod scan;
 pub mod search;
