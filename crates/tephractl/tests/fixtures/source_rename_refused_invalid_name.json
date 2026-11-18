@@ -1,0 +1,11 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "error": {
+    "code": -32011,
+    "message": "\"a:b\" is not a valid source name: it must not contain any of / \\ @ : # ^ | [ ] *",
+    "data": {
+      "reason": "invalid_name"
+    }
+  }
+}

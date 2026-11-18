@@ -20,6 +20,7 @@ USAGE:
     tephractl source add <name> <path> [--json]
     tephractl source promote <name> <path> [--json]
     tephractl source unpromote <name> [--json]
+    tephractl source rename <old> <new> [--json]
     tephractl source remove <name> [--json]
     tephractl source list [--json]
     tephractl status [--json]
@@ -170,6 +171,12 @@ pub enum Command {
     SourceUnpromote {
         name: String,
     },
+    /// `source rename <old> <new>`: the source `old` is called `new` from
+    /// now on and every `@old:` link is rewritten to `@new:`.
+    SourceRename {
+        old: String,
+        new: String,
+    },
     SourceList,
     Status,
     /// `ls <source> [folder] [-r]`: `folder` is `""` for the source
@@ -270,11 +277,12 @@ pub enum Action {
 }
 
 /// Characters a source name must never contain (edge case: "a name
-/// containing invalid characters (spaces, `/`, `@`) is rejected
+/// containing invalid characters (spaces, `/`, `@`, `:`, `*`) is rejected
 /// client-side"). Whitespace is checked separately via
 /// `char::is_whitespace` so it covers more than just the literal
-/// space character.
-const SOURCE_NAME_FORBIDDEN_CHARS: [char; 2] = ['/', '@'];
+/// space character. `:` and `*` join the set with `source rename` (G13):
+/// the daemon refuses them in a new name too.
+const SOURCE_NAME_FORBIDDEN_CHARS: [char; 4] = ['/', '@', ':', '*'];
 
 fn validate_source_name(name: &str) -> Result<(), ArgsError> {
     if name.is_empty() {
@@ -286,7 +294,7 @@ fn validate_source_name(name: &str) -> Result<(), ArgsError> {
             .any(|c| SOURCE_NAME_FORBIDDEN_CHARS.contains(&c))
     {
         return Err(ArgsError(format!(
-            "invalid source name \"{name}\": must not contain spaces, '/', or '@'"
+            "invalid source name \"{name}\": must not contain spaces, '/', '@', ':' or '*'"
         )));
     }
     Ok(())
@@ -397,7 +405,8 @@ fn parse_source<'a>(
 ) -> Result<(Command, bool, Option<String>), ArgsError> {
     let sub = iter.next().ok_or_else(|| {
         ArgsError(
-            "expected a source subcommand: add, promote, unpromote, remove, or list".to_string(),
+            "expected a source subcommand: add, promote, unpromote, rename, remove, or list"
+                .to_string(),
         )
     })?;
 
@@ -436,6 +445,21 @@ fn parse_source<'a>(
             let (json, addr) = parse_trailing_flags(iter)?;
             Ok((Command::SourceUnpromote { name }, json, addr))
         }
+        "rename" => {
+            let old = iter
+                .next()
+                .ok_or_else(|| ArgsError("source rename requires <old> <new>".to_string()))?
+                .to_string();
+            // The name rules apply to the new name only: an existing name is
+            // never re-checked (FR14), so `<old>` goes to the daemon as typed.
+            let new = iter
+                .next()
+                .ok_or_else(|| ArgsError("source rename requires <old> <new>".to_string()))?
+                .to_string();
+            validate_source_name(&new)?;
+            let (json, addr) = parse_trailing_flags(iter)?;
+            Ok((Command::SourceRename { old, new }, json, addr))
+        }
         "remove" => {
             let name = iter
                 .next()
@@ -449,7 +473,7 @@ fn parse_source<'a>(
             Ok((Command::SourceList, json, addr))
         }
         other => Err(ArgsError(format!(
-            "unrecognized source subcommand: {other} (expected add, promote, unpromote, remove, or list)"
+            "unrecognized source subcommand: {other} (expected add, promote, unpromote, rename, remove, or list)"
         ))),
     }
 }
@@ -1090,6 +1114,66 @@ mod tests {
         assert!(json.json);
         assert!(parse_args(["source", "unpromote"]).is_err());
         assert!(parse_args(["source", "unpromote", "a", "b"]).is_err());
+    }
+
+    #[test]
+    fn source_rename_parses_both_names_and_flags_and_needs_both() {
+        let parsed = run(&["source", "rename", "tephrad", "daemon"]).unwrap();
+        assert_eq!(
+            parsed.command,
+            Command::SourceRename {
+                old: "tephrad".to_string(),
+                new: "daemon".to_string()
+            }
+        );
+        assert!(!parsed.json);
+        let json = run(&["source", "rename", "tephrad", "daemon", "--json"]).unwrap();
+        assert!(json.json);
+        // Missing arguments.
+        let err = parse_args(["source", "rename"]).unwrap_err();
+        assert!(
+            err.0.contains("source rename requires <old> <new>"),
+            "{}",
+            err.0
+        );
+        let err = parse_args(["source", "rename", "tephrad"]).unwrap_err();
+        assert!(
+            err.0.contains("source rename requires <old> <new>"),
+            "{}",
+            err.0
+        );
+        // A third name is not accepted.
+        assert!(parse_args(["source", "rename", "a", "b", "c"]).is_err());
+    }
+
+    /// The new name is checked client-side with the widened rule (`:` and
+    /// `*` join `/`, `@` and whitespace); the old name never is (FR14).
+    #[test]
+    fn source_rename_checks_the_new_name_only_and_with_the_widened_rule() {
+        for bad in ["", "bad/name", "a@b", "a:b", "a*b", "a b", "a\tb"] {
+            let err = parse_args(["source", "rename", "tephrad", bad]).unwrap_err();
+            let want = if bad.is_empty() {
+                "source name must not be empty"
+            } else {
+                "invalid source name"
+            };
+            assert!(err.0.contains(want), "{bad:?}: {}", err.0);
+        }
+        let err = parse_args(["source", "rename", "tephrad", "a:b"]).unwrap_err();
+        assert!(err.0.contains("':'") && err.0.contains("'*'"), "{}", err.0);
+        // An existing name that breaks today's rules can still be renamed away.
+        let parsed = run(&["source", "rename", "old*name", "fresh"]).unwrap();
+        assert_eq!(
+            parsed.command,
+            Command::SourceRename {
+                old: "old*name".to_string(),
+                new: "fresh".to_string()
+            }
+        );
+        // `source add` and `source promote` take the widened rule too.
+        assert!(parse_args(["source", "add", "a:b", "/p"]).is_err());
+        assert!(parse_args(["source", "add", "a*b", "/p"]).is_err());
+        assert!(parse_args(["source", "promote", "a:b", "/p"]).is_err());
     }
 
     #[test]

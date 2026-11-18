@@ -1,0 +1,11 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "error": {
+    "code": -32011,
+    "message": "there is no source named \"ghost\"",
+    "data": {
+      "reason": "unknown_source"
+    }
+  }
+}

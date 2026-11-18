@@ -122,12 +122,15 @@ fn bad_params_are_invalid_params_and_unbuilt_verbs_stay_unknown() {
         let frame = client.call("source.promote", params.clone());
         assert_eq!(frame["error"]["code"], -32602, "{params}: {frame}");
     }
-    // PR-14 owns this one (F12). `source.unpromote` is built (PR-13): it
-    // is a real method now, with its own params check.
-    let frame = client.call("source.rename", json!({"name": "x"}));
-    assert_eq!(frame["error"]["code"], -32601, "{frame}");
+    // `source.unpromote` (PR-13) and `source.rename` (PR-14) are real
+    // methods now, each with its own params check; a verb nobody built is
+    // still unknown (F12).
     let frame = client.call("source.unpromote", json!({}));
     assert_eq!(frame["error"]["code"], -32602, "{frame}");
+    let frame = client.call("source.rename", json!({"name": "x"}));
+    assert_eq!(frame["error"]["code"], -32602, "{frame}");
+    let frame = client.call("source.set_name", json!({"name": "x"}));
+    assert_eq!(frame["error"]["code"], -32601, "{frame}");
     d.close();
 }
 

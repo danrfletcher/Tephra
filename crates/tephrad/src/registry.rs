@@ -165,6 +165,27 @@ impl fmt::Display for RegisterError {
     }
 }
 
+impl RegisterError {
+    /// The stable reason string clients branch on (`data.reason`, G14):
+    /// a root nested in or above a registered one is `nested_source`
+    /// (F10), the same root is `is_a_source_root`.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            RegisterError::InvalidPath {
+                reason: PathProbe::Missing | PathProbe::NotADirectory,
+                ..
+            } => "not_a_folder",
+            RegisterError::InvalidPath { .. } => "not_readable",
+            RegisterError::DuplicateName(_) => "name_taken",
+            RegisterError::Conflict {
+                reason: ConflictReason::SameRoot,
+                ..
+            } => "is_a_source_root",
+            RegisterError::Conflict { .. } => "nested_source",
+        }
+    }
+}
+
 impl std::error::Error for RegisterError {}
 
 /// Validates a candidate `(name, root)` registration against the
@@ -333,13 +354,122 @@ impl fmt::Display for UnpromoteError {
 
 impl std::error::Error for UnpromoteError {}
 
+/// Why `source.rename` refused (G13, G14). Each has a stable
+/// machine-readable [`RenameError::reason`]; a refusal changes nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenameError {
+    /// No source has the name to rename.
+    UnknownSource { name: String },
+    /// The new name breaks the name rules ([`check_source_name`]).
+    InvalidName { name: String, why: &'static str },
+    /// Another source has this name, compared without regard to case
+    /// (FR14).
+    NameTaken { name: String, with: String },
+    /// The source to rename is offline: its files cannot be reached.
+    SourceOffline { source: String },
+}
+
+impl RenameError {
+    /// The stable reason string clients branch on (`data.reason`).
+    pub fn reason(&self) -> &'static str {
+        match self {
+            RenameError::UnknownSource { .. } => "unknown_source",
+            RenameError::InvalidName { .. } => "invalid_name",
+            RenameError::NameTaken { .. } => "name_taken",
+            RenameError::SourceOffline { .. } => "source_offline",
+        }
+    }
+}
+
+impl fmt::Display for RenameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RenameError::UnknownSource { name } => {
+                write!(f, "there is no source named \"{name}\"")
+            }
+            RenameError::InvalidName { name, why } => {
+                write!(f, "\"{name}\" is not a valid source name: {why}")
+            }
+            RenameError::NameTaken { name, with } => {
+                write!(f, "the name \"{name}\" is taken by the source \"{with}\"")
+            }
+            RenameError::SourceOffline { source } => {
+                write!(
+                    f,
+                    "the source \"{source}\" is offline, so its links cannot be rewritten"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for RenameError {}
+
+/// What a valid `source.rename` comes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenameCheck {
+    /// The new name is the source's own: nothing to do, and nothing is
+    /// rewritten, logged or pushed.
+    Unchanged,
+    /// Rename the source.
+    Rename,
+}
+
+/// Validates a `source.rename {name, new_name}` against the registered
+/// `existing` sources. Pure, like [`validate_register`]: no filesystem, no
+/// SQLite. `offline` says whether the source `name` is offline.
+///
+/// Checked in this order: the source must exist (`unknown_source`); the
+/// same name is a no-op success whatever the name rules say (an existing
+/// name is never re-checked, FR14); then the new name (`invalid_name`,
+/// then `name_taken`, compared without regard to case, the source's own
+/// name not counting); then `source_offline`.
+pub fn validate_rename(
+    existing: &[Source],
+    offline: bool,
+    name: &str,
+    new_name: &str,
+) -> Result<RenameCheck, RenameError> {
+    if !existing.iter().any(|s| s.name == name) {
+        return Err(RenameError::UnknownSource {
+            name: name.to_string(),
+        });
+    }
+    if name == new_name {
+        return Ok(RenameCheck::Unchanged);
+    }
+    if let Err(why) = check_source_name(new_name) {
+        return Err(RenameError::InvalidName {
+            name: new_name.to_string(),
+            why,
+        });
+    }
+    let lower = new_name.to_lowercase();
+    if let Some(taken) = existing
+        .iter()
+        .find(|s| s.name != name && s.name.to_lowercase() == lower)
+    {
+        return Err(RenameError::NameTaken {
+            name: new_name.to_string(),
+            with: taken.name.clone(),
+        });
+    }
+    if offline {
+        return Err(RenameError::SourceOffline {
+            source: name.to_string(),
+        });
+    }
+    Ok(RenameCheck::Rename)
+}
+
 /// The most characters a new source name may have.
 pub const MAX_SOURCE_NAME_CHARS: usize = 64;
 
 /// The name rules for a NEW source name (FR14: an existing name is never
 /// re-checked): not empty, at most [`MAX_SOURCE_NAME_CHARS`] characters,
 /// no whitespace or control character, none of the characters that mean
-/// something in a link (`/ \\ @ : # ^ | [ ]`), and not `.` or `..`.
+/// something in a link or a glob (`/ \\ @ : # ^ | [ ] *`), and not `.` or
+/// `..`. Used by `source.promote` and `source.rename`.
 pub fn check_source_name(name: &str) -> Result<(), &'static str> {
     if name.is_empty() {
         return Err("it must not be empty");
@@ -353,11 +483,13 @@ pub fn check_source_name(name: &str) -> Result<(), &'static str> {
     if name.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err("it must not contain spaces or control characters");
     }
-    if name
-        .chars()
-        .any(|c| matches!(c, '/' | '\\' | '@' | ':' | '#' | '^' | '|' | '[' | ']'))
-    {
-        return Err("it must not contain any of / \\ @ : # ^ | [ ]");
+    if name.chars().any(|c| {
+        matches!(
+            c,
+            '/' | '\\' | '@' | ':' | '#' | '^' | '|' | '[' | ']' | '*'
+        )
+    }) {
+        return Err("it must not contain any of / \\ @ : # ^ | [ ] *");
     }
     Ok(())
 }
@@ -531,6 +663,8 @@ pub enum RegistryError {
     Promote(PromoteError),
     /// `source.unpromote` refused (G14): nothing was changed.
     Unpromote(UnpromoteError),
+    /// `source.rename` refused (G13, G14): nothing was changed.
+    Rename(RenameError),
     /// The link rewrites of a promote or an unpromote failed after it was
     /// recorded; what is left is finished at the next start.
     Fix(String),
@@ -547,6 +681,7 @@ impl fmt::Display for RegistryError {
             RegistryError::NotFound(name) => write!(f, "no source named \"{name}\""),
             RegistryError::Promote(e) => write!(f, "{e}"),
             RegistryError::Unpromote(e) => write!(f, "{e}"),
+            RegistryError::Rename(e) => write!(f, "{e}"),
             RegistryError::Fix(m) => write!(f, "{m}"),
         }
     }
@@ -557,6 +692,11 @@ impl std::error::Error for RegistryError {}
 impl From<RegisterError> for RegistryError {
     fn from(e: RegisterError) -> Self {
         RegistryError::Validation(e)
+    }
+}
+impl From<RenameError> for RegistryError {
+    fn from(e: RenameError) -> Self {
+        RegistryError::Rename(e)
     }
 }
 impl From<UnpromoteError> for RegistryError {
@@ -811,6 +951,22 @@ pub struct UnpromoteOutcome {
     /// Linking files left for a retry or a person.
     pub deferred: i64,
     /// The fix-log status: `applied`, `partial` or `needs_manual_fix`.
+    pub status: String,
+}
+
+/// What a `source.rename` did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenameOutcome {
+    pub old_name: String,
+    pub new_name: String,
+    /// `true` when the new name was the source's own: nothing was done.
+    pub unchanged: bool,
+    /// Linking files rewritten.
+    pub files_changed: i64,
+    /// Linking files left for a retry or a person.
+    pub deferred: i64,
+    /// The fix-log status: `applied`, `partial` or `needs_manual_fix`
+    /// (`applied` when nothing was done).
     pub status: String,
 }
 
@@ -1341,6 +1497,192 @@ impl SourceRegistry {
             Err(RegistryError::NotFound(_))
             | Err(RegistryError::Unpromote(UnpromoteError::NotPromoted { .. })) => Ok(false),
             Err(e) => Err(e),
+        }
+    }
+
+    /// `source.rename` (G13): the source `name` is called `new_name` from
+    /// now on, and every `@name:` link of every source is rewritten to
+    /// `@new_name:`. The order is a promote's:
+    ///
+    /// 1. validate ([`validate_rename`]; a refusal changes nothing and
+    ///    sends nothing; the same name is a no-op success, and so is a
+    ///    repeat of a rename that already committed, `name` gone and
+    ///    `new_name` registered with a logged `source_rename` between
+    ///    the two);
+    /// 2. the watchers are paused, so nothing interleaves (and the rename
+    ///    is serialised with every promote, unpromote and other rename);
+    /// 3. [`FixEngine::rename_source`]: ONE transaction (the registry row,
+    ///    everything that holds the name, the log entry, every file to
+    ///    rewrite), the source's live watcher moved to the new name, then
+    ///    the link rewrites;
+    /// 4. the files written are indexed;
+    /// 5. the watchers resume (a change made meanwhile is applied now,
+    ///    except Tephra's own writes), and ONE push goes out.
+    ///
+    /// A crash after step 3's transaction leaves the pending list; the
+    /// next start finishes the rewrites.
+    pub fn rename(
+        &self,
+        name: &str,
+        new_name: &str,
+        engine: &crate::fixes::FixEngine,
+    ) -> Result<RenameOutcome, RegistryError> {
+        let _one_at_a_time = self.promote_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let check = {
+            let cache = self.cache.lock().unwrap();
+            let rows = cache.list_sources()?;
+            let existing: Vec<Source> = rows
+                .iter()
+                .map(|r| Source {
+                    name: r.name.clone(),
+                    root: PathBuf::from(&r.path),
+                })
+                .collect();
+            let offline = rows
+                .iter()
+                .any(|r| r.name == name && r.status == SourceStatus::Offline);
+            // A retry of a rename that already committed (a client that
+            // never saw the answer, E9): `name` is gone and `new_name` is
+            // the source the logged rename made of it. Same answer as
+            // the first time, so it is a no-op success. A name that was
+            // simply unregistered has no such log entry and stays
+            // `unknown_source`.
+            let retry = !existing.iter().any(|s| s.name == name)
+                && existing.iter().any(|s| s.name == new_name)
+                && cache.source_rename_logged(name, new_name)?;
+            if retry {
+                RenameCheck::Unchanged
+            } else {
+                validate_rename(&existing, offline, name, new_name)?
+            }
+        };
+        if check == RenameCheck::Unchanged {
+            return Ok(RenameOutcome {
+                old_name: name.to_string(),
+                new_name: new_name.to_string(),
+                unchanged: true,
+                files_changed: 0,
+                deferred: 0,
+                status: crate::fixes::log::STATUS_APPLIED.to_string(),
+            });
+        }
+
+        let spec = crate::fixes::SourceRenameSpec {
+            old_name: name.to_string(),
+            new_name: new_name.to_string(),
+        };
+        self.pause_for_write();
+        let result = self.rename_paused(&spec, engine);
+        // As in `promote`: no path is discarded on resume (FR24).
+        self.resume_after_write(&HashSet::new());
+        let done = result?;
+
+        let deferred = done
+            .announcement
+            .notices
+            .iter()
+            .map(|n| n.deferred)
+            .sum::<i64>();
+        let outcome = RenameOutcome {
+            old_name: name.to_string(),
+            new_name: new_name.to_string(),
+            unchanged: false,
+            files_changed: done.entry.files_changed,
+            deferred,
+            status: done.entry.status.clone(),
+        };
+        // ONE push: the source-list change and the fix entry together.
+        let _ = self.events_tx.send(DaemonEvent::SourceListChanged {
+            changes: vec![SourceChange::renamed(name, new_name)],
+            fixes: done.announcement.notices,
+        });
+        tracing::info!(
+            source = %name,
+            new_name = %new_name,
+            files_changed = outcome.files_changed,
+            "source_renamed"
+        );
+        Ok(outcome)
+    }
+
+    /// The part of [`SourceRegistry::rename`] that runs with the
+    /// watchers paused.
+    fn rename_paused(
+        &self,
+        spec: &crate::fixes::SourceRenameSpec,
+        engine: &crate::fixes::FixEngine,
+    ) -> Result<crate::fixes::SourceRenameDone, RegistryError> {
+        use crate::fixes::FixError;
+
+        let swap = || self.move_watcher(&spec.old_name, &spec.new_name);
+        let done = engine.rename_source(spec, &swap).map_err(|e| match e {
+            FixError::NameTaken(name) => RegistryError::Rename(RenameError::NameTaken {
+                with: name.clone(),
+                name,
+            }),
+            FixError::UnknownSource(name) => {
+                RegistryError::Rename(RenameError::UnknownSource { name })
+            }
+            e => RegistryError::Fix(e.to_string()),
+        })?;
+        for file in &done.announcement.written {
+            if let Err(e) = self.reindex_quietly(&file.source, &file.path) {
+                tracing::warn!(source = %file.source, path = %file.path.display(), error = %e, "could not index a file the rename rewrote");
+            }
+        }
+        Ok(done)
+    }
+
+    /// Moves the live watcher of `old` to the name `new`, after the cache
+    /// row was renamed: the old one stops for good and one under the new
+    /// name starts on the same root, paused like every other watcher
+    /// while a writer is working (it is resumed with them). Nothing is
+    /// scanned: no unit changed. A source with no live watcher (it never
+    /// started, or failed to) gets none now.
+    fn move_watcher(&self, old: &str, new: &str) {
+        let was_running = match self.running.lock().unwrap().remove(old) {
+            Some(running) => {
+                running.handle.stop();
+                *running.live.lock().unwrap_or_else(|p| p.into_inner()) = false;
+                true
+            }
+            None => false,
+        };
+        self.renames.remove_source(old);
+        if self.is_permission_denied(old) {
+            self.set_permission_denied(old, false);
+            self.set_permission_denied(new, true);
+        }
+        if !was_running {
+            return;
+        }
+        let row = Cache::open_read_only(&self.cache_path)
+            .and_then(|cache| cache.get_source(new))
+            .ok()
+            .flatten();
+        let Some(row) = row else {
+            tracing::warn!(source = %new, "renamed source has no row; no watcher started");
+            return;
+        };
+        let root = PathBuf::from(&row.path);
+        let started = self
+            .load_rules(new, &root)
+            .map_err(RegistryError::from)
+            .and_then(|rules| {
+                let rules = Arc::new(RwLock::new(rules));
+                let tap = watcher::start(root.clone(), Arc::clone(&rules))?;
+                self.start_watcher(new.to_string(), row.id, root.clone(), rules, tap)?;
+                Ok(())
+            });
+        match started {
+            Ok(()) => {
+                if let Some(running) = self.running.lock().unwrap().get(new) {
+                    running.pause.pause();
+                }
+            }
+            Err(e) => {
+                tracing::warn!(source = %new, error = %e, "could not start the watcher of a renamed source")
+            }
         }
     }
 
@@ -2729,6 +3071,166 @@ mod tests {
                 .expect_err(&format!("{name:?} at {root:?} must be refused"));
             assert_eq!(err.reason(), *reason, "{name:?} at {root:?}: {err}");
         }
+    }
+
+    // ---- rename (G13, G14) ---------------------------------------------
+
+    fn rename_fixtures() -> Vec<Source> {
+        vec![
+            source("notes", "/home/dan/Vault"),
+            source("tephrad", "/home/dan/Developer/Tephra/crates/tephrad"),
+            // Registered before the name rules widened: never re-checked (FR14).
+            source("old*name", "/home/dan/Old"),
+        ]
+    }
+
+    /// G13/G14: every rule on the new name and every reason of
+    /// `source.rename`, in one table: `(name, new_name, offline, reason)`.
+    #[test]
+    fn validate_rename_refuses_each_case_with_its_reason() {
+        let existing = rename_fixtures();
+        let too_long = "x".repeat(MAX_SOURCE_NAME_CHARS + 1);
+        let cases: &[(&str, &str, bool, &str)] = &[
+            ("tephrad", "", false, "invalid_name"),
+            ("tephrad", " ", false, "invalid_name"),
+            ("tephrad", "a b", false, "invalid_name"),
+            ("tephrad", "a\tb", false, "invalid_name"),
+            ("tephrad", "a/b", false, "invalid_name"),
+            ("tephrad", "a\\b", false, "invalid_name"),
+            ("tephrad", "@a", false, "invalid_name"),
+            ("tephrad", "a:b", false, "invalid_name"),
+            ("tephrad", "a*b", false, "invalid_name"),
+            ("tephrad", "a#b", false, "invalid_name"),
+            ("tephrad", "a^b", false, "invalid_name"),
+            ("tephrad", "a|b", false, "invalid_name"),
+            ("tephrad", "a[b]", false, "invalid_name"),
+            ("tephrad", ".", false, "invalid_name"),
+            ("tephrad", "..", false, "invalid_name"),
+            ("tephrad", too_long.as_str(), false, "invalid_name"),
+            // Taken: exactly, and without regard to case (FR14).
+            ("tephrad", "notes", false, "name_taken"),
+            ("tephrad", "Notes", false, "name_taken"),
+            ("tephrad", "NOTES", false, "name_taken"),
+            ("tephrad", "OLD*NAME", false, "invalid_name"),
+            // The source to rename does not exist (the case counts).
+            ("ghost", "daemon", false, "unknown_source"),
+            ("Tephrad", "daemon", false, "unknown_source"),
+            ("", "daemon", false, "unknown_source"),
+            // Offline: its files cannot be reached.
+            ("tephrad", "daemon", true, "source_offline"),
+        ];
+        for (name, new_name, offline, reason) in cases {
+            let err = validate_rename(&existing, *offline, name, new_name)
+                .expect_err(&format!("{name:?} -> {new_name:?} must be refused"));
+            assert_eq!(err.reason(), *reason, "{name:?} -> {new_name:?}: {err}");
+            assert!(!err.to_string().is_empty());
+        }
+    }
+
+    /// The order of the checks: the source must exist before the name is
+    /// looked at, and the name before the source's state.
+    #[test]
+    fn validate_rename_checks_in_a_fixed_order() {
+        let existing = rename_fixtures();
+        // Unknown source beats a bad name.
+        assert_eq!(
+            validate_rename(&existing, false, "ghost", "a/b")
+                .unwrap_err()
+                .reason(),
+            "unknown_source"
+        );
+        // A bad name beats an offline source.
+        assert_eq!(
+            validate_rename(&existing, true, "tephrad", "a/b")
+                .unwrap_err()
+                .reason(),
+            "invalid_name"
+        );
+        // A taken name beats an offline source.
+        assert_eq!(
+            validate_rename(&existing, true, "tephrad", "notes")
+                .unwrap_err()
+                .reason(),
+            "name_taken"
+        );
+    }
+
+    /// G13: valid names, the same name as a no-op (even for a name that
+    /// would not pass the rules today, FR14), and a case-only change of the
+    /// source's own name, which is a rename and not a clash with itself.
+    #[test]
+    fn validate_rename_accepts_good_names_and_treats_the_same_name_as_a_no_op() {
+        let existing = rename_fixtures();
+        for good in [
+            "daemon",
+            "démon☃",
+            "d-1_x.y",
+            "a",
+            &"x".repeat(MAX_SOURCE_NAME_CHARS),
+        ] {
+            assert_eq!(
+                validate_rename(&existing, false, "tephrad", good),
+                Ok(RenameCheck::Rename),
+                "{good:?}"
+            );
+        }
+        assert_eq!(
+            validate_rename(&existing, false, "tephrad", "tephrad"),
+            Ok(RenameCheck::Unchanged)
+        );
+        // Whatever the rules say about the name, the same name is a no-op,
+        // and an offline source still answers it without a refusal.
+        assert_eq!(
+            validate_rename(&existing, false, "old*name", "old*name"),
+            Ok(RenameCheck::Unchanged)
+        );
+        assert_eq!(
+            validate_rename(&existing, true, "tephrad", "tephrad"),
+            Ok(RenameCheck::Unchanged)
+        );
+        assert_eq!(
+            validate_rename(&existing, false, "tephrad", "Tephrad"),
+            Ok(RenameCheck::Rename)
+        );
+        // The name rules apply to the new name only: a source with a legacy
+        // name can be renamed to a good one.
+        assert_eq!(
+            validate_rename(&existing, false, "old*name", "fresh"),
+            Ok(RenameCheck::Rename)
+        );
+    }
+
+    /// G14: the register reasons, including `nested_source` for a root
+    /// inside or above a registered one (F10).
+    #[test]
+    fn register_refusals_carry_their_stable_reason() {
+        let existing = vec![source("vault", "/home/dan/Vault")];
+        let reason = |name: &str, root: &str, probe: PathProbe| {
+            validate_register(&existing, name, Path::new(root), probe)
+                .expect_err("must be refused")
+                .reason()
+        };
+        assert_eq!(
+            reason("x", "/home/dan/Vault", PathProbe::Ok),
+            "is_a_source_root"
+        );
+        assert_eq!(
+            reason("x", "/home/dan/Vault/inner", PathProbe::Ok),
+            "nested_source"
+        );
+        assert_eq!(reason("x", "/home/dan", PathProbe::Ok), "nested_source");
+        assert_eq!(
+            reason("vault", "/home/dan/Other", PathProbe::Ok),
+            "name_taken"
+        );
+        assert_eq!(
+            reason("x", "/home/dan/Nope", PathProbe::Missing),
+            "not_a_folder"
+        );
+        assert_eq!(
+            reason("x", "/home/dan/f.txt", PathProbe::NotADirectory),
+            "not_a_folder"
+        );
     }
 
     #[test]

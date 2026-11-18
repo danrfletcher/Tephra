@@ -49,8 +49,8 @@ fn subcommands() -> Vec<Vec<String>> {
 }
 
 #[test]
-fn the_dispatch_closed_list_is_seventeen_and_every_method_is_in_architecture() {
-    assert_eq!(METHOD_NAMES.len(), 17);
+fn the_dispatch_closed_list_is_eighteen_and_every_method_is_in_architecture() {
+    assert_eq!(METHOD_NAMES.len(), 18);
     let architecture = doc("docs/ARCHITECTURE.md");
     for method in METHOD_NAMES {
         assert!(
@@ -199,14 +199,44 @@ fn the_docs_say_what_they_must_about_writes_and_resolution() {
         .split("## Not built yet")
         .nth(1)
         .expect("a Not built yet section");
-    for item in [
-        "Remote sources",
-        "`source.rename`",
-        "rename detection",
-        "OCR",
-    ] {
+    for item in ["Remote sources", "Rename detection", "OCR"] {
         assert!(not_built.contains(item), "Not built yet lacks {item}");
     }
+}
+
+/// atlas-25 PR-14 (G13, G14): the rename verb and its command are named in
+/// both docs, the refusal reasons are listed, and it is no longer under
+/// "Not built yet".
+#[test]
+fn rename_is_named_and_its_refusal_reasons_are_listed() {
+    let readme = doc("README.md");
+    let architecture = doc("docs/ARCHITECTURE.md");
+    assert!(readme.contains("`source.rename`"));
+    assert!(readme.contains("`source rename <old> <new>`"));
+    assert!(architecture.contains("`source.rename`"));
+    assert!(architecture.contains("`tephractl source rename <old> <new>`"));
+    for reason in [
+        "invalid_name",
+        "name_taken",
+        "not_inside_a_source",
+        "is_a_source_root",
+        "not_a_folder",
+        "source_offline",
+        "nested_source",
+        "unknown_source",
+        "not_promoted",
+    ] {
+        assert!(
+            architecture.contains(&format!("`{reason}`")),
+            "docs/ARCHITECTURE.md never lists `{reason}`"
+        );
+    }
+    assert!(!readme.contains("**Not built yet:** remote sources, `source.rename`"));
+    let not_built = architecture
+        .split("## Not built yet")
+        .nth(1)
+        .expect("a Not built yet section");
+    assert!(!not_built.contains("`source.rename`, rename detection"));
 }
 
 #[test]

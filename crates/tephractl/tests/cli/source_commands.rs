@@ -486,6 +486,122 @@ fn source_unpromote_refusals_exit_non_zero_and_show_the_reason_verbatim() {
     }
 }
 
+// ---- source rename (G13, G14) -------------------------------------
+
+fn rename_command() -> Command {
+    Command::SourceRename {
+        old: "tephrad".to_string(),
+        new: "daemon".to_string(),
+    }
+}
+
+#[test]
+fn source_rename_sends_exactly_the_two_names_and_renders_byte_for_byte() {
+    let server = MockServer::start(vec![Behavior::Respond {
+        status: 200,
+        body: load_fixture("source_rename_success"),
+    }]);
+    let client = client_for(&server);
+
+    let mut stdin: &[u8] = &[];
+    let outcome = commands::execute(&rename_command(), false, &client, &mut stdin);
+
+    assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
+    assert_eq!(outcome.stdout, load_expected("source_rename_rendered"));
+    assert_eq!(outcome.stderr, "");
+
+    let received = server.received();
+    assert_eq!(received.len(), 1, "one call: the rename, no list first");
+    assert_eq!(received[0].body["method"], "source.rename");
+    assert_eq!(
+        received[0].body["params"],
+        serde_json::json!({"name": "tephrad", "new_name": "daemon"})
+    );
+}
+
+#[test]
+fn source_rename_json_flag_prints_the_raw_result_byte_for_byte() {
+    let server = MockServer::start(vec![Behavior::Respond {
+        status: 200,
+        body: load_fixture("source_rename_success"),
+    }]);
+    let client = client_for(&server);
+
+    let mut stdin: &[u8] = &[];
+    let outcome = commands::execute(&rename_command(), true, &client, &mut stdin);
+
+    assert_eq!(outcome.exit_code, 0);
+    assert_eq!(outcome.stdout, load_expected("source_rename_json"));
+}
+
+#[test]
+fn source_rename_says_when_a_link_fix_is_still_waiting_and_when_nothing_was_done() {
+    let server = MockServer::start(vec![Behavior::Respond {
+        status: 200,
+        body: load_fixture("source_rename_partial"),
+    }]);
+    let client = client_for(&server);
+    let mut stdin: &[u8] = &[];
+    let outcome = commands::execute(&rename_command(), false, &client, &mut stdin);
+    assert_eq!(outcome.exit_code, 0);
+    assert_eq!(
+        outcome.stdout,
+        load_expected("source_rename_partial_rendered")
+    );
+
+    let server = MockServer::start(vec![Behavior::Respond {
+        status: 200,
+        body: load_fixture("source_rename_unchanged"),
+    }]);
+    let client = client_for(&server);
+    let same = Command::SourceRename {
+        old: "daemon".to_string(),
+        new: "daemon".to_string(),
+    };
+    let outcome = commands::execute(&same, false, &client, &mut stdin);
+    assert_eq!(outcome.exit_code, 0);
+    assert_eq!(
+        outcome.stdout,
+        load_expected("source_rename_unchanged_rendered")
+    );
+}
+
+#[test]
+fn source_rename_refusals_exit_non_zero_and_show_the_sentence_and_reason_verbatim() {
+    for (reason, message) in [
+        (
+            "invalid_name",
+            "\"a:b\" is not a valid source name: it must not contain any of / \\ @ : # ^ | [ ] *",
+        ),
+        (
+            "name_taken",
+            "the name \"notes\" is taken by the source \"notes\"",
+        ),
+        ("unknown_source", "there is no source named \"ghost\""),
+        (
+            "source_offline",
+            "the source \"tephrad\" is offline, so its links cannot be rewritten",
+        ),
+    ] {
+        for json in [false, true] {
+            let server = MockServer::start(vec![Behavior::Respond {
+                status: 200,
+                body: load_fixture(&format!("source_rename_refused_{reason}")),
+            }]);
+            let client = client_for(&server);
+            let mut stdin: &[u8] = &[];
+            let outcome = commands::execute(&rename_command(), json, &client, &mut stdin);
+            assert_eq!(outcome.exit_code, 1, "{reason} json={json}");
+            assert_eq!(
+                outcome.stderr,
+                format!("tephractl: {message} (reason: {reason})\n"),
+                "{reason} json={json}"
+            );
+            assert_eq!(outcome.stdout, "", "{reason} json={json}");
+        }
+    }
+}
+
 #[test]
 fn source_remove_of_a_promoted_name_still_lists_first_then_unregisters() {
     let list = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": [

@@ -29,6 +29,11 @@ pub const KIND_PROMOTE: &str = "promote";
 /// [`KIND_PROMOTE`]). A record, never an undo of the promote entry.
 pub const KIND_UNPROMOTE: &str = "unpromote";
 
+/// A fix of a source rename (G13): every `@old:` link of every source was
+/// rewritten to `@new:`. One entry for the whole rename: `old` is
+/// `@<old name>:`, `new` is `@<new name>:`.
+pub const KIND_SOURCE_RENAME: &str = "source_rename";
+
 /// A file that vanished with no certain pair: its links are broken and
 /// nothing is queued (G10).
 pub const KIND_UNCERTAIN: &str = "uncertain";

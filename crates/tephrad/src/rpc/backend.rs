@@ -287,6 +287,14 @@ fn status_str(status: SourceStatus) -> &'static str {
 /// occurred over the wire).
 pub trait SourceBackend: Send + Sync {
     fn register(&self, name: &str, root: &str) -> Result<ScanStatsWire, String>;
+
+    /// [`SourceBackend::register`], with a refusal carrying its stable
+    /// `reason` (G14: `name_taken`, `nested_source`, ...). What the
+    /// dispatcher calls. The default has no reasons to give: a backend
+    /// that does overrides it.
+    fn register_checked(&self, name: &str, root: &str) -> Result<ScanStatsWire, PromoteRpcError> {
+        self.register(name, root).map_err(PromoteRpcError::Failed)
+    }
     fn unregister(&self, name: &str) -> Result<(), String>;
     fn list(&self) -> Result<Vec<SourceRowWire>, String>;
     fn rescan(&self, name: &str) -> Result<ScanStatsWire, String>;
@@ -351,6 +359,17 @@ impl SourceBackend for SourceRegistry {
         SourceRegistry::register(self, name, root)
             .map(ScanStatsWire::from)
             .map_err(registry_err_to_string)
+    }
+    fn register_checked(&self, name: &str, root: &str) -> Result<ScanStatsWire, PromoteRpcError> {
+        SourceRegistry::register(self, name, root)
+            .map(ScanStatsWire::from)
+            .map_err(|e| match e {
+                RegistryError::Validation(v) => PromoteRpcError::Refused {
+                    reason: v.reason(),
+                    message: v.to_string(),
+                },
+                e => PromoteRpcError::Failed(e.to_string()),
+            })
     }
     fn unregister(&self, name: &str) -> Result<(), String> {
         SourceRegistry::unregister(self, name).map_err(registry_err_to_string)
@@ -676,6 +695,33 @@ impl From<crate::registry::PromoteOutcome> for PromoteWire {
     }
 }
 
+/// `source.rename`'s result (G13): what was renamed and what it took.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RenameWire {
+    /// The name the source had, and the one it has now (the same when the
+    /// rename was a no-op).
+    pub name: String,
+    pub new_name: String,
+    /// Linking files rewritten.
+    pub files_changed: i64,
+    /// Linking files left for a retry or a person.
+    pub deferred: i64,
+    /// `applied`, `partial` or `needs_manual_fix`.
+    pub status: String,
+}
+
+impl From<crate::registry::RenameOutcome> for RenameWire {
+    fn from(o: crate::registry::RenameOutcome) -> Self {
+        RenameWire {
+            name: o.old_name,
+            new_name: o.new_name,
+            files_changed: o.files_changed,
+            deferred: o.deferred,
+            status: o.status,
+        }
+    }
+}
+
 /// `source.unpromote`'s result (G12): what was folded back and what it
 /// took.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -708,7 +754,8 @@ impl From<crate::registry::UnpromoteOutcome> for UnpromoteWire {
     }
 }
 
-/// Why `source.promote` or `source.unpromote` did not succeed.
+/// Why `source.register`, `source.promote`, `source.unpromote` or
+/// `source.rename` did not succeed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromoteRpcError {
     /// Refused with a stable `reason`; nothing was changed (E13).
@@ -751,6 +798,15 @@ pub trait FixBackend: Send + Sync {
     fn unpromote(&self, _name: &str) -> Result<UnpromoteWire, PromoteRpcError> {
         Err(PromoteRpcError::Failed(
             "source.unpromote is not configured for this test fixture".to_string(),
+        ))
+    }
+
+    /// `source.rename` (G13): the source `name` is called `new_name` from
+    /// now on and every `@name:` link is rewritten. Blocking: it writes
+    /// files.
+    fn rename(&self, _name: &str, _new_name: &str) -> Result<RenameWire, PromoteRpcError> {
+        Err(PromoteRpcError::Failed(
+            "source.rename is not configured for this test fixture".to_string(),
         ))
     }
 
@@ -836,6 +892,19 @@ impl FixBackend for FixService {
             .unpromote(name, &self.engine)
             .map(UnpromoteWire::from)
             .map_err(unpromote_rpc_error)
+    }
+
+    fn rename(&self, name: &str, new_name: &str) -> Result<RenameWire, PromoteRpcError> {
+        self.registry
+            .rename(name, new_name, &self.engine)
+            .map(RenameWire::from)
+            .map_err(|e| match e {
+                RegistryError::Rename(r) => PromoteRpcError::Refused {
+                    reason: r.reason(),
+                    message: r.to_string(),
+                },
+                e => PromoteRpcError::Failed(e.to_string()),
+            })
     }
 
     fn unregister_promoted(&self, name: &str) -> Result<bool, PromoteRpcError> {

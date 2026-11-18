@@ -420,6 +420,30 @@ pub fn render_source_unpromoted(result: &Value) -> String {
     out
 }
 
+/// `source rename` success (G13): what was renamed and what it took. The
+/// same name twice says nothing was done. A line is added only when some
+/// linking file is still waiting for a retry or a person.
+pub fn render_source_renamed(result: &Value) -> String {
+    let name = str_field(result, "name");
+    let new_name = str_field(result, "new_name");
+    if name == new_name {
+        return format!("The source \"{name}\" already has that name; nothing changed\n");
+    }
+    let count = |key: &str| result.get(key).and_then(Value::as_i64).unwrap_or(0);
+    let mut out = format!("Renamed the source \"{name}\" to \"{new_name}\"\n");
+    out.push_str(&format!(
+        "  files with links rewritten: {}\n",
+        count("files_changed")
+    ));
+    let deferred = count("deferred");
+    if deferred > 0 {
+        out.push_str(&format!(
+            "  {deferred} file(s) still need a link fix; see `tephractl fixes`\n"
+        ));
+    }
+    out
+}
+
 pub fn render_source_removed(name: &str) -> String {
     format!("Removed source \"{name}\"\n")
 }
@@ -697,7 +721,8 @@ pub fn render_backlinks(result: &Value) -> String {
 /// its line is `time kind old (no pair) (n files) status`, followed by
 /// ` - message` when the entry carries one (why it has no fix). An entry that
 /// touched files of two sources names them as `@source:path`. An empty
-/// log prints `no fixes`.
+/// log prints `no fixes`. A `source_rename` entry already names both
+/// sources in full (`@old:` and `@new:`), so it is printed as it is.
 ///
 /// Paths come from file names, so control characters in them are shown
 /// as `?`.
@@ -718,9 +743,11 @@ pub fn render_fixes(result: &Value) -> String {
             .and_then(Value::as_array)
             .map(|a| a.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
+        // The two names of a source rename are already `@source:` forms.
+        let whole = str_field(entry, "kind") == "source_rename";
         let name = |field: &str| {
             entry.get(field).and_then(Value::as_str).map(|path| {
-                if sources.len() > 1 {
+                if sources.len() > 1 && !whole {
                     printable(&format!("@{}:{path}", sources[0]))
                 } else {
                     printable(path)
@@ -729,7 +756,7 @@ pub fn render_fixes(result: &Value) -> String {
         };
         let old = name("old").unwrap_or_else(|| "?".to_string());
         let pair = match entry.get("new").and_then(Value::as_str) {
-            Some(new) if sources.len() > 1 => {
+            Some(new) if sources.len() > 1 && !whole => {
                 format!(
                     "{old} -> {}",
                     printable(&format!("@{}:{new}", sources[sources.len() - 1]))

@@ -336,3 +336,49 @@ fn source_unpromote_gets_the_long_running_timeout() {
     assert!(result.is_ok(), "{result:?}");
     assert_eq!(server.call_count(), 1);
 }
+
+/// G13: `source.rename` rewrites files, so it is never re-sent after a
+/// dropped connection, and it gets the long timeout.
+#[test]
+fn source_rename_is_never_retried_on_a_dropped_connection() {
+    let server = MockServer::start(vec![
+        Behavior::Drop,
+        Behavior::Respond {
+            status: 200,
+            body: ok_envelope(serde_json::json!({"name": "tephrad", "status": "applied"})),
+        },
+    ]);
+    let client = RpcClient::new(server.addr.clone(), "token".to_string());
+
+    let result = client.call(
+        "source.rename",
+        serde_json::json!({"name": "tephrad", "new_name": "daemon"}),
+    );
+
+    assert!(matches!(result, Err(RpcCallError::Ambiguous(_))));
+    assert_eq!(server.call_count(), 1);
+}
+
+#[test]
+fn source_rename_gets_the_long_running_timeout() {
+    let server = MockServer::start(vec![Behavior::Slow {
+        delay: Duration::from_millis(150),
+        status: 200,
+        body: ok_envelope(serde_json::json!({"name": "tephrad", "status": "applied"})),
+    }]);
+    let client = RpcClient::with_timeouts(
+        server.addr.clone(),
+        "token".to_string(),
+        Duration::from_millis(50),
+        Duration::from_millis(400),
+        Duration::from_millis(50),
+    );
+
+    let result = client.call(
+        "source.rename",
+        serde_json::json!({"name": "tephrad", "new_name": "daemon"}),
+    );
+
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(server.call_count(), 1);
+}

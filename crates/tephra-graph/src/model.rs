@@ -656,6 +656,17 @@ impl UnitGraph {
         out.sort_by(edge_sort_key);
         out
     }
+
+    /// Every edge in the graph, one per link occurrence, with none of
+    /// [`UnitGraph::get_edges`]'s query-display collapse (two dangling
+    /// links of one file are two edges here, not one). For a caller that
+    /// must see every link text, such as the rewrite of `@old:` to
+    /// `@new:` when a source is renamed. Sorted for deterministic output.
+    pub fn get_edges_all(&self) -> Vec<Edge> {
+        let mut out: Vec<Edge> = self.edges.iter().filter_map(|e| e.clone()).collect();
+        out.sort_by(edge_sort_key);
+        out
+    }
 }
 
 fn edge_sort_key(a: &Edge, b: &Edge) -> std::cmp::Ordering {

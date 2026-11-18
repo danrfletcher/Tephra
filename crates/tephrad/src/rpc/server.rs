@@ -67,6 +67,8 @@ const MUTATING_SOURCE_METHODS: &[&str] = &[
     "source.promote",
     // FR22 reversed: an unpromote moves the files back and rewrites links.
     "source.unpromote",
+    // G13: a rename moves the source's name and rewrites every `@old:` link.
+    "source.rename",
     // GP8: a successful `link.apply_refactor` writes directly to the
     // affected files' content (not through `source.rescan`'s RPC
     // path) and synchronously re-scans every touched source itself

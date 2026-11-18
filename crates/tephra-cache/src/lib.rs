@@ -22,6 +22,7 @@ mod pending_fixes;
 mod promote;
 mod schema;
 mod search;
+mod source_rename;
 mod sources;
 mod units;
 
@@ -44,6 +45,7 @@ pub use pending_fixes::{
 pub use promote::{NewPromote, NewUnpromote, Promoted, PromotedRootRow, Unpromoted};
 pub use schema::KindInferrer;
 pub use search::{compare_hits, file_stem, resolve_title, NameCandidate, NameHit, NAME_SEARCH_SQL};
+pub use source_rename::{NewSourceRename, SourceRenamed};
 pub use sources::{validate_transition, InvalidTransition, SourceRow, SourceStatus};
 pub use units::{
     BlockOccurrence, BlockRow, HeadingRow, IdBlockText, LinkRow, NewBlock, NewHeading, NewLink,

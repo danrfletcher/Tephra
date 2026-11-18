@@ -263,6 +263,20 @@ impl Cache {
         summaries_for_source(self.connection(), source)
     }
 
+    /// Whether the log holds a `source_rename` entry from the source
+    /// `old` to the source `new`. The entry is written in the same
+    /// transaction as the rename itself, so it is there exactly when the
+    /// rename committed: how a repeated `source.rename` tells a retry of
+    /// one that already happened from a name that was never a source.
+    pub fn source_rename_logged(&self, old: &str, new: &str) -> Result<bool, CacheError> {
+        Ok(self.connection().query_row(
+            "SELECT EXISTS (SELECT 1 FROM fix_log WHERE kind = 'source_rename' \
+             AND old_source = ?1 AND new_source = ?2)",
+            params![old, new],
+            |r| r.get(0),
+        )?)
+    }
+
     /// Renames logged after entry `after_id` that start at `(source,
     /// path)`, oldest first.
     pub fn fix_renames_from(

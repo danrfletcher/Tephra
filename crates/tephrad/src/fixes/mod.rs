@@ -46,7 +46,7 @@ use tephra_graph::{Edge, UnitGraph};
 use crate::refactor::fix_write::{
     FileFixRequest, FileWriteResult, FixWriter, RewriteMode, WriteStatus,
 };
-use crate::refactor::{MoveRewrite, OwnLink};
+use crate::refactor::{MoveRewrite, OwnLink, DOCUMENT_READ_ONLY};
 
 pub use log::{FixDetail, FixEntryWire, FixNotice};
 pub use pending::Verdict;
@@ -54,8 +54,8 @@ pub use retry::Trigger;
 
 use log::{
     overall_status, FileEntry, FILE_NEEDS_MANUAL_FIX, FILE_NOTHING_TO_FIX, FILE_PENDING,
-    FILE_WRITTEN, KIND_MOVE, KIND_PROMOTE, KIND_RENAME, KIND_UNCERTAIN, KIND_UNPROMOTE,
-    STATUS_UNCERTAIN,
+    FILE_WRITTEN, KIND_MOVE, KIND_PROMOTE, KIND_RENAME, KIND_SOURCE_RENAME, KIND_UNCERTAIN,
+    KIND_UNPROMOTE, STATUS_UNCERTAIN,
 };
 
 /// What an uncertain entry says when the watcher logs it.
@@ -93,6 +93,12 @@ pub enum FixError {
     /// A test hook stopped the run after a set number of writes,
     /// leaving the cache and the disk exactly as a crash would.
     Stopped,
+    /// A source rename found its new name taken (case-insensitively) when
+    /// the transaction ran: a register that won the race. Nothing changed.
+    NameTaken(String),
+    /// A source rename found its source gone when the transaction ran.
+    /// Nothing changed.
+    UnknownSource(String),
 }
 
 impl fmt::Display for FixError {
@@ -102,6 +108,8 @@ impl fmt::Display for FixError {
             FixError::Stopped => {
                 write!(f, "stopped by the test hook after the set number of writes")
             }
+            FixError::NameTaken(name) => write!(f, "the name \"{name}\" is taken"),
+            FixError::UnknownSource(name) => write!(f, "no source named \"{name}\""),
         }
     }
 }
@@ -317,6 +325,59 @@ pub struct UnpromoteDone {
     pub entry: FixEntryWire,
     /// The files written and the entry, for the one push.
     pub announcement: FixAnnouncement,
+}
+
+/// A source to rename ([`FixEngine::rename_source`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceRenameSpec {
+    pub old_name: String,
+    pub new_name: String,
+}
+
+/// What [`FixEngine::rename_source`] did.
+pub struct SourceRenameDone {
+    /// The log entry as it stands at the end.
+    pub entry: FixEntryWire,
+    /// The files written and the entry, for the one push.
+    pub announcement: FixAnnouncement,
+}
+
+/// The files that hold a wikilink written with the source prefix
+/// `@old:` (a link of any kind the parser reports, a dangling one too), as
+/// `(source, path)`, read from `graph` as it is BEFORE the rename: a file
+/// of the renamed source itself is named by `new`, since that is its name
+/// by the time the list is used. Plain Markdown links never count, and a
+/// link in a document does (it is logged, never written).
+fn source_rename_files(graph: &UnitGraph, old: &str, new: &str) -> BTreeSet<(String, String)> {
+    graph
+        .get_edges_all()
+        .into_iter()
+        .filter(|e| e.kind == tephra_parser::LINK_KIND_WIKILINK)
+        .filter(|e| names_source(&e.to_raw, old))
+        .filter_map(|e| {
+            let (s, p) = e.from.strip_prefix('@')?.split_once(':')?;
+            let s = if s == old { new } else { s };
+            Some((s.to_string(), p.to_string()))
+        })
+        .collect()
+}
+
+/// Whether the raw text of a wikilink names source `name` with an
+/// explicit `@name:` prefix.
+fn names_source(to_raw: &str, name: &str) -> bool {
+    tephra_parser::parse_wikilink_inner(to_raw)
+        .source_prefix
+        .as_deref()
+        == Some(name)
+}
+
+/// A pending row of a source rename: both sources named, neither path
+/// (it is no file's rename: every `@old:` link of the file changes).
+fn is_source_rename_row(row: &PendingFixRow) -> bool {
+    row.old_path.is_none()
+        && row.new_path.is_none()
+        && row.old_source.is_some()
+        && row.new_source.is_some()
 }
 
 /// The rel paths of `parent`'s cached units under `folder`, relative to
@@ -1203,6 +1264,94 @@ impl FixEngine {
         })
     }
 
+    // -- renaming a source ------------------------------------------
+
+    /// Renames the source `spec.old_name` to `spec.new_name` (G13) and
+    /// rewrites every `@old:` link of every source, in the order a
+    /// promote uses:
+    ///
+    /// 1. the pending list is worked out from the graph as it is now (the
+    ///    links still resolve), then ONE transaction renames the row,
+    ///    everything that holds the name, writes the log entry (kind
+    ///    `source_rename`) and that list ([`Cache::begin_source_rename`]);
+    /// 2. `after_swap` runs (the caller moves its live watcher to the new
+    ///    name), then
+    /// 3. every pending file is rewritten by the same write loop as any
+    ///    fix, so a file that changed under it or is read-only is retried
+    ///    or logged `needs_manual_fix` and the rest go on.
+    ///
+    /// The caller has checked the names ([`crate::registry::validate_rename`]);
+    /// a rename that lost a race with another writer comes back as
+    /// [`FixError::NameTaken`] or [`FixError::UnknownSource`] with nothing
+    /// changed. A crash after step 1 is finished by the next start: the
+    /// pending list is retried like any other.
+    pub fn rename_source(
+        &self,
+        spec: &SourceRenameSpec,
+        after_swap: &dyn Fn(),
+    ) -> Result<SourceRenameDone, FixError> {
+        use crate::registry::retry_cache_on_busy;
+        use tephra_cache::{CacheError, NewSourceRename};
+
+        let _guard = self.lock();
+        let cache = self.open()?;
+        let gate = crate::writer_gate::for_path(&self.cache_path);
+        let now = self.clock.now();
+        let graph = UnitGraph::build_from_cache(&cache)?;
+        let files = source_rename_files(&graph, &spec.old_name, &spec.new_name);
+        drop(graph);
+
+        let detail = FixDetail {
+            files: files
+                .iter()
+                .map(|(s, p)| FileEntry::pending(s, p))
+                .collect(),
+            ..FixDetail::default()
+        };
+        let pending: Vec<NewPendingFix> = files
+            .iter()
+            .map(|(s, p)| NewPendingFix {
+                source: s.clone(),
+                file_path: p.clone(),
+                old_source: Some(spec.old_name.clone()),
+                old_path: None,
+                new_source: Some(spec.new_name.clone()),
+                new_path: None,
+            })
+            .collect();
+        let log = NewFixLog {
+            created_at: now,
+            kind: KIND_SOURCE_RENAME.to_string(),
+            status: overall_status(&detail.files).to_string(),
+            old_source: Some(spec.old_name.clone()),
+            old_path: Some(format!("@{}:", spec.old_name)),
+            new_source: Some(spec.new_name.clone()),
+            new_path: Some(format!("@{}:", spec.new_name)),
+            files_changed: 0,
+            detail_json: Some(detail.to_json()),
+        };
+        let done = retry_cache_on_busy(&gate, || {
+            cache.begin_source_rename(&NewSourceRename {
+                old_name: &spec.old_name,
+                new_name: &spec.new_name,
+                created_at: now,
+                log: &log,
+                pending: &pending,
+            })
+        })
+        .map_err(|e| match e {
+            CacheError::DuplicateSource(name) => FixError::NameTaken(name),
+            CacheError::SourceNotFound(name) => FixError::UnknownSource(name),
+            e => FixError::from(e),
+        })?;
+        after_swap();
+        let (entry, announcement) = self.run_fix(&cache, done.fix_id)?;
+        Ok(SourceRenameDone {
+            entry,
+            announcement,
+        })
+    }
+
     // -- retrying ---------------------------------------------------
 
     /// At start: every pending row of every source (G9).
@@ -1316,6 +1465,17 @@ impl FixEngine {
             // burn attempts: the row waits for the source.
             summary.skipped_offline += 1;
             return Ok(None);
+        }
+
+        if is_source_rename_row(&row) {
+            return self.process_source_rename(
+                cache,
+                graph,
+                row,
+                prior_rounds,
+                &source.path,
+                summary,
+            );
         }
 
         let (target_source, target_path, chain) = match pending::recheck(cache, graph, &row)? {
@@ -1436,6 +1596,74 @@ impl FixEngine {
         let result = self.writer.write_file(&req);
         let wrote = result.status == WriteStatus::Written;
         let outcome = Outcome::from_write(&result, chain);
+        self.finish(cache, &row, outcome, summary)?;
+        Ok(wrote.then(|| WrittenFile {
+            source: row.source.clone(),
+            path: abs_path,
+        }))
+    }
+
+    /// One row of a source rename, start to end: the file's `@old:`
+    /// wikilinks become `@new:`, by the same write loop as any fix. No
+    /// re-check of the intent applies (a source rename is no unit's
+    /// rename: there is no old name to be reused and no target to
+    /// follow). A document is never opened for writing (F4): it is kept
+    /// as `needs_manual_fix`.
+    fn process_source_rename(
+        &self,
+        cache: &Cache,
+        graph: &UnitGraph,
+        row: PendingFixRow,
+        prior_rounds: u32,
+        source_root: &str,
+        summary: &mut RunSummary,
+    ) -> Result<Option<WrittenFile>, FixError> {
+        let old = row.old_source.clone().unwrap_or_default();
+        let new = row.new_source.clone().unwrap_or_default();
+        let abs_path = Path::new(source_root).join(&row.file_path);
+        if tephra_parser::DocumentFormat::from_path(&abs_path).is_some() {
+            self.finish(
+                cache,
+                &row,
+                Outcome::manual(DOCUMENT_READ_ONLY.to_string(), 0, 0, 0),
+                summary,
+            )?;
+            return Ok(None);
+        }
+        let file_id = format!("@{}:{}", row.source, row.file_path);
+        let edges: Vec<Edge> = graph
+            .get_forward_links_all(&file_id)
+            .into_iter()
+            .filter(|e| e.kind == tephra_parser::LINK_KIND_WIKILINK)
+            .filter(|e| names_source(&e.to_raw, &old))
+            .collect();
+        if edges.is_empty() {
+            self.finish(
+                cache,
+                &row,
+                Outcome::done(
+                    FILE_NOTHING_TO_FIX,
+                    format!("the file has no @{old}: link left to rewrite"),
+                ),
+                summary,
+            )?;
+            return Ok(None);
+        }
+        let mut req = FileFixRequest::new(
+            file_id,
+            abs_path.clone(),
+            edges,
+            format!("@{old}:"),
+            format!("@{new}:"),
+            RewriteMode::Move(MoveRewrite::SourceRename {
+                old_source: old,
+                new_source: new,
+            }),
+        );
+        req.prior_rounds = prior_rounds;
+        let result = self.writer.write_file(&req);
+        let wrote = result.status == WriteStatus::Written;
+        let outcome = Outcome::from_write(&result, Vec::new());
         self.finish(cache, &row, outcome, summary)?;
         Ok(wrote.then(|| WrittenFile {
             source: row.source.clone(),

@@ -92,6 +92,7 @@ pub fn execute_with_prompt_writer<R: BufRead, W: Write>(
         Command::SourceAdd { name, path } => source_add(name, path, json, client),
         Command::SourcePromote { name, path } => source_promote(name, path, json, client),
         Command::SourceUnpromote { name } => source_unpromote(name, json, client),
+        Command::SourceRename { old, new } => source_rename(old, new, json, client),
         Command::SourceRemove { name } => source_remove(name, json, client),
         Command::SourceList => source_list(json, client),
         Command::Status => status(json, client),
@@ -206,6 +207,31 @@ fn source_unpromote(name: &str, json: bool, client: &RpcClient) -> CommandOutcom
         Ok(result) => CommandOutcome::ok(json_or(
             &result,
             || render::render_source_unpromoted(&result),
+            json,
+        )),
+        Err(RpcCallError::Rpc { message, data, .. }) => {
+            let reason = data
+                .as_ref()
+                .and_then(|d| d.get("reason"))
+                .and_then(Value::as_str);
+            CommandOutcome::err(match reason {
+                Some(reason) => format!("{message} (reason: {reason})"),
+                None => message,
+            })
+        }
+        Err(e) => CommandOutcome::err(describe_error(&e)),
+    }
+}
+
+/// `source rename <old> <new>` (G13): one `source.rename` call. A refusal
+/// prints the daemon's sentence and its stable `reason` and exits 1;
+/// nothing has changed then. Renaming to the same name is a success that
+/// changed nothing.
+fn source_rename(old: &str, new: &str, json: bool, client: &RpcClient) -> CommandOutcome {
+    match client.call("source.rename", json!({"name": old, "new_name": new})) {
+        Ok(result) => CommandOutcome::ok(json_or(
+            &result,
+            || render::render_source_renamed(&result),
             json,
         )),
         Err(RpcCallError::Rpc { message, data, .. }) => {

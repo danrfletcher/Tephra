@@ -40,6 +40,7 @@ pub const METHOD_NAMES: &[&str] = &[
     "source.rescan",
     "source.promote",
     "source.unpromote",
+    "source.rename",
     "link.preview_refactor",
     "link.apply_refactor",
     "unit.list",
@@ -104,6 +105,7 @@ pub fn dispatch(
         "source.rescan" => source_rescan(params, backends.sources),
         "source.promote" => source_promote(params, backends.fixes),
         "source.unpromote" => source_unpromote(params, backends.fixes),
+        "source.rename" => source_rename(params, backends.fixes),
         "link.preview_refactor" => link_preview_refactor(params, backends.refactor),
         "link.apply_refactor" => link_apply_refactor(params, backends.refactor),
         "unit.list" => unit_list(params, backends.sources),
@@ -149,9 +151,24 @@ fn source_register(params: &Value, sources: &dyn SourceBackend) -> DispatchResul
     let name = require_str(params, "name")?;
     let root = require_str(params, "root")?;
     sources
-        .register(name, root)
+        .register_checked(name, root)
         .map(|stats| serde_json::to_value(stats).expect("ScanStatsWire always serializes"))
-        .map_err(|e| (SOURCE_ERROR, e, None))
+        .map_err(source_refusal)
+}
+
+/// A refusal or failure of a source call as a dispatch error: always a
+/// `SOURCE_ERROR`, with `data.reason` set to the stable reason when the
+/// call was refused (G14).
+fn source_refusal(e: crate::rpc::backend::PromoteRpcError) -> DispatchError {
+    use crate::rpc::backend::PromoteRpcError;
+    match e {
+        PromoteRpcError::Refused { reason, message } => (
+            SOURCE_ERROR,
+            message,
+            Some(serde_json::json!({ "reason": reason })),
+        ),
+        PromoteRpcError::Failed(message) => (SOURCE_ERROR, message, None),
+    }
 }
 
 /// `source.unregister {name}` (G1). A promoted source is folded back into
@@ -215,6 +232,23 @@ fn source_promote(params: &Value, fixes: &dyn FixBackend) -> DispatchResult {
         )),
         Err(PromoteRpcError::Failed(message)) => Err((SOURCE_ERROR, message, None)),
     }
+}
+
+/// `source.rename {name, new_name}` (G13): both non-empty strings (an empty
+/// `new_name` is a refusal with the reason `invalid_name`, not a bad
+/// parameter, so a client shows the same sentence for it as for any bad
+/// name). A refusal is a `SOURCE_ERROR` whose `data.reason` is the stable
+/// reason (G14).
+fn source_rename(params: &Value, fixes: &dyn FixBackend) -> DispatchResult {
+    let name = require_str(params, "name")?;
+    let new_name = params
+        .get("new_name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_params("\"new_name\" (string) is required"))?;
+    fixes
+        .rename(name, new_name)
+        .map(|done| serde_json::to_value(done).expect("RenameWire always serializes"))
+        .map_err(source_refusal)
 }
 
 /// `source.unpromote {name}` (G12): `name` a non-empty string. A refusal
@@ -520,6 +554,7 @@ mod tests {
                 "source.rescan",
                 "source.promote",
                 "source.unpromote",
+                "source.rename",
                 "link.preview_refactor",
                 "link.apply_refactor",
                 "unit.list",

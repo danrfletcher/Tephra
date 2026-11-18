@@ -44,7 +44,7 @@
 //! rewrites a link whose `to_raw`/`kind` the graph already told it
 //! resolves to the unit being renamed.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -197,9 +197,10 @@ pub enum OwnLink {
 }
 
 /// How the links in one file change when a file moves from one source
-/// to another (G6). Wikilinks only, like every automatic fix (F7).
-/// Every cross-source link written carries an explicit `@source:`
-/// prefix (F11); none is written bare.
+/// to another (G6), or when a source is renamed (G13,
+/// [`MoveRewrite::SourceRename`]). Wikilinks only, like every automatic
+/// fix (F7). Every cross-source link written carries an explicit
+/// `@source:` prefix (F11); none is written bare.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MoveRewrite {
     /// Rewrite 1: a file that is not in the source the file moved to
@@ -223,6 +224,14 @@ pub enum MoveRewrite {
         new_path: String,
         bare_resolves: bool,
         links: HashMap<String, OwnLink>,
+    },
+    /// A source was renamed (G13): every link written with the prefix
+    /// `@<old_source>:` is written `@<new_source>:`, whatever file it is
+    /// in. Only the prefix changes; the target, the anchor (a heading or
+    /// a `^block` id) and the alias are kept byte for byte.
+    SourceRename {
+        old_source: String,
+        new_source: String,
     },
 }
 
@@ -285,6 +294,19 @@ pub fn move_new_raw(to_raw: &str, rewrite: &MoveRewrite) -> Option<String> {
             let target = shortest_target(new_path, *bare_resolves);
             join_wikilink(None, &target, anchor, alias)
         }
+        MoveRewrite::SourceRename {
+            old_source,
+            new_source,
+        } => {
+            if w.source_prefix.as_deref() != Some(old_source.as_str()) {
+                return None;
+            }
+            // The prefix is replaced in the raw text itself, so nothing
+            // else of the link can change.
+            let lead = to_raw.len() - to_raw.trim_start().len();
+            let rest = to_raw[lead..].strip_prefix(&format!("@{old_source}:"))?;
+            format!("{}@{new_source}:{rest}", &to_raw[..lead])
+        }
         MoveRewrite::Own {
             new_path,
             bare_resolves,
@@ -311,28 +333,40 @@ pub fn compute_move_changes(
     file_contents: &HashMap<String, String>,
     rewrite: &MoveRewrite,
 ) -> Vec<LinkChange> {
-    let mut seen: HashSet<(String, String)> = HashSet::new();
-    let mut out = Vec::new();
+    // The new text of every raw link, per file: a file is parsed ONCE, however
+    // many different links it holds (a file of thousands of distinct links
+    // is one parse, not one per link).
+    let mut wanted: BTreeMap<&str, HashMap<&str, String>> = BTreeMap::new();
     for edge in edges {
         if edge.kind.as_str() != tephra_parser::LINK_KIND_WIKILINK {
             continue;
         }
-        let Some(content) = file_contents.get(&edge.from) else {
-            continue;
-        };
-        if !seen.insert((edge.from.clone(), edge.to_raw.clone())) {
+        if !file_contents.contains_key(&edge.from) {
             continue;
         }
         let Some(new_raw) = move_new_raw(&edge.to_raw, rewrite) else {
             continue;
         };
-        out.extend(locate_and_diff(
-            &edge.from,
-            content,
-            &edge.kind,
-            &edge.to_raw,
-            &new_raw,
-        ));
+        wanted
+            .entry(edge.from.as_str())
+            .or_default()
+            .insert(edge.to_raw.as_str(), new_raw);
+    }
+    let mut out = Vec::new();
+    for (file_id, links) in wanted {
+        let parsed = parse_for_links(file_id, &file_contents[file_id]);
+        for w in &parsed.wikilinks {
+            if let Some(new_raw) = links.get(w.raw.as_str()) {
+                out.push(LinkChange {
+                    file: file_id.to_string(),
+                    line: w.line,
+                    before: format!("[[{}]]", w.raw),
+                    after: format!("[[{new_raw}]]"),
+                    byte_start: w.span.0,
+                    byte_end: w.span.1,
+                });
+            }
+        }
     }
     out.sort_by_key(|a| (a.file.clone(), a.line));
     out

@@ -293,3 +293,29 @@ fn since_works_out_epoch_seconds_from_the_clock_it_is_given() {
     assert_eq!(Since::Ago(7_200).epoch(1_000_000), 992_800);
     assert_eq!(Since::At(5).epoch(1_000_000), 5);
 }
+
+/// G13: a source rename names both sources already (`@old:` and `@new:`),
+/// so its line carries them as they are, not with a second prefix.
+#[test]
+fn a_source_rename_line_names_the_old_and_new_source_once() {
+    let body = json!({"jsonrpc": "2.0", "id": 1, "result": [{
+        "id": 7,
+        "time": 1_794_790_000,
+        "kind": "source_rename",
+        "sources": ["tephrad", "daemon"],
+        "old": "@tephrad:",
+        "new": "@daemon:",
+        "files_changed": 3,
+        "status": "applied"
+    }]});
+    let server = MockServer::start(vec![Behavior::Respond { status: 200, body }]);
+    let outcome = run(&server, None, false);
+    assert_eq!(outcome.exit_code, 0, "{}", outcome.stderr);
+    assert_eq!(
+        outcome.stdout,
+        format!(
+            "{} source_rename @tephrad: -> @daemon: (3 files) applied\n",
+            local_time(1_794_790_000)
+        )
+    );
+}
