@@ -65,6 +65,8 @@ const MUTATING_SOURCE_METHODS: &[&str] = &[
     // FR22: a promote re-owns files and rewrites links; the push it sends
     // refreshes the graph too, but the reply must already see it.
     "source.promote",
+    // FR22 reversed: an unpromote moves the files back and rewrites links.
+    "source.unpromote",
     // GP8: a successful `link.apply_refactor` writes directly to the
     // affected files' content (not through `source.rescan`'s RPC
     // path) and synchronously re-scans every touched source itself

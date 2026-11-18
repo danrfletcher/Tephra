@@ -1,0 +1,13 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "name": "tephrad",
+    "parent": "tephra",
+    "folder": "crates/tephrad",
+    "units_moved": 12,
+    "files_changed": 2,
+    "deferred": 1,
+    "status": "partial"
+  }
+}

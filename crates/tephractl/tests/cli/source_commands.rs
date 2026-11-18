@@ -393,3 +393,131 @@ fn source_promote_refusals_exit_non_zero_and_show_the_reason_verbatim() {
         assert_eq!(outcome.stdout, "", "{reason}");
     }
 }
+
+// ---- source unpromote (G12) ---------------------------------------
+
+fn unpromote_command() -> Command {
+    Command::SourceUnpromote {
+        name: "tephrad".to_string(),
+    }
+}
+
+#[test]
+fn source_unpromote_sends_only_the_name_and_renders_byte_for_byte() {
+    let server = MockServer::start(vec![Behavior::Respond {
+        status: 200,
+        body: load_fixture("source_unpromote_success"),
+    }]);
+    let client = client_for(&server);
+
+    let mut stdin: &[u8] = &[];
+    let outcome = commands::execute(&unpromote_command(), false, &client, &mut stdin);
+
+    assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
+    assert_eq!(outcome.stdout, load_expected("source_unpromote_rendered"));
+    assert_eq!(outcome.stderr, "");
+
+    let received = server.received();
+    assert_eq!(received.len(), 1, "one call: the unpromote, no list first");
+    assert_eq!(received[0].body["method"], "source.unpromote");
+    assert_eq!(received[0].body["params"]["name"], "tephrad");
+    assert_eq!(received[0].body["params"].as_object().unwrap().len(), 1);
+}
+
+#[test]
+fn source_unpromote_json_flag_prints_the_raw_result_byte_for_byte() {
+    let server = MockServer::start(vec![Behavior::Respond {
+        status: 200,
+        body: load_fixture("source_unpromote_success"),
+    }]);
+    let client = client_for(&server);
+
+    let mut stdin: &[u8] = &[];
+    let outcome = commands::execute(&unpromote_command(), true, &client, &mut stdin);
+
+    assert_eq!(outcome.exit_code, 0);
+    assert_eq!(outcome.stdout, load_expected("source_unpromote_json"));
+}
+
+#[test]
+fn source_unpromote_says_when_a_link_fix_is_still_waiting() {
+    let server = MockServer::start(vec![Behavior::Respond {
+        status: 200,
+        body: load_fixture("source_unpromote_partial"),
+    }]);
+    let client = client_for(&server);
+
+    let mut stdin: &[u8] = &[];
+    let outcome = commands::execute(&unpromote_command(), false, &client, &mut stdin);
+
+    assert_eq!(outcome.exit_code, 0);
+    assert_eq!(
+        outcome.stdout,
+        load_expected("source_unpromote_partial_rendered")
+    );
+}
+
+#[test]
+fn source_unpromote_refusals_exit_non_zero_and_show_the_reason_verbatim() {
+    for (reason, message) in [
+        (
+            "not_promoted",
+            "the source \"tephra\" was not promoted out of another",
+        ),
+        ("source_offline", "the source \"tephra\" is offline"),
+        ("unknown_source", "no source named \"ghost\""),
+    ] {
+        let server = MockServer::start(vec![Behavior::Respond {
+            status: 200,
+            body: load_fixture(&format!("source_unpromote_refused_{reason}")),
+        }]);
+        let client = client_for(&server);
+
+        let mut stdin: &[u8] = &[];
+        let outcome = commands::execute(&unpromote_command(), false, &client, &mut stdin);
+
+        assert_eq!(outcome.exit_code, 1, "{reason}");
+        assert_eq!(
+            outcome.stderr,
+            format!("tephractl: {message} (reason: {reason})\n"),
+            "{reason}"
+        );
+        assert_eq!(outcome.stdout, "", "{reason}");
+    }
+}
+
+#[test]
+fn source_remove_of_a_promoted_name_still_lists_first_then_unregisters() {
+    let list = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": [
+        {"name": "tephra", "root": "/r", "status": "online", "files": 5},
+        {"name": "tephrad", "root": "/r/crates/tephrad", "status": "online", "files": 12},
+    ]});
+    let server = MockServer::start(vec![
+        Behavior::Respond {
+            status: 200,
+            body: list,
+        },
+        Behavior::Respond {
+            status: 200,
+            body: load_fixture("source_unregister_success"),
+        },
+    ]);
+    let client = client_for(&server);
+
+    let mut stdin: &[u8] = &[];
+    let outcome = commands::execute(
+        &Command::SourceRemove {
+            name: "tephrad".to_string(),
+        },
+        false,
+        &client,
+        &mut stdin,
+    );
+
+    assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
+    let received = server.received();
+    assert_eq!(received.len(), 2);
+    assert_eq!(received[0].body["method"], "source.list");
+    assert_eq!(received[1].body["method"], "source.unregister");
+    assert_eq!(received[1].body["params"]["name"], "tephrad");
+}

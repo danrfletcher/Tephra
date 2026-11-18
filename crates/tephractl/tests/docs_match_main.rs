@@ -49,8 +49,8 @@ fn subcommands() -> Vec<Vec<String>> {
 }
 
 #[test]
-fn the_dispatch_closed_list_is_sixteen_and_every_method_is_in_architecture() {
-    assert_eq!(METHOD_NAMES.len(), 16);
+fn the_dispatch_closed_list_is_seventeen_and_every_method_is_in_architecture() {
+    assert_eq!(METHOD_NAMES.len(), 17);
     let architecture = doc("docs/ARCHITECTURE.md");
     for method in METHOD_NAMES {
         assert!(
@@ -207,4 +207,27 @@ fn the_docs_say_what_they_must_about_writes_and_resolution() {
     ] {
         assert!(not_built.contains(item), "Not built yet lacks {item}");
     }
+}
+
+#[test]
+fn unpromote_is_named_and_the_docs_say_it_is_not_an_undo() {
+    let readme = doc("README.md");
+    let architecture = doc("docs/ARCHITECTURE.md");
+    assert!(readme.contains("`source.unpromote`"));
+    assert!(readme.contains("`source unpromote <name>`"));
+    assert!(architecture.contains("`source.unpromote`"));
+    assert!(architecture.contains("`tephractl source unpromote <name>`"));
+    for (name, text) in [
+        ("README.md", &readme),
+        ("docs/ARCHITECTURE.md", &architecture),
+    ] {
+        assert!(
+            text.contains("not an undo"),
+            "{name} never says it is not an undo"
+        );
+    }
+    assert!(
+        !readme.contains("**Not built yet:** remote sources, `source.unpromote`"),
+        "unpromote is built"
+    );
 }

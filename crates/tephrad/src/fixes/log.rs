@@ -22,6 +22,13 @@ pub const KIND_MOVE: &str = "move";
 /// folder's path in the source it left, `new` is `@<name>:`.
 pub const KIND_PROMOTE: &str = "promote";
 
+/// A fix of an unpromote: a promoted source was folded back into the
+/// source it was promoted out of, and the links that crossed the border
+/// went back to canonical form. One entry for the whole folder: `old` is
+/// `@<name>:`, `new` is the folder's path in the parent (the mirror of
+/// [`KIND_PROMOTE`]). A record, never an undo of the promote entry.
+pub const KIND_UNPROMOTE: &str = "unpromote";
+
 /// A file that vanished with no certain pair: its links are broken and
 /// nothing is queued (G10).
 pub const KIND_UNCERTAIN: &str = "uncertain";

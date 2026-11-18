@@ -395,6 +395,31 @@ pub fn render_source_promoted(result: &Value) -> String {
     out
 }
 
+/// `source unpromote` success (G12): the source folded back, where it
+/// went and what it took. A line is added only when some linking file is
+/// still waiting for a retry or a person.
+pub fn render_source_unpromoted(result: &Value) -> String {
+    let name = str_field(result, "name");
+    let parent = str_field(result, "parent");
+    let folder = str_field(result, "folder");
+    let count = |key: &str| result.get(key).and_then(Value::as_i64).unwrap_or(0);
+    let mut out = format!(
+        "Unpromoted the source \"{name}\" (its files are \"{folder}\" in \"{parent}\" again)\n"
+    );
+    out.push_str(&format!(
+        "  files moved: {}, files with links rewritten: {}\n",
+        count("units_moved"),
+        count("files_changed"),
+    ));
+    let deferred = count("deferred");
+    if deferred > 0 {
+        out.push_str(&format!(
+            "  {deferred} file(s) still need a link fix; see `tephractl fixes`\n"
+        ));
+    }
+    out
+}
+
 pub fn render_source_removed(name: &str) -> String {
     format!("Removed source \"{name}\"\n")
 }

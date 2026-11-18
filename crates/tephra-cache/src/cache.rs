@@ -467,6 +467,11 @@ impl Cache {
         units::units_under_prefix(&self.conn, source_id, rel_prefix)
     }
 
+    /// Every `units` row of one source, ordered by path.
+    pub fn units_of_source(&self, source_id: i64) -> Result<Vec<UnitRow>, CacheError> {
+        units::units_of_source(&self.conn, source_id)
+    }
+
     /// Every row whose stored file identity is `(device, inode)`, found
     /// by identity alone: the path and the source play no part. A rename
     /// keeps its identity, so this is how a vanished row's file is

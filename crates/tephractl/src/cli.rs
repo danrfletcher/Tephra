@@ -19,6 +19,7 @@ tephractl - command-line client for the tephrad daemon
 USAGE:
     tephractl source add <name> <path> [--json]
     tephractl source promote <name> <path> [--json]
+    tephractl source unpromote <name> [--json]
     tephractl source remove <name> [--json]
     tephractl source list [--json]
     tephractl status [--json]
@@ -163,6 +164,11 @@ pub enum Command {
     SourcePromote {
         name: String,
         path: String,
+    },
+    /// `source unpromote <name>`: the promoted source `name` folds back
+    /// into the source it was promoted out of.
+    SourceUnpromote {
+        name: String,
     },
     SourceList,
     Status,
@@ -390,7 +396,9 @@ fn parse_source<'a>(
     iter: &mut impl Iterator<Item = &'a str>,
 ) -> Result<(Command, bool, Option<String>), ArgsError> {
     let sub = iter.next().ok_or_else(|| {
-        ArgsError("expected a source subcommand: add, promote, remove, or list".to_string())
+        ArgsError(
+            "expected a source subcommand: add, promote, unpromote, remove, or list".to_string(),
+        )
     })?;
 
     match sub {
@@ -420,6 +428,14 @@ fn parse_source<'a>(
             let (json, addr) = parse_trailing_flags(iter)?;
             Ok((Command::SourcePromote { name, path }, json, addr))
         }
+        "unpromote" => {
+            let name = iter
+                .next()
+                .ok_or_else(|| ArgsError("source unpromote requires <name>".to_string()))?
+                .to_string();
+            let (json, addr) = parse_trailing_flags(iter)?;
+            Ok((Command::SourceUnpromote { name }, json, addr))
+        }
         "remove" => {
             let name = iter
                 .next()
@@ -433,7 +449,7 @@ fn parse_source<'a>(
             Ok((Command::SourceList, json, addr))
         }
         other => Err(ArgsError(format!(
-            "unrecognized source subcommand: {other} (expected add, promote, remove, or list)"
+            "unrecognized source subcommand: {other} (expected add, promote, unpromote, remove, or list)"
         ))),
     }
 }
@@ -1059,6 +1075,21 @@ mod tests {
     fn source_add_rejects_name_with_at_sign() {
         let err = parse_args(["source", "add", "my@notes", "/path"]).unwrap_err();
         assert!(err.0.contains("invalid source name"));
+    }
+
+    #[test]
+    fn source_unpromote_parses_a_name_and_flags_and_needs_the_name() {
+        let parsed = run(&["source", "unpromote", "tephrad"]).unwrap();
+        assert_eq!(
+            parsed.command,
+            Command::SourceUnpromote {
+                name: "tephrad".to_string()
+            }
+        );
+        let json = run(&["source", "unpromote", "tephrad", "--json"]).unwrap();
+        assert!(json.json);
+        assert!(parse_args(["source", "unpromote"]).is_err());
+        assert!(parse_args(["source", "unpromote", "a", "b"]).is_err());
     }
 
     #[test]

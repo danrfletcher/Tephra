@@ -52,6 +52,7 @@ const MUTATING_METHODS: &[&str] = &[
     "source.unregister",
     "source.rescan",
     "source.promote",
+    "source.unpromote",
     "link.apply_refactor",
 ];
 
@@ -62,6 +63,7 @@ const LONG_RUNNING_METHODS: &[&str] = &[
     "source.register",
     "source.rescan",
     "source.promote",
+    "source.unpromote",
     "link.apply_refactor",
 ];
 

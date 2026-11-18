@@ -54,7 +54,8 @@ pub use retry::Trigger;
 
 use log::{
     overall_status, FileEntry, FILE_NEEDS_MANUAL_FIX, FILE_NOTHING_TO_FIX, FILE_PENDING,
-    FILE_WRITTEN, KIND_MOVE, KIND_PROMOTE, KIND_RENAME, KIND_UNCERTAIN, STATUS_UNCERTAIN,
+    FILE_WRITTEN, KIND_MOVE, KIND_PROMOTE, KIND_RENAME, KIND_UNCERTAIN, KIND_UNPROMOTE,
+    STATUS_UNCERTAIN,
 };
 
 /// What an uncertain entry says when the watcher logs it.
@@ -295,6 +296,85 @@ pub struct PromoteDone {
     pub announcement: FixAnnouncement,
 }
 
+/// A promoted source to fold back into its parent
+/// ([`FixEngine::unpromote`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnpromoteSpec {
+    /// The promoted source.
+    pub name: String,
+    /// The source it was promoted out of.
+    pub parent: String,
+    /// The folder of `parent` it was promoted from, forward slashes, no
+    /// trailing slash.
+    pub folder: String,
+}
+
+/// What [`FixEngine::unpromote`] did.
+pub struct UnpromoteDone {
+    /// How many cached rows went back to the parent.
+    pub units_moved: usize,
+    /// The log entry as it stands at the end.
+    pub entry: FixEntryWire,
+    /// The files written and the entry, for the one push.
+    pub announcement: FixAnnouncement,
+}
+
+/// The rel paths of `parent`'s cached units under `folder`, relative to
+/// the folder. After an unpromote these are the files the promoted source
+/// had.
+fn folder_units(cache: &Cache, parent: &str, folder: &str) -> Result<Vec<String>, FixError> {
+    let Some(parent) = cache.get_source(parent)? else {
+        return Ok(Vec::new());
+    };
+    let prefix = format!("{folder}/");
+    Ok(cache
+        .units_under_prefix(parent.id, folder)?
+        .into_iter()
+        .filter_map(|u| u.rel_path.strip_prefix(&prefix).map(str::to_string))
+        .collect())
+}
+
+/// The pending rows of an unpromote, read from `cache` as it will be once
+/// the promoted source is folded back: for each file that moves to the
+/// parent (`folder/<path>`), every file with a link that names it and has
+/// to change (rewrites 1 and 2 of a move, run in the opposite direction
+/// of a promote), and the file itself when links of its own have to
+/// change (rewrite 3, [`own_links_folded`]).
+fn unpromote_rows(cache: &Cache, spec: &UnpromoteSpec) -> Result<Vec<PlanRow>, FixError> {
+    let graph = UnitGraph::build_from_cache(cache)?;
+    let units = folder_units(cache, &spec.parent, &spec.folder)?;
+    let mut rows: BTreeSet<PlanRow> = BTreeSet::new();
+    for old in &units {
+        let new = format!("{}/{old}", spec.folder);
+        if let Ok(files) = linking_files(&graph, &spec.name, old, &spec.parent, &new) {
+            for file in files {
+                rows.insert(PlanRow {
+                    file,
+                    old: old.clone(),
+                    new: new.clone(),
+                });
+            }
+        }
+        let new_id = format!("@{}:{new}", spec.parent);
+        let own = own_links_folded(
+            &graph,
+            &spec.name,
+            &spec.parent,
+            &spec.folder,
+            &units,
+            &new_id,
+        );
+        if !own.0.is_empty() {
+            rows.insert(PlanRow {
+                file: (spec.parent.clone(), new.clone()),
+                old: old.clone(),
+                new,
+            });
+        }
+    }
+    Ok(rows.into_iter().collect())
+}
+
 /// The pending rows of a promote, read from `cache` as it will be once
 /// the folder is its own source: for each file that moved (`moved`, the
 /// parent's rows under the folder), every file with a link that names it
@@ -344,14 +424,15 @@ fn promote_rows(
 }
 
 /// Finishes the re-owning of every promote the daemon was killed in the
-/// middle of: for each `promoted_roots` row, any row its parent still
+/// middle of: for each live `promoted_roots` row (a stale one, history of
+/// an unregistered parent, is skipped), any row its parent still
 /// holds under the folder goes to the promoted source. A no-op once a
 /// promote is complete. Called before anything reads the cache at start,
 /// because a pending fix of a promote is only valid once the files have
 /// moved.
 pub fn complete_promotes(cache: &Cache) -> Result<usize, FixError> {
     let mut moved = 0;
-    for root in cache.promoted_roots()? {
+    for root in cache.live_promoted_roots()? {
         let (Some(parent), Some(child)) = (
             cache.get_source(&root.parent)?,
             cache.get_source(&root.source)?,
@@ -1030,6 +1111,98 @@ impl FixEngine {
         })
     }
 
+    // -- unpromoting a folder ---------------------------------------
+
+    /// Folds a promoted source back into the source it was promoted out
+    /// of (FR22's reverse), in the order [`FixEngine::promote`] uses:
+    ///
+    /// 1. the pending list is worked out against the cache as it WILL be
+    ///    ([`Cache::simulate_unpromote`], always rolled back), then ONE
+    ///    transaction moves the units back, removes the source's row and
+    ///    the folder's exclusion, and writes the log entry (kind
+    ///    `unpromote`) and that list;
+    /// 2. `after_fold` runs (the caller drops the promoted source's live
+    ///    watcher and lets the parent's see the folder again), then
+    /// 3. every pending file is rewritten by the same write loop as any
+    ///    fix, so links come out in canonical form for the parent.
+    ///
+    /// Unlike a promote the cache change is one transaction, so a crash
+    /// leaves the source whole or gone, and only step 3 is resumed by the
+    /// next start.
+    pub fn unpromote(
+        &self,
+        spec: &UnpromoteSpec,
+        after_fold: &dyn Fn(),
+    ) -> Result<UnpromoteDone, FixError> {
+        use crate::registry::retry_cache_on_busy;
+        use tephra_cache::NewUnpromote;
+
+        let _guard = self.lock();
+        let cache = self.open()?;
+        let gate = crate::writer_gate::for_path(&self.cache_path);
+        let now = self.clock.now();
+        if cache.get_source(&spec.parent)?.is_none() {
+            return Err(FixError::Refused(format!(
+                "source {} is not registered",
+                spec.parent
+            )));
+        }
+
+        let rows = retry_cache_on_busy(&gate, || {
+            cache.simulate_unpromote(&spec.name, &spec.parent, &spec.folder, |after| {
+                unpromote_rows(after, spec)
+            })
+        })??;
+
+        let files: BTreeSet<&(String, String)> = rows.iter().map(|r| &r.file).collect();
+        let detail = FixDetail {
+            files: files
+                .iter()
+                .map(|(s, p)| FileEntry::pending(s, p))
+                .collect(),
+            ..FixDetail::default()
+        };
+        let pending: Vec<NewPendingFix> = rows
+            .iter()
+            .map(|r| NewPendingFix {
+                source: r.file.0.clone(),
+                file_path: r.file.1.clone(),
+                old_source: Some(spec.name.clone()),
+                old_path: Some(r.old.clone()),
+                new_source: Some(spec.parent.clone()),
+                new_path: Some(r.new.clone()),
+            })
+            .collect();
+        let log = NewFixLog {
+            created_at: now,
+            kind: KIND_UNPROMOTE.to_string(),
+            status: overall_status(&detail.files).to_string(),
+            old_source: Some(spec.name.clone()),
+            old_path: Some(format!("@{}:", spec.name)),
+            new_source: Some(spec.parent.clone()),
+            new_path: Some(spec.folder.clone()),
+            files_changed: 0,
+            detail_json: Some(detail.to_json()),
+        };
+        let done = retry_cache_on_busy(&gate, || {
+            cache.begin_unpromote(&NewUnpromote {
+                name: &spec.name,
+                parent: &spec.parent,
+                rel_path: &spec.folder,
+                created_at: now,
+                log: &log,
+                pending: &pending,
+            })
+        })?;
+        after_fold();
+        let (entry, announcement) = self.run_fix(&cache, done.fix_id)?;
+        Ok(UnpromoteDone {
+            units_moved: done.units_moved,
+            entry,
+            announcement,
+        })
+    }
+
     // -- retrying ---------------------------------------------------
 
     /// At start: every pending row of every source (G9).
@@ -1195,14 +1368,24 @@ impl FixEngine {
             )
         } else if file_id == new_id {
             let promoted = promoted_folder(cache, &row)?;
-            let (edges, links) = own_links(
-                graph,
-                &old_source,
-                &old_path,
-                &target_source,
-                &target_path,
-                promoted.as_deref(),
-            );
+            let (edges, links) = match unpromoted_folder(cache, &row)? {
+                Some(folder) => own_links_folded(
+                    graph,
+                    &old_source,
+                    &target_source,
+                    &folder,
+                    &folder_units(cache, &target_source, &folder)?,
+                    &new_id,
+                ),
+                None => own_links(
+                    graph,
+                    &old_source,
+                    &old_path,
+                    &target_source,
+                    &target_path,
+                    promoted.as_deref(),
+                ),
+            };
             (
                 edges,
                 RewriteMode::Move(MoveRewrite::Own {
@@ -1553,6 +1736,107 @@ fn strip_folder<'a>(target: &'a str, folder: &str) -> Option<&'a str> {
     (head.eq_ignore_ascii_case(folder) && !rest.is_empty()).then_some(rest)
 }
 
+/// What the links of a file that was in a promoted source `child` need
+/// now that `child` is folded back into `parent` (rewrite 3 of an
+/// unpromote): the wikilink edges of `new_id` that change, and what each
+/// changes to (see [`OwnLink`]). `units` are the paths, relative to the
+/// folder, of every file that moved back.
+///
+/// Where a link pointed is worked out from its text alone, the way the
+/// resolver read it in `child` (the source is gone from the graph, so it
+/// cannot be asked), against `units`:
+///
+/// - `[[@parent:x]]` (a prefix a promote added): the prefix goes when the
+///   bare text reaches the same file in the parent.
+/// - `[[src/x]]`, `[[x]]` or `[[@child:src/x]]` naming a file that moved:
+///   a link that still reaches that file is left alone (a bare name that
+///   is still unique); any other becomes the shortest unique target in
+///   the parent, with no prefix (FR23).
+/// - A link to any other source, or to nothing, is left alone.
+fn own_links_folded(
+    graph: &UnitGraph,
+    child: &str,
+    parent: &str,
+    folder: &str,
+    units: &[String],
+    new_id: &str,
+) -> (Vec<Edge>, HashMap<String, OwnLink>) {
+    let mut edges = Vec::new();
+    let mut links: HashMap<String, OwnLink> = HashMap::new();
+    for edge in graph.get_forward_links_all(new_id) {
+        if edge.kind != tephra_parser::LINK_KIND_WIKILINK {
+            continue;
+        }
+        let w = tephra_parser::parse_wikilink_inner(&edge.to_raw);
+        if w.target.is_empty() {
+            continue;
+        }
+        let action = match w.source_prefix.as_deref() {
+            Some(p) if p == parent => {
+                let prefixed = graph.resolve_link(&format!("@{parent}:{}", w.target), None);
+                let bare = graph.resolve_link(&w.target, Some(parent));
+                match (prefixed, bare) {
+                    (Ok(a), Ok(b)) if a.unit.id == b.unit.id => Some(OwnLink::DropPrefix),
+                    _ => None,
+                }
+            }
+            Some(p) if p != child => None,
+            prefix => {
+                // Spelled from the promoted source's root (bare, or with
+                // its own prefix): the file it named there.
+                child_target(units, &w.target).and_then(|rel| {
+                    let target_id = format!("@{parent}:{folder}/{rel}");
+                    let still_reaches = prefix.is_none()
+                        && graph
+                            .resolve_link(&w.target, Some(parent))
+                            .is_ok_and(|r| r.unit.id == target_id);
+                    if still_reaches {
+                        None
+                    } else {
+                        graph
+                            .shortest_unique_target(&target_id)
+                            .map(OwnLink::Retarget)
+                    }
+                })
+            }
+        };
+        if let Some(action) = action {
+            links.insert(edge.to_raw.clone(), action);
+            edges.push(edge);
+        }
+    }
+    (edges, links)
+}
+
+/// The file of `units` (paths relative to a folder) that the link text
+/// `target` named when that folder was a source of its own, or `None`:
+/// a text with a `/` is a full stem; one without is a file name, and the
+/// shortest stem wins, a tie being no file at all (the resolver's rule,
+/// without regard to case). The extension of a Markdown file is optional.
+fn child_target<'a>(units: &'a [String], target: &str) -> Option<&'a str> {
+    let key = crate::refactor::strip_md_ext_pub(target).0.to_lowercase();
+    let stem = |u: &'a str| crate::refactor::strip_md_ext_pub(u).0.to_lowercase();
+    let mut found: Vec<(&'a str, usize)> = units
+        .iter()
+        .map(String::as_str)
+        .filter(|u| {
+            let s = stem(u);
+            if key.contains('/') {
+                s == key
+            } else {
+                s.rsplit('/').next() == Some(key.as_str())
+            }
+        })
+        .map(|u| (u, stem(u).chars().count()))
+        .collect();
+    found.sort_by_key(|&(_, len)| len);
+    match found.as_slice() {
+        [(only, _)] => Some(only),
+        [(first, a), (_, b), ..] if a < b => Some(first),
+        _ => None,
+    }
+}
+
 /// The folder a pending row's fix promoted, or `None` when it is no
 /// promote.
 fn promoted_folder(cache: &Cache, row: &PendingFixRow) -> Result<Option<String>, FixError> {
@@ -1563,6 +1847,18 @@ fn promoted_folder(cache: &Cache, row: &PendingFixRow) -> Result<Option<String>,
         .get_fix_log(fix_id)?
         .filter(|e| e.kind == KIND_PROMOTE)
         .and_then(|e| e.old_path))
+}
+
+/// The folder of the parent a pending row's fix folded a promoted source
+/// back into, or `None` when it is no unpromote.
+fn unpromoted_folder(cache: &Cache, row: &PendingFixRow) -> Result<Option<String>, FixError> {
+    let Some(fix_id) = row.fix_id else {
+        return Ok(None);
+    };
+    Ok(cache
+        .get_fix_log(fix_id)?
+        .filter(|e| e.kind == KIND_UNPROMOTE)
+        .and_then(|e| e.new_path))
 }
 
 /// `changed` (paths on disk) relative to the root of `source`. Paths

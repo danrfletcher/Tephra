@@ -297,6 +297,42 @@ impl fmt::Display for PromoteError {
 
 impl std::error::Error for PromoteError {}
 
+/// Why `source.unpromote` refused (G14). Each has a stable
+/// machine-readable [`UnpromoteError::reason`]; a refusal changes nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnpromoteError {
+    /// The source exists but was not made by a promote, or its parent
+    /// was unregistered (it is top-level now).
+    NotPromoted { name: String },
+    /// The source it would fold back into is offline.
+    SourceOffline { source: String },
+}
+
+impl UnpromoteError {
+    /// The stable reason string clients branch on (`data.reason`).
+    pub fn reason(&self) -> &'static str {
+        match self {
+            UnpromoteError::NotPromoted { .. } => "not_promoted",
+            UnpromoteError::SourceOffline { .. } => "source_offline",
+        }
+    }
+}
+
+impl fmt::Display for UnpromoteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            UnpromoteError::NotPromoted { name } => {
+                write!(f, "the source \"{name}\" was not promoted out of another")
+            }
+            UnpromoteError::SourceOffline { source } => {
+                write!(f, "the source \"{source}\" is offline")
+            }
+        }
+    }
+}
+
+impl std::error::Error for UnpromoteError {}
+
 /// The most characters a new source name may have.
 pub const MAX_SOURCE_NAME_CHARS: usize = 64;
 
@@ -493,7 +529,9 @@ pub enum RegistryError {
     NotFound(String),
     /// `source.promote` refused (E13): nothing was changed.
     Promote(PromoteError),
-    /// The link rewrites of a promote failed after the promote was
+    /// `source.unpromote` refused (G14): nothing was changed.
+    Unpromote(UnpromoteError),
+    /// The link rewrites of a promote or an unpromote failed after it was
     /// recorded; what is left is finished at the next start.
     Fix(String),
 }
@@ -508,6 +546,7 @@ impl fmt::Display for RegistryError {
             RegistryError::Scan(e) => write!(f, "{e}"),
             RegistryError::NotFound(name) => write!(f, "no source named \"{name}\""),
             RegistryError::Promote(e) => write!(f, "{e}"),
+            RegistryError::Unpromote(e) => write!(f, "{e}"),
             RegistryError::Fix(m) => write!(f, "{m}"),
         }
     }
@@ -518,6 +557,11 @@ impl std::error::Error for RegistryError {}
 impl From<RegisterError> for RegistryError {
     fn from(e: RegisterError) -> Self {
         RegistryError::Validation(e)
+    }
+}
+impl From<UnpromoteError> for RegistryError {
+    fn from(e: UnpromoteError) -> Self {
+        RegistryError::Unpromote(e)
     }
 }
 impl From<PromoteError> for RegistryError {
@@ -743,6 +787,24 @@ pub struct PromoteOutcome {
     pub parent: String,
     pub folder: String,
     /// Cached rows that moved to the new source.
+    pub units_moved: usize,
+    /// Linking files rewritten.
+    pub files_changed: i64,
+    /// Linking files left for a retry or a person.
+    pub deferred: i64,
+    /// The fix-log status: `applied`, `partial` or `needs_manual_fix`.
+    pub status: String,
+}
+
+/// What a `source.unpromote` did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnpromoteOutcome {
+    /// The source that was folded back.
+    pub name: String,
+    /// The source that took the folder back, and the folder's path in it.
+    pub parent: String,
+    pub folder: String,
+    /// Cached rows that moved back to the parent.
     pub units_moved: usize,
     /// Linking files rewritten.
     pub files_changed: i64,
@@ -1114,6 +1176,172 @@ impl SourceRegistry {
             .scan_and_watch(&spec.name, done.source_id, &spec.root)
             .map(|_| ());
         Ok((done, scanned))
+    }
+
+    /// `true` when `name` is a source made by a promote and still tied to
+    /// the parent it was promoted out of: a LIVE `promoted_roots` row
+    /// (`Cache::live_promoted_roots`: the parent is registered and
+    /// `name`'s root is the parent's root plus the row's folder). The
+    /// cache keeps the row after the parent is unregistered, as history;
+    /// such a source is top-level, also when another source has since
+    /// taken the parent's name.
+    pub fn is_promoted(&self, name: &str) -> Result<bool, RegistryError> {
+        let cache = self.cache.lock().unwrap();
+        Ok(cache
+            .live_promoted_roots()?
+            .iter()
+            .any(|root| root.source == name))
+    }
+
+    /// `source.unpromote` (FR22 reversed): the promoted source `name`
+    /// folds back into the source it was promoted out of. The order is
+    /// the promote's:
+    ///
+    /// 1. validate: `name` is a source, is promoted and its parent is
+    ///    online ([`UnpromoteError`]; a refusal changes nothing);
+    /// 2. the watchers are paused, so nothing interleaves;
+    /// 3. [`FixEngine::unpromote`]: ONE transaction (the units back in
+    ///    the parent, the registry row and the exclusion gone, the log
+    ///    entry, every crossing link), the promoted source's watcher
+    ///    stopped and the parent's told to read the folder again, then
+    ///    the link rewrites;
+    /// 4. the files written are indexed;
+    /// 5. the watchers resume (a change made meanwhile is applied now,
+    ///    except Tephra's own writes), and ONE push goes out.
+    ///
+    /// A crash after step 3's transaction leaves the pending list; the
+    /// next start finishes the rewrites.
+    pub fn unpromote(
+        &self,
+        name: &str,
+        engine: &crate::fixes::FixEngine,
+    ) -> Result<UnpromoteOutcome, RegistryError> {
+        let _one_at_a_time = self.promote_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let (parent, folder) = {
+            let cache = self.cache.lock().unwrap();
+            if cache.get_source(name)?.is_none() {
+                return Err(RegistryError::NotFound(name.to_string()));
+            }
+            let not_promoted = || UnpromoteError::NotPromoted {
+                name: name.to_string(),
+            };
+            let root = cache
+                .live_promoted_roots()?
+                .into_iter()
+                .find(|r| r.source == name)
+                .ok_or_else(not_promoted)?;
+            let parent = cache.get_source(&root.parent)?.ok_or_else(not_promoted)?;
+            if parent.status == SourceStatus::Offline {
+                return Err(UnpromoteError::SourceOffline {
+                    source: parent.name,
+                }
+                .into());
+            }
+            (parent, root.rel_path)
+        };
+
+        let spec = crate::fixes::UnpromoteSpec {
+            name: name.to_string(),
+            parent: parent.name.clone(),
+            folder: folder.clone(),
+        };
+        self.pause_for_write();
+        let result = self.unpromote_paused(&spec, &parent, engine);
+        // As in `promote`: no path is discarded on resume (FR24).
+        self.resume_after_write(&HashSet::new());
+        let done = result?;
+
+        let mut outcome = UnpromoteOutcome {
+            name: name.to_string(),
+            parent: parent.name,
+            folder,
+            units_moved: done.units_moved,
+            files_changed: done.entry.files_changed,
+            deferred: 0,
+            status: done.entry.status.clone(),
+        };
+        outcome.deferred = done
+            .announcement
+            .notices
+            .iter()
+            .map(|n| n.deferred)
+            .sum::<i64>();
+        // ONE push: the source-list change and the fix entry together.
+        let _ = self.events_tx.send(DaemonEvent::SourceListChanged {
+            changes: vec![SourceChange::new(SourceChangeKind::Unpromoted, name)],
+            fixes: done.announcement.notices,
+        });
+        tracing::info!(
+            source = %name,
+            parent = %outcome.parent,
+            folder = %outcome.folder,
+            units_moved = outcome.units_moved,
+            files_changed = outcome.files_changed,
+            "source_unpromoted"
+        );
+        Ok(outcome)
+    }
+
+    /// The part of [`SourceRegistry::unpromote`] that runs with the
+    /// watchers paused.
+    fn unpromote_paused(
+        &self,
+        spec: &crate::fixes::UnpromoteSpec,
+        parent: &SourceRow,
+        engine: &crate::fixes::FixEngine,
+    ) -> Result<crate::fixes::UnpromoteDone, RegistryError> {
+        let parent_root = PathBuf::from(&parent.path);
+        let fold = || {
+            // The promoted source is gone from the cache: its watcher
+            // stops for good, and the parent's reads the folder again.
+            if let Some(running) = self.running.lock().unwrap().remove(&spec.name) {
+                running.handle.stop();
+                *running.live.lock().unwrap_or_else(|p| p.into_inner()) = false;
+            }
+            self.renames.remove_source(&spec.name);
+            self.set_permission_denied(&spec.name, false);
+            let rules = self.load_rules(&parent.name, &parent_root);
+            let running = self.running.lock().unwrap();
+            if let (Some(running), Ok(rules)) = (running.get(&parent.name), rules) {
+                *running
+                    .ignore_rules
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner()) = rules;
+            }
+        };
+        let done = engine
+            .unpromote(spec, &fold)
+            .map_err(|e| RegistryError::Fix(e.to_string()))?;
+        for file in &done.announcement.written {
+            if let Err(e) = self.reindex_quietly(&file.source, &file.path) {
+                tracing::warn!(source = %file.source, path = %file.path.display(), error = %e, "could not index a file the unpromote rewrote");
+            }
+        }
+        Ok(done)
+    }
+
+    /// `source.unregister` of a promoted source behaves as
+    /// [`SourceRegistry::unpromote`] (FR22): the same rewrites, the same
+    /// log entry, the same push. `Ok(true)` when it did that, `Ok(false)`
+    /// when `name` is not promoted (a normal source, an unknown name, or
+    /// one already unregistered): nothing was done and the caller
+    /// unregisters it the plain way. A refusal of the unpromote (the
+    /// parent is offline) is an error and changes nothing.
+    pub fn unregister_promoted(
+        &self,
+        name: &str,
+        engine: &crate::fixes::FixEngine,
+    ) -> Result<bool, RegistryError> {
+        if !self.is_promoted(name)? {
+            return Ok(false);
+        }
+        match self.unpromote(name, engine) {
+            Ok(_) => Ok(true),
+            // Another call unpromoted it between the check and here.
+            Err(RegistryError::NotFound(_))
+            | Err(RegistryError::Unpromote(UnpromoteError::NotPromoted { .. })) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// Finishes the re-owning of any promote that was recorded and not

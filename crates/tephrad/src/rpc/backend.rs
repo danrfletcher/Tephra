@@ -676,7 +676,39 @@ impl From<crate::registry::PromoteOutcome> for PromoteWire {
     }
 }
 
-/// Why `source.promote` did not succeed.
+/// `source.unpromote`'s result (G12): what was folded back and what it
+/// took.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnpromoteWire {
+    pub name: String,
+    /// The source that took the folder back, and the folder's path in it.
+    pub parent: String,
+    pub folder: String,
+    /// Cached files that moved back to the parent.
+    pub units_moved: usize,
+    /// Linking files rewritten.
+    pub files_changed: i64,
+    /// Linking files left for a retry or a person.
+    pub deferred: i64,
+    /// `applied`, `partial` or `needs_manual_fix`.
+    pub status: String,
+}
+
+impl From<crate::registry::UnpromoteOutcome> for UnpromoteWire {
+    fn from(o: crate::registry::UnpromoteOutcome) -> Self {
+        UnpromoteWire {
+            name: o.name,
+            parent: o.parent,
+            folder: o.folder,
+            units_moved: o.units_moved,
+            files_changed: o.files_changed,
+            deferred: o.deferred,
+            status: o.status,
+        }
+    }
+}
+
+/// Why `source.promote` or `source.unpromote` did not succeed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromoteRpcError {
     /// Refused with a stable `reason`; nothing was changed (E13).
@@ -712,6 +744,22 @@ pub trait FixBackend: Send + Sync {
         Err(PromoteRpcError::Failed(
             "source.promote is not configured for this test fixture".to_string(),
         ))
+    }
+
+    /// `source.unpromote` (FR22 reversed): the promoted source `name`
+    /// folds back into its parent. Blocking: it writes files.
+    fn unpromote(&self, _name: &str) -> Result<UnpromoteWire, PromoteRpcError> {
+        Err(PromoteRpcError::Failed(
+            "source.unpromote is not configured for this test fixture".to_string(),
+        ))
+    }
+
+    /// `source.unregister` of `name` when it is a promoted source: does
+    /// what [`FixBackend::unpromote`] does and answers `Ok(true)`.
+    /// `Ok(false)` when `name` is not promoted: the caller unregisters it
+    /// the plain way.
+    fn unregister_promoted(&self, _name: &str) -> Result<bool, PromoteRpcError> {
+        Ok(false)
     }
 
     /// `link.rename_event` (G3): Obsidian renamed `old_path` to
@@ -781,6 +829,35 @@ impl FixBackend for FixService {
             }),
             Err(e) => Err(PromoteRpcError::Failed(e.to_string())),
         }
+    }
+
+    fn unpromote(&self, name: &str) -> Result<UnpromoteWire, PromoteRpcError> {
+        self.registry
+            .unpromote(name, &self.engine)
+            .map(UnpromoteWire::from)
+            .map_err(unpromote_rpc_error)
+    }
+
+    fn unregister_promoted(&self, name: &str) -> Result<bool, PromoteRpcError> {
+        self.registry
+            .unregister_promoted(name, &self.engine)
+            .map_err(unpromote_rpc_error)
+    }
+}
+
+/// A refusal of an unpromote as the RPC layer reports it: an unknown
+/// name is `unknown_source`, the rest carry the reason they have.
+fn unpromote_rpc_error(e: RegistryError) -> PromoteRpcError {
+    match e {
+        RegistryError::NotFound(_) => PromoteRpcError::Refused {
+            reason: "unknown_source",
+            message: e.to_string(),
+        },
+        RegistryError::Unpromote(u) => PromoteRpcError::Refused {
+            reason: u.reason(),
+            message: u.to_string(),
+        },
+        e => PromoteRpcError::Failed(e.to_string()),
     }
 }
 

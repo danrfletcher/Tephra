@@ -295,3 +295,44 @@ fn read_only_timeout_message_is_plain_not_ambiguous() {
         other => panic!("expected a plain Timeout, got {other:?}"),
     }
 }
+
+/// G12: `source.unpromote` writes files, so like `source.promote` it is
+/// never re-sent after a dropped connection, and (it can rewrite many
+/// files) it gets the long timeout.
+#[test]
+fn source_unpromote_is_never_retried_on_a_dropped_connection() {
+    let server = MockServer::start(vec![
+        Behavior::Drop,
+        Behavior::Respond {
+            status: 200,
+            body: ok_envelope(serde_json::json!({"name": "tephrad", "status": "applied"})),
+        },
+    ]);
+    let client = RpcClient::new(server.addr.clone(), "token".to_string());
+
+    let result = client.call("source.unpromote", serde_json::json!({"name": "tephrad"}));
+
+    assert!(matches!(result, Err(RpcCallError::Ambiguous(_))));
+    assert_eq!(server.call_count(), 1);
+}
+
+#[test]
+fn source_unpromote_gets_the_long_running_timeout() {
+    let server = MockServer::start(vec![Behavior::Slow {
+        delay: Duration::from_millis(150),
+        status: 200,
+        body: ok_envelope(serde_json::json!({"name": "tephrad", "status": "applied"})),
+    }]);
+    let client = RpcClient::with_timeouts(
+        server.addr.clone(),
+        "token".to_string(),
+        Duration::from_millis(50),
+        Duration::from_millis(400),
+        Duration::from_millis(50),
+    );
+
+    let result = client.call("source.unpromote", serde_json::json!({"name": "tephrad"}));
+
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(server.call_count(), 1);
+}

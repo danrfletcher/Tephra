@@ -41,7 +41,7 @@ pub use listing::{
 pub use pending_fixes::{
     NewPendingFix, PendingFixRow, PendingOp, STATE_NEEDS_MANUAL_FIX, STATE_PENDING,
 };
-pub use promote::{NewPromote, Promoted, PromotedRootRow};
+pub use promote::{NewPromote, NewUnpromote, Promoted, PromotedRootRow, Unpromoted};
 pub use schema::KindInferrer;
 pub use search::{compare_hits, file_stem, resolve_title, NameCandidate, NameHit, NAME_SEARCH_SQL};
 pub use sources::{validate_transition, InvalidTransition, SourceRow, SourceStatus};
@@ -103,6 +103,10 @@ pub enum CacheError {
     /// This SQLite build has no FTS5 with the `trigram` tokenizer, which
     /// the `^^` search needs. Carries a message saying what is missing.
     Fts5Unavailable(String),
+    /// [`Cache::begin_unpromote`] (or its simulation) named a source that
+    /// has no `promoted_roots` row for the given parent and folder: it
+    /// was never promoted out of that folder.
+    NotPromoted(String),
 }
 
 impl fmt::Display for CacheError {
@@ -130,6 +134,9 @@ impl fmt::Display for CacheError {
                 write!(f, "\"{name}\" is not a recognized cache table name")
             }
             CacheError::Fts5Unavailable(message) => write!(f, "{message}"),
+            CacheError::NotPromoted(name) => {
+                write!(f, "the source \"{name}\" was not promoted out of a folder")
+            }
         }
     }
 }

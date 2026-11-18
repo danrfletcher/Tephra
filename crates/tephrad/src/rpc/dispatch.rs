@@ -39,6 +39,7 @@ pub const METHOD_NAMES: &[&str] = &[
     "source.list",
     "source.rescan",
     "source.promote",
+    "source.unpromote",
     "link.preview_refactor",
     "link.apply_refactor",
     "unit.list",
@@ -98,10 +99,11 @@ pub fn dispatch(
         "graph.get_forward_links" => graph_get_forward_links(params, backends.graph),
         "graph.get_edges" => graph_get_edges(backends.graph),
         "source.register" => source_register(params, backends.sources),
-        "source.unregister" => source_unregister(params, backends.sources),
+        "source.unregister" => source_unregister(params, backends.sources, backends.fixes),
         "source.list" => source_list(backends.sources),
         "source.rescan" => source_rescan(params, backends.sources),
         "source.promote" => source_promote(params, backends.fixes),
+        "source.unpromote" => source_unpromote(params, backends.fixes),
         "link.preview_refactor" => link_preview_refactor(params, backends.refactor),
         "link.apply_refactor" => link_apply_refactor(params, backends.refactor),
         "unit.list" => unit_list(params, backends.sources),
@@ -152,8 +154,30 @@ fn source_register(params: &Value, sources: &dyn SourceBackend) -> DispatchResul
         .map_err(|e| (SOURCE_ERROR, e, None))
 }
 
-fn source_unregister(params: &Value, sources: &dyn SourceBackend) -> DispatchResult {
+/// `source.unregister {name}` (G1). A promoted source is folded back into
+/// its parent, exactly as `source.unpromote` does it (G12); any other
+/// source (or an unknown or already removed name) is unregistered the
+/// plain way.
+fn source_unregister(
+    params: &Value,
+    sources: &dyn SourceBackend,
+    fixes: &dyn FixBackend,
+) -> DispatchResult {
+    use crate::rpc::backend::PromoteRpcError;
+
     let name = require_str(params, "name")?;
+    match fixes.unregister_promoted(name) {
+        Ok(true) => return Ok(Value::Null),
+        Ok(false) => {}
+        Err(PromoteRpcError::Refused { reason, message }) => {
+            return Err((
+                SOURCE_ERROR,
+                message,
+                Some(serde_json::json!({ "reason": reason })),
+            ))
+        }
+        Err(PromoteRpcError::Failed(message)) => return Err((SOURCE_ERROR, message, None)),
+    }
     sources
         .unregister(name)
         .map(|_| Value::Null)
@@ -184,6 +208,23 @@ fn source_promote(params: &Value, fixes: &dyn FixBackend) -> DispatchResult {
     let root = require_str(params, "root")?;
     match fixes.promote(name, root) {
         Ok(done) => Ok(serde_json::to_value(done).expect("PromoteWire always serializes")),
+        Err(PromoteRpcError::Refused { reason, message }) => Err((
+            SOURCE_ERROR,
+            message,
+            Some(serde_json::json!({ "reason": reason })),
+        )),
+        Err(PromoteRpcError::Failed(message)) => Err((SOURCE_ERROR, message, None)),
+    }
+}
+
+/// `source.unpromote {name}` (G12): `name` a non-empty string. A refusal
+/// is a `SOURCE_ERROR` whose `data.reason` is the stable reason (G14).
+fn source_unpromote(params: &Value, fixes: &dyn FixBackend) -> DispatchResult {
+    use crate::rpc::backend::PromoteRpcError;
+
+    let name = require_str(params, "name")?;
+    match fixes.unpromote(name) {
+        Ok(done) => Ok(serde_json::to_value(done).expect("UnpromoteWire always serializes")),
         Err(PromoteRpcError::Refused { reason, message }) => Err((
             SOURCE_ERROR,
             message,
@@ -478,6 +519,7 @@ mod tests {
                 "source.list",
                 "source.rescan",
                 "source.promote",
+                "source.unpromote",
                 "link.preview_refactor",
                 "link.apply_refactor",
                 "unit.list",

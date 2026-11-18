@@ -112,7 +112,8 @@ fn dispatch_methods() -> Vec<String> {
 }
 
 #[test]
-fn f2_the_rpc_method_list_is_the_one_before_this_pr_plus_fix_list_rename_event_and_promote() {
+fn f2_the_rpc_method_list_is_the_one_before_this_pr_plus_fix_list_rename_event_promote_and_unpromote(
+) {
     let mut expected: Vec<String> = [
         "unit.resolve_link",
         "graph.get_backlinks",
@@ -124,6 +125,8 @@ fn f2_the_rpc_method_list_is_the_one_before_this_pr_plus_fix_list_rename_event_a
         "source.rescan",
         // atlas-25 PR-12 (G11, F12): the one method that PR adds.
         "source.promote",
+        // atlas-25 PR-13 (G12, F12): the one method that PR adds.
+        "source.unpromote",
         "link.preview_refactor",
         "link.apply_refactor",
         "unit.list",

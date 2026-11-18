@@ -214,7 +214,7 @@ fn unknown_method_returns_method_not_found() {
 /// (PR-11.F1), then `fix.list` (atlas-25 PR-5, G18) and `link.rename_event`
 /// (atlas-25 PR-8, G3). Adding a method
 /// means changing this list on purpose.
-const EXPECTED_METHODS: [&str; 16] = [
+const EXPECTED_METHODS: [&str; 17] = [
     "unit.resolve_link",
     "graph.get_backlinks",
     "graph.get_forward_links",
@@ -224,6 +224,7 @@ const EXPECTED_METHODS: [&str; 16] = [
     "source.list",
     "source.rescan",
     "source.promote",
+    "source.unpromote",
     "link.preview_refactor",
     "link.apply_refactor",
     "unit.list",
@@ -234,13 +235,25 @@ const EXPECTED_METHODS: [&str; 16] = [
 ];
 
 #[test]
-fn method_table_is_exactly_the_sixteen_named_verbs() {
+fn method_table_is_exactly_the_seventeen_named_verbs() {
     assert_eq!(METHOD_NAMES, EXPECTED_METHODS);
     // No duplicates either.
     let mut sorted = METHOD_NAMES.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
     assert_eq!(sorted.len(), METHOD_NAMES.len());
+}
+
+/// F9: the fix log is a record, never an undo. Unpromote folds a source
+/// back (a forward fix of its own); no method undoes or reverts a fix.
+#[test]
+fn there_is_no_undo_or_revert_method() {
+    for method in METHOD_NAMES {
+        assert!(
+            !method.contains("undo") && !method.contains("revert"),
+            "{method}"
+        );
+    }
 }
 
 /// `unit.search` is routed (it reaches the sources backend, which here

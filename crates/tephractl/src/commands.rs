@@ -91,6 +91,7 @@ pub fn execute_with_prompt_writer<R: BufRead, W: Write>(
     match command {
         Command::SourceAdd { name, path } => source_add(name, path, json, client),
         Command::SourcePromote { name, path } => source_promote(name, path, json, client),
+        Command::SourceUnpromote { name } => source_unpromote(name, json, client),
         Command::SourceRemove { name } => source_remove(name, json, client),
         Command::SourceList => source_list(json, client),
         Command::Status => status(json, client),
@@ -180,6 +181,31 @@ fn source_promote(name: &str, path: &str, json: bool, client: &RpcClient) -> Com
         Ok(result) => CommandOutcome::ok(json_or(
             &result,
             || render::render_source_promoted(&result),
+            json,
+        )),
+        Err(RpcCallError::Rpc { message, data, .. }) => {
+            let reason = data
+                .as_ref()
+                .and_then(|d| d.get("reason"))
+                .and_then(Value::as_str);
+            CommandOutcome::err(match reason {
+                Some(reason) => format!("{message} (reason: {reason})"),
+                None => message,
+            })
+        }
+        Err(e) => CommandOutcome::err(describe_error(&e)),
+    }
+}
+
+/// `source unpromote <name>` (G12): one `source.unpromote` call. A
+/// refusal prints the daemon's message and its stable `reason` and exits
+/// 1; nothing has changed then. This is a fold back, never an undo: the
+/// fix log keeps the promote entry.
+fn source_unpromote(name: &str, json: bool, client: &RpcClient) -> CommandOutcome {
+    match client.call("source.unpromote", json!({"name": name})) {
+        Ok(result) => CommandOutcome::ok(json_or(
+            &result,
+            || render::render_source_unpromoted(&result),
             json,
         )),
         Err(RpcCallError::Rpc { message, data, .. }) => {
