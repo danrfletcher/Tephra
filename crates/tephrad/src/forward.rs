@@ -40,10 +40,10 @@ pub fn payload(event: &DaemonEvent) -> Value {
             paths,
             fixes,
         } => (source.as_str(), path_strings(paths), fixes.as_slice(), None),
-        DaemonEvent::SourceListChanged { changes } => (
+        DaemonEvent::SourceListChanged { changes, fixes } => (
             changes.first().map(|c| c.name.as_str()).unwrap_or(""),
             Vec::new(),
-            [].as_slice(),
+            fixes.as_slice(),
             Some(changes),
         ),
     };

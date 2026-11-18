@@ -262,3 +262,134 @@ fn status_with_zero_sources_says_so_plainly() {
     assert_eq!(outcome.exit_code, 0);
     assert!(outcome.stdout.contains("no sources registered"));
 }
+
+// ---- source promote (G11, E13) ------------------------------------
+
+fn promote_command() -> Command {
+    Command::SourcePromote {
+        name: "tephrad".to_string(),
+        path: "/home/dan/Developer/Tephra/crates/tephrad".to_string(),
+    }
+}
+
+#[test]
+fn source_promote_sends_name_and_root_and_renders_byte_for_byte() {
+    let server = MockServer::start(vec![Behavior::Respond {
+        status: 200,
+        body: load_fixture("source_promote_success"),
+    }]);
+    let client = client_for(&server);
+
+    let mut stdin: &[u8] = &[];
+    let outcome = commands::execute(&promote_command(), false, &client, &mut stdin);
+
+    assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
+    assert_eq!(outcome.stdout, load_expected("source_promote_rendered"));
+    assert_eq!(outcome.stderr, "");
+
+    let received = server.received();
+    assert_eq!(
+        received.len(),
+        1,
+        "one call: the promote, nothing before it"
+    );
+    assert_eq!(received[0].body["method"], "source.promote");
+    assert_eq!(received[0].body["params"]["name"], "tephrad");
+    assert_eq!(
+        received[0].body["params"]["root"],
+        "/home/dan/Developer/Tephra/crates/tephrad"
+    );
+    assert_eq!(received[0].body["params"].as_object().unwrap().len(), 2);
+}
+
+#[test]
+fn source_promote_json_flag_prints_the_raw_result_byte_for_byte() {
+    let server = MockServer::start(vec![Behavior::Respond {
+        status: 200,
+        body: load_fixture("source_promote_success"),
+    }]);
+    let client = client_for(&server);
+
+    let mut stdin: &[u8] = &[];
+    let outcome = commands::execute(&promote_command(), true, &client, &mut stdin);
+
+    assert_eq!(outcome.exit_code, 0);
+    assert_eq!(outcome.stdout, load_expected("source_promote_json"));
+}
+
+#[test]
+fn source_promote_says_when_a_link_fix_is_still_waiting() {
+    let server = MockServer::start(vec![Behavior::Respond {
+        status: 200,
+        body: load_fixture("source_promote_partial"),
+    }]);
+    let client = client_for(&server);
+
+    let mut stdin: &[u8] = &[];
+    let outcome = commands::execute(&promote_command(), false, &client, &mut stdin);
+
+    assert_eq!(outcome.exit_code, 0);
+    assert_eq!(
+        outcome.stdout,
+        load_expected("source_promote_partial_rendered")
+    );
+}
+
+#[test]
+fn source_promote_resolves_a_relative_path_against_the_callers_directory() {
+    let server = MockServer::start(vec![Behavior::Respond {
+        status: 200,
+        body: load_fixture("source_promote_success"),
+    }]);
+    let client = client_for(&server);
+
+    let mut stdin: &[u8] = &[];
+    let outcome = commands::execute(
+        &Command::SourcePromote {
+            name: "tephrad".to_string(),
+            path: "crates/tephrad".to_string(),
+        },
+        false,
+        &client,
+        &mut stdin,
+    );
+
+    assert_eq!(outcome.exit_code, 0);
+    let sent = server.received()[0].body["params"]["root"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let want = std::env::current_dir().unwrap().join("crates/tephrad");
+    assert_eq!(sent, want.display().to_string());
+}
+
+#[test]
+fn source_promote_refusals_exit_non_zero_and_show_the_reason_verbatim() {
+    for (reason, message) in [
+        (
+            "not_inside_a_source",
+            "/home/dan/Documents/Notes is not inside any registered source",
+        ),
+        (
+            "name_taken",
+            "the name \"Tephra\" is taken by the source \"tephra\"",
+        ),
+    ] {
+        let server = MockServer::start(vec![Behavior::Respond {
+            status: 200,
+            body: load_fixture(&format!("source_promote_refused_{reason}")),
+        }]);
+        let client = client_for(&server);
+
+        let mut stdin: &[u8] = &[];
+        let outcome = commands::execute(&promote_command(), false, &client, &mut stdin);
+
+        assert_eq!(outcome.exit_code, 1, "{reason}");
+        assert_eq!(
+            outcome.stderr,
+            format!("tephractl: {message} (reason: {reason})\n"),
+            "{reason}"
+        );
+        assert_eq!(outcome.stdout, "", "{reason}");
+    }
+}

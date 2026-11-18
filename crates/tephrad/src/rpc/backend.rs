@@ -642,6 +642,52 @@ impl BlockBackend for UnsupportedBlockIds {
     }
 }
 
+/// `source.promote`'s result (G11): what was made and what it took.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PromoteWire {
+    pub name: String,
+    /// The new source's canonical root.
+    pub root: String,
+    /// The source the folder left, and the folder's path in it.
+    pub parent: String,
+    pub folder: String,
+    /// Cached files that moved to the new source.
+    pub units_moved: usize,
+    /// Linking files rewritten.
+    pub files_changed: i64,
+    /// Linking files left for a retry or a person.
+    pub deferred: i64,
+    /// `applied`, `partial` or `needs_manual_fix`.
+    pub status: String,
+}
+
+impl From<crate::registry::PromoteOutcome> for PromoteWire {
+    fn from(o: crate::registry::PromoteOutcome) -> Self {
+        PromoteWire {
+            name: o.name,
+            root: o.root.display().to_string(),
+            parent: o.parent,
+            folder: o.folder,
+            units_moved: o.units_moved,
+            files_changed: o.files_changed,
+            deferred: o.deferred,
+            status: o.status,
+        }
+    }
+}
+
+/// Why `source.promote` did not succeed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromoteRpcError {
+    /// Refused with a stable `reason`; nothing was changed (E13).
+    Refused {
+        reason: &'static str,
+        message: String,
+    },
+    /// Failed for another reason.
+    Failed(String),
+}
+
 /// `fix.list` (G18), and the one non-RPC call the server makes after a
 /// `source.rescan`: pending fixes are retried then (G9). Behind a trait
 /// for the same reason as [`BlockBackend`].
@@ -659,6 +705,14 @@ pub trait FixBackend: Send + Sync {
     /// answer to give; a failure is logged, never raised to the caller
     /// of `source.rescan`.
     fn after_rescan(&self, _source: &str) {}
+
+    /// `source.promote` (FR22): the folder `root` of a registered source
+    /// becomes the source `name`. Blocking: it scans and writes files.
+    fn promote(&self, _name: &str, _root: &str) -> Result<PromoteWire, PromoteRpcError> {
+        Err(PromoteRpcError::Failed(
+            "source.promote is not configured for this test fixture".to_string(),
+        ))
+    }
 
     /// `link.rename_event` (G3): Obsidian renamed `old_path` to
     /// `new_path` (absolute paths). Fixes the links and answers with
@@ -679,6 +733,7 @@ pub trait FixBackend: Send + Sync {
 /// also knows the sources.
 pub struct FixService {
     engine: std::sync::Arc<crate::fixes::FixEngine>,
+    registry: std::sync::Arc<crate::registry::SourceRegistry>,
     events: crate::fixes::event::RenameEvents,
 }
 
@@ -687,8 +742,12 @@ impl FixService {
         engine: std::sync::Arc<crate::fixes::FixEngine>,
         registry: std::sync::Arc<crate::registry::SourceRegistry>,
     ) -> Self {
-        let events = crate::fixes::event::RenameEvents::new(registry, engine.clone());
-        FixService { engine, events }
+        let events = crate::fixes::event::RenameEvents::new(registry.clone(), engine.clone());
+        FixService {
+            engine,
+            registry,
+            events,
+        }
     }
 }
 
@@ -711,6 +770,17 @@ impl FixBackend for FixService {
         new_path: &str,
     ) -> Result<crate::fixes::event::RenameEventWire, crate::fixes::event::RenameEventError> {
         self.events.handle(old_path, new_path)
+    }
+
+    fn promote(&self, name: &str, root: &str) -> Result<PromoteWire, PromoteRpcError> {
+        match self.registry.promote(name, root, &self.engine) {
+            Ok(done) => Ok(PromoteWire::from(done)),
+            Err(RegistryError::Promote(e)) => Err(PromoteRpcError::Refused {
+                reason: e.reason(),
+                message: e.to_string(),
+            }),
+            Err(e) => Err(PromoteRpcError::Failed(e.to_string())),
+        }
     }
 }
 

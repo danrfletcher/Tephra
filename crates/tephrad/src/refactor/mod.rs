@@ -188,6 +188,12 @@ pub enum OwnLink {
     /// A link to the moved file itself: it names the new path in the
     /// shortest unique form, never with a prefix.
     SelfLink,
+    /// A link inside a folder that was just made a source, spelled from
+    /// the old source's root (`folder/x`, with or without the old
+    /// source's prefix), to another file of that folder: it becomes
+    /// this target text, relative to the new root and shortest unique,
+    /// with no prefix (FR23).
+    Retarget(String),
 }
 
 /// How the links in one file change when a file moves from one source
@@ -286,6 +292,7 @@ pub fn move_new_raw(to_raw: &str, rewrite: &MoveRewrite) -> Option<String> {
         } => match links.get(to_raw)? {
             OwnLink::AddPrefix(source) => join_wikilink(Some(source), &w.target, anchor, alias),
             OwnLink::DropPrefix => join_wikilink(None, &w.target, anchor, alias),
+            OwnLink::Retarget(target) => join_wikilink(None, target, anchor, alias),
             OwnLink::SelfLink => {
                 let target = shortest_target(new_path, *bare_resolves);
                 join_wikilink(None, &target, anchor, alias)
@@ -1731,6 +1738,35 @@ mod tests {
         assert_eq!(
             moved_text("@tephra:docs/rename-notes.md", text, &raws, &rewrite),
             "[[@notes:Other Note]] [[@notes:Other Note|alias]] ![[@notes:Other Note#^b1]] self [[rename-notes]] [[rename-notes#^k3f9a2]] [[docs/sibling]] [[Not Planned]]\n"
+        );
+    }
+
+    #[test]
+    fn rewrite_three_respells_a_link_to_a_sibling_in_a_promoted_folder_and_keeps_anchor_and_alias()
+    {
+        let links = HashMap::from([
+            (
+                "café notes/Plain#^b1|the plain".to_string(),
+                OwnLink::Retarget("Plain".into()),
+            ),
+            (
+                "@notes:café notes/sub/Deep".to_string(),
+                OwnLink::Retarget("sub/Deep".into()),
+            ),
+        ]);
+        let rewrite = MoveRewrite::Own {
+            new_path: "Ünï.md".into(),
+            bare_resolves: true,
+            links,
+        };
+        let raws = [
+            "café notes/Plain#^b1|the plain",
+            "@notes:café notes/sub/Deep",
+        ];
+        let text = "a [[café notes/Plain#^b1|the plain]] b ![[@notes:café notes/sub/Deep]] c\n";
+        assert_eq!(
+            moved_text("@cafe:Ünï.md", text, &raws, &rewrite),
+            "a [[Plain#^b1|the plain]] b ![[sub/Deep]] c\n"
         );
     }
 

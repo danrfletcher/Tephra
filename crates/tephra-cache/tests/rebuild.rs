@@ -234,3 +234,27 @@ fn injected_failure_during_the_v1_to_v2_rebuild_on_open_leaves_the_v1_file_intac
         Some(CURRENT_SCHEMA_VERSION)
     );
 }
+
+#[test]
+fn a_successful_rebuild_keeps_the_promoted_roots_and_the_pending_fixes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut cache = common::open_temp_cache(&dir);
+    common::seed_source_with_units(&cache, "notes", "/vault/notes", SourceStatus::Active);
+    common::seed_durable_rows(cache.connection());
+    let roots = cache.promoted_roots().expect("roots before");
+    let pending = cache.pending_fixes(None, None).expect("pending before");
+    assert_eq!((roots.len(), pending.len()), (2, 2));
+
+    cache.rebuild(&FaultInjector::none()).expect("rebuild");
+
+    assert_eq!(
+        cache.table_row_count("units").unwrap(),
+        0,
+        "only units are rebuilt"
+    );
+    assert_eq!(cache.promoted_roots().expect("roots after"), roots);
+    assert_eq!(
+        cache.pending_fixes(None, None).expect("pending after"),
+        pending
+    );
+}

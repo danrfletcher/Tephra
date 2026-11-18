@@ -16,6 +16,12 @@ pub const KIND_RENAME: &str = "rename";
 /// source to another (G6). One entry for the whole move.
 pub const KIND_MOVE: &str = "move";
 
+/// A fix of a promote: a folder of one source became a source of its own
+/// (FR22), and the links that named its files, or that its files hold,
+/// changed with it. One entry for the whole folder: `old` is the
+/// folder's path in the source it left, `new` is `@<name>:`.
+pub const KIND_PROMOTE: &str = "promote";
+
 /// A file that vanished with no certain pair: its links are broken and
 /// nothing is queued (G10).
 pub const KIND_UNCERTAIN: &str = "uncertain";

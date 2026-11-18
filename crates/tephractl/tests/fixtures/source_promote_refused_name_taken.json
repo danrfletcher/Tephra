@@ -1,0 +1,11 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "error": {
+    "code": -32011,
+    "message": "the name \"Tephra\" is taken by the source \"tephra\"",
+    "data": {
+      "reason": "name_taken"
+    }
+  }
+}

@@ -49,8 +49,8 @@ fn subcommands() -> Vec<Vec<String>> {
 }
 
 #[test]
-fn the_dispatch_closed_list_is_fifteen_and_every_method_is_in_architecture() {
-    assert_eq!(METHOD_NAMES.len(), 15);
+fn the_dispatch_closed_list_is_sixteen_and_every_method_is_in_architecture() {
+    assert_eq!(METHOD_NAMES.len(), 16);
     let architecture = doc("docs/ARCHITECTURE.md");
     for method in METHOD_NAMES {
         assert!(

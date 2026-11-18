@@ -228,6 +228,175 @@ pub fn validate_register<'a>(
     Ok(())
 }
 
+/// Why `source.promote` refused (E13). Each has a stable machine-readable
+/// [`PromoteError::reason`]; a refusal changes nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromoteError {
+    /// The path is not a folder: a file, or nothing at all.
+    NotAFolder { path: PathBuf },
+    /// The OS will not let `tephrad` read the folder.
+    Unreadable { path: PathBuf, reason: PathProbe },
+    /// The folder is the root of a registered source (a whole vault, or an
+    /// already-promoted folder).
+    IsASourceRoot { path: PathBuf, source: String },
+    /// The folder is inside no registered source.
+    NotInsideASource { path: PathBuf },
+    /// The source the folder is in is offline.
+    SourceOffline { source: String },
+    /// The new name breaks the name rules ([`check_source_name`]).
+    InvalidName { name: String, why: &'static str },
+    /// A source already has this name, compared without regard to case
+    /// (FR14).
+    NameTaken { name: String, with: String },
+}
+
+impl PromoteError {
+    /// The stable reason string clients branch on (`data.reason`).
+    pub fn reason(&self) -> &'static str {
+        match self {
+            PromoteError::NotAFolder { .. } => "not_a_folder",
+            PromoteError::Unreadable { .. } => "not_readable",
+            PromoteError::IsASourceRoot { .. } => "is_a_source_root",
+            PromoteError::NotInsideASource { .. } => "not_inside_a_source",
+            PromoteError::SourceOffline { .. } => "source_offline",
+            PromoteError::InvalidName { .. } => "invalid_name",
+            PromoteError::NameTaken { .. } => "name_taken",
+        }
+    }
+}
+
+impl fmt::Display for PromoteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PromoteError::NotAFolder { path } => {
+                write!(f, "{} is not a folder", path.display())
+            }
+            PromoteError::Unreadable { path, reason } => {
+                write!(f, "{} can't be read: {reason:?}", path.display())
+            }
+            PromoteError::IsASourceRoot { path, source } => write!(
+                f,
+                "{} is already the root of the source \"{source}\"",
+                path.display()
+            ),
+            PromoteError::NotInsideASource { path } => {
+                write!(f, "{} is not inside any registered source", path.display())
+            }
+            PromoteError::SourceOffline { source } => {
+                write!(f, "the source \"{source}\" is offline")
+            }
+            PromoteError::InvalidName { name, why } => {
+                write!(f, "invalid source name \"{name}\": {why}")
+            }
+            PromoteError::NameTaken { name, with } => {
+                write!(f, "the name \"{name}\" is taken by the source \"{with}\"")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PromoteError {}
+
+/// The most characters a new source name may have.
+pub const MAX_SOURCE_NAME_CHARS: usize = 64;
+
+/// The name rules for a NEW source name (FR14: an existing name is never
+/// re-checked): not empty, at most [`MAX_SOURCE_NAME_CHARS`] characters,
+/// no whitespace or control character, none of the characters that mean
+/// something in a link (`/ \\ @ : # ^ | [ ]`), and not `.` or `..`.
+pub fn check_source_name(name: &str) -> Result<(), &'static str> {
+    if name.is_empty() {
+        return Err("it must not be empty");
+    }
+    if name.chars().count() > MAX_SOURCE_NAME_CHARS {
+        return Err("it must be at most 64 characters");
+    }
+    if name == "." || name == ".." {
+        return Err("it must not be '.' or '..'");
+    }
+    if name.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("it must not contain spaces or control characters");
+    }
+    if name
+        .chars()
+        .any(|c| matches!(c, '/' | '\\' | '@' | ':' | '#' | '^' | '|' | '[' | ']'))
+    {
+        return Err("it must not contain any of / \\ @ : # ^ | [ ]");
+    }
+    Ok(())
+}
+
+/// The registered source that owns `path`: the one with the deepest root
+/// that contains it (a file belongs to the deepest registered root above
+/// it). `path` equal to a root is that source's own root.
+pub fn deepest_owner<'a>(existing: &'a [Source], path: &Path) -> Option<&'a Source> {
+    existing
+        .iter()
+        .filter(|s| path.starts_with(&s.root))
+        .max_by_key(|s| s.root.components().count())
+}
+
+/// Validates a `source.promote {name, root}` against the registered
+/// `existing` sources and a pre-computed `probe` of `root`. Pure, like
+/// [`validate_register`]: no filesystem, no SQLite. `root` must be
+/// canonical (see [`SourceRegistry::promote`]). On success returns the
+/// name of the source the folder is in, the one that gives it up.
+///
+/// Checked in this order: the folder itself (a file or a path that is
+/// not there: `not_a_folder`; one the OS will not list), whether it is a
+/// registered root (`is_a_source_root`), whether it is inside a source
+/// at all (`not_inside_a_source`), then the name (`invalid_name`, then
+/// `name_taken`, case-insensitively). A folder that already holds a
+/// promoted source is fine: the inner source stays its own.
+pub fn validate_promote(
+    existing: &[Source],
+    name: &str,
+    root: &Path,
+    probe: PathProbe,
+) -> Result<String, PromoteError> {
+    match probe {
+        PathProbe::Ok => {}
+        PathProbe::Missing | PathProbe::NotADirectory => {
+            return Err(PromoteError::NotAFolder {
+                path: root.to_path_buf(),
+            })
+        }
+        PathProbe::NotReadable | PathProbe::NotReadablePrivacy => {
+            return Err(PromoteError::Unreadable {
+                path: root.to_path_buf(),
+                reason: probe,
+            })
+        }
+    }
+    if let Some(src) = existing.iter().find(|s| s.root == root) {
+        return Err(PromoteError::IsASourceRoot {
+            path: root.to_path_buf(),
+            source: src.name.clone(),
+        });
+    }
+    let Some(parent) = deepest_owner(existing, root) else {
+        return Err(PromoteError::NotInsideASource {
+            path: root.to_path_buf(),
+        });
+    };
+    if let Err(why) = check_source_name(name) {
+        return Err(PromoteError::InvalidName {
+            name: name.to_string(),
+            why,
+        });
+    }
+    if let Some(taken) = existing
+        .iter()
+        .find(|s| s.name.to_lowercase() == name.to_lowercase())
+    {
+        return Err(PromoteError::NameTaken {
+            name: name.to_string(),
+            with: taken.name.clone(),
+        });
+    }
+    Ok(parent.name.clone())
+}
+
 // ---- orchestration ----------------------------------------------------
 
 /// One internal `source_changed` event (GP6) — the seam a later
@@ -257,7 +426,14 @@ pub enum DaemonEvent {
     /// [`SourceRegistry::announce_sources_changed`], after the change is
     /// made, and never for a file change or a fix. The forwarder refreshes
     /// the graph and sends ONE `graph:changed` carrying `sources_changed`.
-    SourceListChanged { changes: Vec<SourceChange> },
+    ///
+    /// `fixes` is empty for every change but a promote (FR22), whose link
+    /// rewrites go out in the same push: the log entry of kind `promote`,
+    /// with its `files_changed`.
+    SourceListChanged {
+        changes: Vec<SourceChange>,
+        fixes: Vec<crate::fixes::FixNotice>,
+    },
 }
 
 /// How the source list changed (FR12). The wire name is the lowercase
@@ -315,6 +491,11 @@ pub enum RegistryError {
     Watch(WatchError),
     Scan(ScanError),
     NotFound(String),
+    /// `source.promote` refused (E13): nothing was changed.
+    Promote(PromoteError),
+    /// The link rewrites of a promote failed after the promote was
+    /// recorded; what is left is finished at the next start.
+    Fix(String),
 }
 
 impl fmt::Display for RegistryError {
@@ -326,6 +507,8 @@ impl fmt::Display for RegistryError {
             RegistryError::Watch(e) => write!(f, "{e}"),
             RegistryError::Scan(e) => write!(f, "{e}"),
             RegistryError::NotFound(name) => write!(f, "no source named \"{name}\""),
+            RegistryError::Promote(e) => write!(f, "{e}"),
+            RegistryError::Fix(m) => write!(f, "{m}"),
         }
     }
 }
@@ -335,6 +518,11 @@ impl std::error::Error for RegistryError {}
 impl From<RegisterError> for RegistryError {
     fn from(e: RegisterError) -> Self {
         RegistryError::Validation(e)
+    }
+}
+impl From<PromoteError> for RegistryError {
+    fn from(e: PromoteError) -> Self {
+        RegistryError::Promote(e)
     }
 }
 impl From<CacheError> for RegistryError {
@@ -459,7 +647,7 @@ fn is_cache_busy(err: &CacheError) -> bool {
 /// in `tests/register_busy_retry.rs`) never also blocks some other,
 /// unrelated source's writes against the same gate for the whole
 /// retry window.
-fn retry_cache_on_busy<T>(
+pub(crate) fn retry_cache_on_busy<T>(
     gate: &WriterGate,
     mut attempt: impl FnMut() -> Result<T, CacheError>,
 ) -> Result<T, CacheError> {
@@ -537,9 +725,31 @@ pub struct SourceRegistry {
     /// identify waits is [`watcher::RENAME_HOLD`] unless a test shortens
     /// it ([`SourceRegistry::set_rename_hold`]).
     renames: Arc<RenamePool>,
+    /// Held for the whole of a `source.promote`: two promotes, however
+    /// they overlap, run one after the other.
+    promote_lock: Mutex<()>,
     /// The one task that wakes the pool's detector when a hold ends
     /// ([`rename_detect::run_holds`]).
     _hold_task: AbortOnDrop,
+}
+
+/// What a `source.promote` did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromoteOutcome {
+    pub name: String,
+    /// The new source's canonical root.
+    pub root: PathBuf,
+    /// The source that gave the folder up, and the folder's path in it.
+    pub parent: String,
+    pub folder: String,
+    /// Cached rows that moved to the new source.
+    pub units_moved: usize,
+    /// Linking files rewritten.
+    pub files_changed: i64,
+    /// Linking files left for a retry or a person.
+    pub deferred: i64,
+    /// The fix-log status: `applied`, `partial` or `needs_manual_fix`.
+    pub status: String,
 }
 
 /// What [`SourceRegistry::start_all`] did with one source.
@@ -641,6 +851,7 @@ impl SourceRegistry {
             write_pause: Mutex::new(WritePause::default()),
             rename_fixer,
             renames,
+            promote_lock: Mutex::new(()),
             _hold_task: AbortOnDrop(hold_task),
         })
     }
@@ -750,6 +961,182 @@ impl SourceRegistry {
         }
     }
 
+    /// `source.promote` (FR22): the folder `root` of a registered source
+    /// becomes the source `name`. The order is the plan's:
+    ///
+    /// 1. validate ([`validate_promote`], on the canonical root, like
+    ///    `register`), and refuse an offline parent;
+    /// 2. the watchers are paused, so nothing interleaves;
+    /// 3. [`FixEngine::promote`]: ONE transaction (the registry row, the
+    ///    parent's exclusion, the log entry, every crossing link), the
+    ///    units re-owned, the parent's live watcher told to skip the
+    ///    folder, then the link rewrites;
+    /// 4. the files written are indexed, and the new source is scanned
+    ///    and watched;
+    /// 5. the watchers resume (a change made meanwhile is applied now,
+    ///    except Tephra's own writes), and ONE push goes out.
+    ///
+    /// A refusal ([`PromoteError`]) changes nothing and sends nothing.
+    pub fn promote(
+        &self,
+        name: &str,
+        root: impl AsRef<Path>,
+        engine: &crate::fixes::FixEngine,
+    ) -> Result<PromoteOutcome, RegistryError> {
+        let _one_at_a_time = self.promote_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let root = root.as_ref();
+        let probe = probe_path(root);
+        // Canonical before validating, as `register` does: stored roots
+        // are canonical, and a symlink out of the parent must be seen
+        // for where it really goes.
+        let canonical_root = if probe == PathProbe::Ok {
+            root.canonicalize()?
+        } else {
+            root.to_path_buf()
+        };
+
+        let (parent, folder) = {
+            let cache = self.cache.lock().unwrap();
+            let rows = cache.list_sources()?;
+            let existing: Vec<Source> = rows
+                .iter()
+                .map(|r| Source {
+                    name: r.name.clone(),
+                    root: PathBuf::from(&r.path),
+                })
+                .collect();
+            let parent_name = validate_promote(&existing, name, &canonical_root, probe)?;
+            let parent = rows
+                .into_iter()
+                .find(|r| r.name == parent_name)
+                .ok_or_else(|| RegistryError::NotFound(parent_name.clone()))?;
+            if parent.status == SourceStatus::Offline {
+                return Err(PromoteError::SourceOffline {
+                    source: parent.name,
+                }
+                .into());
+            }
+            let folder = canonical_root
+                .strip_prefix(&parent.path)
+                .map_err(|_| PromoteError::NotInsideASource {
+                    path: canonical_root.clone(),
+                })?
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/");
+            (parent, folder)
+        };
+
+        let spec = crate::fixes::PromoteSpec {
+            parent: parent.name.clone(),
+            name: name.to_string(),
+            root: canonical_root.clone(),
+            folder: folder.clone(),
+        };
+
+        self.pause_for_write();
+        let result = self.promote_paused(&spec, &parent, engine);
+        // No path is discarded on resume (FR24): the rewrites are indexed
+        // here and recorded with size and mtime by the write loop's sink
+        // (`FixEngine::set_sink`), so the watcher drops the event of
+        // exactly those bytes and no other. A discard by path alone would
+        // also throw away a user's save made after Tephra's write.
+        self.resume_after_write(&HashSet::new());
+        let (done, scanned) = result?;
+
+        let mut outcome = PromoteOutcome {
+            name: name.to_string(),
+            root: canonical_root,
+            parent: parent.name,
+            folder,
+            units_moved: done.units_moved,
+            files_changed: done.entry.files_changed,
+            deferred: 0,
+            status: done.entry.status.clone(),
+        };
+        outcome.deferred = done
+            .announcement
+            .notices
+            .iter()
+            .map(|n| n.deferred)
+            .sum::<i64>();
+        // ONE push: the source-list change and the fix entry together.
+        let _ = self.events_tx.send(DaemonEvent::SourceListChanged {
+            changes: vec![SourceChange::new(SourceChangeKind::Promoted, name)],
+            fixes: done.announcement.notices,
+        });
+        tracing::info!(
+            source = %name,
+            parent = %outcome.parent,
+            folder = %outcome.folder,
+            units_moved = outcome.units_moved,
+            files_changed = outcome.files_changed,
+            "source_promoted"
+        );
+        scanned?;
+        Ok(outcome)
+    }
+
+    /// The part of [`SourceRegistry::promote`] that runs with the
+    /// watchers paused. `Err` only when the promote did not get past the
+    /// link rewrites; a failure of the new source's own scan or watcher
+    /// (the promote is recorded and the rewrites are done) comes back
+    /// beside the result, so the caller still pushes the change.
+    fn promote_paused(
+        &self,
+        spec: &crate::fixes::PromoteSpec,
+        parent: &SourceRow,
+        engine: &crate::fixes::FixEngine,
+    ) -> Result<(crate::fixes::PromoteDone, Result<(), RegistryError>), RegistryError> {
+        let parent_root = PathBuf::from(&parent.path);
+        let skip_folder = || {
+            // From here the parent's live watcher drops every event in
+            // the folder, and every load of its rules skips it.
+            let rules = self.load_rules(&parent.name, &parent_root);
+            let running = self.running.lock().unwrap();
+            if let (Some(running), Ok(rules)) = (running.get(&parent.name), rules) {
+                *running
+                    .ignore_rules
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner()) = rules;
+            }
+        };
+        let done = engine
+            .promote(spec, &skip_folder)
+            .map_err(|e| RegistryError::Fix(e.to_string()))?;
+        for file in &done.announcement.written {
+            if let Err(e) = self.reindex_quietly(&file.source, &file.path) {
+                tracing::warn!(source = %file.source, path = %file.path.display(), error = %e, "could not index a file the promote rewrote");
+            }
+        }
+        let scanned = self
+            .scan_and_watch(&spec.name, done.source_id, &spec.root)
+            .map(|_| ());
+        Ok((done, scanned))
+    }
+
+    /// Finishes the re-owning of any promote that was recorded and not
+    /// completed (a kill between its transaction and the move of the
+    /// rows). Idempotent; run before anything compares the cache with a
+    /// disk, since the parent no longer reads the folder and would
+    /// otherwise see its rows as deleted.
+    pub fn complete_promotes(&self) {
+        let result = {
+            let cache = self.cache.lock().unwrap();
+            let _permit = self.gate.acquire();
+            crate::fixes::complete_promotes(&cache)
+        };
+        match result {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(
+                units = n,
+                "finished the re-owning of an interrupted promote"
+            ),
+            Err(e) => tracing::warn!(error = %e, "could not finish an interrupted promote"),
+        }
+    }
+
     /// The rest of `register`'s work once the source row exists:
     /// initial scan, then start the watcher. Split out so `register`
     /// can roll the row back on any failure from this point on (R2).
@@ -759,7 +1146,7 @@ impl SourceRegistry {
         source_id: i64,
         root: &Path,
     ) -> Result<ScanStats, RegistryError> {
-        let ignore_rules = Arc::new(RwLock::new(IgnoreRules::load(root)?));
+        let ignore_rules = Arc::new(RwLock::new(self.load_rules(name, root)?));
 
         // R13: subscribe the real watcher *before* the walk, not
         // after. `watcher::start` returns as soon as the OS-level
@@ -808,6 +1195,19 @@ impl SourceRegistry {
             tap,
         )?;
         Ok(stats)
+    }
+
+    /// The ignore rules of source `name` at `root`: the defaults, its
+    /// `.tephraignore`, and the folders it gave up to a source of their
+    /// own (`promoted_roots`, FR22), which it never scans, watches or
+    /// lists. Read from the cache each time, so a promote that has
+    /// committed is honored by every load after it.
+    fn load_rules(&self, name: &str, root: &Path) -> std::io::Result<IgnoreRules> {
+        let rules = IgnoreRules::load(root)?;
+        let promoted = Cache::open_read_only(&self.cache_path)
+            .and_then(|cache| cache.promoted_roots_of(name))
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        Ok(rules.with_promoted(promoted.iter().map(|r| r.rel_path.as_str())))
     }
 
     /// Hands every certain rename a watcher sees to `fixer` from now
@@ -1147,9 +1547,10 @@ impl SourceRegistry {
         if changes.is_empty() {
             return;
         }
-        let _ = self
-            .events_tx
-            .send(DaemonEvent::SourceListChanged { changes });
+        let _ = self.events_tx.send(DaemonEvent::SourceListChanged {
+            changes,
+            fixes: Vec::new(),
+        });
     }
 
     /// `source.list` (G1): the stored rows, with their stored status.
@@ -1327,6 +1728,7 @@ impl SourceRegistry {
             appeared: Vec<crate::rename_detect::Appeared>,
         }
 
+        self.complete_promotes();
         let rows = match self.list() {
             Ok(rows) => rows,
             Err(e) => {
@@ -1362,7 +1764,7 @@ impl SourceRegistry {
                     continue;
                 }
             }
-            let ignore_rules = match IgnoreRules::load(&root) {
+            let ignore_rules = match self.load_rules(&row.name, &root) {
                 Ok(rules) => Arc::new(RwLock::new(rules)),
                 Err(e) => {
                     tracing::warn!(source = %row.name, error = %e, "could not read the source's ignore rules; no catch-up and no watcher");
@@ -1616,6 +2018,7 @@ impl SourceRegistry {
         &self,
         should_stop: impl Fn() -> bool,
     ) -> Vec<(String, Result<ScanStats, RegistryError>)> {
+        self.complete_promotes();
         let unfinished = {
             let cache = self.cache.lock().unwrap();
             match cache.sources_with_unfinished_scan() {
@@ -1735,7 +2138,7 @@ impl SourceRegistry {
             }
         }
 
-        let ignore_rules = IgnoreRules::load(&root)?;
+        let ignore_rules = self.load_rules(name, &root)?;
 
         // R12: push the freshly-reloaded rules into the live
         // watcher's shared lock (if one is currently running for this
@@ -1868,7 +2271,7 @@ impl SourceRegistry {
             .get_source(source)?
             .ok_or_else(|| RegistryError::NotFound(source.to_string()))?;
         let root = PathBuf::from(&row.path);
-        let ignore_rules = IgnoreRules::load(&root)?;
+        let ignore_rules = self.load_rules(source, &root)?;
         let changed: HashSet<PathBuf> = paths.iter().cloned().collect();
         Ok(scan::apply_change_batch(&cache, row.id, &root, &changed, &ignore_rules)?.changed_paths)
     }
@@ -1968,6 +2371,234 @@ mod tests {
     }
 
     // ---- register: path validity --------------------------------------
+
+    fn promote_fixtures() -> Vec<Source> {
+        vec![
+            source("vault", "/home/dan/Vault"),
+            source("tephra", "/home/dan/Developer/Tephra"),
+            source("inner", "/home/dan/Developer/Tephra/crates/tephrad/inner"),
+        ]
+    }
+
+    /// E13: every refusal, with its stable reason, in one table.
+    #[test]
+    fn validate_promote_refuses_each_case_with_its_reason() {
+        let existing = promote_fixtures();
+        let cases: &[(&str, &str, PathProbe, &str)] = &[
+            // The folder is a registered root: a vault, or a promoted source.
+            ("x", "/home/dan/Vault", PathProbe::Ok, "is_a_source_root"),
+            (
+                "x",
+                "/home/dan/Developer/Tephra",
+                PathProbe::Ok,
+                "is_a_source_root",
+            ),
+            (
+                "x",
+                "/home/dan/Developer/Tephra/crates/tephrad/inner",
+                PathProbe::Ok,
+                "is_a_source_root",
+            ),
+            // In no source, and above one.
+            (
+                "x",
+                "/home/dan/Documents/Notes",
+                PathProbe::Ok,
+                "not_inside_a_source",
+            ),
+            (
+                "x",
+                "/home/dan/Developer",
+                PathProbe::Ok,
+                "not_inside_a_source",
+            ),
+            ("x", "/", PathProbe::Ok, "not_inside_a_source"),
+            // A file, or nothing there.
+            (
+                "x",
+                "/home/dan/Vault/a.md",
+                PathProbe::NotADirectory,
+                "not_a_folder",
+            ),
+            (
+                "x",
+                "/home/dan/Vault/gone",
+                PathProbe::Missing,
+                "not_a_folder",
+            ),
+            (
+                "x",
+                "/home/dan/Vault/locked",
+                PathProbe::NotReadable,
+                "not_readable",
+            ),
+            // Names.
+            ("", "/home/dan/Vault/notes", PathProbe::Ok, "invalid_name"),
+            (
+                "my notes",
+                "/home/dan/Vault/notes",
+                PathProbe::Ok,
+                "invalid_name",
+            ),
+            (
+                "my/notes",
+                "/home/dan/Vault/notes",
+                PathProbe::Ok,
+                "invalid_name",
+            ),
+            (
+                "@notes",
+                "/home/dan/Vault/notes",
+                PathProbe::Ok,
+                "invalid_name",
+            ),
+            (
+                "a:b",
+                "/home/dan/Vault/notes",
+                PathProbe::Ok,
+                "invalid_name",
+            ),
+            (
+                "a]b",
+                "/home/dan/Vault/notes",
+                PathProbe::Ok,
+                "invalid_name",
+            ),
+            ("..", "/home/dan/Vault/notes", PathProbe::Ok, "invalid_name"),
+            (
+                "tab\there",
+                "/home/dan/Vault/notes",
+                PathProbe::Ok,
+                "invalid_name",
+            ),
+            (
+                "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+                "/home/dan/Vault/notes",
+                PathProbe::Ok,
+                "invalid_name",
+            ),
+            (
+                "vault",
+                "/home/dan/Vault/notes",
+                PathProbe::Ok,
+                "name_taken",
+            ),
+            (
+                "VAULT",
+                "/home/dan/Vault/notes",
+                PathProbe::Ok,
+                "name_taken",
+            ),
+            (
+                "Tephra",
+                "/home/dan/Vault/notes",
+                PathProbe::Ok,
+                "name_taken",
+            ),
+        ];
+        for (name, root, probe, reason) in cases {
+            let err = validate_promote(&existing, name, Path::new(root), *probe)
+                .expect_err(&format!("{name:?} at {root:?} must be refused"));
+            assert_eq!(err.reason(), *reason, "{name:?} at {root:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn validate_promote_allows_any_depth_and_names_the_source_that_gives_the_folder_up() {
+        let existing = promote_fixtures();
+        let ok = |name: &str, root: &str| {
+            validate_promote(&existing, name, Path::new(root), PathProbe::Ok)
+        };
+        // A folder in a vault, at any depth, and a source's own top folder.
+        assert_eq!(ok("notes", "/home/dan/Vault/Notes").unwrap(), "vault");
+        assert_eq!(ok("deep", "/home/dan/Vault/a/b/c/d").unwrap(), "vault");
+        assert_eq!(
+            ok("tephrad", "/home/dan/Developer/Tephra/crates/tephrad").unwrap(),
+            "tephra"
+        );
+        // A multi-byte folder name, and a name that is not ASCII.
+        assert_eq!(ok("café", "/home/dan/Vault/café notes").unwrap(), "vault");
+        // E14: a folder that holds a promoted source is allowed; the inner
+        // source stays its own.
+        assert_eq!(
+            ok("outer", "/home/dan/Developer/Tephra/crates").unwrap(),
+            "tephra"
+        );
+        // A folder inside the promoted source belongs to that source.
+        assert_eq!(
+            ok("sub", "/home/dan/Developer/Tephra/crates/tephrad/inner/src").unwrap(),
+            "inner"
+        );
+        // A sibling whose name only starts like a root is not inside it.
+        assert_eq!(
+            validate_promote(
+                &existing,
+                "x",
+                Path::new("/home/dan/Vault2/notes"),
+                PathProbe::Ok
+            )
+            .unwrap_err()
+            .reason(),
+            "not_inside_a_source"
+        );
+    }
+
+    #[test]
+    fn a_refused_promote_carries_its_reason_and_a_plain_message() {
+        let existing = promote_fixtures();
+        let err = validate_promote(&existing, "x", Path::new("/home/dan/Vault"), PathProbe::Ok)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "/home/dan/Vault is already the root of the source \"vault\""
+        );
+        let err = validate_promote(
+            &existing,
+            "VAULT",
+            Path::new("/home/dan/Vault/n"),
+            PathProbe::Ok,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "the name \"VAULT\" is taken by the source \"vault\""
+        );
+    }
+
+    /// F10: `register` is untouched by promoted sources: a root nested in,
+    /// or above, an existing one is still refused, whatever else exists.
+    #[test]
+    fn register_still_refuses_nested_and_ancestor_roots_when_promoted_roots_exist() {
+        let existing = promote_fixtures();
+        let nested = validate_register(
+            &existing,
+            "n",
+            Path::new("/home/dan/Developer/Tephra/docs"),
+            PathProbe::Ok,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            nested,
+            RegisterError::Conflict {
+                reason: ConflictReason::NestedInsideExisting,
+                ..
+            }
+        ));
+        let above = validate_register(
+            &existing,
+            "a",
+            Path::new("/home/dan/Developer"),
+            PathProbe::Ok,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            above,
+            RegisterError::Conflict {
+                reason: ConflictReason::ExistingIsNestedInside,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn register_rejects_a_missing_path() {
@@ -2422,6 +3053,7 @@ mod tests {
             let name = change.name.clone();
             let payload = crate::forward::payload(&DaemonEvent::SourceListChanged {
                 changes: vec![change],
+                fixes: Vec::new(),
             });
             assert_eq!(
                 payload,
@@ -2431,6 +3063,7 @@ mod tests {
         // Several changes in one push keep their order.
         let payload = crate::forward::payload(&DaemonEvent::SourceListChanged {
             changes: change_kinds().into_iter().map(|(c, _)| c).collect(),
+            fixes: Vec::new(),
         });
         assert_eq!(payload["sources_changed"].as_array().unwrap().len(), 5);
         assert_eq!(payload["sources_changed"][2]["old_name"], "notes");
@@ -2454,7 +3087,7 @@ mod tests {
     ) -> Vec<Vec<SourceChange>> {
         let mut out = Vec::new();
         while let Ok(event) = rx.try_recv() {
-            if let DaemonEvent::SourceListChanged { changes } = event {
+            if let DaemonEvent::SourceListChanged { changes, .. } = event {
                 out.push(changes);
             }
         }
@@ -2665,7 +3298,8 @@ mod tests {
         assert_eq!(
             seen,
             vec![DaemonEvent::SourceListChanged {
-                changes: vec![SourceChange::new(SourceChangeKind::Removed, "notes")]
+                changes: vec![SourceChange::new(SourceChangeKind::Removed, "notes")],
+                fixes: Vec::new(),
             }]
         );
     }

@@ -265,6 +265,7 @@ async fn a_sources_changed_payload_passes_through_unchanged_as_a_notification() 
     // Built by the forwarder's payload function.
     let event = DaemonEvent::SourceListChanged {
         changes: vec![SourceChange::new(SourceChangeKind::Added, "notes")],
+        fixes: Vec::new(),
     };
     let built = tephrad::forward::payload(&event);
     server.broadcast_graph_changed(built.clone());

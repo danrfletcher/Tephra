@@ -6,7 +6,7 @@ A federated graph and link engine for plain-text notes and code folders, written
 
 Everything described here is on `main`: the daemon with config and bearer-token auth; parsers for Markdown notes, code in 13 languages (tree-sitter) and the text of `.docx`, `.pptx` and PDF files; a SQLite cache (schema version 2); a source registry with a filesystem watcher; a link graph and resolver; block links (`[[path#^id]]`); an authenticated JSON-RPC server over HTTP and WebSocket; link refactoring on disk; search by name, heading, block and full text; and `tephractl` for all of it, including running the daemon as a macOS launchd agent.
 
-**Not built yet:** remote sources, promoting a folder to a nested source, `source.rename`, rename detection and automatic link fixes, links to a code symbol by name, OCR for scanned documents, and clients for Obsidian, VSCode and Chrome. No benchmark has been published. [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#not-built-yet) has the list.
+**Not built yet:** remote sources, `source.unpromote`, `source.rename`, rename detection and automatic link fixes, links to a code symbol by name, OCR for scanned documents, and clients for Obsidian, VSCode and Chrome. No benchmark has been published. [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#not-built-yet) has the list.
 
 ## Build and test
 
@@ -38,6 +38,7 @@ Every command takes `--json` (raw structured output) and `--addr <addr>` (daemon
 | Command | What it does |
 |---|---|
 | `source add <name> <path>`, `source remove <name>`, `source list` | Register, unregister and list sources. Adding or removing a source sends connected WebSocket clients a `graph:changed` push with a `sources_changed` list (`[{kind: "added"|"removed", name}]`), so a client need not wait for its next check. |
+| `source promote <name> <path>` | Make a folder of a registered source its own source (`source.promote`). The folder's files leave the parent, links that must change to keep resolving are rewritten for you (`@source:` prefixes), and connected clients get one `graph:changed` push with `sources_changed: [{kind: "promoted", name}]`. Refused, with nothing changed, when the folder is a source root or in no source, is a file, its source is offline, or the name is invalid or taken. `source add` still refuses a root nested in another. |
 | `status` | Daemon and source status. |
 | `ls <source> [folder] [-r]` | List one folder of a source (works for an offline source, from the cache). |
 | `search <query> [--limit n]` | Find files by name, title or path across every source. |

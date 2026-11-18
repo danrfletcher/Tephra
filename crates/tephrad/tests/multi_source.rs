@@ -3,6 +3,7 @@
 //! crash/removal of one leaving the other's watcher and cache rows
 //! untouched (spec: `tests/multi_source.rs`).
 
+mod fix_world;
 mod fixtures;
 
 use std::time::{Duration, Instant};
@@ -949,4 +950,47 @@ fn the_live_watchers_move_a_files_rows_between_sources_too() {
     assert_eq!(units_named(&cache_path, "Rename Notes.md"), 0);
     registry.unregister("notes").unwrap();
     registry.unregister("other").unwrap();
+}
+
+/// After a promote the two sources scan fully independently: a file added
+/// in the folder is the child's, one beside it is the parent's, and
+/// neither source sees the other's files as its own or as deleted.
+#[test]
+fn a_promoted_folder_and_its_parent_scan_independently() {
+    let d = fix_world::Daemon::start(
+        &[("proj/A.md", "# A\n"), ("Top.md", "# Top\n")],
+        &[],
+        fix_world::real_writer(),
+        false,
+    );
+    d.registry
+        .promote("proj", d.notes_root().join("proj"), &d.engine)
+        .expect("promote");
+    d.notes.write("proj/New.md", "# new\n");
+    d.notes.write("Beside.md", "# beside\n");
+    let parent_stats = d.registry.rescan("notes").expect("rescan parent");
+    let child_stats = d.registry.rescan("proj").expect("rescan child");
+    assert_eq!(
+        parent_stats.files_seen, 3,
+        "Top.md, Beside.md and the daemon fixture's Warmup.md"
+    );
+    assert_eq!(child_stats.files_seen, 2, "A.md and New.md");
+
+    let cache = Cache::open(&d.cache_path).unwrap();
+    let (parent, child) = (
+        cache.get_source("notes").unwrap().unwrap(),
+        cache.get_source("proj").unwrap().unwrap(),
+    );
+    for (id, present, absent) in [
+        (parent.id, ["Top.md", "Beside.md"], ["proj/A.md", "A.md"]),
+        (child.id, ["A.md", "New.md"], ["Top.md", "proj/A.md"]),
+    ] {
+        for p in present {
+            assert!(cache.get_unit_by_rel_path(id, p).unwrap().is_some(), "{p}");
+        }
+        for p in absent {
+            assert!(cache.get_unit_by_rel_path(id, p).unwrap().is_none(), "{p}");
+        }
+    }
+    d.close();
 }

@@ -54,7 +54,7 @@ pub use retry::Trigger;
 
 use log::{
     overall_status, FileEntry, FILE_NEEDS_MANUAL_FIX, FILE_NOTHING_TO_FIX, FILE_PENDING,
-    FILE_WRITTEN, KIND_MOVE, KIND_RENAME, KIND_UNCERTAIN, STATUS_UNCERTAIN,
+    FILE_WRITTEN, KIND_MOVE, KIND_PROMOTE, KIND_RENAME, KIND_UNCERTAIN, STATUS_UNCERTAIN,
 };
 
 /// What an uncertain entry says when the watcher logs it.
@@ -272,6 +272,97 @@ struct PlanRow {
     new: String,
 }
 
+/// A folder to make its own source ([`FixEngine::promote`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromoteSpec {
+    /// The source the folder is in.
+    pub parent: String,
+    /// The new source's name, and its canonical root (the folder).
+    pub name: String,
+    pub root: PathBuf,
+    /// The folder's path in `parent`, forward slashes, no trailing slash.
+    pub folder: String,
+}
+
+/// What [`FixEngine::promote`] did.
+pub struct PromoteDone {
+    pub source_id: i64,
+    /// How many cached rows moved to the new source.
+    pub units_moved: usize,
+    /// The log entry as it stands at the end.
+    pub entry: FixEntryWire,
+    /// The files written and the entry, for the one push.
+    pub announcement: FixAnnouncement,
+}
+
+/// The pending rows of a promote, read from `cache` as it will be once
+/// the folder is its own source: for each file that moved (`moved`, the
+/// parent's rows under the folder), every file with a link that names it
+/// and has to change (rewrites 1 and 2), and the file itself when links
+/// of its own have to change (rewrite 3), all as the moves they are,
+/// from `(parent, path)` to `(name, path under the folder)`. A moved file
+/// that is no unit of the graph (nothing to link to) adds no work.
+fn promote_rows(
+    cache: &Cache,
+    spec: &PromoteSpec,
+    moved: &[tephra_cache::UnitRow],
+) -> Result<Vec<PlanRow>, FixError> {
+    let graph = UnitGraph::build_from_cache(cache)?;
+    let prefix = format!("{}/", spec.folder);
+    let mut rows: BTreeSet<PlanRow> = BTreeSet::new();
+    for unit in moved {
+        let old = unit.rel_path.clone();
+        let Some(new) = old.strip_prefix(&prefix).map(str::to_string) else {
+            continue;
+        };
+        if let Ok(files) = linking_files(&graph, &spec.parent, &old, &spec.name, &new) {
+            for file in files {
+                rows.insert(PlanRow {
+                    file,
+                    old: old.clone(),
+                    new: new.clone(),
+                });
+            }
+        }
+        let own = own_links(
+            &graph,
+            &spec.parent,
+            &old,
+            &spec.name,
+            &new,
+            Some(&spec.folder),
+        );
+        if !own.1.is_empty() {
+            rows.insert(PlanRow {
+                file: (spec.name.clone(), new.clone()),
+                old,
+                new,
+            });
+        }
+    }
+    Ok(rows.into_iter().collect())
+}
+
+/// Finishes the re-owning of every promote the daemon was killed in the
+/// middle of: for each `promoted_roots` row, any row its parent still
+/// holds under the folder goes to the promoted source. A no-op once a
+/// promote is complete. Called before anything reads the cache at start,
+/// because a pending fix of a promote is only valid once the files have
+/// moved.
+pub fn complete_promotes(cache: &Cache) -> Result<usize, FixError> {
+    let mut moved = 0;
+    for root in cache.promoted_roots()? {
+        let (Some(parent), Some(child)) = (
+            cache.get_source(&root.parent)?,
+            cache.get_source(&root.source)?,
+        ) else {
+            continue;
+        };
+        moved += cache.reown_units(parent.id, child.id, &root.rel_path)?;
+    }
+    Ok(moved)
+}
+
 /// What one pass over the pending rows did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunSummary {
@@ -335,6 +426,7 @@ pub struct FixEngine {
     writer: Arc<dyn FileWriter>,
     clock: Arc<dyn Clock>,
     stop_after_writes: Option<usize>,
+    stop_after_promote_commit: bool,
     run_lock: Mutex<()>,
     /// Held from the question "is this rename in the log already?" to
     /// the entry that answers it (G4): the exact event and the watcher's
@@ -358,6 +450,7 @@ impl FixEngine {
             writer,
             clock: Arc::new(SystemClock),
             stop_after_writes: None,
+            stop_after_promote_commit: false,
             run_lock: Mutex::new(()),
             decision_lock: Mutex::new(()),
             sink: RwLock::new(None),
@@ -412,6 +505,15 @@ impl FixEngine {
     /// the cache and the disk are as a kill at that moment leaves them.
     pub fn with_stop_after_writes(mut self, n: usize) -> Self {
         self.stop_after_writes = Some(n);
+        self
+    }
+
+    /// Test hook: [`FixEngine::promote`] stops, with
+    /// [`FixError::Stopped`], right after its one transaction commits and
+    /// before the rows are re-owned: the cache is as a kill at that
+    /// moment leaves it.
+    pub fn with_stop_after_promote_commit(mut self) -> Self {
+        self.stop_after_promote_commit = true;
         self
     }
 
@@ -637,7 +739,7 @@ impl FixEngine {
                 })
                 .collect();
             // The moved file's own links, when it has any that change.
-            let own = own_links(&graph, old_source, old_path, new_source, new_path);
+            let own = own_links(&graph, old_source, old_path, new_source, new_path, None);
             if !own.1.is_empty() {
                 rows.insert(PlanRow {
                     file: (new_source.to_string(), new_path.to_string()),
@@ -793,6 +895,17 @@ impl FixEngine {
             },
             &pending,
         )?;
+        self.run_fix(&cache, fix_id)
+    }
+
+    /// The work of the entry `fix_id`, which has just been stored with
+    /// its pending list: every row is written (or finished without a
+    /// write). The entry as it stands at the end, and what to announce.
+    fn run_fix(
+        &self,
+        cache: &Cache,
+        fix_id: i64,
+    ) -> Result<(FixEntryWire, FixAnnouncement), FixError> {
         let rows = cache.pending_fixes(None, Some(fix_id))?;
         let picks = rows
             .into_iter()
@@ -802,8 +915,8 @@ impl FixEngine {
             })
             .collect();
         let mut report = Report::default();
-        let run = self.run_picks(&cache, picks, &mut report);
-        let announcement = report.announcement(&cache, &[fix_id]);
+        let run = self.run_picks(cache, picks, &mut report);
+        let announcement = report.announcement(cache, &[fix_id]);
         if let Err(e) = run {
             // A caller that gets an error has no announcement to merge
             // into its own: whatever was written is announced now, so
@@ -813,7 +926,108 @@ impl FixEngine {
             }
             return Err(e);
         }
-        Ok((entry(&cache, fix_id)?, announcement?))
+        Ok((entry(cache, fix_id)?, announcement?))
+    }
+
+    // -- promoting a folder ----------------------------------------
+
+    /// Makes a folder of `spec.parent` its own source (FR22), in the
+    /// order the plan fixes:
+    ///
+    /// 1. the pending list is worked out against the cache as it WILL be
+    ///    (a savepoint that is always rolled back, [`Cache::simulate_promote`]),
+    ///    then ONE transaction writes the new source's row, the parent's
+    ///    exclusion, the log entry (kind `promote`) and that list;
+    /// 2. the parent's rows under the folder are re-owned, in place;
+    /// 3. `after_reown` runs (the caller makes its live watchers skip the
+    ///    folder from here on), then
+    /// 4. every pending file is rewritten, by the same write loop as any
+    ///    fix, so a file that changed under it or is read-only is
+    ///    retried or logged `needs_manual_fix` and the rest go on.
+    ///
+    /// The cache writes go through the writer gate, like every other
+    /// writer's. A crash after step 1 is finished by the next start:
+    /// [`complete_promotes`] re-owns what is left, then the pending list
+    /// is retried like any other.
+    pub fn promote(
+        &self,
+        spec: &PromoteSpec,
+        after_reown: &dyn Fn(),
+    ) -> Result<PromoteDone, FixError> {
+        use crate::registry::retry_cache_on_busy;
+        use tephra_cache::NewPromote;
+
+        let _guard = self.lock();
+        let cache = self.open()?;
+        let gate = crate::writer_gate::for_path(&self.cache_path);
+        let now = self.clock.now();
+        let parent = cache.get_source(&spec.parent)?.ok_or_else(|| {
+            FixError::Refused(format!("source {} is not registered", spec.parent))
+        })?;
+        let root = spec.root.to_string_lossy().into_owned();
+        let moved = cache.units_under_prefix(parent.id, &spec.folder)?;
+
+        let rows = retry_cache_on_busy(&gate, || {
+            cache.simulate_promote(parent.id, &spec.name, &root, &spec.folder, |after| {
+                promote_rows(after, spec, &moved)
+            })
+        })??;
+
+        let files: BTreeSet<&(String, String)> = rows.iter().map(|r| &r.file).collect();
+        let detail = FixDetail {
+            files: files
+                .iter()
+                .map(|(s, p)| FileEntry::pending(s, p))
+                .collect(),
+            ..FixDetail::default()
+        };
+        let pending: Vec<NewPendingFix> = rows
+            .iter()
+            .map(|r| NewPendingFix {
+                source: r.file.0.clone(),
+                file_path: r.file.1.clone(),
+                old_source: Some(spec.parent.clone()),
+                old_path: Some(r.old.clone()),
+                new_source: Some(spec.name.clone()),
+                new_path: Some(r.new.clone()),
+            })
+            .collect();
+        let log = NewFixLog {
+            created_at: now,
+            kind: KIND_PROMOTE.to_string(),
+            status: overall_status(&detail.files).to_string(),
+            old_source: Some(spec.parent.clone()),
+            old_path: Some(spec.folder.clone()),
+            new_source: Some(spec.name.clone()),
+            new_path: Some(format!("@{}:", spec.name)),
+            files_changed: 0,
+            detail_json: Some(detail.to_json()),
+        };
+        let begun = retry_cache_on_busy(&gate, || {
+            cache.begin_promote(&NewPromote {
+                name: &spec.name,
+                root: &root,
+                parent: &spec.parent,
+                rel_path: &spec.folder,
+                created_at: now,
+                log: &log,
+                pending: &pending,
+            })
+        })?;
+        if self.stop_after_promote_commit {
+            return Err(FixError::Stopped);
+        }
+        let units_moved = retry_cache_on_busy(&gate, || {
+            cache.reown_units(parent.id, begun.source_id, &spec.folder)
+        })?;
+        after_reown();
+        let (entry, announcement) = self.run_fix(&cache, begun.fix_id)?;
+        Ok(PromoteDone {
+            source_id: begun.source_id,
+            units_moved,
+            entry,
+            announcement,
+        })
     }
 
     // -- retrying ---------------------------------------------------
@@ -980,8 +1194,15 @@ impl FixEngine {
                 RewriteMode::Fix { bare_resolves },
             )
         } else if file_id == new_id {
-            let (edges, links) =
-                own_links(graph, &old_source, &old_path, &target_source, &target_path);
+            let promoted = promoted_folder(cache, &row)?;
+            let (edges, links) = own_links(
+                graph,
+                &old_source,
+                &old_path,
+                &target_source,
+                &target_path,
+                promoted.as_deref(),
+            );
             (
                 edges,
                 RewriteMode::Move(MoveRewrite::Own {
@@ -1247,12 +1468,18 @@ fn linking_files(
 /// of the file is looked at in the graph as it is after the move; where
 /// it pointed before is worked out by resolving it in the source the
 /// file left (the old file is no unit of it any more).
+///
+/// `promoted` is the folder of `old_source` that became `new_source`
+/// when this is a promote (FR22), else `None`: a link of the file that
+/// names another file of that folder by its path from `old_source`'s
+/// root is then respelled relative to the new root (FR23).
 fn own_links(
     graph: &UnitGraph,
     old_source: &str,
     old_path: &str,
     new_source: &str,
     new_path: &str,
+    promoted: Option<&str>,
 ) -> (Vec<Edge>, HashMap<String, OwnLink>) {
     let new_id = format!("@{new_source}:{new_path}");
     let (old_stem, _) = crate::refactor::strip_md_ext_pub(old_path);
@@ -1272,7 +1499,21 @@ fn own_links(
             continue;
         }
         let file_ref = |source: &str| format!("@{source}:{}", w.target);
+        let respelled = promoted.and_then(|folder| {
+            // Spelled from the old source: bare, or with its prefix.
+            if w.source_prefix.as_deref().is_some_and(|p| p != old_source) {
+                return None;
+            }
+            let rest = strip_folder(&w.target, folder)?;
+            let unit = graph
+                .resolve_link(&format!("@{new_source}:{rest}"), None)
+                .ok()?
+                .unit
+                .id;
+            graph.shortest_unique_target(&unit)
+        });
         let action = match w.source_prefix.as_deref() {
+            _ if respelled.is_some() => respelled.map(OwnLink::Retarget),
             None => match graph.resolve_link(&file_ref(old_source), None) {
                 Ok(_) => Some(OwnLink::AddPrefix(old_source.to_string())),
                 Err(_) if names_old_file(&w.target) => Some(OwnLink::SelfLink),
@@ -1301,6 +1542,27 @@ fn own_links(
         }
     }
     (edges, links)
+}
+
+/// `target` without its leading `folder/` (compared without regard to
+/// case), or `None` when it is not under that folder.
+fn strip_folder<'a>(target: &'a str, folder: &str) -> Option<&'a str> {
+    let n = folder.len();
+    let head = target.get(..n)?;
+    let rest = target.get(n..)?.strip_prefix('/')?;
+    (head.eq_ignore_ascii_case(folder) && !rest.is_empty()).then_some(rest)
+}
+
+/// The folder a pending row's fix promoted, or `None` when it is no
+/// promote.
+fn promoted_folder(cache: &Cache, row: &PendingFixRow) -> Result<Option<String>, FixError> {
+    let Some(fix_id) = row.fix_id else {
+        return Ok(None);
+    };
+    Ok(cache
+        .get_fix_log(fix_id)?
+        .filter(|e| e.kind == KIND_PROMOTE)
+        .and_then(|e| e.old_path))
 }
 
 /// `changed` (paths on disk) relative to the root of `source`. Paths

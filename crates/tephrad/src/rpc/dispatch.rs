@@ -38,6 +38,7 @@ pub const METHOD_NAMES: &[&str] = &[
     "source.unregister",
     "source.list",
     "source.rescan",
+    "source.promote",
     "link.preview_refactor",
     "link.apply_refactor",
     "unit.list",
@@ -100,6 +101,7 @@ pub fn dispatch(
         "source.unregister" => source_unregister(params, backends.sources),
         "source.list" => source_list(backends.sources),
         "source.rescan" => source_rescan(params, backends.sources),
+        "source.promote" => source_promote(params, backends.fixes),
         "link.preview_refactor" => link_preview_refactor(params, backends.refactor),
         "link.apply_refactor" => link_apply_refactor(params, backends.refactor),
         "unit.list" => unit_list(params, backends.sources),
@@ -171,6 +173,24 @@ fn source_rescan(params: &Value, sources: &dyn SourceBackend) -> DispatchResult 
         .rescan(name)
         .map(|stats| serde_json::to_value(stats).expect("ScanStatsWire always serializes"))
         .map_err(|e| (SOURCE_ERROR, e, None))
+}
+
+/// `source.promote {name, root}` (G11): both non-empty strings. A refusal
+/// is a `SOURCE_ERROR` whose `data.reason` is the stable reason (E13).
+fn source_promote(params: &Value, fixes: &dyn FixBackend) -> DispatchResult {
+    use crate::rpc::backend::PromoteRpcError;
+
+    let name = require_str(params, "name")?;
+    let root = require_str(params, "root")?;
+    match fixes.promote(name, root) {
+        Ok(done) => Ok(serde_json::to_value(done).expect("PromoteWire always serializes")),
+        Err(PromoteRpcError::Refused { reason, message }) => Err((
+            SOURCE_ERROR,
+            message,
+            Some(serde_json::json!({ "reason": reason })),
+        )),
+        Err(PromoteRpcError::Failed(message)) => Err((SOURCE_ERROR, message, None)),
+    }
 }
 
 /// `unit.list {source, folder?, recursive?}` (G1). `source` is a
@@ -457,6 +477,7 @@ mod tests {
                 "source.unregister",
                 "source.list",
                 "source.rescan",
+                "source.promote",
                 "link.preview_refactor",
                 "link.apply_refactor",
                 "unit.list",

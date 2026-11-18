@@ -90,6 +90,7 @@ pub fn execute_with_prompt_writer<R: BufRead, W: Write>(
 ) -> CommandOutcome {
     match command {
         Command::SourceAdd { name, path } => source_add(name, path, json, client),
+        Command::SourcePromote { name, path } => source_promote(name, path, json, client),
         Command::SourceRemove { name } => source_remove(name, json, client),
         Command::SourceList => source_list(json, client),
         Command::Status => status(json, client),
@@ -158,6 +159,39 @@ fn source_add(name: &str, path: &str, json: bool, client: &RpcClient) -> Command
             || render::render_source_added(name, path, &stats),
             json,
         )),
+        Err(e) => CommandOutcome::err(describe_error(&e)),
+    }
+}
+
+/// `source promote <name> <path>` (G11): one `source.promote` call. A
+/// relative `<path>` is made absolute against this process's directory
+/// first, because the daemon's own working directory is not the user's.
+/// A refusal prints the daemon's message and its stable `reason` and
+/// exits 1; nothing has changed then.
+fn source_promote(name: &str, path: &str, json: bool, client: &RpcClient) -> CommandOutcome {
+    let root = match std::path::Path::new(path) {
+        p if p.is_absolute() => path.to_string(),
+        p => match std::env::current_dir() {
+            Ok(cwd) => cwd.join(p).display().to_string(),
+            Err(_) => path.to_string(),
+        },
+    };
+    match client.call("source.promote", json!({"name": name, "root": root})) {
+        Ok(result) => CommandOutcome::ok(json_or(
+            &result,
+            || render::render_source_promoted(&result),
+            json,
+        )),
+        Err(RpcCallError::Rpc { message, data, .. }) => {
+            let reason = data
+                .as_ref()
+                .and_then(|d| d.get("reason"))
+                .and_then(Value::as_str);
+            CommandOutcome::err(match reason {
+                Some(reason) => format!("{message} (reason: {reason})"),
+                None => message,
+            })
+        }
         Err(e) => CommandOutcome::err(describe_error(&e)),
     }
 }

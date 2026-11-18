@@ -19,6 +19,7 @@ mod fts;
 mod in_file;
 mod listing;
 mod pending_fixes;
+mod promote;
 mod schema;
 mod search;
 mod sources;
@@ -40,6 +41,7 @@ pub use listing::{
 pub use pending_fixes::{
     NewPendingFix, PendingFixRow, PendingOp, STATE_NEEDS_MANUAL_FIX, STATE_PENDING,
 };
+pub use promote::{NewPromote, Promoted, PromotedRootRow};
 pub use schema::KindInferrer;
 pub use search::{compare_hits, file_stem, resolve_title, NameCandidate, NameHit, NAME_SEARCH_SQL};
 pub use sources::{validate_transition, InvalidTransition, SourceRow, SourceStatus};

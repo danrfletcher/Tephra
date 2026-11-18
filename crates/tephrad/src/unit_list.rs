@@ -146,7 +146,11 @@ pub fn list_units(
         .map_err(source_error)?;
 
     let entries = if from_disk {
-        list_online(source, root, &folder, recursive, listing.entries)?
+        // The folders this source gave up to a source of their own are
+        // no part of it: never listed, though they are on its disk.
+        let promoted = cache.promoted_roots_of(source).map_err(source_error)?;
+        let promoted: Vec<&str> = promoted.iter().map(|r| r.rel_path.as_str()).collect();
+        list_online(source, root, &folder, recursive, listing.entries, &promoted)?
     } else {
         match listing.state {
             FolderState::Missing => return Err(no_such_folder(&folder)),
@@ -202,8 +206,11 @@ fn list_online(
     folder: &str,
     recursive: bool,
     cached: Vec<FolderEntry>,
+    promoted: &[&str],
 ) -> Result<Vec<UnitEntryWire>, UnitListError> {
-    let ignore = IgnoreRules::load(root).map_err(source_error)?;
+    let ignore = IgnoreRules::load(root)
+        .map_err(source_error)?
+        .with_promoted(promoted.iter().copied());
 
     // An ignored folder is as good as absent: nothing under it is ever
     // indexed, and it must never appear.

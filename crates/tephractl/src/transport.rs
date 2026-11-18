@@ -51,13 +51,19 @@ const MUTATING_METHODS: &[&str] = &[
     "source.register",
     "source.unregister",
     "source.rescan",
+    "source.promote",
     "link.apply_refactor",
 ];
 
 /// Methods long/expensive enough on the daemon side that they need
 /// more than [`REQUEST_TIMEOUT`] to complete under normal operation
 /// (not just under failure).
-const LONG_RUNNING_METHODS: &[&str] = &["source.register", "source.rescan", "link.apply_refactor"];
+const LONG_RUNNING_METHODS: &[&str] = &[
+    "source.register",
+    "source.rescan",
+    "source.promote",
+    "link.apply_refactor",
+];
 
 fn is_mutating(method: &str) -> bool {
     MUTATING_METHODS.contains(&method)
