@@ -6,7 +6,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::schema::{self, KindInferrer};
 use crate::sources::{self, SourceRow, SourceStatus};
@@ -317,6 +317,23 @@ impl Cache {
             [source_id],
         )?;
         Ok(())
+    }
+
+    /// Whether a scan of `source_id` ran to completion at some point
+    /// and none has been started since without finishing: the cached
+    /// rows are then a baseline a later start can compare the disk
+    /// with. `false` for a source with an unfinished scan and for one
+    /// with no scan record at all.
+    pub fn scan_finished(&self, source_id: i64) -> Result<bool, CacheError> {
+        let finished: Option<Option<i64>> = self
+            .conn
+            .query_row(
+                "SELECT finished_at FROM scan_state WHERE source_id = ?1",
+                [source_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(matches!(finished, Some(Some(_))))
     }
 
     /// Every source with a scan that started and never finished (E11),

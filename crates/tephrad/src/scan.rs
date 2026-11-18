@@ -378,7 +378,7 @@ fn cached_ids_of_file(
 /// Relative path, normalized to forward slashes regardless of
 /// platform, for storage in `units.rel_path` and for matching against
 /// [`IgnoreRules`].
-fn to_rel_string(root: &Path, abs: &Path) -> Option<String> {
+pub(crate) fn to_rel_string(root: &Path, abs: &Path) -> Option<String> {
     let rel = abs.strip_prefix(root).ok()?;
     let joined: Vec<&str> = rel
         .components()
@@ -392,7 +392,7 @@ fn to_rel_string(root: &Path, abs: &Path) -> Option<String> {
 }
 
 /// Seconds since the epoch of `metadata`'s modification time.
-fn metadata_mtime(metadata: &fs::Metadata) -> Option<i64> {
+pub(crate) fn metadata_mtime(metadata: &fs::Metadata) -> Option<i64> {
     let modified = metadata.modified().ok()?;
     let since_epoch = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
     Some(since_epoch.as_secs() as i64)

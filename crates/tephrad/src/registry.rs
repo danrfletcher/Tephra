@@ -27,6 +27,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tephra_cache::{Cache, CacheError, SourceRow, SourceStatus};
 
+use crate::catch_up::{self, BootHooks};
 use crate::ignore::IgnoreRules;
 use crate::rename_detect::{self, RenameFixer, SourceRenames};
 use crate::scan::{self, ScanError, ScanStats};
@@ -462,6 +463,30 @@ pub struct SourceRegistry {
     /// fix engine, set once by the daemon. While unset, watchers index
     /// a rename as a delete and a create, as before.
     rename_fixer: Arc<RwLock<Option<Arc<dyn RenameFixer>>>>,
+    /// How long a rename the OS did not identify waits before it is
+    /// applied ([`watcher::RENAME_HOLD`] unless a test shortens it).
+    /// Read when a source's watcher is started.
+    rename_hold: Mutex<std::time::Duration>,
+}
+
+/// What [`SourceRegistry::start_all`] did with one source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BootOutcome {
+    /// Compared with the cache (`paths` files brought up to date) and
+    /// watched from now on.
+    CaughtUp { paths: usize },
+    /// Watched from now on, with no comparison: the source has no
+    /// finished scan to compare with, or it was already watched.
+    Watching,
+    /// Skipped: its root is missing. Marked `offline`, rows kept.
+    Offline,
+    /// Skipped: the OS will not list its root. Rows kept.
+    PermissionDenied,
+    /// Skipped: its watcher could not be started (or its root could
+    /// not be read). Nothing was written for it.
+    Failed(String),
+    /// A shutdown arrived first: nothing was written for it.
+    Stopped,
 }
 
 /// The writers currently holding the watchers paused, and the paths
@@ -516,7 +541,15 @@ impl SourceRegistry {
             permission_denied: Mutex::new(HashSet::new()),
             write_pause: Mutex::new(WritePause::default()),
             rename_fixer: Arc::new(RwLock::new(None)),
+            rename_hold: Mutex::new(watcher::RENAME_HOLD),
         })
+    }
+
+    /// Replaces the hold a hash-only rename waits ([`watcher::RENAME_HOLD`])
+    /// for every watcher started from now on. For a test that cannot
+    /// wait the real two seconds.
+    pub fn set_rename_hold(&self, hold: std::time::Duration) {
+        *self.rename_hold.lock().unwrap_or_else(|p| p.into_inner()) = hold;
     }
 
     /// Subscribes to this registry's internal `source_changed` event
@@ -682,7 +715,7 @@ impl SourceRegistry {
         root: PathBuf,
         ignore_rules: Arc<RwLock<IgnoreRules>>,
         tap: watcher::WatcherTap,
-    ) -> Result<(), RegistryError> {
+    ) -> Result<Arc<SourceRenames>, RegistryError> {
         // A dedicated connection, guarded by its own mutex, for this
         // source's debounced batch-apply path (R8): independent of
         // `self.cache` and of every other source's own dedicated
@@ -699,7 +732,7 @@ impl SourceRegistry {
         let renames = Arc::new(SourceRenames::new(
             name.clone(),
             root.clone(),
-            watcher::RENAME_HOLD,
+            *self.rename_hold.lock().unwrap_or_else(|p| p.into_inner()),
         ));
         let renames_for_batch = Arc::clone(&renames);
         let fixer_for_batch = Arc::clone(&self.rename_fixer);
@@ -894,7 +927,7 @@ impl SourceRegistry {
                 _hold_task: AbortOnDrop(hold_task),
             },
         );
-        Ok(())
+        Ok(renames)
     }
 
     /// GP8: pauses every currently-running source's watcher batch
@@ -926,6 +959,12 @@ impl SourceRegistry {
         for running in self.running.lock().unwrap().values() {
             running.pause.resume_except(written_paths);
         }
+    }
+
+    /// Whether a watcher is running for `name`: started by
+    /// [`SourceRegistry::register`] or by [`SourceRegistry::start_all`].
+    pub fn is_watching(&self, name: &str) -> bool {
+        self.running.lock().unwrap().contains_key(name)
     }
 
     /// Whether any running source's watcher is currently paused.
@@ -1101,6 +1140,342 @@ impl SourceRegistry {
             }
         }
         Ok(marked)
+    }
+
+    /// The boot's last two steps (G5), after
+    /// [`SourceRegistry::rescan_unfinished`]: for every registered
+    /// source that is online and readable, a startup catch-up (what
+    /// changed on disk while `tephrad` was down, found by comparing the
+    /// disk with the cached rows, a certain rename fixed under the live
+    /// rules), then a watcher, in the same `running` map
+    /// [`SourceRegistry::register`] fills.
+    ///
+    /// Per source, in this order: the OS watch is subscribed first (an
+    /// edit made while the catch-up runs queues and is indexed once the
+    /// watcher drains it, never missed); the source is compared with its
+    /// cache and the new files that could be a vanished file's twin are
+    /// hashed; then, one source at a time, the changed files are indexed
+    /// in one transaction (through the writer gate, so an RPC that
+    /// arrives meanwhile waits its turn), one `source_changed` is sent
+    /// if anything changed, the watcher is started, and what vanished
+    /// and appeared is handed to the source's rename detector, which
+    /// applies a unique hash pair after the hold
+    /// ([`SourceRegistry::set_rename_hold`]) and logs the vanished that
+    /// got no pair as `uncertain`. `rescan_source` is never used: it
+    /// deletes the rows first, which would leave nothing to compare.
+    ///
+    /// Skipped, with nothing written and no watcher: a source whose root
+    /// is missing (marked `offline`, rows kept) and one the OS will not
+    /// list. A source whose scan never finished has no baseline to
+    /// compare with, so it is only watched. A source stored as `offline`
+    /// whose root is back is compared like any other and goes
+    /// `offline` -> `stale` -> `active` around the catch-up. A source whose watcher
+    /// cannot start is logged and skipped; the others carry on.
+    /// `should_stop` is checked before each source; one already being
+    /// indexed finishes, since its batch is a single transaction.
+    pub fn start_all(&self, should_stop: impl Fn() -> bool) -> Vec<(String, BootOutcome)> {
+        self.start_all_with(should_stop, &BootHooks::default())
+    }
+
+    /// [`SourceRegistry::start_all`] with how a new file is hashed and
+    /// how a source's watcher is started supplied by the caller.
+    pub fn start_all_with(
+        &self,
+        should_stop: impl Fn() -> bool,
+        hooks: &BootHooks<'_>,
+    ) -> Vec<(String, BootOutcome)> {
+        /// One online source on its way to a watcher.
+        struct Boot {
+            row: SourceRow,
+            root: PathBuf,
+            ignore_rules: Arc<RwLock<IgnoreRules>>,
+            tap: watcher::WatcherTap,
+            /// `None` when there is no baseline to compare with.
+            diff: Option<catch_up::Diff>,
+            vanished: Vec<crate::rename_detect::Vanished>,
+            appeared: Vec<crate::rename_detect::Appeared>,
+        }
+
+        let rows = match self.list() {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not list the sources to start their watchers");
+                return Vec::new();
+            }
+        };
+        let mut outcomes: Vec<(String, BootOutcome)> = Vec::new();
+        let mut boots: Vec<Boot> = Vec::new();
+
+        // 1. Which sources are online, and their OS watch.
+        for row in rows {
+            if should_stop() {
+                outcomes.push((row.name, BootOutcome::Stopped));
+                continue;
+            }
+            if self.running.lock().unwrap().contains_key(&row.name) {
+                outcomes.push((row.name, BootOutcome::Watching));
+                continue;
+            }
+            let root = PathBuf::from(&row.path);
+            match probe_path(&root) {
+                PathProbe::Ok => self.set_permission_denied(&row.name, false),
+                PathProbe::NotReadable | PathProbe::NotReadablePrivacy => {
+                    tracing::warn!(source = %row.name, root = %root.display(), "source root can't be read (permission denied); no catch-up and no watcher");
+                    self.set_permission_denied(&row.name, true);
+                    outcomes.push((row.name, BootOutcome::PermissionDenied));
+                    continue;
+                }
+                PathProbe::Missing | PathProbe::NotADirectory => {
+                    self.mark_offline(&row);
+                    outcomes.push((row.name, BootOutcome::Offline));
+                    continue;
+                }
+            }
+            let ignore_rules = match IgnoreRules::load(&root) {
+                Ok(rules) => Arc::new(RwLock::new(rules)),
+                Err(e) => {
+                    tracing::warn!(source = %row.name, error = %e, "could not read the source's ignore rules; no catch-up and no watcher");
+                    outcomes.push((row.name, BootOutcome::Failed(e.to_string())));
+                    continue;
+                }
+            };
+            let tap = match (hooks.start_tap)(&root, Arc::clone(&ignore_rules)) {
+                Ok(tap) => tap,
+                Err(e) => {
+                    tracing::warn!(source = %row.name, error = %e, "the source's watcher could not be started; skipping the source");
+                    outcomes.push((row.name, BootOutcome::Failed(e.to_string())));
+                    continue;
+                }
+            };
+            boots.push(Boot {
+                row,
+                root,
+                ignore_rules,
+                tap,
+                diff: None,
+                vanished: Vec::new(),
+                appeared: Vec::new(),
+            });
+        }
+
+        // 2. Compare each source with its cache (reads only).
+        let mut stopped = false;
+        let mut failed: Vec<usize> = Vec::new();
+        for (i, boot) in boots.iter_mut().enumerate() {
+            if should_stop() {
+                stopped = true;
+                break;
+            }
+            let compared = (|| -> Result<Option<catch_up::Diff>, String> {
+                let cache = Cache::open_read_only(&self.cache_path).map_err(|e| e.to_string())?;
+                if !cache
+                    .scan_finished(boot.row.id)
+                    .map_err(|e| e.to_string())?
+                {
+                    tracing::info!(source = %boot.row.name, "no finished scan to compare with; watching only");
+                    return Ok(None);
+                }
+                let cached =
+                    catch_up::cached_files(&cache, &boot.row.name).map_err(|e| e.to_string())?;
+                let rules = boot.ignore_rules.read().unwrap().clone();
+                let disk = catch_up::list_disk(&boot.root, &rules).map_err(|e| e.to_string())?;
+                Ok(Some(catch_up::diff(cached, disk, |rel| {
+                    catch_up::is_gone(&boot.root, rel)
+                })))
+            })();
+            match compared {
+                Ok(diff) => boot.diff = diff,
+                Err(e) => {
+                    tracing::warn!(source = %boot.row.name, error = %e, "catch-up could not compare the source with its cache; skipping the source");
+                    outcomes.push((boot.row.name.clone(), BootOutcome::Failed(e)));
+                    failed.push(i);
+                }
+            }
+        }
+
+        // 3. Hash the new files that could be a vanished file's twin
+        // (size equal to a vanished file's, in any source), then keep
+        // only the hashes that are unique across sources (FR21).
+        if !stopped {
+            let sizes = catch_up::size_matches(boots.iter().filter_map(|b| b.diff.as_ref()));
+            for boot in boots.iter_mut() {
+                let Some(diff) = &boot.diff else { continue };
+                let hashes = catch_up::hash_new_files(diff, &boot.root, &sizes, hooks.hash_file);
+                boot.vanished = catch_up::vanished_facts(diff);
+                boot.appeared = catch_up::appeared_facts(diff, &hashes);
+            }
+            let mut facts: Vec<_> = boots
+                .iter_mut()
+                .map(|b| {
+                    (
+                        std::mem::take(&mut b.vanished),
+                        std::mem::take(&mut b.appeared),
+                    )
+                })
+                .collect();
+            catch_up::drop_cross_source_hashes(&mut facts);
+            for (boot, (vanished, appeared)) in boots.iter_mut().zip(facts) {
+                boot.vanished = vanished;
+                boot.appeared = appeared;
+            }
+        }
+
+        // 4. One source at a time: index what changed, start the watcher,
+        // hand the rename detector what vanished and appeared.
+        for (i, boot) in boots.into_iter().enumerate() {
+            if failed.contains(&i) {
+                continue;
+            }
+            if stopped || should_stop() {
+                stopped = true;
+                outcomes.push((boot.row.name, BootOutcome::Stopped));
+                continue;
+            }
+            let Boot {
+                row,
+                root,
+                ignore_rules,
+                tap,
+                diff,
+                vanished,
+                appeared,
+            } = boot;
+            let mut paths = 0;
+            if let Some(diff) = &diff {
+                if row.status == SourceStatus::Offline {
+                    // The root is back and its cached rows are the
+                    // baseline just compared: stale while they are
+                    // brought up to date (offline cannot go straight
+                    // to active).
+                    self.set_status(&row, SourceStatus::Stale);
+                }
+                let changed = diff.changed_paths(&root);
+                if !changed.is_empty() {
+                    match self.index_catch_up(&row, &root, &ignore_rules, changed) {
+                        Ok(n) => paths = n,
+                        Err(e) => {
+                            tracing::warn!(source = %row.name, error = %e, "catch-up could not bring the cache up to date; skipping the source");
+                            outcomes.push((row.name, BootOutcome::Failed(e)));
+                            continue;
+                        }
+                    }
+                }
+            }
+            if diff.is_some() && row.status != SourceStatus::Active {
+                self.set_status(&row, SourceStatus::Active);
+            }
+            let renames = match self.start_watcher(
+                row.name.clone(),
+                row.id,
+                root,
+                ignore_rules,
+                tap,
+            ) {
+                Ok(renames) => renames,
+                Err(e) => {
+                    tracing::warn!(source = %row.name, error = %e, "the source's watcher could not be started");
+                    outcomes.push((row.name, BootOutcome::Failed(e.to_string())));
+                    continue;
+                }
+            };
+            if diff.is_some() {
+                let fixer = self
+                    .rename_fixer
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone();
+                if let Some(fixer) = fixer {
+                    renames.on_batch(&*fixer, &HashMap::new(), vanished, appeared);
+                }
+                tracing::info!(source = %row.name, paths, "catch_up_complete");
+                outcomes.push((row.name, BootOutcome::CaughtUp { paths }));
+            } else {
+                outcomes.push((row.name, BootOutcome::Watching));
+            }
+        }
+        outcomes
+    }
+
+    /// Brings the cache up to date with `changed` in one transaction, as
+    /// a watcher batch does, and announces it as one `source_changed`.
+    /// Returns how many paths changed.
+    fn index_catch_up(
+        &self,
+        row: &SourceRow,
+        root: &Path,
+        ignore_rules: &Arc<RwLock<IgnoreRules>>,
+        changed: HashSet<PathBuf>,
+    ) -> Result<usize, String> {
+        let cache = Cache::open(&self.cache_path).map_err(|e| e.to_string())?;
+        let rules = ignore_rules.read().unwrap().clone();
+        let total = scan::settle_deferred(
+            changed,
+            scan::DEFER_RETRY_DELAY,
+            |paths, can_defer| {
+                scan::apply_change_batch_deferring(
+                    &cache,
+                    row.id,
+                    root,
+                    paths,
+                    &rules,
+                    &crate::refactor::RealFs,
+                    can_defer,
+                )
+            },
+            |_| {},
+        )
+        .map_err(|e| e.to_string())?;
+        let n = total.changed_paths.len();
+        if n > 0 {
+            let _ = self.events_tx.send(DaemonEvent::SourceChanged {
+                source: row.name.clone(),
+                paths: total.changed_paths,
+                fixes: Vec::new(),
+            });
+        }
+        Ok(n)
+    }
+
+    /// A source whose root is missing: stored as `offline` (its rows
+    /// stay), and the graph told, as the watcher does when a root goes.
+    fn mark_offline(&self, row: &SourceRow) {
+        if row.status == SourceStatus::Offline {
+            return;
+        }
+        let cache = self.cache.lock().unwrap();
+        match retry_cache_on_busy(&self.gate, || {
+            cache.transition_source_status(&row.name, SourceStatus::Offline)
+        }) {
+            Ok(()) => {
+                tracing::warn!(source = %row.name, "source root is missing; marked offline");
+                let _ = self.events_tx.send(DaemonEvent::SourceChanged {
+                    source: row.name.clone(),
+                    paths: Vec::new(),
+                    fixes: Vec::new(),
+                });
+            }
+            Err(e) => {
+                tracing::warn!(source = %row.name, error = %e, "failed to mark source offline");
+            }
+        }
+    }
+
+    /// Moves a source's stored status along one valid edge and tells the
+    /// graph, logging (not failing) when the edge is refused.
+    fn set_status(&self, row: &SourceRow, to: SourceStatus) {
+        let cache = self.cache.lock().unwrap();
+        match retry_cache_on_busy(&self.gate, || cache.transition_source_status(&row.name, to)) {
+            Ok(()) => {
+                let _ = self.events_tx.send(DaemonEvent::SourceChanged {
+                    source: row.name.clone(),
+                    paths: Vec::new(),
+                    fixes: Vec::new(),
+                });
+            }
+            Err(e) => {
+                tracing::warn!(source = %row.name, error = %e, status = ?to, "failed to change the source's status");
+            }
+        }
     }
 
     /// E11: rescans from the top every source whose last scan started
@@ -1840,5 +2215,50 @@ mod tests {
             calls, 1,
             "a non-busy error must be returned immediately on the first attempt"
         );
+    }
+
+    // ---- start_all: behind the writer gate ---------------------------
+
+    /// G5: the catch-up's write is one of the gate's writes, so an RPC
+    /// write that is already holding the gate is not overtaken: the
+    /// catch-up waits for it, then goes ahead.
+    #[test]
+    fn start_all_writes_behind_the_writer_gate() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.md"), "# A\n").unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache_path = cache_dir.path().join("cache.db");
+        {
+            let registry = SourceRegistry::new(Cache::open(&cache_path).unwrap()).unwrap();
+            registry.register("notes", root.path()).unwrap();
+        }
+        std::fs::write(root.path().join("a.md"), "# A\n\nedited while down\n").unwrap();
+        let registry = Arc::new(SourceRegistry::new(Cache::open(&cache_path).unwrap()).unwrap());
+
+        let gate = writer_gate::for_path(&cache_path);
+        let held = gate.acquire();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread = {
+            let (registry, done) = (registry.clone(), done.clone());
+            std::thread::spawn(move || {
+                let outcomes = registry.start_all(|| false);
+                done.store(true, std::sync::atomic::Ordering::SeqCst);
+                outcomes
+            })
+        };
+
+        // A bounded negative wait: the catch-up must still be waiting.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(
+            !done.load(std::sync::atomic::Ordering::SeqCst),
+            "the catch-up wrote while another writer held the gate"
+        );
+        drop(held);
+        let outcomes = thread.join().unwrap();
+        assert!(
+            matches!(outcomes[0].1, BootOutcome::CaughtUp { paths: 1 }),
+            "{outcomes:?}"
+        );
+        registry.unregister("notes").unwrap();
     }
 }

@@ -531,6 +531,15 @@ fn run_server(
         let resume_fixes = fix_engine.clone();
         let rescan_handle = tokio::task::spawn_blocking(move || {
             let outcomes = rescan_registry.rescan_unfinished(|| *rescan_shutdown_rx.borrow());
+            // G5: with the unfinished scans redone, catch each source up
+            // with what changed on disk while the daemon was down, then
+            // watch it. Skipped on shutdown.
+            let started = if *rescan_shutdown_rx.borrow() {
+                Vec::new()
+            } else {
+                rescan_registry.start_all(|| *rescan_shutdown_rx.borrow())
+            };
+            let started_count = started.len();
             drop(rescan_registry);
             // G9: with the scans done, retry every pending fix of every
             // source. Rows of an offline source wait.
@@ -539,7 +548,7 @@ fn run_server(
                     tracing::warn!(error = %e, "retrying pending fixes at startup failed");
                 }
             }
-            outcomes.len()
+            outcomes.len() + started_count
         });
 
         let socket_tasks = state.socket_tasks.clone();

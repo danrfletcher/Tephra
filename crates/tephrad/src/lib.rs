@@ -10,6 +10,7 @@
 //! test needs to call directly.
 pub mod access;
 pub mod block_id;
+pub mod catch_up;
 pub mod dup_ids;
 pub mod file_kind;
 pub mod file_lock;

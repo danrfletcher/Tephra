@@ -1222,3 +1222,53 @@ fn the_watcher_keeps_the_block_index_in_step_with_an_edit_a_delete_and_a_rename(
 
     registry.unregister("n").expect("unregister");
 }
+
+/// G5: a watcher started by `start_all` after a restart (not by
+/// `register`) is paused, resumed and stopped like a registered one.
+#[test]
+fn a_boot_started_watcher_is_paused_resumed_and_stopped_like_a_registered_one() {
+    let fixture = fixtures::vault_fixture();
+    let cache_dir = tempfile::tempdir().expect("cache tempdir");
+    let cache_path = cache_dir.path().join("cache.db");
+    {
+        let registry = SourceRegistry::new(Cache::open(&cache_path).unwrap()).unwrap();
+        registry.register("notes", fixture.root()).unwrap();
+    }
+    let registry = SourceRegistry::new(Cache::open(&cache_path).unwrap()).unwrap();
+    assert!(
+        !registry.is_watching("notes"),
+        "nothing is watched before start"
+    );
+    registry.start_all(|| false);
+    assert!(registry.is_watching("notes"));
+
+    let indexed = |rel: &str| {
+        let cache = Cache::open(&cache_path).unwrap();
+        let source = cache.get_source("notes").unwrap().unwrap();
+        cache
+            .get_unit_by_rel_path(source.id, rel)
+            .unwrap()
+            .is_some()
+    };
+
+    registry.pause_all_watchers();
+    assert!(registry.watchers_paused());
+    fixture.write("while-paused.md", "# paused\n");
+    // Queued, not dropped: still not indexed after the debounce window
+    // has certainly passed, and indexed once resumed.
+    std::thread::sleep(Duration::from_millis(700));
+    assert!(!indexed("while-paused.md"), "indexed while paused");
+    registry.resume_all_watchers();
+    assert!(!registry.watchers_paused());
+    assert!(
+        wait_until(Duration::from_secs(20), || indexed("while-paused.md")),
+        "the queued create was not indexed after resume"
+    );
+
+    registry.unregister("notes").unwrap();
+    assert!(!registry.is_watching("notes"));
+    assert!(
+        registry.list().unwrap().is_empty(),
+        "the source and its rows are gone"
+    );
+}
