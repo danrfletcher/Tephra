@@ -329,27 +329,30 @@ fn a_file_deleted_while_down_leaves_the_cache_and_is_uncertain() {
 }
 
 // ---------------------------------------------------------------
-// Across sources (FR21): a move is not applied
+// Across sources (FR21, G6): a move is fixed as one `move`
 // ---------------------------------------------------------------
 
 #[test]
-fn a_file_moved_to_another_source_while_down_is_a_delete_and_a_create() {
+fn a_file_moved_to_another_source_while_down_is_fixed_as_one_move() {
     let w = World::new(&GP1_FILES);
     let text = w.text("Training Plan.md");
     fs::remove_file(w.root().join("Training Plan.md")).unwrap();
     w.tephra.write("Training Plan.md", &text);
-    let weekly = w.text("Weekly Review.md");
 
     let b = w.boot();
 
     assert!(
-        wait_until(WAIT, || b.uncertain()
-            == vec!["Training Plan.md".to_string()]),
+        wait_until(WAIT, || b.kinds("move").len() == 1
+            && w.text("Weekly Review.md").contains("@tephra:")),
         "{:?}",
         b.entries()
     );
+    assert!(b.uncertain().is_empty(), "{:?}", b.entries());
     assert!(b.kinds("rename").is_empty());
-    assert_eq!(w.text("Weekly Review.md"), weekly, "no link was touched");
+    assert_eq!(
+        w.text("Weekly Review.md"),
+        "# Weekly Review\n\nThis week: [[@tephra:Training Plan]].\n"
+    );
     assert!(!w.indexed("notes", "Training Plan.md"));
     assert!(w.indexed("tephra", "Training Plan.md"));
 }
@@ -357,7 +360,8 @@ fn a_file_moved_to_another_source_while_down_is_a_delete_and_a_create() {
 #[test]
 fn a_hash_in_two_sources_is_not_used_to_pair_a_rename_inside_one() {
     let w = World::new(&GP1_FILES);
-    // The same content also appears in the other source.
+    // The same content also appears in the other source: two candidates
+    // for the vanished file across all sources, so no pair (FR21).
     let text = w.text("Training Plan.md");
     w.tephra.write("copy.md", &text);
     w.rename("Training Plan.md", "Plan.md");

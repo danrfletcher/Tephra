@@ -12,6 +12,10 @@ use tephra_cache::FixLogRow;
 /// A fix of a rename: the links to a file that moved.
 pub const KIND_RENAME: &str = "rename";
 
+/// A fix of a move: the links to, and in, a file that went from one
+/// source to another (G6). One entry for the whole move.
+pub const KIND_MOVE: &str = "move";
+
 /// A file that vanished with no certain pair: its links are broken and
 /// nothing is queued (G10).
 pub const KIND_UNCERTAIN: &str = "uncertain";
@@ -194,7 +198,7 @@ impl FixNotice {
 
 /// One entry of `fix.list`'s answer: time, kind, source(s), old, new,
 /// files changed and status (G18). `new` is `null` for an uncertain
-/// entry, which has no pair.
+/// entry, which has no pair; that entry also carries `message`, why.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FixEntryWire {
     pub id: i64,
@@ -206,6 +210,11 @@ pub struct FixEntryWire {
     pub new: Option<String>,
     pub files_changed: i64,
     pub status: String,
+    /// Why an `uncertain` entry has no fix (for example "vanished, no
+    /// certain pair: links broken"). Left out of the JSON for every
+    /// other kind, so their shape is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 impl From<&FixLogRow> for FixEntryWire {
@@ -225,6 +234,9 @@ impl From<&FixLogRow> for FixEntryWire {
             new: row.new_path.clone(),
             files_changed: row.files_changed,
             status: row.status.clone(),
+            message: (row.kind == KIND_UNCERTAIN)
+                .then(|| FixDetail::parse(row.detail_json.as_deref()).message)
+                .flatten(),
         }
     }
 }

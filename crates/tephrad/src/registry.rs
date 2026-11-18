@@ -29,7 +29,7 @@ use tephra_cache::{Cache, CacheError, SourceRow, SourceStatus};
 
 use crate::catch_up::{self, BootHooks};
 use crate::ignore::IgnoreRules;
-use crate::rename_detect::{self, RenameFixer, SourceRenames};
+use crate::rename_detect::{self, RenameFixer, RenamePool, SourceRenames};
 use crate::scan::{self, ScanError, ScanStats};
 use crate::watcher::{self, WatchError, WatcherHandle};
 use crate::writer_gate::{self, WriterGate};
@@ -320,9 +320,6 @@ struct RunningSource {
     /// reflects the rescan's rules immediately, rather than only the
     /// stale rules captured when the watcher was first started.
     ignore_rules: Arc<RwLock<IgnoreRules>>,
-    /// The task that wakes this source's rename detector when a hold
-    /// ends ([`rename_detect::run_holds`]). Ends with the source.
-    _hold_task: AbortOnDrop,
 }
 
 /// Aborts its task when dropped, so the task cannot outlive the source
@@ -463,10 +460,15 @@ pub struct SourceRegistry {
     /// fix engine, set once by the daemon. While unset, watchers index
     /// a rename as a delete and a create, as before.
     rename_fixer: Arc<RwLock<Option<Arc<dyn RenameFixer>>>>,
-    /// How long a rename the OS did not identify waits before it is
-    /// applied ([`watcher::RENAME_HOLD`] unless a test shortens it).
-    /// Read when a source's watcher is started.
-    rename_hold: Mutex<std::time::Duration>,
+    /// The pending-delete pool every source's watcher feeds: what
+    /// vanished and appeared and is not paired yet, across ALL sources
+    /// (G6), and where each source is. The hold a rename the OS did not
+    /// identify waits is [`watcher::RENAME_HOLD`] unless a test shortens
+    /// it ([`SourceRegistry::set_rename_hold`]).
+    renames: Arc<RenamePool>,
+    /// The one task that wakes the pool's detector when a hold ends
+    /// ([`rename_detect::run_holds`]).
+    _hold_task: AbortOnDrop,
 }
 
 /// What [`SourceRegistry::start_all`] did with one source.
@@ -531,6 +533,32 @@ impl SourceRegistry {
         let (events_tx, _rx) = tokio::sync::broadcast::channel(1024);
         let cache_path = cache.path().to_path_buf();
         let gate = writer_gate::for_path(&cache_path);
+        let renames = Arc::new(RenamePool::new(watcher::RENAME_HOLD));
+        let rename_fixer: Arc<RwLock<Option<Arc<dyn RenameFixer>>>> = Arc::new(RwLock::new(None));
+        // G2, G6: a rename the OS did not identify waits a hold. The
+        // task that ends it runs on the registry's runtime and hands the
+        // fix to the blocking pool, like a batch. Its clock stands still
+        // while a pause or the writer gate is active.
+        let hold_task = {
+            let pool = Arc::clone(&renames);
+            let pool_for_blocked = Arc::clone(&renames);
+            let fixer_slot = Arc::clone(&rename_fixer);
+            let blocking = runtime.handle().clone();
+            let gate = Arc::clone(&gate);
+            runtime.spawn(rename_detect::run_holds(
+                Arc::clone(&renames.detector),
+                Arc::clone(&renames.wake),
+                move || pool_for_blocked.any_paused() || gate.is_busy(),
+                move |decisions| {
+                    let fixer = fixer_slot.read().unwrap_or_else(|p| p.into_inner()).clone();
+                    let Some(fixer) = fixer else { return };
+                    let pool = Arc::clone(&pool);
+                    drop(blocking.spawn_blocking(move || {
+                        pool.dispatch(&*fixer, decisions);
+                    }));
+                },
+            ))
+        };
         Ok(SourceRegistry {
             cache: Arc::new(Mutex::new(cache)),
             cache_path,
@@ -540,16 +568,17 @@ impl SourceRegistry {
             events_tx,
             permission_denied: Mutex::new(HashSet::new()),
             write_pause: Mutex::new(WritePause::default()),
-            rename_fixer: Arc::new(RwLock::new(None)),
-            rename_hold: Mutex::new(watcher::RENAME_HOLD),
+            rename_fixer,
+            renames,
+            _hold_task: AbortOnDrop(hold_task),
         })
     }
 
-    /// Replaces the hold a hash-only rename waits ([`watcher::RENAME_HOLD`])
-    /// for every watcher started from now on. For a test that cannot
+    /// Replaces the hold a hash-only rename waits ([`watcher::RENAME_HOLD`]),
+    /// for the one pool every source shares. For a test that cannot
     /// wait the real two seconds.
     pub fn set_rename_hold(&self, hold: std::time::Duration) {
-        *self.rename_hold.lock().unwrap_or_else(|p| p.into_inner()) = hold;
+        self.renames.set_hold(hold);
     }
 
     /// Subscribes to this registry's internal `source_changed` event
@@ -732,7 +761,7 @@ impl SourceRegistry {
         let renames = Arc::new(SourceRenames::new(
             name.clone(),
             root.clone(),
-            *self.rename_hold.lock().unwrap_or_else(|p| p.into_inner()),
+            Arc::clone(&self.renames),
         ));
         let renames_for_batch = Arc::clone(&renames);
         let fixer_for_batch = Arc::clone(&self.rename_fixer);
@@ -886,30 +915,7 @@ impl SourceRegistry {
         let pause = watcher::WatcherPause::new(on_batch);
         let pause_for_handler = pause.clone();
 
-        // G2: a rename the OS did not identify waits a hold. The task
-        // that ends it runs on the registry's runtime and hands the
-        // fix to the blocking pool, like a batch. Its clock stands
-        // still while a pause or the writer gate is active.
-        let hold_task = {
-            let renames = Arc::clone(&renames);
-            let fixer_slot = Arc::clone(&self.rename_fixer);
-            let blocking = self.runtime.handle().clone();
-            let pause = pause.clone();
-            let gate = Arc::clone(&self.gate);
-            self.runtime.spawn(rename_detect::run_holds(
-                Arc::clone(&renames.detector),
-                Arc::clone(&renames.wake),
-                move || pause.is_paused() || gate.is_busy(),
-                move |decisions| {
-                    let fixer = fixer_slot.read().unwrap_or_else(|p| p.into_inner()).clone();
-                    let Some(fixer) = fixer else { return };
-                    let renames = Arc::clone(&renames);
-                    drop(blocking.spawn_blocking(move || {
-                        rename_detect::dispatch(&*fixer, &renames.source, &renames.root, decisions);
-                    }));
-                },
-            ))
-        };
+        self.renames.add_source(&name, root.clone(), pause.clone());
 
         let handle = watcher::spawn_debounce(
             tap,
@@ -924,7 +930,6 @@ impl SourceRegistry {
                 handle,
                 pause,
                 ignore_rules,
-                _hold_task: AbortOnDrop(hold_task),
             },
         );
         Ok(renames)
@@ -1015,6 +1020,7 @@ impl SourceRegistry {
         if let Some(running) = self.running.lock().unwrap().remove(name) {
             running.handle.stop();
         }
+        self.renames.remove_source(name);
         self.set_permission_denied(name, false);
         let cache = self.cache.lock().unwrap();
         retry_cache_on_busy(&self.gate, || cache.delete_source(name))?;
@@ -1294,8 +1300,9 @@ impl SourceRegistry {
         }
 
         // 3. Hash the new files that could be a vanished file's twin
-        // (size equal to a vanished file's, in any source), then keep
-        // only the hashes that are unique across sources (FR21).
+        // (size equal to a vanished file's, in any source). Whether a
+        // hash is unique across the sources (FR21) is for the pool the
+        // sources share ([`rename_detect::pair`]).
         if !stopped {
             let sizes = catch_up::size_matches(boots.iter().filter_map(|b| b.diff.as_ref()));
             for boot in boots.iter_mut() {
@@ -1303,20 +1310,6 @@ impl SourceRegistry {
                 let hashes = catch_up::hash_new_files(diff, &boot.root, &sizes, hooks.hash_file);
                 boot.vanished = catch_up::vanished_facts(diff);
                 boot.appeared = catch_up::appeared_facts(diff, &hashes);
-            }
-            let mut facts: Vec<_> = boots
-                .iter_mut()
-                .map(|b| {
-                    (
-                        std::mem::take(&mut b.vanished),
-                        std::mem::take(&mut b.appeared),
-                    )
-                })
-                .collect();
-            catch_up::drop_cross_source_hashes(&mut facts);
-            for (boot, (vanished, appeared)) in boots.iter_mut().zip(facts) {
-                boot.vanished = vanished;
-                boot.appeared = appeared;
             }
         }
 

@@ -48,7 +48,7 @@ Every command takes `--json` (raw structured output) and `--addr <addr>` (daemon
 | `link refactor --source <name> --old <path> --new <path> [--apply] [--yes]` | Preview or apply the link rewrites a file move needs. |
 | `block-id <unit-id> --line <n>` or `--symbol <name>` | Give a block an ID and print the link to it. |
 | `backlinks <id>` | The links to one file (`@s:path`) or one block (`@s:path#^id`), one row per link with its line. |
-| `fixes [--since <30m\|2h\|7d\|date>] [--json]` | The log of automatic link fixes (`fix.list`), newest first: `time kind old -> new (n files) status`. It only reads. |
+| `fixes [--since <30m\|2h\|7d\|date>] [--json]` | The log of automatic link fixes (`fix.list`), newest first: `time kind old -> new (n files) status`; an `uncertain` line ends with ` - why`. It only reads. |
 | `daemon install`, `daemon uninstall`, `daemon status` | Run `tephrad` as a launchd agent (macOS only). |
 
 Searches never change how a link resolves: an unprefixed `[[Name]]` resolves only inside its own source.

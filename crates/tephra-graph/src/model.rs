@@ -415,6 +415,23 @@ impl UnitGraph {
         out
     }
 
+    /// Every outgoing link of `id`, one edge per link occurrence, with
+    /// none of [`UnitGraph::get_forward_links`]'s query-display
+    /// collapse: two links that name the same unit in different words
+    /// (`[[A]]` and `[[A|alias]]`) are two edges here, which a caller
+    /// that rewrites every spelling needs (the links of a file that
+    /// moved to another source). Sorted for deterministic output; empty
+    /// when `id` has no links or does not exist.
+    pub fn get_forward_links_all(&self, id: &str) -> Vec<Edge> {
+        let mut out: Vec<Edge> = self
+            .forward_index
+            .get(id)
+            .map(|idxs| idxs.iter().filter_map(|&i| self.edges[i].clone()).collect())
+            .unwrap_or_default();
+        out.sort_by(edge_sort_key);
+        out
+    }
+
     /// `graph.get_backlinks` (G4, G16): the links to `id`, one row per
     /// link occurrence — `(from, line)` — so two links in one file are
     /// two rows, and sorted for deterministic output. (Occurrences

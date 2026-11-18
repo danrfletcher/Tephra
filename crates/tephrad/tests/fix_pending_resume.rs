@@ -205,8 +205,9 @@ fn a_kill_after_n_writes_resumes_with_the_rest_and_never_touches_a_written_file_
 fn a_kill_after_the_list_was_stored_and_before_any_write_resumes_all_three() {
     let w = world();
     // The state a kill right after the transaction leaves: entry and
-    // rows, nothing written. The engine's own hook cannot stop before
-    // the first write, so the transaction is made with the cache API.
+    // rows, nothing written, made here with the cache API (the engine's
+    // `with_stop_after_writes(0)` leaves the same state, for a fix it
+    // starts itself).
     let c = cache(&w);
     let files: Vec<_> = RENAMED
         .iter()

@@ -46,6 +46,7 @@ use tephra_graph::{Edge, UnitGraph};
 use crate::refactor::fix_write::{
     FileFixRequest, FileWriteResult, FixWriter, RewriteMode, WriteStatus,
 };
+use crate::refactor::{MoveRewrite, OwnLink};
 
 pub use log::{FixDetail, FixEntryWire, FixNotice};
 pub use pending::Verdict;
@@ -53,7 +54,7 @@ pub use retry::Trigger;
 
 use log::{
     overall_status, FileEntry, FILE_NEEDS_MANUAL_FIX, FILE_NOTHING_TO_FIX, FILE_PENDING,
-    FILE_WRITTEN, KIND_RENAME, KIND_UNCERTAIN, STATUS_UNCERTAIN,
+    FILE_WRITTEN, KIND_MOVE, KIND_RENAME, KIND_UNCERTAIN, STATUS_UNCERTAIN,
 };
 
 /// What an uncertain entry says when the watcher logs it.
@@ -252,6 +253,9 @@ pub struct FixSpec {
 /// path (a file's, or a folder's), and the work, one row per linking
 /// file per moved file.
 struct Plan {
+    /// [`KIND_RENAME`], or [`KIND_MOVE`] for a file that went to another
+    /// source.
+    kind: &'static str,
     old_source: String,
     new_source: String,
     entry_old: String,
@@ -402,9 +406,10 @@ impl FixEngine {
     }
 
     /// Test hook: each call stops, with [`FixError::Stopped`], right
-    /// after the `n`-th file it writes has been recorded. Nothing is
-    /// rolled back or finished: the cache and the disk are as a kill at
-    /// that moment leaves them.
+    /// after the `n`-th file it writes has been recorded; with `n` of 0
+    /// it stops after the entry and its work list are stored and before
+    /// the first file is written. Nothing is rolled back or finished:
+    /// the cache and the disk are as a kill at that moment leaves them.
     pub fn with_stop_after_writes(mut self, n: usize) -> Self {
         self.stop_after_writes = Some(n);
         self
@@ -534,7 +539,7 @@ impl FixEngine {
         let files = {
             let cache = self.open()?;
             let graph = UnitGraph::build_from_cache(&cache)?;
-            linking_files(&graph, source, old_path, new_path)?
+            linking_files(&graph, source, old_path, source, new_path)?
         };
         self.begin_fix_announced(&FixSpec {
             old_source: source.to_string(),
@@ -582,7 +587,7 @@ impl FixEngine {
                 // A moved file that cannot be fixed (not a unit now, or
                 // its old path is one again) is left out; the rest
                 // still are.
-                let Ok(files) = linking_files(&graph, source, old, new) else {
+                let Ok(files) = linking_files(&graph, source, old, source, new) else {
                     continue;
                 };
                 for file in files {
@@ -596,12 +601,116 @@ impl FixEngine {
             rows.into_iter().collect::<Vec<_>>()
         };
         self.begin_plan(&Plan {
+            kind: KIND_RENAME,
             old_source: source.to_string(),
             new_source: source.to_string(),
             entry_old: old_dir.to_string(),
             entry_new: new_dir.to_string(),
             rows,
         })
+    }
+
+    /// Fixes the links of a file that went from `old_source` to
+    /// `new_source` (G6), as ONE entry of kind `move`: the links in the
+    /// old source (rewrite 1), the links in the new one (rewrite 2) and
+    /// the moved file's own links (rewrite 3). Every file is stored in
+    /// the pending list in one transaction before the first write.
+    /// `Refused` when `new_path` is not a unit of `new_source`, or the
+    /// old path still is one of `old_source` (the move was not indexed).
+    pub fn begin_move_announced(
+        &self,
+        old_source: &str,
+        old_path: &str,
+        new_source: &str,
+        new_path: &str,
+    ) -> Result<(FixEntryWire, FixAnnouncement), FixError> {
+        let rows = {
+            let cache = self.open()?;
+            let graph = UnitGraph::build_from_cache(&cache)?;
+            let files = linking_files(&graph, old_source, old_path, new_source, new_path)?;
+            let mut rows: BTreeSet<PlanRow> = files
+                .into_iter()
+                .map(|file| PlanRow {
+                    file,
+                    old: old_path.to_string(),
+                    new: new_path.to_string(),
+                })
+                .collect();
+            // The moved file's own links, when it has any that change.
+            let own = own_links(&graph, old_source, old_path, new_source, new_path);
+            if !own.1.is_empty() {
+                rows.insert(PlanRow {
+                    file: (new_source.to_string(), new_path.to_string()),
+                    old: old_path.to_string(),
+                    new: new_path.to_string(),
+                });
+            }
+            rows.into_iter().collect::<Vec<_>>()
+        };
+        self.begin_plan(&Plan {
+            kind: KIND_MOVE,
+            old_source: old_source.to_string(),
+            new_source: new_source.to_string(),
+            entry_old: old_path.to_string(),
+            entry_new: new_path.to_string(),
+            rows,
+        })
+    }
+
+    /// Whether the log has this exact move already, and it still stands
+    /// (the watcher's pairing and an exact event are two signals of one
+    /// move, E7). It stands when no later `rename` or `move` entry took
+    /// the file away from the new place again, or brought a file back to
+    /// the old one: after `A -> B`, `B -> A`, a second `A -> B` is a new
+    /// move to fix, not the first one seen twice (the log chain, as for a
+    /// rename in `state::decide`).
+    pub(crate) fn move_logged(
+        &self,
+        old_source: &str,
+        old_path: &str,
+        new_source: &str,
+        new_path: &str,
+    ) -> Result<bool, FixError> {
+        let cache = self.open()?;
+        // Both sources' entries, oldest first (id order); a move names
+        // both, so a same-source pair is read twice and deduplicated.
+        let mut log = cache.fix_log_summaries(old_source)?;
+        if new_source != old_source {
+            log.extend(cache.fix_log_summaries(new_source)?);
+        }
+        log.sort_by_key(|e| e.id);
+        log.dedup_by_key(|e| e.id);
+
+        let at = |source: &Option<String>, path: &Option<String>, want: (&str, &str)| {
+            source.as_deref() == Some(want.0) && path.as_deref() == Some(want.1)
+        };
+        let Some(last) = log.iter().rev().find(|e| {
+            e.kind == KIND_MOVE
+                && at(&e.old_source, &e.old_path, (old_source, old_path))
+                && at(&e.new_source, &e.new_path, (new_source, new_path))
+        }) else {
+            return Ok(false);
+        };
+        let undone = log.iter().any(|e| {
+            e.id > last.id
+                && (e.kind == KIND_MOVE || e.kind == KIND_RENAME)
+                && (at(&e.old_source, &e.old_path, (new_source, new_path))
+                    || at(&e.new_source, &e.new_path, (old_source, old_path)))
+        });
+        Ok(!undone)
+    }
+
+    /// Whether the log has `path` of `source` leaving it by a recent
+    /// move to another source.
+    pub(crate) fn move_departed(&self, source: &str, path: &str) -> Result<bool, FixError> {
+        let cache = self.open()?;
+        let now = self.clock.now();
+        Ok(cache.fix_log_summaries(source)?.into_iter().any(|e| {
+            e.kind == KIND_MOVE
+                && e.old_source.as_deref() == Some(source)
+                && e.old_path.as_deref() == Some(path)
+                && now - e.created_at <= UNCERTAIN_DEDUPE_SECS
+        }))
     }
 
     /// Logs ONE entry for the rename and stores every linking file in
@@ -619,6 +728,11 @@ impl FixEngine {
     ) -> Result<(FixEntryWire, FixAnnouncement), FixError> {
         let files: BTreeSet<&(String, String)> = spec.files.iter().collect();
         self.begin_plan(&Plan {
+            kind: if spec.old_source == spec.new_source {
+                KIND_RENAME
+            } else {
+                KIND_MOVE
+            },
             old_source: spec.old_source.clone(),
             new_source: spec.new_source.clone(),
             entry_old: spec.old_path.clone(),
@@ -668,7 +782,7 @@ impl FixEngine {
         let (fix_id, _) = cache.start_fix(
             &NewFixLog {
                 created_at: now,
-                kind: KIND_RENAME.to_string(),
+                kind: plan.kind.to_string(),
                 status: overall_status(&detail.files).to_string(),
                 old_source: Some(plan.old_source.clone()),
                 old_path: Some(plan.entry_old.clone()),
@@ -771,6 +885,9 @@ impl FixEngine {
         }
         let graph = UnitGraph::build_from_cache(cache)?;
         let mut writes = 0usize;
+        if self.stop_after_writes == Some(0) {
+            return Err(FixError::Stopped);
+        }
         for pick in picks {
             let wrote = self.process(cache, &graph, pick, &mut summary)?;
             if let Some(file) = wrote {
@@ -848,14 +965,48 @@ impl FixEngine {
         }
 
         let old_path = row.old_path.clone().unwrap_or_default();
-        let old_id = format!(
-            "@{}:{}",
-            row.old_source.as_deref().unwrap_or_default(),
-            old_path
-        );
+        let old_source = row.old_source.clone().unwrap_or_default();
+        let old_id = format!("@{old_source}:{old_path}");
         let new_id = format!("@{target_source}:{target_path}");
         let file_id = format!("@{}:{}", row.source, row.file_path);
-        let edges = file_edges(graph, &old_id, &new_id, &file_id);
+        let bare_resolves = graph
+            .shortest_unique_target(&new_id)
+            .is_some_and(|t| !t.contains('/'));
+        // A file that went to another source is fixed by one of the three
+        // rewrites of a move, by where the linking file is (G6).
+        let (edges, mode) = if old_source == target_source {
+            (
+                file_edges(graph, &old_id, &new_id, &file_id),
+                RewriteMode::Fix { bare_resolves },
+            )
+        } else if file_id == new_id {
+            let (edges, links) =
+                own_links(graph, &old_source, &old_path, &target_source, &target_path);
+            (
+                edges,
+                RewriteMode::Move(MoveRewrite::Own {
+                    new_path: target_path.clone(),
+                    bare_resolves,
+                    links,
+                }),
+            )
+        } else if row.source == target_source {
+            (
+                file_edges(graph, &old_id, &new_id, &file_id),
+                RewriteMode::Move(MoveRewrite::NewSource {
+                    new_path: target_path.clone(),
+                    bare_resolves,
+                }),
+            )
+        } else {
+            (
+                file_edges(graph, &old_id, &new_id, &file_id),
+                RewriteMode::Move(MoveRewrite::OldSource {
+                    new_source: target_source.clone(),
+                    new_path: target_path.clone(),
+                }),
+            )
+        };
         if edges.is_empty() {
             self.finish(
                 cache,
@@ -866,9 +1017,6 @@ impl FixEngine {
             return Ok(None);
         }
 
-        let bare_resolves = graph
-            .shortest_unique_target(&new_id)
-            .is_some_and(|t| !t.contains('/'));
         let abs_path = Path::new(&source.path).join(&row.file_path);
         let mut req = FileFixRequest::new(
             file_id,
@@ -876,7 +1024,7 @@ impl FixEngine {
             edges,
             old_path,
             target_path,
-            RewriteMode::Fix { bare_resolves },
+            mode,
         );
         req.chain = chain.clone();
         req.prior_rounds = prior_rounds;
@@ -1051,26 +1199,29 @@ fn file_edges(graph: &UnitGraph, old_id: &str, new_id: &str, file_id: &str) -> V
         .collect()
 }
 
-/// Every file with a wikilink that named `old_path`, as `(source, path)`.
+/// Every file with a wikilink that named `old_path` of `old_source`,
+/// as `(source, path)`, after it was renamed (or moved to another source)
+/// to `new_path` of `new_source`.
 fn linking_files(
     graph: &UnitGraph,
-    source: &str,
+    old_source: &str,
     old_path: &str,
+    new_source: &str,
     new_path: &str,
 ) -> Result<Vec<(String, String)>, FixError> {
-    let old_id = format!("@{source}:{old_path}");
-    let new_id = format!("@{source}:{new_path}");
-    if old_path == new_path {
+    let old_id = format!("@{old_source}:{old_path}");
+    let new_id = format!("@{new_source}:{new_path}");
+    if old_source == new_source && old_path == new_path {
         return Ok(Vec::new());
     }
     if graph.unit(&new_id).is_none() {
         return Err(FixError::Refused(format!(
-            "'{new_path}' is not a unit in source '{source}'"
+            "'{new_path}' is not a unit in source '{new_source}'"
         )));
     }
     if graph.unit(&old_id).is_some() {
         return Err(FixError::Refused(format!(
-            "'{old_path}' is still a unit in source '{source}': the rename has not been indexed"
+            "'{old_path}' is still a unit in source '{old_source}': the rename has not been indexed"
         )));
     }
     let files: BTreeSet<(String, String)> = graph
@@ -1088,6 +1239,68 @@ fn linking_files(
         })
         .collect();
     Ok(files.into_iter().collect())
+}
+
+/// What the links of the moved file itself need when it went from
+/// `old_source` to `new_source` (rewrite 3): the file's wikilink edges
+/// that change, and what each changes to (see [`OwnLink`]). Every link
+/// of the file is looked at in the graph as it is after the move; where
+/// it pointed before is worked out by resolving it in the source the
+/// file left (the old file is no unit of it any more).
+fn own_links(
+    graph: &UnitGraph,
+    old_source: &str,
+    old_path: &str,
+    new_source: &str,
+    new_path: &str,
+) -> (Vec<Edge>, HashMap<String, OwnLink>) {
+    let new_id = format!("@{new_source}:{new_path}");
+    let (old_stem, _) = crate::refactor::strip_md_ext_pub(old_path);
+    let old_base = old_stem.rsplit('/').next().unwrap_or(old_stem);
+    let names_old_file = |target: &str| {
+        let (t, _) = crate::refactor::strip_md_ext_pub(target);
+        t.eq_ignore_ascii_case(old_stem) || t.eq_ignore_ascii_case(old_base)
+    };
+    let mut edges = Vec::new();
+    let mut links: HashMap<String, OwnLink> = HashMap::new();
+    for edge in graph.get_forward_links_all(&new_id) {
+        if edge.kind != tephra_parser::LINK_KIND_WIKILINK {
+            continue;
+        }
+        let w = tephra_parser::parse_wikilink_inner(&edge.to_raw);
+        if w.target.is_empty() {
+            continue;
+        }
+        let file_ref = |source: &str| format!("@{source}:{}", w.target);
+        let action = match w.source_prefix.as_deref() {
+            None => match graph.resolve_link(&file_ref(old_source), None) {
+                Ok(_) => Some(OwnLink::AddPrefix(old_source.to_string())),
+                Err(_) if names_old_file(&w.target) => Some(OwnLink::SelfLink),
+                Err(_) => None,
+            },
+            Some(p) if p == old_source => {
+                // `@old:<own old path>`: the file itself. Anything else
+                // with that prefix still names the other source, right.
+                let full = crate::refactor::strip_md_ext_pub(&w.target).0;
+                full.eq_ignore_ascii_case(old_stem)
+                    .then_some(OwnLink::SelfLink)
+            }
+            Some(p) if p == new_source => {
+                let prefixed = graph.resolve_link(&file_ref(new_source), None);
+                let bare = graph.resolve_link(&w.target, Some(new_source));
+                match (prefixed, bare) {
+                    (Ok(a), Ok(b)) if a.unit.id == b.unit.id => Some(OwnLink::DropPrefix),
+                    _ => None,
+                }
+            }
+            Some(_) => None,
+        };
+        if let Some(action) = action {
+            links.insert(edge.to_raw.clone(), action);
+            edges.push(edge);
+        }
+    }
+    (edges, links)
 }
 
 /// `changed` (paths on disk) relative to the root of `source`. Paths
@@ -1178,6 +1391,46 @@ impl crate::rename_detect::RenameFixer for FixEngine {
             .map_err(|e| e.to_string())
     }
 
+    fn fix_move(
+        &self,
+        old_source: &str,
+        old: &str,
+        new_source: &str,
+        new: &str,
+    ) -> Result<(), String> {
+        // E7: the same move may be in the log already (an exact event got
+        // there first). The pairing then does nothing.
+        let _decision = self.decision_guard();
+        if self
+            .move_logged(old_source, old, new_source, new)
+            .map_err(|e| e.to_string())?
+        {
+            return Ok(());
+        }
+        match self.begin_move_announced(old_source, old, new_source, new) {
+            Ok((e, a)) => {
+                log_entry(&e);
+                self.announce_or_collect(a);
+                Ok(())
+            }
+            // The new file is not a unit (ignored, not indexed) or the
+            // old one still is: the pair is no move Tephra can fix, and
+            // the vanished side is reported like any other.
+            Err(FixError::Refused(why)) => {
+                tracing::debug!(old_source, old, new_source, new, %why, "move refused by the engine");
+                self.record_uncertain_inner(
+                    old_source,
+                    old,
+                    MSG_UNCERTAIN,
+                    Dedupe::AfterOutsideEvent,
+                )
+                .map(|e| log_entry(&e))
+                .map_err(|e| e.to_string())
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
     fn record_uncertain(&self, source: &str, path: &str) -> Result<(), String> {
         // An exact event moved this file already: its links were fixed
         // (or reported), so the vanishing is no news (G4).
@@ -1185,6 +1438,9 @@ impl crate::rename_detect::RenameFixer for FixEngine {
         if self
             .log_says_departed(source, path)
             .map_err(|e| e.to_string())?
+            || self
+                .move_departed(source, path)
+                .map_err(|e| e.to_string())?
         {
             return Ok(());
         }

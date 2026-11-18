@@ -175,6 +175,162 @@ pub fn compute_fix_changes(
     )
 }
 
+/// What one link in the moved file itself needs (see
+/// [`MoveRewrite::Own`]), decided by the caller from the graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnLink {
+    /// An unprefixed link that resolved in the source the file left:
+    /// it now names that source, so the link gains `@<source>:`.
+    AddPrefix(String),
+    /// A link prefixed with the source the file is in now, which
+    /// resolves inside that source without the prefix: it loses it.
+    DropPrefix,
+    /// A link to the moved file itself: it names the new path in the
+    /// shortest unique form, never with a prefix.
+    SelfLink,
+}
+
+/// How the links in one file change when a file moves from one source
+/// to another (G6). Wikilinks only, like every automatic fix (F7).
+/// Every cross-source link written carries an explicit `@source:`
+/// prefix (F11); none is written bare.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MoveRewrite {
+    /// Rewrite 1: a file that is not in the source the file moved to
+    /// (the one it left, or any other). A link that named the old path
+    /// becomes `@<new_source>:<new stem>`; anchor and alias stay.
+    OldSource {
+        new_source: String,
+        new_path: String,
+    },
+    /// Rewrite 2: a file in the source the file moved to. A link written
+    /// `@<old_source>:<old path>` becomes the shortest unique target in
+    /// its own source, with no prefix. `bare_resolves` is whether the
+    /// bare file name reaches the moved file there.
+    NewSource {
+        new_path: String,
+        bare_resolves: bool,
+    },
+    /// Rewrite 3: the moved file's own links, by the raw text of each
+    /// link (the key of `links`). A link not in `links` is left alone.
+    Own {
+        new_path: String,
+        bare_resolves: bool,
+        links: HashMap<String, OwnLink>,
+    },
+}
+
+/// The shortest target text for `new_path` in its own source: the bare
+/// file name when `bare_resolves`, else the full stem. The extension is
+/// dropped (`.md`, `.markdown`); another extension stays.
+fn shortest_target(new_path: &str, bare_resolves: bool) -> String {
+    let (stem, _) = strip_md_ext(new_path);
+    let core = if bare_resolves { basename(stem) } else { stem };
+    core.to_string()
+}
+
+/// Puts a wikilink's parts back together: `[@prefix:]target[#anchor][|alias]`.
+fn join_wikilink(
+    prefix: Option<&str>,
+    target: &str,
+    anchor: Option<&str>,
+    alias: Option<&str>,
+) -> String {
+    let mut out = String::new();
+    if let Some(p) = prefix {
+        out.push('@');
+        out.push_str(p);
+        out.push(':');
+    }
+    out.push_str(target);
+    if let Some(a) = anchor {
+        out.push('#');
+        out.push_str(a);
+    }
+    if let Some(a) = alias {
+        out.push('|');
+        out.push_str(a);
+    }
+    out
+}
+
+/// The new raw text of one wikilink under `rewrite`, or `None` when the
+/// link stays as it is. Pure: the raw text in, the raw text out; the
+/// anchor (heading or `^block` id) and the alias are never touched.
+pub fn move_new_raw(to_raw: &str, rewrite: &MoveRewrite) -> Option<String> {
+    let w = tephra_parser::parse_wikilink_inner(to_raw);
+    if w.target.is_empty() {
+        return None;
+    }
+    let anchor = w.anchor.as_deref();
+    let alias = w.alias.as_deref();
+    let new_raw = match rewrite {
+        MoveRewrite::OldSource {
+            new_source,
+            new_path,
+        } => {
+            let (stem, _) = strip_md_ext(new_path);
+            join_wikilink(Some(new_source), stem, anchor, alias)
+        }
+        MoveRewrite::NewSource {
+            new_path,
+            bare_resolves,
+        } => {
+            let target = shortest_target(new_path, *bare_resolves);
+            join_wikilink(None, &target, anchor, alias)
+        }
+        MoveRewrite::Own {
+            new_path,
+            bare_resolves,
+            links,
+        } => match links.get(to_raw)? {
+            OwnLink::AddPrefix(source) => join_wikilink(Some(source), &w.target, anchor, alias),
+            OwnLink::DropPrefix => join_wikilink(None, &w.target, anchor, alias),
+            OwnLink::SelfLink => {
+                let target = shortest_target(new_path, *bare_resolves);
+                join_wikilink(None, &target, anchor, alias)
+            }
+        },
+    };
+    (new_raw != to_raw).then_some(new_raw)
+}
+
+/// [`compute_fix_changes`] for a file that moved to another source:
+/// the span changes `rewrite` implies for the wikilinks in `edges`,
+/// found again in the text of `file_contents`. Same shape and same
+/// span-exact guarantees as the rename rewrite: only link text changes.
+pub fn compute_move_changes(
+    edges: &[Edge],
+    file_contents: &HashMap<String, String>,
+    rewrite: &MoveRewrite,
+) -> Vec<LinkChange> {
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut out = Vec::new();
+    for edge in edges {
+        if edge.kind.as_str() != tephra_parser::LINK_KIND_WIKILINK {
+            continue;
+        }
+        let Some(content) = file_contents.get(&edge.from) else {
+            continue;
+        };
+        if !seen.insert((edge.from.clone(), edge.to_raw.clone())) {
+            continue;
+        }
+        let Some(new_raw) = move_new_raw(&edge.to_raw, rewrite) else {
+            continue;
+        };
+        out.extend(locate_and_diff(
+            &edge.from,
+            content,
+            &edge.kind,
+            &edge.to_raw,
+            &new_raw,
+        ));
+    }
+    out.sort_by_key(|a| (a.file.clone(), a.line));
+    out
+}
+
 /// The one body behind [`compute_changes`] and [`compute_fix_changes`].
 /// `fix` is `None` for the manual refactor (every kind, a bare target
 /// always rewritten to the new basename) and `Some(bare_resolves)` for
@@ -609,6 +765,12 @@ fn strip_md_ext(p: &str) -> (&str, Option<&str>) {
         }
     }
     (p, None)
+}
+
+/// [`strip_md_ext`] for the fix engine: the path without a `.md` or
+/// `.markdown` extension, and the extension.
+pub(crate) fn strip_md_ext_pub(p: &str) -> (&str, Option<&str>) {
+    strip_md_ext(p)
 }
 
 fn basename(p: &str) -> &str {
@@ -1448,6 +1610,175 @@ mod tests {
             offline: false,
             line: None,
         }
+    }
+
+    // --- compute_move_changes (G6) ----------------------------------------
+
+    /// One edge per distinct raw wikilink of `text` as the graph would hold
+    /// it: `from` is the file, every link dangling (what a move leaves).
+    fn dangling_edges(from: &str, raws: &[&str]) -> Vec<Edge> {
+        raws.iter()
+            .map(|raw| Edge {
+                from: from.to_string(),
+                to: EdgeTarget::Dangling,
+                to_raw: (*raw).to_string(),
+                kind: tephra_parser::LINK_KIND_WIKILINK.to_string(),
+                offline: false,
+                line: None,
+            })
+            .collect()
+    }
+
+    /// `text` after `compute_move_changes` and the real span rewrite.
+    fn moved_text(from: &str, text: &str, raws: &[&str], rewrite: &MoveRewrite) -> String {
+        let contents = HashMap::from([(from.to_string(), text.to_string())]);
+        let changes = compute_move_changes(&dangling_edges(from, raws), &contents, rewrite);
+        let refs: Vec<&LinkChange> = changes.iter().collect();
+        apply_changes_to_content(text, &refs).expect("the spans apply")
+    }
+
+    /// The link kinds the rewrites have to survive, in one file.
+    const LINK_KINDS: &str = "---\nrelated: \"[[Rename Notes]]\"\n---\n\
+        plain [[Rename Notes]], alias [[Rename Notes|the notes]], embed ![[Rename Notes]],\n\
+        block [[Rename Notes#^k3f9a2]], heading [[Rename Notes#Goals|goals]],\n\
+        with extension [[Rename Notes.md]], prefixed [[@notes:Ideas/Rename Notes]],\n\
+        other [[Unrelated]], markdown [text](Rename%20Notes.md), code `[[Rename Notes]]`\n";
+
+    #[test]
+    fn rewrite_one_names_the_new_source_with_the_full_path_and_keeps_anchor_alias_and_embed() {
+        let rewrite = MoveRewrite::OldSource {
+            new_source: "tephra".into(),
+            new_path: "docs/rename-notes.md".into(),
+        };
+        let raws = [
+            "Rename Notes",
+            "Rename Notes|the notes",
+            "Rename Notes#^k3f9a2",
+            "Rename Notes#Goals|goals",
+            "Rename Notes.md",
+            "@notes:Ideas/Rename Notes",
+        ];
+        let out = moved_text("@notes:Index.md", LINK_KINDS, &raws, &rewrite);
+        assert_eq!(
+            out,
+            "---\nrelated: \"[[@tephra:docs/rename-notes]]\"\n---\n\
+        plain [[@tephra:docs/rename-notes]], alias [[@tephra:docs/rename-notes|the notes]], embed ![[@tephra:docs/rename-notes]],\n\
+        block [[@tephra:docs/rename-notes#^k3f9a2]], heading [[@tephra:docs/rename-notes#Goals|goals]],\n\
+        with extension [[@tephra:docs/rename-notes]], prefixed [[@tephra:docs/rename-notes]],\n\
+        other [[Unrelated]], markdown [text](Rename%20Notes.md), code `[[Rename Notes]]`\n"
+        );
+    }
+
+    #[test]
+    fn rewrite_two_drops_the_prefix_and_writes_the_shortest_unique_path() {
+        let raws = [
+            "@notes:Ideas/Rename Notes",
+            "@notes:Ideas/Rename Notes|notes",
+            "@notes:Ideas/Rename Notes#^k3f9a2",
+        ];
+        let text = "a [[@notes:Ideas/Rename Notes]] b [[@notes:Ideas/Rename Notes|notes]] c ![[@notes:Ideas/Rename Notes#^k3f9a2]]\n";
+        let bare = MoveRewrite::NewSource {
+            new_path: "docs/rename-notes.md".into(),
+            bare_resolves: true,
+        };
+        assert_eq!(
+            moved_text("@tephra:Readme.md", text, &raws, &bare),
+            "a [[rename-notes]] b [[rename-notes|notes]] c ![[rename-notes#^k3f9a2]]\n"
+        );
+        // Another file of that name in the source: the full stem is the
+        // shortest that resolves.
+        let full = MoveRewrite::NewSource {
+            new_path: "docs/rename-notes.md".into(),
+            bare_resolves: false,
+        };
+        assert_eq!(
+            moved_text("@tephra:Readme.md", text, &raws, &full),
+            "a [[docs/rename-notes]] b [[docs/rename-notes|notes]] c ![[docs/rename-notes#^k3f9a2]]\n"
+        );
+    }
+
+    #[test]
+    fn rewrite_three_prefixes_links_that_resolved_in_the_old_source_and_unprefixes_the_self_link() {
+        let links = HashMap::from([
+            ("Other Note".to_string(), OwnLink::AddPrefix("notes".into())),
+            (
+                "Other Note|alias".to_string(),
+                OwnLink::AddPrefix("notes".into()),
+            ),
+            (
+                "Other Note#^b1".to_string(),
+                OwnLink::AddPrefix("notes".into()),
+            ),
+            ("Rename Notes".to_string(), OwnLink::SelfLink),
+            ("Rename Notes#^k3f9a2".to_string(), OwnLink::SelfLink),
+            ("@tephra:docs/sibling".to_string(), OwnLink::DropPrefix),
+        ]);
+        let rewrite = MoveRewrite::Own {
+            new_path: "docs/rename-notes.md".into(),
+            bare_resolves: true,
+            links,
+        };
+        let raws = [
+            "Other Note",
+            "Other Note|alias",
+            "Other Note#^b1",
+            "Rename Notes",
+            "Rename Notes#^k3f9a2",
+            "@tephra:docs/sibling",
+            "Not Planned",
+        ];
+        let text = "[[Other Note]] [[Other Note|alias]] ![[Other Note#^b1]] self [[Rename Notes]] [[Rename Notes#^k3f9a2]] [[@tephra:docs/sibling]] [[Not Planned]]\n";
+        assert_eq!(
+            moved_text("@tephra:docs/rename-notes.md", text, &raws, &rewrite),
+            "[[@notes:Other Note]] [[@notes:Other Note|alias]] ![[@notes:Other Note#^b1]] self [[rename-notes]] [[rename-notes#^k3f9a2]] [[docs/sibling]] [[Not Planned]]\n"
+        );
+    }
+
+    #[test]
+    fn a_move_rewrite_never_touches_markdown_links_or_text_outside_link_spans() {
+        let rewrite = MoveRewrite::OldSource {
+            new_source: "tephra".into(),
+            new_path: "docs/rename-notes.md".into(),
+        };
+        let mut edges = dangling_edges("@notes:Index.md", &["Rename Notes"]);
+        edges.push(Edge {
+            kind: tephra_parser::LINK_KIND_MARKDOWN.to_string(),
+            to_raw: "Rename%20Notes.md".into(),
+            ..edges[0].clone()
+        });
+        let text = "keep [[Rename Notes]] and [x](Rename%20Notes.md) as they are\n";
+        let contents = HashMap::from([("@notes:Index.md".to_string(), text.to_string())]);
+        let changes = compute_move_changes(&edges, &contents, &rewrite);
+        assert_eq!(changes.len(), 1, "only the wikilink: {changes:?}");
+        let refs: Vec<&LinkChange> = changes.iter().collect();
+        assert_eq!(
+            apply_changes_to_content(text, &refs).unwrap(),
+            "keep [[@tephra:docs/rename-notes]] and [x](Rename%20Notes.md) as they are\n"
+        );
+    }
+
+    #[test]
+    fn move_new_raw_is_pure_and_leaves_a_link_it_has_no_rule_for() {
+        let own = MoveRewrite::Own {
+            new_path: "docs/a.md".into(),
+            bare_resolves: true,
+            links: HashMap::new(),
+        };
+        assert_eq!(move_new_raw("Anything", &own), None);
+        let one = MoveRewrite::OldSource {
+            new_source: "tephra".into(),
+            new_path: "docs/a.md".into(),
+        };
+        assert_eq!(
+            move_new_raw("#Heading", &one),
+            None,
+            "an anchor-only link has no target"
+        );
+        assert_eq!(
+            move_new_raw("@tephra:docs/a", &one),
+            None,
+            "a link already written as the rewrite would write it is not changed"
+        );
     }
 
     // --- compute_changes --------------------------------------------------

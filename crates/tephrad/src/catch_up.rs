@@ -17,15 +17,12 @@
 //!   size equals the size of some vanished file with a hash, in any
 //!   source. Everything else is not read, so a start with nothing
 //!   changed reads no file at all.
-//! - [`drop_cross_source_hashes`] (FR21): a hash that vanished or
-//!   appeared in more than one source is not unique, so it pairs
-//!   nothing. A pair across two sources is a move, which a later PR
-//!   applies; until then its sides stay a plain delete and create, and
-//!   the vanished one is logged uncertain.
 //!
 //! What the pairing rule does with these facts is
 //! [`crate::rename_detect`], the same rule the live watcher uses: a
-//! unique hash pair waits the hold, an ambiguous one is no pair, and
+//! unique hash pair waits the hold, an ambiguous one is no pair, a hash
+//! is unique only over ALL sources together (FR21: the sources share
+//! one pool, so a file gone from one and new in another is a move), and
 //! there is no similarity (F5). A catch-up has no OS rename flags, so
 //! every pair here is a hash pair: a file renamed and edited while down
 //! (E3) is uncertain.
@@ -187,6 +184,7 @@ pub fn vanished_facts(diff: &Diff) -> Vec<Vanished> {
     diff.vanished
         .iter()
         .map(|v| Vanished {
+            source: String::new(),
             path: v.path.clone(),
             identity: v.identity,
             hash: v.hash.clone(),
@@ -201,51 +199,13 @@ pub fn appeared_facts(diff: &Diff, hashes: &HashMap<String, String>) -> Vec<Appe
     diff.new
         .iter()
         .map(|f| Appeared {
+            source: String::new(),
             path: f.path.clone(),
             identity: None,
             hash: hashes.get(&f.path).cloned(),
             os: None,
         })
         .collect()
-}
-
-/// FR21 across sources: removes the hash of every file whose hash is
-/// shared with a vanished or new file of another source. What is left
-/// without a hash cannot pair, so such a file is a plain delete or
-/// create (and an uncertain vanish), whatever the other source holds.
-/// A hash that is only in one source is left for the pairing rule,
-/// which decides within the source.
-pub fn drop_cross_source_hashes(sources: &mut [(Vec<Vanished>, Vec<Appeared>)]) {
-    let mut seen_in: HashMap<String, HashSet<usize>> = HashMap::new();
-    for (i, (vanished, appeared)) in sources.iter().enumerate() {
-        let hashes = vanished
-            .iter()
-            .filter_map(|v| v.hash.as_deref())
-            .chain(appeared.iter().filter_map(|a| a.hash.as_deref()));
-        for h in hashes {
-            seen_in.entry(h.to_string()).or_default().insert(i);
-        }
-    }
-    let shared: HashSet<String> = seen_in
-        .into_iter()
-        .filter(|(_, in_sources)| in_sources.len() > 1)
-        .map(|(h, _)| h)
-        .collect();
-    if shared.is_empty() {
-        return;
-    }
-    for (vanished, appeared) in sources.iter_mut() {
-        for v in vanished.iter_mut() {
-            if v.hash.as_ref().is_some_and(|h| shared.contains(h)) {
-                v.hash = None;
-            }
-        }
-        for a in appeared.iter_mut() {
-            if a.hash.as_ref().is_some_and(|h| shared.contains(h)) {
-                a.hash = None;
-            }
-        }
-    }
 }
 
 // ---------------------------------------------------------------
@@ -661,6 +621,7 @@ mod tests {
 
     fn v(path: &str, hash: Option<&str>) -> Vanished {
         Vanished {
+            source: String::new(),
             path: path.into(),
             identity: None,
             hash: hash.map(str::to_string),
@@ -670,6 +631,7 @@ mod tests {
 
     fn a(path: &str, hash: Option<&str>) -> Appeared {
         Appeared {
+            source: String::new(),
             path: path.into(),
             identity: None,
             hash: hash.map(str::to_string),
@@ -690,75 +652,6 @@ mod tests {
             appeared_facts(&d, &hashes),
             vec![a("new.md", Some("h")), a("other.md", None)]
         );
-    }
-
-    #[test]
-    fn a_hash_in_one_source_only_is_left_for_the_pairing_rule() {
-        let mut s = vec![
-            (vec![v("o.md", Some("h"))], vec![a("n.md", Some("h"))]),
-            (vec![v("x.md", Some("g"))], vec![]),
-        ];
-        let before = s.clone();
-        drop_cross_source_hashes(&mut s);
-        assert_eq!(s, before);
-    }
-
-    #[test]
-    fn a_vanished_in_one_source_and_a_new_in_another_pair_nothing() {
-        // A move between sources: not applied until a later PR.
-        let mut s = vec![
-            (vec![v("o.md", Some("h"))], vec![]),
-            (vec![], vec![a("n.md", Some("h"))]),
-        ];
-        drop_cross_source_hashes(&mut s);
-        assert_eq!(s[0].0[0].hash, None);
-        assert_eq!(s[1].1[0].hash, None);
-    }
-
-    #[test]
-    fn a_second_candidate_in_another_source_makes_the_pair_in_the_first_ambiguous() {
-        // One vanished and one new share `h` in source 0, and source 1
-        // has a second new file with it: two candidates anywhere.
-        let mut s = vec![
-            (vec![v("o.md", Some("h"))], vec![a("n.md", Some("h"))]),
-            (
-                vec![],
-                vec![a("copy.md", Some("h")), a("other.md", Some("k"))],
-            ),
-        ];
-        drop_cross_source_hashes(&mut s);
-        assert_eq!(s[0].0[0].hash, None);
-        assert_eq!(s[0].1[0].hash, None);
-        assert_eq!(s[1].1[0].hash, None);
-        assert_eq!(
-            s[1].1[1].hash.as_deref(),
-            Some("k"),
-            "an unrelated hash is kept"
-        );
-    }
-
-    #[test]
-    fn two_candidates_in_one_source_are_left_for_the_pairing_rule() {
-        // Within a source `pair` refuses the ambiguous hash itself (and
-        // lets the folder rule settle a renamed folder).
-        let mut s = vec![(
-            vec![v("a.md", Some("h")), v("b.md", Some("h"))],
-            vec![a("c.md", Some("h")), a("d.md", Some("h"))],
-        )];
-        let before = s.clone();
-        drop_cross_source_hashes(&mut s);
-        assert_eq!(s, before);
-    }
-
-    #[test]
-    fn a_file_without_a_hash_is_never_dropped_or_matched() {
-        let mut s = vec![
-            (vec![v("o.md", None)], vec![]),
-            (vec![], vec![a("n.md", None)]),
-        ];
-        let before = s.clone();
-        drop_cross_source_hashes(&mut s);
-        assert_eq!(s, before);
     }
 
     // ---- the disk --------------------------------------------------

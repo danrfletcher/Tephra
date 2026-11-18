@@ -10,6 +10,7 @@
 //! sleep (the project has learned fixed-timeout waits on real
 //! watchers flake).
 
+mod fix_world;
 mod fixtures;
 
 use std::time::{Duration, Instant};
@@ -1271,4 +1272,81 @@ fn a_boot_started_watcher_is_paused_resumed_and_stopped_like_a_registered_one() 
         registry.list().unwrap().is_empty(),
         "the source and its rows are gone"
     );
+}
+
+/// E17 for a move between sources: the three rewrites are Tephra's own
+/// writes to files of two sources. They must start no new batch and no
+/// second log entry: the watchers of both sources read the writes as
+/// the fix's own, not as edits, and not as a vanish or a create to pair.
+#[test]
+fn a_cross_source_moves_three_rewrites_start_no_new_batch_and_no_second_log_entry() {
+    const TARGET: &str = "# Target\n\nBack to [[Sibling]], me again [[Target]].\n";
+    let notes = [
+        ("Ideas/Target.md", TARGET),
+        ("Sibling.md", "# Sibling\n"),
+        ("Index.md", "plain [[Target]] and ![[Target]]\n"),
+    ];
+    let others = [
+        ("Reader.md", "reads [[@notes:Ideas/Target]]\n"),
+        ("Elsewhere.md", "# Elsewhere\n"),
+    ];
+    let rewritten = |d: &fix_world::Daemon| {
+        [
+            d.text("Index.md"),
+            d.other_text("Reader.md"),
+            d.other_text("docs/target.md"),
+        ]
+    };
+    let d = fix_world::Daemon::start(&notes, &others, fix_world::real_writer(), true);
+    d.registry
+        .set_rename_hold(std::time::Duration::from_millis(300));
+    let mut client = d.connect();
+    let mut events = d.registry.subscribe();
+
+    let to = d.other.root().join("docs/target.md");
+    std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+    std::fs::rename(d.notes.root().join("Ideas/Target.md"), to).unwrap();
+
+    let (push, _) = client.next_fix_push(fix_world::WAIT);
+    let Some(push) = push else {
+        assert!(!d.watcher_live, "no fix was pushed: {:?}", d.entries());
+        eprintln!("the OS watcher was deaf; nothing to check");
+        d.close();
+        return;
+    };
+    assert_eq!(fix_world::fixes_of(&push)[0]["kind"], "move");
+    assert_eq!(fix_world::fixes_of(&push)[0]["files_changed"], 3);
+    // The writes of the three rewrites are all on disk once the push is out.
+    let fixed = rewritten(&d);
+    assert!(fixed[0].contains("[[@other:docs/target]]"), "{fixed:?}");
+    assert!(fixed[1].contains("[[target]]"), "{fixed:?}");
+    assert!(fixed[2].contains("[[@notes:Sibling]]"), "{fixed:?}");
+
+    // Past the debounce window of both watchers: nothing more.
+    let later = client.drain(fix_world::QUIET);
+    assert!(
+        fix_world::with_fixes(&later).is_empty(),
+        "a second batch made a fix: {later:?}"
+    );
+    let mut seen = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        seen.push(event);
+    }
+    for tephrad::registry::DaemonEvent::SourceChanged { paths, .. } in &seen {
+        assert!(
+            paths
+                .iter()
+                .all(|p| !p.to_string_lossy().contains(".tephra-tmp-")),
+            "a temp file of the writer was reported: {paths:?}"
+        );
+    }
+    let entries = d.entries();
+    assert_eq!(entries.len(), 1, "one entry only: {entries:?}");
+    assert_eq!(entries[0].kind, "move");
+    assert_eq!(
+        rewritten(&d),
+        fixed,
+        "no file was rewritten a second time, or by a second fix"
+    );
+    d.close();
 }

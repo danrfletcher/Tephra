@@ -1547,6 +1547,8 @@ fn note_appeared(
 ) -> Result<(), ScanError> {
     if let Some(row) = cache.get_unit_by_rel_path(source_id, rel_path)? {
         appeared.push(crate::rename_detect::Appeared {
+            // The registry names the source when it takes the facts in.
+            source: String::new(),
             path: rel_path.to_string(),
             identity: identity_of(&row),
             hash: row.hash,
@@ -1569,6 +1571,7 @@ fn note_vanished(
         rows.insert(0, own);
     }
     vanished.extend(rows.into_iter().map(|row| crate::rename_detect::Vanished {
+        source: String::new(),
         identity: identity_of(&row),
         path: row.rel_path,
         hash: row.hash,

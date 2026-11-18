@@ -172,7 +172,8 @@ async fn fix_list_answers_the_log_newest_first_with_the_documented_shape_body(ri
         json!({
             "id": rows[0]["id"], "time": 3000, "kind": "uncertain",
             "sources": ["notes"], "old": "Gone.md", "new": null,
-            "files_changed": 0, "status": "uncertain"
+            "files_changed": 0, "status": "uncertain",
+            "message": "vanished, no certain pair: links broken"
         })
     );
 

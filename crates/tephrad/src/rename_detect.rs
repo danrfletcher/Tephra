@@ -11,14 +11,21 @@
 //!    are the vanished row's ([`OsMark`], [`Identity`]);
 //! 2. the file identity itself (part of 1);
 //! 3. an exact content hash: exactly one vanished and one new file in
-//!    the source share it; or, when several share it, the path under a
-//!    renamed folder (`Old/a.md` and `New/a.md`) names the pair.
+//!    ALL the sources together share it (FR21); or, when several share
+//!    it inside one source, the path under a renamed folder (`Old/a.md`
+//!    and `New/a.md`) names the pair.
+//!
+//! The pool of what is not paired yet spans every registered source
+//! (G6): a file that vanished from one source and a file with the same
+//! hash that appeared in another are one `move`, never a delete and a
+//! create. The facts carry the name of their source.
 //!
 //! There is no similarity, edit distance or guessing. A pair by 1 is
 //! certain with no wait. A pair by 3 alone ([`Basis::Hash`]) waits a
 //! hold ([`crate::watcher::RENAME_HOLD`]) in case another twin turns
-//! up; so does a pair by the relative path under a folder. Where 1 and 3 disagree, 1 wins: a renamed and edited file has a
-//! new hash and the OS still says it is the same file.
+//! up, in any source; so does a pair by the relative path under a
+//! folder. Where 1 and 3 disagree, 1 wins: a renamed and edited file
+//! has a new hash and the OS still says it is the same file.
 //!
 //! Three layers, each testable alone:
 //!
@@ -33,11 +40,12 @@
 //!
 //! [`dispatch`] turns the detector's decisions into calls on a
 //! [`RenameFixer`] (in production, [`crate::fixes::FixEngine`]): one fix
-//! per file, one fix per renamed folder, and an `uncertain` log entry
-//! for a vanished file that got no certain pair.
+//! per file, one fix per renamed folder, one `move` per file that
+//! crossed from one source to another, and an `uncertain` log entry for
+//! a vanished file that got no certain pair.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -66,6 +74,10 @@ pub struct Identity {
 /// OS said about its path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Vanished {
+    /// The source it vanished from. Filled in by the registry when the
+    /// facts are handed to the pool ([`SourceRenames::on_batch`]); the
+    /// code that finds the facts does not know the source's name.
+    pub source: String,
     /// Relative to the source's root.
     pub path: String,
     pub identity: Option<Identity>,
@@ -78,6 +90,8 @@ pub struct Vanished {
 /// OS said about its path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Appeared {
+    /// The source it appeared in (see [`Vanished::source`]).
+    pub source: String,
     pub path: String,
     pub identity: Option<Identity>,
     /// `None` for a file over the size cap (identity only), or one not
@@ -105,19 +119,25 @@ pub struct Pair {
     pub basis: Basis,
 }
 
-/// The pairing rule (G1, E3, E4, F5). Pure: facts in, pairs out.
+/// The pairing rule (G1, G6, E3, E4, F5, FR21). Pure: facts in, pairs
+/// out. The facts come from every source at once (the pool spans all
+/// of them), so a file that vanished from one source and one that
+/// appeared in another can pair: that is a move.
 ///
 /// First the OS pass: a vanished file and a new file are a pair when
 /// both carry equal [`OsMark`]s (the flag, or the same cookie) and their
 /// [`Identity`] is equal. Hashes play no part, so a renamed and edited
 /// file pairs. Then the hash pass over what is left: a hash that exactly
-/// one vanished and exactly one new file have is a pair. Two files with
-/// the same hash on either side are ambiguous and pair with nothing,
-/// unless their paths differ only by the folder prefix: then a last
-/// pass pairs them by relative path ([`relative_path_pairs`]). A pair
-/// never has the same old and new path: a path seen gone in one batch
-/// and new in a later one is not a rename to itself, so its vanished
-/// side stays unpaired and ends up `uncertain`.
+/// one vanished and exactly one new file have, counted over ALL sources
+/// together, is a pair. Two files with the same hash on either side
+/// are ambiguous and pair with nothing, wherever they are: two empty
+/// files that vanish in one source and one that appears in another make
+/// no pair. Inside one source, files whose paths differ only by the
+/// folder prefix are then paired by relative path
+/// ([`relative_path_pairs`]); that pass never looks across sources. A
+/// pair never has the same source and path on both sides: a path seen
+/// gone in one batch and new in a later one is not a rename to itself,
+/// so its vanished side stays unpaired and ends up `uncertain`.
 pub fn pair(vanished: &[Vanished], appeared: &[Appeared]) -> Vec<Pair> {
     let mut pairs = Vec::new();
     let mut used_v = vec![false; vanished.len()];
@@ -128,7 +148,10 @@ pub fn pair(vanished: &[Vanished], appeared: &[Appeared]) -> Vec<Pair> {
             continue;
         };
         let found = appeared.iter().enumerate().find(|(ai, a)| {
-            !used_a[*ai] && a.path != v.path && a.os == Some(mark) && a.identity == Some(identity)
+            !used_a[*ai]
+                && !(a.source == v.source && a.path == v.path)
+                && a.os == Some(mark)
+                && a.identity == Some(identity)
         });
         if let Some((ai, _)) = found {
             used_v[vi] = true;
@@ -159,11 +182,16 @@ pub fn pair(vanished: &[Vanished], appeared: &[Appeared]) -> Vec<Pair> {
             |(h, vs)| match (vs.as_slice(), by_hash_a.get(h)?.as_slice()) {
                 // A path that is on both sides (seen gone in one batch
                 // and new in a later one) was not renamed to itself.
-                ([vi], [ai]) if vanished[*vi].path != appeared[*ai].path => Some(Pair {
-                    vanished: *vi,
-                    appeared: *ai,
-                    basis: Basis::Hash,
-                }),
+                ([vi], [ai])
+                    if (&vanished[*vi].source, &vanished[*vi].path)
+                        != (&appeared[*ai].source, &appeared[*ai].path) =>
+                {
+                    Some(Pair {
+                        vanished: *vi,
+                        appeared: *ai,
+                        basis: Basis::Hash,
+                    })
+                }
                 _ => None,
             },
         )
@@ -218,7 +246,9 @@ fn relative_path_pairs(
             continue;
         };
         for (ai, a) in appeared.iter().enumerate() {
-            if used_a[ai] || a.hash.as_deref() != Some(h) {
+            // A folder is renamed inside its own source: a pair across
+            // sources is a move of one file, never a folder.
+            if used_a[ai] || a.source != v.source || a.hash.as_deref() != Some(h) {
                 continue;
             }
             let shared = shared_tail(&v.path, &a.path);
@@ -255,12 +285,24 @@ fn relative_path_pairs(
 // Holding what is not paired yet
 // ---------------------------------------------------------------
 
-/// A certain rename.
+/// A certain rename, or, when `source` and `to_source` differ, a move
+/// from one source to another (G6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rename {
+    /// The source the file left.
+    pub source: String,
     pub from: String,
+    /// The source the file is in now.
+    pub to_source: String,
     pub to: String,
     pub basis: Basis,
+}
+
+impl Rename {
+    /// Whether the file crossed from one source to another.
+    pub fn is_move(&self) -> bool {
+        self.source != self.to_source
+    }
 }
 
 /// What [`Detector`] decided.
@@ -283,8 +325,9 @@ impl Decisions {
     }
 }
 
-/// The files of one source that are not paired yet, and when each was
-/// first seen. Never reads a clock: every call takes `now`.
+/// The files of every source that are not paired yet, and when each was
+/// first seen: the pending-delete pool, which spans all sources (G6).
+/// Never reads a clock: every call takes `now`.
 ///
 /// - An OS pair is decided the moment both ends are known.
 /// - A hash pair is decided `hold` after the later of its two ends was
@@ -325,6 +368,26 @@ impl Detector {
         !self.vanished.is_empty()
     }
 
+    /// Sets the hold for what is ingested from now on and for what is
+    /// held already (a hold is measured from when a file was first seen,
+    /// so a longer hold lengthens every wait).
+    pub fn set_hold(&mut self, hold: Duration) {
+        self.hold = hold;
+    }
+
+    /// Drops everything held for `source`: it was unregistered, so
+    /// nothing in it is gone or new any more.
+    pub fn forget_source(&mut self, source: &str) {
+        let take_v: HashSet<usize> = (0..self.vanished.len())
+            .filter(|&i| self.vanished[i].source == source)
+            .collect();
+        let take_a: HashSet<usize> = (0..self.appeared.len())
+            .filter(|&i| self.appeared[i].source == source)
+            .collect();
+        retain_not(&mut self.vanished, &mut self.vanished_since, &take_v);
+        retain_not(&mut self.appeared, &mut self.appeared_since, &take_a);
+    }
+
     /// Takes in what one batch found and decides what can be decided.
     pub fn ingest(
         &mut self,
@@ -335,7 +398,11 @@ impl Detector {
         let seen = self.frozen_at.unwrap_or(now);
         for v in vanished {
             // The same path vanishing again replaces what was held.
-            if let Some(i) = self.vanished.iter().position(|h| h.path == v.path) {
+            if let Some(i) = self
+                .vanished
+                .iter()
+                .position(|h| h.source == v.source && h.path == v.path)
+            {
                 self.vanished[i] = v;
                 self.vanished_since[i] = seen;
                 continue;
@@ -344,7 +411,11 @@ impl Detector {
             self.vanished_since.push(seen);
         }
         for a in appeared {
-            if let Some(i) = self.appeared.iter().position(|h| h.path == a.path) {
+            if let Some(i) = self
+                .appeared
+                .iter()
+                .position(|h| h.source == a.source && h.path == a.path)
+            {
                 self.appeared[i] = a;
                 self.appeared_since[i] = seen;
                 continue;
@@ -440,7 +511,9 @@ impl Detector {
                 take_v.insert(p.vanished);
                 take_a.insert(p.appeared);
                 out.renames.push(Rename {
+                    source: self.vanished[p.vanished].source.clone(),
                     from: self.vanished[p.vanished].path.clone(),
+                    to_source: self.appeared[p.appeared].source.clone(),
                     to: self.appeared[p.appeared].path.clone(),
                     basis: p.basis,
                 });
@@ -672,6 +745,16 @@ pub trait RenameFixer: Send + Sync {
         new_dir: &str,
         moves: &[(String, String)],
     ) -> Result<(), String>;
+    /// Fixes the links to `old` of `old_source` after the file moved to
+    /// `new` of `new_source` (G6): the links in the old source, the links
+    /// in the new one and the moved file's own. One entry of kind `move`.
+    fn fix_move(
+        &self,
+        old_source: &str,
+        old: &str,
+        new_source: &str,
+        new: &str,
+    ) -> Result<(), String>;
     /// Logs a file that vanished with no certain pair (G10).
     fn record_uncertain(&self, source: &str, path: &str) -> Result<(), String>;
     /// [`dispatch`] calls this before the first fix of a batch and
@@ -691,78 +774,179 @@ impl Drop for BatchGuard<'_> {
     }
 }
 
+/// Where a source's root is, by name. `None` for a source that is not
+/// registered (any more).
+pub type RootOf<'a> = &'a dyn Fn(&str) -> Option<PathBuf>;
+
 /// Fixes every certain rename in `decisions` and logs every vanished
 /// file that was given up. A folder is fixed as one when its old path
 /// is really gone from disk ([`group_folders`]); otherwise (two files
 /// moved out of a folder that is still there) each file is fixed on its
-/// own.
+/// own. A file that went from one source to another is a move
+/// ([`RenameFixer::fix_move`]), one fix per file; a folder is only ever
+/// renamed inside its source.
 ///
 /// A rename whose old and new path are equal is no rename ([`pair`]
 /// never makes one). If one arrives anyway it is not fixed; when the
 /// path is gone from disk it is logged `uncertain` like any vanished
 /// file with no pair.
-pub fn dispatch(fixer: &dyn RenameFixer, source: &str, root: &Path, decisions: Decisions) {
+pub fn dispatch(fixer: &dyn RenameFixer, root_of: RootOf<'_>, decisions: Decisions) {
     fixer.start_batch();
     let _batch = BatchGuard(fixer);
-    let (selfs, renames): (Vec<Rename>, Vec<Rename>) =
-        decisions.renames.into_iter().partition(|r| r.from == r.to);
+    let (selfs, rest): (Vec<Rename>, Vec<Rename>) = decisions
+        .renames
+        .into_iter()
+        .partition(|r| !r.is_move() && r.from == r.to);
     for r in selfs {
-        if !root.join(&r.from).exists() {
-            if let Err(e) = fixer.record_uncertain(source, &r.from) {
-                tracing::warn!(source, path = %r.from, error = %e, "could not log an uncertain vanish");
+        let gone = root_of(&r.source).is_some_and(|root| !root.join(&r.from).exists());
+        if gone {
+            if let Err(e) = fixer.record_uncertain(&r.source, &r.from) {
+                tracing::warn!(source = %r.source, path = %r.from, error = %e, "could not log an uncertain vanish");
             }
         }
     }
-    for change in group_folders(renames, |dir| !root.join(dir).exists()) {
-        let result = match change {
-            Change::File(r) => fixer.fix_rename(source, &r.from, &r.to),
-            Change::Folder {
-                old_dir,
-                new_dir,
-                files,
-            } => {
-                let moves: Vec<(String, String)> = files
-                    .iter()
-                    .map(|r| (r.from.clone(), r.to.clone()))
-                    .collect();
-                fixer.fix_folder_rename(source, &old_dir, &new_dir, &moves)
+    let (moves, renames): (Vec<Rename>, Vec<Rename>) = rest.into_iter().partition(Rename::is_move);
+
+    // The renames of each source, in the order they were decided.
+    let mut by_source: Vec<(String, Vec<Rename>)> = Vec::new();
+    for r in renames {
+        match by_source.iter_mut().find(|(s, _)| *s == r.source) {
+            Some((_, list)) => list.push(r),
+            None => by_source.push((r.source.clone(), vec![r])),
+        }
+    }
+    for (source, list) in by_source {
+        let root = root_of(&source);
+        let gone = |dir: &str| root.as_ref().is_none_or(|root| !root.join(dir).exists());
+        for change in group_folders(list, gone) {
+            let result = match change {
+                Change::File(r) => fixer.fix_rename(&source, &r.from, &r.to),
+                Change::Folder {
+                    old_dir,
+                    new_dir,
+                    files,
+                } => {
+                    let moves: Vec<(String, String)> = files
+                        .iter()
+                        .map(|r| (r.from.clone(), r.to.clone()))
+                        .collect();
+                    fixer.fix_folder_rename(&source, &old_dir, &new_dir, &moves)
+                }
+            };
+            if let Err(e) = result {
+                tracing::warn!(source = %source, error = %e, "automatic link fix of a rename failed");
             }
-        };
-        if let Err(e) = result {
-            tracing::warn!(source, error = %e, "automatic link fix of a rename failed");
+        }
+    }
+    for m in moves {
+        if let Err(e) = fixer.fix_move(&m.source, &m.from, &m.to_source, &m.to) {
+            tracing::warn!(from = %m.source, to = %m.to_source, error = %e, "automatic link fix of a move failed");
         }
     }
     for v in decisions.gave_up_vanished {
-        if let Err(e) = fixer.record_uncertain(source, &v.path) {
-            tracing::warn!(source, path = %v.path, error = %e, "could not log an uncertain vanish");
+        if let Err(e) = fixer.record_uncertain(&v.source, &v.path) {
+            tracing::warn!(source = %v.source, path = %v.path, error = %e, "could not log an uncertain vanish");
         }
     }
     for a in decisions.gave_up_appeared {
-        tracing::debug!(source, path = %a.path, "new file had no vanished twin: a plain create");
+        tracing::debug!(source = %a.source, path = %a.path, "new file had no vanished twin: a plain create");
     }
 }
 
 // ---------------------------------------------------------------
-// One source's detector, as the registry holds it
+// The pool, as the registry holds it
 // ---------------------------------------------------------------
 
-/// What one running source keeps for rename detection: the detector,
-/// the wake-up its hold task waits on, and where the source is.
-pub struct SourceRenames {
-    pub source: String,
-    pub root: std::path::PathBuf,
+/// What every running source shares for rename detection: ONE detector
+/// (the pending-delete pool spans all sources, so a delete in one and a
+/// create in another can pair, G6), the wake-up its hold task waits on,
+/// and where each source is and whether its watcher is paused.
+pub struct RenamePool {
     pub detector: Arc<Mutex<Detector>>,
     pub wake: Arc<Notify>,
+    roots: Mutex<HashMap<String, PathBuf>>,
+    pauses: Mutex<HashMap<String, crate::watcher::WatcherPause>>,
+}
+
+impl RenamePool {
+    pub fn new(hold: Duration) -> Self {
+        RenamePool {
+            detector: Arc::new(Mutex::new(Detector::new(hold))),
+            wake: Arc::new(Notify::new()),
+            roots: Mutex::new(HashMap::new()),
+            pauses: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn set_hold(&self, hold: Duration) {
+        self.detector
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .set_hold(hold);
+    }
+
+    /// A source's watcher started: its root and pause control are known.
+    pub fn add_source(&self, source: &str, root: PathBuf, pause: crate::watcher::WatcherPause) {
+        self.roots
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(source.to_string(), root);
+        self.pauses
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(source.to_string(), pause);
+    }
+
+    /// A source's watcher stopped: what was held for it is dropped.
+    pub fn remove_source(&self, source: &str) {
+        self.roots
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(source);
+        self.pauses
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(source);
+        self.detector
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .forget_source(source);
+    }
+
+    pub fn root_of(&self, source: &str) -> Option<PathBuf> {
+        self.roots
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(source)
+            .cloned()
+    }
+
+    /// Whether any running source has its watcher paused: no hold runs
+    /// down then (a refactor is writing files).
+    pub fn any_paused(&self) -> bool {
+        self.pauses
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .any(|p| p.is_paused())
+    }
+
+    /// What the hold task and a batch hand to [`dispatch`].
+    pub fn dispatch(&self, fixer: &dyn RenameFixer, decisions: Decisions) {
+        dispatch(fixer, &|source| self.root_of(source), decisions);
+    }
+}
+
+/// One running source's way into the pool.
+pub struct SourceRenames {
+    pub source: String,
+    pub root: PathBuf,
+    pub pool: Arc<RenamePool>,
 }
 
 impl SourceRenames {
-    pub fn new(source: String, root: std::path::PathBuf, hold: Duration) -> Self {
-        SourceRenames {
-            source,
-            root,
-            detector: Arc::new(Mutex::new(Detector::new(hold))),
-            wake: Arc::new(Notify::new()),
-        }
+    pub fn new(source: String, root: PathBuf, pool: Arc<RenamePool>) -> Self {
+        SourceRenames { source, root, pool }
     }
 
     /// Takes in what one applied batch found. `marks` are what the OS
@@ -772,7 +956,7 @@ impl SourceRenames {
     pub fn on_batch(
         &self,
         fixer: &dyn RenameFixer,
-        marks: &HashMap<std::path::PathBuf, OsMark>,
+        marks: &HashMap<PathBuf, OsMark>,
         mut vanished: Vec<Vanished>,
         mut appeared: Vec<Appeared>,
     ) {
@@ -781,18 +965,20 @@ impl SourceRenames {
         }
         let mark = |rel: &str| crate::watcher::mark_of(marks, &self.root, &self.root.join(rel));
         for v in &mut vanished {
+            v.source = self.source.clone();
             v.os = mark(&v.path);
         }
         for a in &mut appeared {
+            a.source = self.source.clone();
             a.os = mark(&a.path);
         }
         let decisions = {
-            let mut d = self.detector.lock().unwrap_or_else(|p| p.into_inner());
+            let mut d = self.pool.detector.lock().unwrap_or_else(|p| p.into_inner());
             d.ingest(Instant::now(), vanished, appeared)
         };
-        self.wake.notify_one();
+        self.pool.wake.notify_one();
         if !decisions.is_empty() {
-            dispatch(fixer, &self.source, &self.root, decisions);
+            self.pool.dispatch(fixer, decisions);
         }
     }
 }
@@ -815,6 +1001,7 @@ mod tests {
         os: Option<OsMark>,
     ) -> Vanished {
         Vanished {
+            source: "notes".to_string(),
             path: path.to_string(),
             identity: ident,
             hash: hash.map(str::to_string),
@@ -829,6 +1016,7 @@ mod tests {
         os: Option<OsMark>,
     ) -> Appeared {
         Appeared {
+            source: "notes".to_string(),
             path: path.to_string(),
             identity: ident,
             hash: hash.map(str::to_string),
@@ -1229,7 +1417,9 @@ mod tests {
 
     fn r(from: &str, to: &str) -> Rename {
         Rename {
+            source: "notes".into(),
             from: from.into(),
+            to_source: "notes".into(),
             to: to.into(),
             basis: Basis::Os,
         }
@@ -1314,14 +1504,7 @@ mod tests {
             vec![van("a.md", id(1, 10), Some("h1"), c(1))],
             vec![app("b.md", id(1, 10), Some("h1"), c(1))],
         );
-        assert_eq!(
-            out.renames,
-            vec![Rename {
-                from: "a.md".into(),
-                to: "b.md".into(),
-                basis: Basis::Os
-            }]
-        );
+        assert_eq!(out.renames, vec![r("a.md", "b.md")]);
         assert!(d.is_empty());
     }
 
@@ -1643,6 +1826,19 @@ mod tests {
             ));
             Ok(())
         }
+        fn fix_move(
+            &self,
+            old_source: &str,
+            old: &str,
+            new_source: &str,
+            new: &str,
+        ) -> Result<(), String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("move {old_source}:{old} -> {new_source}:{new}"));
+            Ok(())
+        }
         fn record_uncertain(&self, source: &str, path: &str) -> Result<(), String> {
             self.0
                 .lock()
@@ -1652,14 +1848,18 @@ mod tests {
         }
     }
 
+    /// The roots `dispatch` looks a source up in: `notes` is `dir`.
+    fn notes_at(dir: &std::path::Path) -> impl Fn(&str) -> Option<PathBuf> + '_ {
+        move |source| (source == "notes").then(|| dir.to_path_buf())
+    }
+
     #[test]
     fn dispatch_fixes_a_folder_once_and_logs_the_vanished_that_were_given_up() {
         let dir = tempfile::tempdir().unwrap();
         let rec = Recorder::default();
         dispatch(
             &rec,
-            "notes",
-            dir.path(),
+            &notes_at(dir.path()),
             Decisions {
                 renames: vec![
                     r("Old/a.md", "New/a.md"),
@@ -1687,8 +1887,7 @@ mod tests {
         let rec = Recorder::default();
         dispatch(
             &rec,
-            "notes",
-            dir.path(),
+            &notes_at(dir.path()),
             Decisions {
                 renames: vec![r("Old/a.md", "New/a.md"), r("Old/b.md", "New/b.md")],
                 ..Decisions::default()
@@ -1713,8 +1912,7 @@ mod tests {
         let rec = Recorder::default();
         dispatch(
             &rec,
-            "notes",
-            dir.path(),
+            &notes_at(dir.path()),
             Decisions {
                 renames: vec![
                     r("Notes/2024/a.md", "Archive/2024/a.md"),
@@ -1737,8 +1935,7 @@ mod tests {
         let rec = Recorder::default();
         dispatch(
             &rec,
-            "notes",
-            dir.path(),
+            &notes_at(dir.path()),
             Decisions {
                 renames: vec![r("Out.md", "Out.md"), r("x.md", "y.md")],
                 ..Decisions::default()
@@ -1751,6 +1948,343 @@ mod tests {
                 "file notes x.md -> y.md".to_string(),
             ],
             "the self pair is no fix; its path is gone from disk, so it is uncertain"
+        );
+    }
+
+    // ---- across sources (G6, FR21) ---------------------------------
+
+    fn van_in(source: &str, path: &str, hash: Option<&str>) -> Vanished {
+        Vanished {
+            source: source.to_string(),
+            ..van(path, None, hash, None)
+        }
+    }
+
+    fn app_in(source: &str, path: &str, hash: Option<&str>) -> Appeared {
+        Appeared {
+            source: source.to_string(),
+            ..app(path, None, hash, None)
+        }
+    }
+
+    /// `(from source, from, to source, to)` of every pair.
+    fn cross_pairs(v: &[Vanished], a: &[Appeared]) -> Vec<(String, String, String, String)> {
+        let mut out: Vec<_> = pair(v, a)
+            .into_iter()
+            .map(|p| {
+                (
+                    v[p.vanished].source.clone(),
+                    v[p.vanished].path.clone(),
+                    a[p.appeared].source.clone(),
+                    a[p.appeared].path.clone(),
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn mv(
+        from_source: &str,
+        from: &str,
+        to_source: &str,
+        to: &str,
+    ) -> (String, String, String, String) {
+        (
+            from_source.to_string(),
+            from.to_string(),
+            to_source.to_string(),
+            to.to_string(),
+        )
+    }
+
+    struct CrossCase {
+        name: &'static str,
+        vanished: Vec<Vanished>,
+        appeared: Vec<Appeared>,
+        want: Vec<(String, String, String, String)>,
+    }
+
+    #[test]
+    fn the_pool_spans_sources_and_a_hash_is_unique_over_all_of_them() {
+        let cases = vec![
+            CrossCase {
+                name: "G6 one vanished in notes and one new in tephra with the same hash: a move",
+                vanished: vec![van_in("notes", "Ideas/Rename Notes.md", Some("h"))],
+                appeared: vec![app_in("tephra", "docs/rename-notes.md", Some("h"))],
+                want: vec![mv(
+                    "notes",
+                    "Ideas/Rename Notes.md",
+                    "tephra",
+                    "docs/rename-notes.md",
+                )],
+            },
+            CrossCase {
+                name: "G6 the same file name in both sources is still a move, not the same path",
+                vanished: vec![van_in("notes", "a.md", Some("h"))],
+                appeared: vec![app_in("tephra", "a.md", Some("h"))],
+                want: vec![mv("notes", "a.md", "tephra", "a.md")],
+            },
+            CrossCase {
+                name: "E4 two empty files vanish in notes, one appears in tephra: no pair",
+                vanished: vec![
+                    van_in("notes", "a.md", Some("empty")),
+                    van_in("notes", "b.md", Some("empty")),
+                ],
+                appeared: vec![app_in("tephra", "c.md", Some("empty"))],
+                want: vec![],
+            },
+            CrossCase {
+                name: "E4 one vanishes in notes, two appear (one per source): no pair",
+                vanished: vec![van_in("notes", "a.md", Some("h"))],
+                appeared: vec![
+                    app_in("tephra", "b.md", Some("h")),
+                    app_in("notes", "c.md", Some("h")),
+                ],
+                want: vec![],
+            },
+            CrossCase {
+                name: "E4 a second vanished with the hash in a third source: no pair",
+                vanished: vec![
+                    van_in("notes", "a.md", Some("h")),
+                    van_in("other", "z.md", Some("h")),
+                ],
+                appeared: vec![app_in("tephra", "b.md", Some("h"))],
+                want: vec![],
+            },
+            CrossCase {
+                name: "an unrelated hash is paired while the ambiguous one is not",
+                vanished: vec![
+                    van_in("notes", "a.md", Some("h")),
+                    van_in("notes", "b.md", Some("h")),
+                    van_in("notes", "x.md", Some("k")),
+                ],
+                appeared: vec![
+                    app_in("tephra", "c.md", Some("h")),
+                    app_in("tephra", "y.md", Some("k")),
+                ],
+                want: vec![mv("notes", "x.md", "tephra", "y.md")],
+            },
+            CrossCase {
+                name: "no hash on either side: nothing to pair on",
+                vanished: vec![van_in("notes", "a.md", None)],
+                appeared: vec![app_in("tephra", "a2.md", None)],
+                want: vec![],
+            },
+            CrossCase {
+                name: "E5 a copy: the original is not vanished, so there is no vanished side",
+                vanished: vec![],
+                appeared: vec![app_in("tephra", "copy.md", Some("h"))],
+                want: vec![],
+            },
+        ];
+        for case in cases {
+            assert_eq!(
+                cross_pairs(&case.vanished, &case.appeared),
+                case.want,
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn an_os_pair_across_sources_is_a_move_when_the_identity_agrees() {
+        let v = vec![Vanished {
+            source: "notes".into(),
+            ..van("a.md", id(1, 10), Some("old"), F)
+        }];
+        let a = vec![Appeared {
+            source: "tephra".into(),
+            ..app("docs/a.md", id(1, 10), Some("new"), F)
+        }];
+        assert_eq!(
+            cross_pairs(&v, &a),
+            vec![mv("notes", "a.md", "tephra", "docs/a.md")]
+        );
+        let other_inode = vec![Appeared {
+            source: "tephra".into(),
+            ..app("docs/a.md", id(1, 11), Some("new"), F)
+        }];
+        assert!(cross_pairs(&v, &other_inode).is_empty());
+    }
+
+    #[test]
+    fn a_folder_is_only_ever_renamed_inside_its_source() {
+        // Identical files under `Old/` in notes and `New/` in tephra: the
+        // relative-path pass must not pair them as a folder rename.
+        let v = vec![
+            van_in("notes", "Old/a.md", Some("h")),
+            van_in("notes", "Old/b.md", Some("h")),
+        ];
+        let a = vec![
+            app_in("tephra", "New/a.md", Some("h")),
+            app_in("tephra", "New/b.md", Some("h")),
+        ];
+        assert!(cross_pairs(&v, &a).is_empty());
+        // Inside one source the same facts pair.
+        let a_same = vec![
+            app_in("notes", "New/a.md", Some("h")),
+            app_in("notes", "New/b.md", Some("h")),
+        ];
+        assert_eq!(cross_pairs(&v, &a_same).len(), 2);
+    }
+
+    /// What the detector decides, with the clock handed in.
+    #[tokio::test(start_paused = true)]
+    async fn the_create_before_the_delete_and_the_delete_before_the_create_both_pair() {
+        for create_first in [false, true] {
+            let mut d = Detector::new(2 * SEC);
+            let v = vec![van_in("notes", "a.md", Some("h"))];
+            let a = vec![app_in("tephra", "docs/a.md", Some("h"))];
+            let (first, second) = if create_first {
+                ((vec![], a), (v, vec![]))
+            } else {
+                ((v, vec![]), (vec![], a))
+            };
+            assert!(d.ingest(Instant::now(), first.0, first.1).is_empty());
+            tokio::time::advance(SEC).await;
+            assert!(d.ingest(Instant::now(), second.0, second.1).is_empty());
+            // Held from the later of the two.
+            tokio::time::advance(Duration::from_millis(1900)).await;
+            assert!(d.expire(Instant::now()).is_empty(), "still inside the hold");
+            tokio::time::advance(Duration::from_millis(200)).await;
+            let out = d.expire(Instant::now());
+            assert_eq!(out.renames.len(), 1, "create_first = {create_first}");
+            let m = &out.renames[0];
+            assert!(m.is_move());
+            assert_eq!(
+                (
+                    m.source.as_str(),
+                    m.from.as_str(),
+                    m.to_source.as_str(),
+                    m.to.as_str()
+                ),
+                ("notes", "a.md", "tephra", "docs/a.md")
+            );
+            assert!(d.is_empty());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_partner_after_the_hold_is_no_late_move() {
+        let mut d = Detector::new(2 * SEC);
+        d.ingest(
+            Instant::now(),
+            vec![van_in("notes", "a.md", Some("h"))],
+            vec![],
+        );
+        tokio::time::advance(2 * SEC + Duration::from_millis(1)).await;
+        let out = d.expire(Instant::now());
+        assert_eq!(out.gave_up_vanished.len(), 1);
+        assert_eq!(out.gave_up_vanished[0].source, "notes");
+        let out = d.ingest(
+            Instant::now(),
+            vec![],
+            vec![app_in("tephra", "docs/a.md", Some("h"))],
+        );
+        assert!(out.renames.is_empty());
+        tokio::time::advance(3 * SEC).await;
+        let out = d.expire(Instant::now());
+        assert!(out.renames.is_empty(), "no retroactive pairing");
+        assert_eq!(out.gave_up_appeared.len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_second_candidate_in_another_source_makes_the_pair_ambiguous() {
+        let mut d = Detector::new(2 * SEC);
+        d.ingest(
+            Instant::now(),
+            vec![van_in("notes", "a.md", Some("h"))],
+            vec![app_in("tephra", "b.md", Some("h"))],
+        );
+        tokio::time::advance(SEC).await;
+        d.ingest(
+            Instant::now(),
+            vec![],
+            vec![app_in("other", "c.md", Some("h"))],
+        );
+        tokio::time::advance(3 * SEC).await;
+        let out = d.expire(Instant::now());
+        assert!(out.renames.is_empty());
+        assert_eq!(out.gave_up_vanished.len(), 1);
+        assert_eq!(out.gave_up_appeared.len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_same_path_in_two_sources_is_two_files_not_one() {
+        let mut d = Detector::new(2 * SEC);
+        // `a.md` vanishes from notes and a different file `a.md` appears
+        // in tephra with another hash: nothing pairs, and neither is
+        // mistaken for the other.
+        d.ingest(
+            Instant::now(),
+            vec![van_in("notes", "a.md", Some("h1"))],
+            vec![app_in("tephra", "a.md", Some("h2"))],
+        );
+        tokio::time::advance(3 * SEC).await;
+        let out = d.expire(Instant::now());
+        assert!(out.renames.is_empty());
+        assert_eq!(out.gave_up_vanished.len(), 1);
+        assert_eq!(out.gave_up_appeared.len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forgetting_a_source_drops_what_is_held_for_it() {
+        let mut d = Detector::new(2 * SEC);
+        d.ingest(
+            Instant::now(),
+            vec![
+                van_in("notes", "a.md", Some("h")),
+                van_in("tephra", "t.md", Some("k")),
+            ],
+            vec![app_in("notes", "n.md", Some("g"))],
+        );
+        d.forget_source("notes");
+        tokio::time::advance(3 * SEC).await;
+        let out = d.expire(Instant::now());
+        assert_eq!(out.gave_up_vanished.len(), 1);
+        assert_eq!(out.gave_up_vanished[0].source, "tephra");
+        assert!(out.gave_up_appeared.is_empty());
+        assert!(d.is_empty());
+    }
+
+    #[test]
+    fn dispatch_fixes_a_move_once_and_a_rename_in_the_old_source_as_before() {
+        let notes = tempfile::tempdir().unwrap();
+        let tephra = tempfile::tempdir().unwrap();
+        let roots = |source: &str| match source {
+            "notes" => Some(notes.path().to_path_buf()),
+            "tephra" => Some(tephra.path().to_path_buf()),
+            _ => None,
+        };
+        let rec = Recorder::default();
+        dispatch(
+            &rec,
+            &roots,
+            Decisions {
+                renames: vec![
+                    Rename {
+                        source: "notes".into(),
+                        from: "Ideas/Rename Notes.md".into(),
+                        to_source: "tephra".into(),
+                        to: "docs/rename-notes.md".into(),
+                        basis: Basis::Hash,
+                    },
+                    r("x.md", "y.md"),
+                ],
+                gave_up_vanished: vec![van_in("notes", "gone.md", None)],
+                gave_up_appeared: vec![],
+            },
+        );
+        let log = rec.0.lock().unwrap().clone();
+        assert_eq!(
+            log,
+            vec![
+                "file notes x.md -> y.md".to_string(),
+                "move notes:Ideas/Rename Notes.md -> tephra:docs/rename-notes.md".to_string(),
+                "uncertain notes gone.md".to_string(),
+            ]
         );
     }
 

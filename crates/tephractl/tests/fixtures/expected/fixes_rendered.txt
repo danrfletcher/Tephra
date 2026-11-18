@@ -1,4 +1,4 @@
-{T1794790000} uncertain Gone.md (no pair) (0 files) uncertain
+{T1794790000} uncertain Gone.md (no pair) (0 files) uncertain - vanished, no certain pair: links broken
 {T1794789000} rename Solo?[2J.md -> Single.md (2 files) partial
 {T1794788000} rename Training Plan.md -> Plan.md (3 files) applied
 {T1794787000} rename @notes:Ideas/One.md -> @work:Ideas/Uno.md (1 file) needs_manual_fix

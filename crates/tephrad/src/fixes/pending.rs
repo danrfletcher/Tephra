@@ -103,9 +103,15 @@ pub fn recheck(cache: &Cache, graph: &UnitGraph, row: &PendingFixRow) -> Result<
     let mut after = after;
     for _ in 0..=MAX_CHAIN_HOPS {
         if graph.unit(&unit_id(&source, &path)).is_some() {
-            if source != old_source {
-                // Rewriting a link across sources is not done by this
-                // writer: it is left for a person.
+            // A rename stays inside its source. A move ends in the source
+            // it went to; a target that went on to a third source (or back)
+            // is no move this row describes: it is left for a person.
+            let home = if old_source == new_source {
+                old_source
+            } else {
+                new_source
+            };
+            if source != home {
                 return Ok(finish(
                     FILE_NEEDS_MANUAL_FIX,
                     format!("the target moved to source {source}: links across sources are not rewritten"),

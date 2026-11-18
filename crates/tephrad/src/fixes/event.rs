@@ -392,6 +392,15 @@ impl FixEngine {
         Ok((!todo.is_empty()).then_some(todo))
     }
 
+    /// How many files the entry `id` has work for (written or not).
+    pub(crate) fn files_in(&self, id: i64) -> Result<usize, FixError> {
+        let cache = self.open()?;
+        let row = cache
+            .get_fix_log(id)?
+            .ok_or_else(|| FixError::Cache(format!("fix log entry {id} is gone")))?;
+        Ok(FixDetail::parse(row.detail_json.as_deref()).files.len())
+    }
+
     /// What the entry `id` says to the caller of `link.rename_event`.
     pub(crate) fn reply_of(&self, id: i64) -> Result<RenameEventWire, FixError> {
         let cache = self.open()?;
@@ -648,15 +657,23 @@ impl RenameEvents {
         let Some(new_at) = new_at else {
             return self.moved_outside(&old);
         };
-        // A move from one source to another is pooled by PR-10; nothing
-        // is guessed here.
-        if new_at.source != old.at.source || new_at.rel.is_empty() {
+        if new_at.rel.is_empty() {
             return Ok(RenameEventWire::NothingToFix);
         }
+        if offline(&new_at.source) {
+            return Err(RenameEventError::Refused {
+                reason: REASON_SOURCE_OFFLINE,
+                message: format!("source '{}' is offline", new_at.source),
+            });
+        }
+        let crosses = new_at.source != old.at.source;
         let new = Side {
             abs: new_abs,
             at: new_at,
         };
+        if crosses {
+            return self.moved(&old, &new);
+        }
 
         // A path in an ignored folder or `.tephraignore` is not indexed:
         // nothing links to it as far as Tephra knows.
@@ -667,6 +684,85 @@ impl RenameEvents {
         }
 
         self.rename(&old, &new)
+    }
+
+    /// The old path was in one source and the new one is in another
+    /// (G6): the file moved. The same move the watcher's pool pairs, so
+    /// whichever signal comes second answers `already_applied` and logs
+    /// nothing (E7). A folder is left to the watcher, which pairs its
+    /// files one by one; a copy (the old path is still there) is no move.
+    fn moved(&self, old: &Side, new: &Side) -> Result<RenameEventWire, RenameEventError> {
+        let old_ignore =
+            IgnoreRules::load(&old.at.root).map_err(|e| RenameEventError::Failed(e.to_string()))?;
+        let new_ignore =
+            IgnoreRules::load(&new.at.root).map_err(|e| RenameEventError::Failed(e.to_string()))?;
+        if old_ignore.is_ignored(Path::new(&old.at.rel))
+            || new_ignore.is_ignored(Path::new(&new.at.rel))
+            || new.abs.is_dir()
+        {
+            return Ok(RenameEventWire::NothingToFix);
+        }
+
+        let _decision = self.engine.decision_guard();
+        let (old_source, new_source) = (old.at.source.as_str(), new.at.source.as_str());
+        if self
+            .engine
+            .move_logged(old_source, &old.at.rel, new_source, &new.at.rel)?
+        {
+            return Ok(RenameEventWire::AlreadyApplied);
+        }
+        if old.abs.symlink_metadata().is_ok() {
+            // Something is at the old path still: a copy, not a move.
+            return Ok(RenameEventWire::NothingToFix);
+        }
+
+        // The cache learns of the move now, in both sources, so the fix
+        // reads the graph as the watchers would have left it.
+        let index_old = [old.abs.clone()];
+        let index_new = [new.abs.clone()];
+        self.registry
+            .reindex_paths(old_source, &index_old)
+            .map_err(|e| RenameEventError::Failed(e.to_string()))?;
+        self.registry
+            .reindex_paths(new_source, &index_new)
+            .map_err(|e| RenameEventError::Failed(e.to_string()))?;
+
+        let (entry, mut announcement) = match self.engine.begin_move_announced(
+            old_source,
+            &old.at.rel,
+            new_source,
+            &new.at.rel,
+        ) {
+            Ok(done) => done,
+            // The new path is not a unit (a file Tephra does not index):
+            // there is nothing to link to.
+            Err(FixError::Refused(why)) => {
+                tracing::debug!(old_source, old = %old.at.rel, new_source, new = %new.at.rel, %why, "move event refused by the engine");
+                self.announce_paths(old_source, &index_old);
+                self.announce_paths(new_source, &index_new);
+                return Ok(RenameEventWire::NothingToFix);
+            }
+            Err(e) => return Err(e.into()),
+        };
+        for (source, paths) in [(old_source, &index_old), (new_source, &index_new)] {
+            for path in paths {
+                announcement.merge(FixAnnouncement {
+                    notices: Vec::new(),
+                    written: vec![WrittenFile {
+                        source: source.to_string(),
+                        path: path.clone(),
+                    }],
+                });
+            }
+        }
+        self.engine.announce(announcement);
+        // Nothing links to the file and it links to nothing that changes:
+        // the move is logged (so the watcher's pairing of it answers
+        // `already_applied`), but there was nothing to fix.
+        if self.engine.files_in(entry.id)? == 0 {
+            return Ok(RenameEventWire::NothingToFix);
+        }
+        Ok(self.engine.reply_of(entry.id)?)
     }
 
     /// The old path was in a source and the new one is in none: the file

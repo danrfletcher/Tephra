@@ -179,7 +179,7 @@ pub struct FixLogSummary {
     pub new_path: Option<String>,
 }
 
-/// The `rename` and `uncertain` entries that name `source` on either
+/// The `rename`, `move` and `uncertain` entries that name `source` on either
 /// side, oldest first (id order).
 pub(crate) fn summaries_for_source(
     conn: &Connection,
@@ -187,7 +187,7 @@ pub(crate) fn summaries_for_source(
 ) -> Result<Vec<FixLogSummary>, CacheError> {
     let mut stmt = conn.prepare(
         "SELECT id, created_at, kind, old_source, old_path, new_source, new_path \
-         FROM fix_log WHERE kind IN ('rename', 'uncertain') \
+         FROM fix_log WHERE kind IN ('rename', 'move', 'uncertain') \
          AND (old_source = ?1 OR new_source = ?1) ORDER BY id ASC",
     )?;
     let rows = stmt

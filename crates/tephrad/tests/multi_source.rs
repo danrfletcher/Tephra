@@ -829,3 +829,124 @@ fn a_half_written_code_file_never_fails_the_scan_and_keeps_the_symbols_before_th
     assert_eq!(names("fine.rs"), ["fine"]);
     registry.unregister("repo").unwrap();
 }
+
+// ------------------------------------------------ G6: a move between sources
+
+const MOVING: &str =
+    "# Rename Notes\n\nSee [[Sibling]] and [[Rename Notes]] #idea\n\nA claim. ^k3f9a2\n";
+
+/// How many units, across every source, have this file name.
+fn units_named(cache_path: &std::path::Path, file_name: &str) -> i64 {
+    let cache = Cache::open(cache_path).expect("open cache");
+    cache
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM units WHERE rel_path = ?1 OR rel_path LIKE '%/' || ?1",
+            [file_name],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+fn two_sources_with_a_file_in_the_first() -> (
+    fixtures::TempSource,
+    fixtures::TempSource,
+    tempfile::TempDir,
+    std::path::PathBuf,
+    SourceRegistry,
+) {
+    let notes = fixtures::empty_source();
+    notes.write("Ideas/Rename Notes.md", MOVING);
+    notes.write("Sibling.md", "# Sibling\n");
+    let other = fixtures::empty_source();
+    other.write("Home.md", "# Home\n");
+    let cache_dir = tempfile::tempdir().expect("cache tempdir");
+    let cache_path = cache_dir.path().join("cache.db");
+    let registry =
+        SourceRegistry::new(Cache::open(&cache_path).expect("open cache")).expect("registry");
+    registry.register("notes", notes.root()).expect("notes");
+    registry.register("other", other.root()).expect("other");
+    (notes, other, cache_dir, cache_path, registry)
+}
+
+#[test]
+fn a_moved_files_rows_leave_the_old_source_and_join_the_new_one_with_no_duplicate_unit() {
+    let (notes, other, _dir, cache_path, registry) = two_sources_with_a_file_in_the_first();
+    let before = fixtures::unit_rows(&cache_path, "notes", "Ideas/Rename Notes.md")
+        .expect("the unit is in notes at the start");
+    assert_eq!(before.links.len(), 2, "{before:?}");
+    assert_eq!(before.tags, ["idea"]);
+    assert_eq!(before.headings.len(), 1);
+    assert!(before
+        .blocks
+        .iter()
+        .any(|b| b.0.as_deref() == Some("k3f9a2")));
+    assert_eq!(units_named(&cache_path, "Rename Notes.md"), 1);
+
+    let to = other.root().join("docs/rename-notes.md");
+    std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+    std::fs::rename(notes.root().join("Ideas/Rename Notes.md"), &to).unwrap();
+    registry.rescan("notes").expect("rescan notes");
+    registry.rescan("other").expect("rescan other");
+
+    assert!(
+        fixtures::unit_rows(&cache_path, "notes", "Ideas/Rename Notes.md").is_none(),
+        "the old source no longer has the unit"
+    );
+    let after = fixtures::unit_rows(&cache_path, "other", "docs/rename-notes.md")
+        .expect("the new source has the unit");
+    assert_eq!(after, before, "the same rows, now in the new source");
+    // Nothing is left behind and nothing is doubled: one unit in all, no
+    // orphan row of the old one in `blocks`, `links`, `tags` or `headings`.
+    assert_eq!(units_named(&cache_path, "Rename Notes.md"), 0);
+    assert_eq!(units_named(&cache_path, "rename-notes.md"), 1);
+    assert_eq!(
+        blocks_with_id_rows(&cache_path, "notes", "k3f9a2"),
+        Vec::<(String, i64)>::new()
+    );
+    assert_eq!(
+        blocks_with_id_rows(&cache_path, "other", "k3f9a2").len(),
+        1,
+        "the block row is in the new source only"
+    );
+    let cache = Cache::open(&cache_path).unwrap();
+    let orphans: i64 = cache
+        .connection()
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM links WHERE from_unit_id NOT IN (SELECT id FROM units)) \
+                  + (SELECT COUNT(*) FROM tags WHERE unit_id NOT IN (SELECT id FROM units)) \
+                  + (SELECT COUNT(*) FROM blocks WHERE unit_id NOT IN (SELECT id FROM units))",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(orphans, 0);
+    registry.unregister("notes").unwrap();
+    registry.unregister("other").unwrap();
+}
+
+#[test]
+fn the_live_watchers_move_a_files_rows_between_sources_too() {
+    let (notes, other, _dir, cache_path, registry) = two_sources_with_a_file_in_the_first();
+    let to = other.root().join("docs/rename-notes.md");
+    std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+    std::fs::rename(notes.root().join("Ideas/Rename Notes.md"), &to).unwrap();
+    let moved = wait_until(Duration::from_secs(20), || {
+        fixtures::unit_rows(&cache_path, "notes", "Ideas/Rename Notes.md").is_none()
+            && fixtures::unit_rows(&cache_path, "other", "docs/rename-notes.md").is_some()
+    });
+    if !moved {
+        // The OS watcher is sometimes deaf on this Mac; a rescan is what
+        // the daemon falls back to, and the rows must then be the same.
+        eprintln!("the OS watcher reported nothing; rescanning");
+        registry.rescan("notes").unwrap();
+        registry.rescan("other").unwrap();
+    }
+    assert!(fixtures::unit_rows(&cache_path, "notes", "Ideas/Rename Notes.md").is_none());
+    let rows = fixtures::unit_rows(&cache_path, "other", "docs/rename-notes.md").expect("rows");
+    assert_eq!(rows.links.len(), 2);
+    assert_eq!(units_named(&cache_path, "rename-notes.md"), 1);
+    assert_eq!(units_named(&cache_path, "Rename Notes.md"), 0);
+    registry.unregister("notes").unwrap();
+    registry.unregister("other").unwrap();
+}

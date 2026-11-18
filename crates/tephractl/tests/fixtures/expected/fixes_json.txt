@@ -3,6 +3,7 @@
     "files_changed": 0,
     "id": 3,
     "kind": "uncertain",
+    "message": "vanished, no certain pair: links broken",
     "new": null,
     "old": "Gone.md",
     "sources": [

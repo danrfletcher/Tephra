@@ -74,8 +74,8 @@ use serde::Serialize;
 use tephra_graph::Edge;
 
 use super::{
-    apply_changes_to_content, compute_changes, compute_fix_changes, AtomicFs, LinkChange, RealFs,
-    RefactorEngine,
+    apply_changes_to_content, compute_changes, compute_fix_changes, compute_move_changes, AtomicFs,
+    LinkChange, MoveRewrite, RealFs, RefactorEngine,
 };
 use crate::file_lock;
 
@@ -191,13 +191,16 @@ pub fn classify_io_error(e: &io::Error) -> FailureClass {
 // ---------------------------------------------------------------
 
 /// How the rewrite is derived from the current text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RewriteMode {
     /// [`compute_fix_changes`]: wikilinks only, a bare target kept bare
     /// only when `bare_resolves`.
     Fix { bare_resolves: bool },
     /// [`compute_changes`]: every link kind, as the manual refactor does.
     Manual,
+    /// [`compute_move_changes`]: the links of a file after the file they
+    /// name moved to another source (G6).
+    Move(MoveRewrite),
 }
 
 /// One linking file and the links in it that named the old target.
@@ -568,17 +571,18 @@ impl FixWriter {
 
         // 3. The rewrite, from the text just read.
         let contents = HashMap::from([(req.file.clone(), content.clone())]);
-        let changes: Vec<LinkChange> = match req.mode {
+        let changes: Vec<LinkChange> = match &req.mode {
             RewriteMode::Fix { bare_resolves } => compute_fix_changes(
                 &req.edges,
                 &contents,
                 &req.old_path,
                 &req.new_path,
-                bare_resolves,
+                *bare_resolves,
             ),
             RewriteMode::Manual => {
                 compute_changes(&req.edges, &contents, &req.old_path, &req.new_path)
             }
+            RewriteMode::Move(rewrite) => compute_move_changes(&req.edges, &contents, rewrite),
         };
         if changes.is_empty() {
             return Attempt::NothingToWrite;

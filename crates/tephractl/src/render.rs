@@ -644,7 +644,8 @@ pub fn render_backlinks(result: &Value) -> String {
 /// `fixes`' output (G18): one line per entry, in the daemon's order
 /// (newest first): `time kind old -> new (n files) status`, where `time`
 /// is local `YYYY-MM-DD HH:MM`. An `uncertain` entry has no new name:
-/// its line is `time kind old (no pair) (n files) status`. An entry that
+/// its line is `time kind old (no pair) (n files) status`, followed by
+/// ` - message` when the entry carries one (why it has no fix). An entry that
 /// touched files of two sources names them as `@source:path`. An empty
 /// log prints `no fixes`.
 ///
@@ -691,8 +692,12 @@ pub fn render_fixes(result: &Value) -> String {
             .get("files_changed")
             .and_then(Value::as_i64)
             .unwrap_or(0);
+        let why = match entry.get("message").and_then(Value::as_str) {
+            Some(message) if !message.is_empty() => format!(" - {}", printable(message)),
+            _ => String::new(),
+        };
         out.push_str(&format!(
-            "{time} {} {pair} ({files} {}) {}\n",
+            "{time} {} {pair} ({files} {}) {}{why}\n",
             printable(str_field(entry, "kind")),
             if files == 1 { "file" } else { "files" },
             printable(str_field(entry, "status")),
