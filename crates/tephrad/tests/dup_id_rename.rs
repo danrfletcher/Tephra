@@ -1129,6 +1129,7 @@ fn count_batches(
                 count += 1;
                 deadline = Instant::now() + quiet;
             }
+            Ok(DaemonEvent::SourceListChanged { .. }) => {}
             Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
             Err(_) => std::thread::sleep(Duration::from_millis(20)),
         }

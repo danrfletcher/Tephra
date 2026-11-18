@@ -391,7 +391,9 @@ fn live_case(k: &Kind) {
     // file, not the linking one.)
     let after = drain_events(&mut events, QUIET);
     for e in &after {
-        let DaemonEvent::SourceChanged { paths, .. } = e;
+        let DaemonEvent::SourceChanged { paths, .. } = e else {
+            continue;
+        };
         assert!(
             paths
                 .iter()
@@ -402,7 +404,7 @@ fn live_case(k: &Kind) {
     }
     let about_link: Vec<_> = after
         .iter()
-        .filter(|DaemonEvent::SourceChanged { paths, .. }| paths.contains(&file))
+        .filter(|e| matches!(e, DaemonEvent::SourceChanged { paths, .. } if paths.contains(&file)))
         .collect();
     assert_eq!(
         about_link.len(),
@@ -414,7 +416,10 @@ fn live_case(k: &Kind) {
         source,
         paths,
         fixes,
-    } = about_link[0];
+    } = about_link[0]
+    else {
+        panic!("a file change expected: {:?}", about_link[0]);
+    };
     assert_eq!(source, "notes");
     assert_eq!(paths, &vec![file.clone()], "{}", k.name);
     assert_eq!(fixes.len(), 1, "{}: one fixes entry", k.name);
@@ -476,8 +481,9 @@ fn save_until_reported(
         round += 1;
         let seen = drain_events(events, Duration::from_millis(1500))
             .iter()
-            .any(|DaemonEvent::SourceChanged { paths, fixes, .. }| {
-                fixes.is_empty() && paths.contains(&file.to_path_buf())
+            .any(|e| {
+                matches!(e, DaemonEvent::SourceChanged { paths, fixes, .. }
+                    if fixes.is_empty() && paths.contains(&file.to_path_buf()))
             });
         if seen {
             return true;
@@ -530,7 +536,9 @@ fn live_a_second_external_change_after_the_fixs_own_event_is_not_swallowed() {
     let own = drain_events(&mut events, QUIET);
     assert_eq!(
         own.iter()
-            .filter(|DaemonEvent::SourceChanged { paths, .. }| paths.contains(&file))
+            .filter(
+                |e| matches!(e, DaemonEvent::SourceChanged { paths, .. } if paths.contains(&file))
+            )
             .count(),
         1,
         "{own:?}"

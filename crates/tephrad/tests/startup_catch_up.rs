@@ -1252,7 +1252,10 @@ fn one_source_changed_per_source_after_the_catch_up_and_none_for_an_untouched_on
         source,
         paths,
         fixes,
-    } = &sent[0];
+    } = &sent[0]
+    else {
+        panic!("a file change, not a source-list change: {:?}", sent[0]);
+    };
     assert_eq!(source, "notes");
     assert_eq!(paths.len(), 2);
     assert!(fixes.is_empty());

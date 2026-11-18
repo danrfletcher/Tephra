@@ -37,7 +37,7 @@ Every command takes `--json` (raw structured output) and `--addr <addr>` (daemon
 
 | Command | What it does |
 |---|---|
-| `source add <name> <path>`, `source remove <name>`, `source list` | Register, unregister and list sources. |
+| `source add <name> <path>`, `source remove <name>`, `source list` | Register, unregister and list sources. Adding or removing a source sends connected WebSocket clients a `graph:changed` push with a `sources_changed` list (`[{kind: "added"|"removed", name}]`), so a client need not wait for its next check. |
 | `status` | Daemon and source status. |
 | `ls <source> [folder] [-r]` | List one folder of a source (works for an offline source, from the cache). |
 | `search <query> [--limit n]` | Find files by name, title or path across every source. |

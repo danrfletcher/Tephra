@@ -1332,7 +1332,10 @@ fn a_cross_source_moves_three_rewrites_start_no_new_batch_and_no_second_log_entr
     while let Ok(event) = events.try_recv() {
         seen.push(event);
     }
-    for tephrad::registry::DaemonEvent::SourceChanged { paths, .. } in &seen {
+    for event in &seen {
+        let tephrad::registry::DaemonEvent::SourceChanged { paths, .. } = event else {
+            continue;
+        };
         assert!(
             paths
                 .iter()

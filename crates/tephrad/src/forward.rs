@@ -6,10 +6,13 @@
 //! task the daemon runs against a real registry, graph and WebSocket
 //! client.
 //!
-//! The push is data only (F13): `source` and `paths` always, and `fixes`
-//! only when Tephra's own link fix has something to report. A push with
-//! no fixes is exactly what it was before `fixes` existed. Nothing here
-//! waits for a client: the push is broadcast and the loop goes on.
+//! The push is data only (F13): `source` and `paths` always, `fixes`
+//! only when Tephra's own link fix has something to report, and
+//! `sources_changed` only for a change to the source list (G16). A push
+//! with neither is exactly what it was before they existed. Both go out
+//! through [`push`], the only caller of `broadcast_graph_changed` in the
+//! daemon. Nothing here waits for a client: the push is broadcast and the
+//! loop goes on.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -24,18 +27,35 @@ use crate::registry::DaemonEvent;
 use crate::rpc::server::AppState;
 
 /// The `graph:changed` payload for `event`.
+///
+/// A file change keeps `source` and `paths` (and `fixes` when Tephra's own
+/// fix has something to report). A source-list change keeps the same two
+/// keys, `paths` empty (the whole-source form), `source` the first named
+/// source, and adds `sources_changed` (G16). A client that ignores the new
+/// key re-queries as before.
 pub fn payload(event: &DaemonEvent) -> Value {
-    let DaemonEvent::SourceChanged {
-        source,
-        paths,
-        fixes,
-    } = event;
+    let (source, paths, fixes, changes) = match event {
+        DaemonEvent::SourceChanged {
+            source,
+            paths,
+            fixes,
+        } => (source.as_str(), path_strings(paths), fixes.as_slice(), None),
+        DaemonEvent::SourceListChanged { changes } => (
+            changes.first().map(|c| c.name.as_str()).unwrap_or(""),
+            Vec::new(),
+            [].as_slice(),
+            Some(changes),
+        ),
+    };
     let mut body = json!({
         "source": source,
-        "paths": path_strings(paths),
+        "paths": paths,
     });
     if !fixes.is_empty() {
         body["fixes"] = json!(fixes);
+    }
+    if let Some(changes) = changes {
+        body["sources_changed"] = Value::Array(changes.iter().map(|c| c.to_json()).collect());
     }
     body
 }
@@ -87,7 +107,11 @@ pub async fn run(
                         source,
                         paths,
                         fixes: announced,
-                    } = event;
+                    } = event
+                    else {
+                        // A source-list push has no files to retry fixes for.
+                        continue;
+                    };
                     if !announced.is_empty() {
                         continue;
                     }

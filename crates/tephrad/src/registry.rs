@@ -252,6 +252,59 @@ pub enum DaemonEvent {
         paths: Vec<PathBuf>,
         fixes: Vec<crate::fixes::FixNotice>,
     },
+    /// The list of sources changed (G16, FR12): a source was added,
+    /// removed, renamed, promoted or un-promoted. Sent only by
+    /// [`SourceRegistry::announce_sources_changed`], after the change is
+    /// made, and never for a file change or a fix. The forwarder refreshes
+    /// the graph and sends ONE `graph:changed` carrying `sources_changed`.
+    SourceListChanged { changes: Vec<SourceChange> },
+}
+
+/// How the source list changed (FR12). The wire name is the lowercase
+/// variant name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceChangeKind {
+    Added,
+    Removed,
+    Renamed,
+    Promoted,
+    Unpromoted,
+}
+
+/// One entry of the `sources_changed` list on `graph:changed`: `kind`
+/// and `name`, plus `old_name` for a rename (`name` is then the new name,
+/// an additive wire detail).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SourceChange {
+    pub kind: SourceChangeKind,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_name: Option<String>,
+}
+
+impl SourceChange {
+    pub fn new(kind: SourceChangeKind, name: impl Into<String>) -> Self {
+        SourceChange {
+            kind,
+            name: name.into(),
+            old_name: None,
+        }
+    }
+
+    /// A rename: `name` is the new name, `old_name` the old one.
+    pub fn renamed(old_name: impl Into<String>, new_name: impl Into<String>) -> Self {
+        SourceChange {
+            kind: SourceChangeKind::Renamed,
+            name: new_name.into(),
+            old_name: Some(old_name.into()),
+        }
+    }
+
+    /// The JSON object sent in `sources_changed`.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::to_value(self).expect("SourceChange always serializes")
+    }
 }
 
 #[derive(Debug)]
@@ -320,6 +373,24 @@ struct RunningSource {
     /// reflects the rescan's rules immediately, rather than only the
     /// stale rules captured when the watcher was first started.
     ignore_rules: Arc<RwLock<IgnoreRules>>,
+    /// `true` while the source is registered. Every `SourceChanged` the
+    /// watcher's batch or root-gone callback sends is sent holding this
+    /// lock and only while it is `true`; [`SourceRegistry::unregister`]
+    /// sets it `false` before it announces the removal, so a batch that
+    /// was mid-flight cannot send an event for the name after `removed`.
+    live: Arc<Mutex<bool>>,
+}
+
+/// Sends `event` unless the source it belongs to has been unregistered.
+fn send_if_live(
+    live: &Mutex<bool>,
+    tx: &tokio::sync::broadcast::Sender<DaemonEvent>,
+    event: DaemonEvent,
+) {
+    let alive = live.lock().unwrap_or_else(|p| p.into_inner());
+    if *alive {
+        let _ = tx.send(event);
+    }
 }
 
 /// Aborts its task when dropped, so the task cannot outlive the source
@@ -653,6 +724,14 @@ impl SourceRegistry {
                     root = %canonical_root.display(),
                     "source_registered"
                 );
+                // G16: one push, after the row, the scan and the watcher
+                // are in place (the forwarder refreshes the graph before it
+                // broadcasts). A failed register returns above and sends
+                // nothing.
+                self.announce_sources_changed(vec![SourceChange::new(
+                    SourceChangeKind::Added,
+                    name,
+                )]);
                 Ok(stats)
             }
             Err(e) => {
@@ -753,6 +832,8 @@ impl SourceRegistry {
         // the shared registry cache.
         let batch_cache = Arc::new(Mutex::new(Cache::open(&self.cache_path)?));
         let events_tx = self.events_tx.clone();
+        let live = Arc::new(Mutex::new(true));
+        let live_for_batch = Arc::clone(&live);
         let source_name = name.clone();
         let source_root = root.clone();
         let blocking_handle = self.runtime.handle().clone();
@@ -788,6 +869,7 @@ impl SourceRegistry {
 
             let batch_cache = Arc::clone(&batch_cache);
             let events_tx = events_tx.clone();
+            let live = Arc::clone(&live_for_batch);
             let source_name = source_name.clone();
             let source_root = source_root.clone();
             let ignore_for_batch = Arc::clone(&ignore_for_batch);
@@ -844,11 +926,15 @@ impl SourceRegistry {
                                 paths = ?outcome.changed_paths,
                                 "source_changed"
                             );
-                            let _ = events_tx.send(DaemonEvent::SourceChanged {
-                                source: source_name.clone(),
-                                paths: outcome.changed_paths.clone(),
-                                fixes: Vec::new(),
-                            });
+                            send_if_live(
+                                &live,
+                                &events_tx,
+                                DaemonEvent::SourceChanged {
+                                    source: source_name.clone(),
+                                    paths: outcome.changed_paths.clone(),
+                                    fixes: Vec::new(),
+                                },
+                            );
                         }
                     },
                 );
@@ -884,6 +970,7 @@ impl SourceRegistry {
         let name_for_offline = name.clone();
         let gate_for_offline = Arc::clone(&self.gate);
         let events_for_offline = self.events_tx.clone();
+        let live_for_offline = Arc::clone(&live);
         let on_root_removed = move || {
             let cache = cache_for_offline.lock().unwrap();
             if let Err(e) = retry_cache_on_busy(&gate_for_offline, || {
@@ -897,11 +984,15 @@ impl SourceRegistry {
                 // reach it the way a file change does: announce it, and
                 // the daemon refreshes the graph and tells clients.
                 // `paths` is empty because no file changed.
-                let _ = events_for_offline.send(DaemonEvent::SourceChanged {
-                    source: name_for_offline.clone(),
-                    paths: Vec::new(),
-                    fixes: Vec::new(),
-                });
+                send_if_live(
+                    &live_for_offline,
+                    &events_for_offline,
+                    DaemonEvent::SourceChanged {
+                        source: name_for_offline.clone(),
+                        paths: Vec::new(),
+                        fixes: Vec::new(),
+                    },
+                );
             }
         };
 
@@ -930,6 +1021,7 @@ impl SourceRegistry {
                 handle,
                 pause,
                 ignore_rules,
+                live,
             },
         );
         Ok(renames)
@@ -1015,16 +1107,49 @@ impl SourceRegistry {
     /// running — it may not be, e.g. for a source whose watcher
     /// failed to start) and removes the source's rows from the cache.
     /// Idempotent: calling this twice on an already-removed source
-    /// returns `Ok(())` both times rather than erroring.
+    /// returns `Ok(())` both times rather than erroring. Only a call that
+    /// really removed a registered source announces it (G16): one `removed`
+    /// event, and none for an unknown name, since nothing changed.
     pub fn unregister(&self, name: &str) -> Result<(), RegistryError> {
         if let Some(running) = self.running.lock().unwrap().remove(name) {
             running.handle.stop();
+            // A batch already running for this source can no longer send
+            // an event once this is set, so none follows `removed`.
+            *running.live.lock().unwrap_or_else(|p| p.into_inner()) = false;
         }
         self.renames.remove_source(name);
         self.set_permission_denied(name, false);
-        let cache = self.cache.lock().unwrap();
-        retry_cache_on_busy(&self.gate, || cache.delete_source(name))?;
+        let existed = {
+            let cache = self.cache.lock().unwrap();
+            let existed = cache.get_source(name)?.is_some();
+            retry_cache_on_busy(&self.gate, || cache.delete_source(name))?;
+            existed
+        };
+        if existed {
+            self.announce_sources_changed(vec![SourceChange::new(SourceChangeKind::Removed, name)]);
+        }
         Ok(())
+    }
+
+    /// The one way a change to the source list reaches clients (G16): sends
+    /// ONE [`DaemonEvent::SourceListChanged`] for `changes`, which the
+    /// forwarder turns into one `graph:changed` with `sources_changed`,
+    /// through the same path as the `fixes` push. `register` and
+    /// `unregister` call it; the `renamed`, `promoted` and `unpromoted`
+    /// kinds are for the rename, promote and un-promote work to call, once
+    /// the change is made. An empty list sends nothing. With nobody
+    /// subscribed the event is dropped, not buffered.
+    ///
+    /// Every caller of `register`/`unregister` pushes, the
+    /// `register_sources` bin included; that bin has no forwarder, so
+    /// there the event goes to no one.
+    pub fn announce_sources_changed(&self, changes: Vec<SourceChange>) {
+        if changes.is_empty() {
+            return;
+        }
+        let _ = self
+            .events_tx
+            .send(DaemonEvent::SourceListChanged { changes });
     }
 
     /// `source.list` (G1): the stored rows, with their stored status.
@@ -2253,5 +2378,295 @@ mod tests {
             "{outcomes:?}"
         );
         registry.unregister("notes").unwrap();
+    }
+
+    // ---- the source-list push (G16, FR12) -----------------------------
+
+    fn change_kinds() -> Vec<(SourceChange, serde_json::Value)> {
+        use serde_json::json;
+        vec![
+            (
+                SourceChange::new(SourceChangeKind::Added, "notes"),
+                json!({"kind": "added", "name": "notes"}),
+            ),
+            (
+                SourceChange::new(SourceChangeKind::Removed, "notes"),
+                json!({"kind": "removed", "name": "notes"}),
+            ),
+            (
+                SourceChange::renamed("notes", "journal"),
+                json!({"kind": "renamed", "name": "journal", "old_name": "notes"}),
+            ),
+            (
+                SourceChange::new(SourceChangeKind::Promoted, "docs"),
+                json!({"kind": "promoted", "name": "docs"}),
+            ),
+            (
+                SourceChange::new(SourceChangeKind::Unpromoted, "docs"),
+                json!({"kind": "unpromoted", "name": "docs"}),
+            ),
+        ]
+    }
+
+    #[test]
+    fn every_kind_builds_exact_json_and_only_a_rename_has_old_name() {
+        for (change, want) in change_kinds() {
+            assert_eq!(change.to_json(), want, "{change:?}");
+        }
+    }
+
+    #[test]
+    fn every_kind_builds_one_graph_changed_payload_keeping_source_and_empty_paths() {
+        use serde_json::json;
+        for (change, want) in change_kinds() {
+            let name = change.name.clone();
+            let payload = crate::forward::payload(&DaemonEvent::SourceListChanged {
+                changes: vec![change],
+            });
+            assert_eq!(
+                payload,
+                json!({"source": name, "paths": [], "sources_changed": [want]}),
+            );
+        }
+        // Several changes in one push keep their order.
+        let payload = crate::forward::payload(&DaemonEvent::SourceListChanged {
+            changes: change_kinds().into_iter().map(|(c, _)| c).collect(),
+        });
+        assert_eq!(payload["sources_changed"].as_array().unwrap().len(), 5);
+        assert_eq!(payload["sources_changed"][2]["old_name"], "notes");
+    }
+
+    fn registry_in(dir: &Path) -> SourceRegistry {
+        SourceRegistry::new(Cache::open(dir.join("cache.db")).unwrap()).unwrap()
+    }
+
+    fn source_dir(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for (rel, text) in files {
+            std::fs::write(dir.path().join(rel), text).unwrap();
+        }
+        dir
+    }
+
+    /// Every source-list event waiting on `rx`.
+    fn list_events(
+        rx: &mut tokio::sync::broadcast::Receiver<DaemonEvent>,
+    ) -> Vec<Vec<SourceChange>> {
+        let mut out = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let DaemonEvent::SourceListChanged { changes } = event {
+                out.push(changes);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn register_and_unregister_each_send_exactly_one_event_naming_the_source() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let src = source_dir(&[("a.md", "# A\n"), ("b.md", "[[a]]\n"), ("c.md", "# C\n")]);
+        let registry = registry_in(cache_dir.path());
+        let mut rx = registry.subscribe();
+
+        registry.register("notes", src.path()).unwrap();
+        assert_eq!(
+            list_events(&mut rx),
+            vec![vec![SourceChange::new(SourceChangeKind::Added, "notes")]]
+        );
+
+        registry.unregister("notes").unwrap();
+        assert_eq!(
+            list_events(&mut rx),
+            vec![vec![SourceChange::new(SourceChangeKind::Removed, "notes")]]
+        );
+    }
+
+    #[test]
+    fn the_event_comes_after_the_scan_and_the_row_so_a_requery_sees_the_change() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let src = source_dir(&[("a.md", "# A\n"), ("b.md", "# B\n")]);
+        let registry = registry_in(cache_dir.path());
+        let mut rx = registry.subscribe();
+
+        registry.register("notes", src.path()).unwrap();
+        // The event is already waiting when `register` returns, and what
+        // it announces is already true: listed, and scanned.
+        assert_eq!(list_events(&mut rx).len(), 1);
+        let listed = registry.list().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(registry.is_watching("notes"));
+        let verify = Cache::open(cache_dir.path().join("cache.db")).unwrap();
+        assert_eq!(
+            verify.units_with_status_for_source("notes").unwrap().len(),
+            2
+        );
+
+        registry.unregister("notes").unwrap();
+        assert_eq!(list_events(&mut rx).len(), 1);
+        assert!(registry.list().unwrap().is_empty());
+        assert!(!registry.is_watching("notes"));
+    }
+
+    #[test]
+    fn a_register_that_fails_validation_sends_no_event() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let src = source_dir(&[("a.md", "# A\n")]);
+        let nested = src.path().join("sub");
+        std::fs::create_dir(&nested).unwrap();
+        let other = source_dir(&[("o.md", "# O\n")]);
+        let a_file = src.path().join("a.md");
+        let registry = registry_in(cache_dir.path());
+        registry.register("notes", src.path()).unwrap();
+        let mut rx = registry.subscribe();
+
+        // Missing path, not a folder, duplicate name, duplicate root,
+        // nested root, ancestor root.
+        assert!(registry.register("x", "/no/such/path/for/tephra").is_err());
+        assert!(registry.register("x", &a_file).is_err());
+        assert!(registry.register("notes", other.path()).is_err());
+        assert!(registry.register("again", src.path()).is_err());
+        assert!(registry.register("inner", &nested).is_err());
+        let parent = src.path().parent().unwrap();
+        assert!(registry.register("outer", parent).is_err());
+
+        assert!(list_events(&mut rx).is_empty());
+        assert_eq!(registry.list().unwrap().len(), 1);
+        registry.unregister("notes").unwrap();
+    }
+
+    #[test]
+    fn a_register_whose_scan_fails_rolls_back_and_sends_no_added_event() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        // A `.tephraignore` that is a folder cannot be read: the row has
+        // been inserted by then, so this takes the rollback path.
+        let src = source_dir(&[("a.md", "# A\n")]);
+        std::fs::create_dir(src.path().join(".tephraignore")).unwrap();
+        let registry = registry_in(cache_dir.path());
+        let mut rx = registry.subscribe();
+
+        assert!(registry.register("notes", src.path()).is_err());
+
+        assert!(list_events(&mut rx).is_empty());
+        assert!(
+            registry.list().unwrap().is_empty(),
+            "the row was rolled back"
+        );
+    }
+
+    #[test]
+    fn unregistering_a_name_that_is_not_registered_is_ok_and_sends_nothing() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let src = source_dir(&[("a.md", "# A\n")]);
+        let registry = registry_in(cache_dir.path());
+        let mut rx = registry.subscribe();
+
+        registry.unregister("ghost").unwrap();
+        assert!(list_events(&mut rx).is_empty());
+
+        // Twice on a source that was removed: one event in all.
+        registry.register("notes", src.path()).unwrap();
+        registry.unregister("notes").unwrap();
+        registry.unregister("notes").unwrap();
+        let events = list_events(&mut rx);
+        assert_eq!(events.len(), 2, "one added and one removed: {events:?}");
+        assert_eq!(events[1][0].kind, SourceChangeKind::Removed);
+    }
+
+    #[test]
+    fn the_emitter_accepts_renamed_promoted_and_unpromoted_and_ignores_an_empty_list() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let registry = registry_in(cache_dir.path());
+        let mut rx = registry.subscribe();
+
+        registry.announce_sources_changed(Vec::new());
+        assert!(list_events(&mut rx).is_empty());
+
+        for (change, _) in change_kinds() {
+            registry.announce_sources_changed(vec![change.clone()]);
+            assert_eq!(list_events(&mut rx), vec![vec![change]]);
+        }
+    }
+
+    #[test]
+    fn announcing_with_nobody_subscribed_is_dropped_without_error() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let src = source_dir(&[("a.md", "# A\n")]);
+        let registry = registry_in(cache_dir.path());
+        // No `subscribe()` anywhere: register and unregister still succeed.
+        registry.register("notes", src.path()).unwrap();
+        registry.unregister("notes").unwrap();
+        // A receiver that joins later hears nothing of what was dropped.
+        let mut late = registry.subscribe();
+        assert!(list_events(&mut late).is_empty());
+    }
+
+    #[test]
+    fn a_restart_and_the_catch_up_announce_no_source_as_added() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let src = source_dir(&[("a.md", "# A\n")]);
+        {
+            let registry = registry_in(cache_dir.path());
+            registry.register("notes", src.path()).unwrap();
+            registry.unregister("notes").unwrap();
+            registry.register("notes", src.path()).unwrap();
+        }
+        // The daemon restarts: a new registry over the same cache.
+        let registry = registry_in(cache_dir.path());
+        let mut rx = registry.subscribe();
+        registry.start_all(|| false);
+        assert!(list_events(&mut rx).is_empty());
+        registry.unregister("notes").unwrap();
+    }
+
+    #[test]
+    fn a_rescan_and_a_file_change_are_not_list_changes() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let src = source_dir(&[("a.md", "# A\n")]);
+        let registry = registry_in(cache_dir.path());
+        registry.register("notes", src.path()).unwrap();
+        let mut rx = registry.subscribe();
+
+        std::fs::write(src.path().join("new.md"), "# New\n").unwrap();
+        registry.rescan("notes").unwrap();
+
+        assert!(list_events(&mut rx).is_empty());
+        registry.unregister("notes").unwrap();
+    }
+
+    #[test]
+    fn a_batch_still_running_when_its_source_is_unregistered_sends_nothing_after_removed() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let src = source_dir(&[("a.md", "# A\n")]);
+        let registry = registry_in(cache_dir.path());
+        registry.register("notes", src.path()).unwrap();
+        // What a batch captured before the unregister: the live flag.
+        let live = Arc::clone(&registry.running.lock().unwrap().get("notes").unwrap().live);
+        let mut rx = registry.subscribe();
+        let stale = || DaemonEvent::SourceChanged {
+            source: "notes".into(),
+            paths: vec![src.path().join("a.md")],
+            fixes: Vec::new(),
+        };
+
+        // Before: the batch's event goes out.
+        send_if_live(&live, &registry.events_tx, stale());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(DaemonEvent::SourceChanged { .. })
+        ));
+
+        registry.unregister("notes").unwrap();
+        // After: `removed` is the last event for the name.
+        send_if_live(&live, &registry.events_tx, stale());
+        let mut seen = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            seen.push(e);
+        }
+        assert_eq!(
+            seen,
+            vec![DaemonEvent::SourceListChanged {
+                changes: vec![SourceChange::new(SourceChangeKind::Removed, "notes")]
+            }]
+        );
     }
 }

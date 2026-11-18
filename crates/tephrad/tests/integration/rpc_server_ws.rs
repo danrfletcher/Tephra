@@ -249,6 +249,59 @@ async fn a_push_carrying_fixes_reaches_a_client_as_a_notification_and_an_old_sha
     assert_eq!(params.source, "notes");
 }
 
+/// G16: a `sources_changed` payload passes through `broadcast_graph_changed`
+/// unchanged (the server adds and drops nothing) and is delivered as a
+/// notification with no `id`. Both a payload built by the forwarder's own
+/// function from a `SourceListChanged` event and a hand-written one with
+/// every kind (a `renamed` entry with `old_name`) are checked.
+#[tokio::test]
+async fn a_sources_changed_payload_passes_through_unchanged_as_a_notification() {
+    use tephrad::registry::{DaemonEvent, SourceChange, SourceChangeKind};
+
+    let server = spawn(MockGraph::new(), MockSources::new()).await;
+    let mut ws = connect_ws(&server.ws_url(), &server.token).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Built by the forwarder's payload function.
+    let event = DaemonEvent::SourceListChanged {
+        changes: vec![SourceChange::new(SourceChangeKind::Added, "notes")],
+    };
+    let built = tephrad::forward::payload(&event);
+    server.broadcast_graph_changed(built.clone());
+    // Hand-written, every kind in one push.
+    let by_hand = json!({
+        "source": "journal",
+        "paths": [],
+        "sources_changed": [
+            { "kind": "added", "name": "notes" },
+            { "kind": "removed", "name": "old" },
+            { "kind": "renamed", "name": "journal", "old_name": "notes" },
+            { "kind": "promoted", "name": "docs" },
+            { "kind": "unpromoted", "name": "docs" }
+        ]
+    });
+    server.broadcast_graph_changed(by_hand.clone());
+
+    let first = next_push(&mut ws).await;
+    assert!(first.get("id").is_none(), "a notification has no id");
+    assert_eq!(first["jsonrpc"], json!("2.0"));
+    assert_eq!(first["method"], json!("graph:changed"));
+    assert_eq!(first["params"], built);
+    assert_eq!(
+        first["params"],
+        json!({
+            "source": "notes",
+            "paths": [],
+            "sources_changed": [{ "kind": "added", "name": "notes" }]
+        })
+    );
+
+    let second = next_push(&mut ws).await;
+    assert!(second.get("id").is_none(), "a notification has no id");
+    assert_eq!(second["method"], json!("graph:changed"));
+    assert_eq!(second["params"], by_hand, "passed through unchanged");
+}
+
 /// R3/E9: the WebSocket transport must enforce the same body-size cap
 /// as `POST /rpc` (`MAX_BODY_BYTES`), not axum/tungstenite's own much
 /// larger defaults (64 MiB message / 16 MiB frame) — otherwise a WS
