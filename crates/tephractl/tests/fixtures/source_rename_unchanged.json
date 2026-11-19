@@ -1,0 +1,11 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "name": "daemon",
+    "new_name": "daemon",
+    "files_changed": 0,
+    "deferred": 0,
+    "status": "applied"
+  }
+}

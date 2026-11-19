@@ -5,6 +5,10 @@
 #[path = "rpc_fixtures/mod.rs"]
 mod rpc_fixtures;
 
+#[path = "unit/qualify_ambiguous.rs"]
+mod qualify_ambiguous;
+#[path = "unit/rename_event_state.rs"]
+mod rename_event_state;
 #[path = "unit/rpc_auth.rs"]
 mod rpc_auth;
 #[path = "unit/rpc_envelope.rs"]

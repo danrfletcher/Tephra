@@ -38,6 +38,9 @@ fn five_thousand_edges_resolve_and_get_backlinks_stays_bounded_time() {
             rel_path: "Hub.md",
             mtime: None,
             frontmatter_json: None,
+            hash: None,
+            inode: None,
+            device: None,
         })
         .expect("insert hub unit");
 
@@ -57,6 +60,9 @@ fn five_thousand_edges_resolve_and_get_backlinks_stays_bounded_time() {
                     rel_path: &rel_path,
                     mtime: None,
                     frontmatter_json: None,
+                    hash: None,
+                    inode: None,
+                    device: None,
                 })
                 .expect("insert spoke unit");
             cache

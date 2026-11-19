@@ -1,0 +1,47 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": [
+    {
+      "id": 3,
+      "time": 1794790000,
+      "kind": "uncertain",
+      "sources": ["notes"],
+      "old": "Gone.md",
+      "new": null,
+      "files_changed": 0,
+      "status": "uncertain",
+      "message": "vanished, no certain pair: links broken"
+    },
+    {
+      "id": 2,
+      "time": 1794789000,
+      "kind": "rename",
+      "sources": ["notes"],
+      "old": "Solo\u001b[2J.md",
+      "new": "Single.md",
+      "files_changed": 2,
+      "status": "partial"
+    },
+    {
+      "id": 1,
+      "time": 1794788000,
+      "kind": "rename",
+      "sources": ["notes"],
+      "old": "Training Plan.md",
+      "new": "Plan.md",
+      "files_changed": 3,
+      "status": "applied"
+    },
+    {
+      "id": 0,
+      "time": 1794787000,
+      "kind": "rename",
+      "sources": ["notes", "work"],
+      "old": "Ideas/One.md",
+      "new": "Ideas/Uno.md",
+      "files_changed": 1,
+      "status": "needs_manual_fix"
+    }
+  ]
+}

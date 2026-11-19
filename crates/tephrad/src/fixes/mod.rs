@@ -1,0 +1,2280 @@
+//! The fix log and the pending-fixes engine (G9, G10): what the
+//! automatic link fix records, what it keeps for later, and when it
+//! tries again.
+//!
+//! The one thing that touches a linking file is PR-4's write loop
+//! ([`crate::refactor::fix_write::FixWriter`], behind [`FileWriter`]).
+//! This module decides which files go to it, when, and what the log
+//! says came of it:
+//!
+//! - [`FixEngine::begin_fix`] logs one entry for one rename and stores
+//!   every linking file in `pending_fixes` in the same transaction,
+//!   BEFORE any file is written. Then it works through the list: each
+//!   file's outcome (the row deleted or kept, the entry's per-file
+//!   result and status updated) is one transaction too. A crash leaves
+//!   a row for every file not yet recorded, and the one entry.
+//! - [`FixEngine::resume`] (startup), [`FixEngine::after_rescan`] and
+//!   [`FixEngine::after_batch`] pick the rows up again ([`retry`]):
+//!   each is re-checked against the graph and the log first
+//!   ([`pending`]), then handed to the write loop. A retry that
+//!   succeeds updates the entry it belongs to; it never adds one.
+//! - Nothing is stored as a recorded edit: a row is the file, the old
+//!   target and the new one, and the retry re-derives the edit from the
+//!   file's text as it is then.
+//!
+//! The log is a record only (F9): there is no undo or replay here.
+
+pub mod event;
+pub mod log;
+pub mod pending;
+pub mod retry;
+pub mod state;
+
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fmt;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use tephra_cache::{
+    Cache, FixLogChange, NewFixLog, NewPendingFix, PendingFixRow, PendingOp, SourceStatus,
+    STATE_NEEDS_MANUAL_FIX, STATE_PENDING,
+};
+use tephra_graph::{Edge, UnitGraph};
+
+use crate::fix::FixSpelling;
+use crate::refactor::fix_write::{
+    FileFixRequest, FileWriteResult, FixWriter, RewriteMode, WriteStatus,
+};
+use crate::refactor::{MoveRewrite, OwnLink, DOCUMENT_READ_ONLY};
+
+pub use log::{FixDetail, FixEntryWire, FixNotice};
+pub use pending::Verdict;
+pub use retry::Trigger;
+
+use log::{
+    overall_status, FileEntry, FILE_NEEDS_MANUAL_FIX, FILE_NOTHING_TO_FIX, FILE_PENDING,
+    FILE_WRITTEN, KIND_MOVE, KIND_PROMOTE, KIND_RENAME, KIND_SOURCE_RENAME, KIND_UNCERTAIN,
+    KIND_UNPROMOTE, STATUS_UNCERTAIN,
+};
+
+/// What an uncertain entry says when the watcher logs it.
+const MSG_UNCERTAIN: &str = "vanished, no certain pair: links broken";
+
+/// How long a second report of the same vanished file can be the first one
+/// again.
+pub const UNCERTAIN_DEDUPE_SECS: i64 = 120;
+
+/// What makes a second "vanished" entry for one path, inside
+/// [`UNCERTAIN_DEDUPE_SECS`], the same vanishing seen twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Dedupe {
+    /// Nothing: every call logs an entry.
+    Never,
+    /// Any recent entry for the path.
+    AnyRecent,
+    /// A recent entry an exact event logged as "moved outside sources".
+    AfterOutsideEvent,
+}
+
+// ---------------------------------------------------------------
+// Errors, seams
+// ---------------------------------------------------------------
+
+/// Why an engine call failed. A file that could not be fixed is not an
+/// error: it is a result in the log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FixError {
+    /// The cache could not be read or written.
+    Cache(String),
+    /// The call cannot be answered at all (no such unit, a rename that
+    /// has not been indexed).
+    Refused(String),
+    /// A test hook stopped the run after a set number of writes,
+    /// leaving the cache and the disk exactly as a crash would.
+    Stopped,
+    /// A source rename found its new name taken (case-insensitively) when
+    /// the transaction ran: a register that won the race. Nothing changed.
+    NameTaken(String),
+    /// A source rename found its source gone when the transaction ran.
+    /// Nothing changed.
+    UnknownSource(String),
+}
+
+impl fmt::Display for FixError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FixError::Cache(m) | FixError::Refused(m) => write!(f, "{m}"),
+            FixError::Stopped => {
+                write!(f, "stopped by the test hook after the set number of writes")
+            }
+            FixError::NameTaken(name) => write!(f, "the name \"{name}\" is taken"),
+            FixError::UnknownSource(name) => write!(f, "no source named \"{name}\""),
+        }
+    }
+}
+
+impl std::error::Error for FixError {}
+
+impl From<tephra_cache::CacheError> for FixError {
+    fn from(e: tephra_cache::CacheError) -> Self {
+        FixError::Cache(e.to_string())
+    }
+}
+
+impl From<tephra_graph::GraphError> for FixError {
+    fn from(e: tephra_graph::GraphError) -> Self {
+        FixError::Cache(e.to_string())
+    }
+}
+
+/// The write loop, behind a trait so the retry rules can be tested with
+/// its results given directly (no filesystem flags needed).
+pub trait FileWriter: Send + Sync {
+    fn write_file(&self, req: &FileFixRequest) -> FileWriteResult;
+
+    /// Asks the writer to record each file it writes as Tephra's own
+    /// write ([`crate::dup_ids::note_self_write`]), so the watcher drops
+    /// the file's event. Called by [`FixEngine::set_sink`]: the sink is
+    /// what indexes the written files again, so the watcher need not.
+    /// A writer that has no such record ignores it.
+    fn record_own_writes(&self, _on: bool) {}
+}
+
+impl FileWriter for FixWriter {
+    fn write_file(&self, req: &FileFixRequest) -> FileWriteResult {
+        FixWriter::write_file(self, req)
+    }
+
+    fn record_own_writes(&self, on: bool) {
+        FixWriter::record_own_writes(self, on)
+    }
+}
+
+// ---------------------------------------------------------------
+// What a fix tells the clients
+// ---------------------------------------------------------------
+
+/// A linking file a fix rewrote: the source it is in and where it is on
+/// disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WrittenFile {
+    pub source: String,
+    pub path: PathBuf,
+}
+
+/// What one batch of fixes has to announce (G17): the entries of the
+/// `fixes` list, and every file rewritten (which has to be indexed again,
+/// and is what the push's `paths` lists). Several renames fixed together
+/// are merged into one, so they make one push.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FixAnnouncement {
+    pub notices: Vec<FixNotice>,
+    pub written: Vec<WrittenFile>,
+}
+
+impl FixAnnouncement {
+    pub fn is_empty(&self) -> bool {
+        self.notices.is_empty() && self.written.is_empty()
+    }
+
+    /// Adds `other`: its entries after this one's, its files the ones
+    /// this one does not hold yet.
+    pub fn merge(&mut self, other: FixAnnouncement) {
+        self.notices.extend(other.notices);
+        for file in other.written {
+            if !self.written.contains(&file) {
+                self.written.push(file);
+            }
+        }
+    }
+}
+
+/// Where the engine hands what it announces when no caller collects it:
+/// a retry (startup, `source.rescan`, a watcher batch) has no caller to
+/// return it to. The daemon's implementation is
+/// [`crate::registry::Announcer`]: it indexes the written files, then
+/// sends one event, which the forwarder turns into the `graph:changed`
+/// push after refreshing the in-memory graph.
+///
+/// The engine never waits for a client: it hands the announcement over
+/// and goes on (F13).
+pub trait FixSink: Send + Sync {
+    fn announce(&self, announcement: FixAnnouncement);
+}
+
+/// The time, in epoch seconds, behind a trait so a test can move it.
+pub trait Clock: Send + Sync {
+    fn now(&self) -> i64;
+}
+
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+}
+
+/// A clock a test sets by hand.
+#[derive(Default)]
+pub struct ManualClock(AtomicI64);
+
+impl ManualClock {
+    pub fn new(now: i64) -> Self {
+        ManualClock(AtomicI64::new(now))
+    }
+    pub fn set(&self, now: i64) {
+        self.0.store(now, Ordering::SeqCst);
+    }
+    pub fn advance(&self, secs: i64) {
+        self.0.fetch_add(secs, Ordering::SeqCst);
+    }
+}
+
+impl Clock for ManualClock {
+    fn now(&self) -> i64 {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+// ---------------------------------------------------------------
+// Requests and summaries
+// ---------------------------------------------------------------
+
+/// A rename to fix, and the linking files to fix it in. Callers that
+/// have only the rename use [`FixEngine::begin_rename`], which finds
+/// the files in the graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixSpec {
+    pub old_source: String,
+    pub old_path: String,
+    pub new_source: String,
+    pub new_path: String,
+    /// `(source, path)` of each linking file.
+    pub files: Vec<(String, String)>,
+}
+
+/// What [`FixEngine::begin_plan`] stores: the entry's own old and new
+/// path (a file's, or a folder's), and the work, one row per linking
+/// file per moved file.
+struct Plan {
+    /// [`KIND_RENAME`], or [`KIND_MOVE`] for a file that went to another
+    /// source.
+    kind: &'static str,
+    old_source: String,
+    new_source: String,
+    entry_old: String,
+    entry_new: String,
+    rows: Vec<PlanRow>,
+}
+
+/// One pending row: `file` is `(source, path)` of the linking file, and
+/// `old` to `new` the rename it is to be fixed for.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PlanRow {
+    file: (String, String),
+    old: String,
+    new: String,
+}
+
+/// A folder to make its own source ([`FixEngine::promote`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromoteSpec {
+    /// The source the folder is in.
+    pub parent: String,
+    /// The new source's name, and its canonical root (the folder).
+    pub name: String,
+    pub root: PathBuf,
+    /// The folder's path in `parent`, forward slashes, no trailing slash.
+    pub folder: String,
+}
+
+/// What [`FixEngine::promote`] did.
+pub struct PromoteDone {
+    pub source_id: i64,
+    /// How many cached rows moved to the new source.
+    pub units_moved: usize,
+    /// The log entry as it stands at the end.
+    pub entry: FixEntryWire,
+    /// The files written and the entry, for the one push.
+    pub announcement: FixAnnouncement,
+}
+
+/// A promoted source to fold back into its parent
+/// ([`FixEngine::unpromote`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnpromoteSpec {
+    /// The promoted source.
+    pub name: String,
+    /// The source it was promoted out of.
+    pub parent: String,
+    /// The folder of `parent` it was promoted from, forward slashes, no
+    /// trailing slash.
+    pub folder: String,
+}
+
+/// What [`FixEngine::unpromote`] did.
+pub struct UnpromoteDone {
+    /// How many cached rows went back to the parent.
+    pub units_moved: usize,
+    /// The log entry as it stands at the end.
+    pub entry: FixEntryWire,
+    /// The files written and the entry, for the one push.
+    pub announcement: FixAnnouncement,
+}
+
+/// A source to rename ([`FixEngine::rename_source`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceRenameSpec {
+    pub old_name: String,
+    pub new_name: String,
+}
+
+/// What [`FixEngine::rename_source`] did.
+pub struct SourceRenameDone {
+    /// The log entry as it stands at the end.
+    pub entry: FixEntryWire,
+    /// The files written and the entry, for the one push.
+    pub announcement: FixAnnouncement,
+}
+
+/// The files that hold a wikilink written with the source prefix
+/// `@old:` (a link of any kind the parser reports, a dangling one too), as
+/// `(source, path)`, read from `graph` as it is BEFORE the rename: a file
+/// of the renamed source itself is named by `new`, since that is its name
+/// by the time the list is used. Plain Markdown links never count, and a
+/// link in a document does (it is logged, never written).
+fn source_rename_files(graph: &UnitGraph, old: &str, new: &str) -> BTreeSet<(String, String)> {
+    graph
+        .get_edges_all()
+        .into_iter()
+        .filter(|e| e.kind == tephra_parser::LINK_KIND_WIKILINK)
+        .filter(|e| names_source(&e.to_raw, old))
+        .filter_map(|e| {
+            let (s, p) = e.from.strip_prefix('@')?.split_once(':')?;
+            let s = if s == old { new } else { s };
+            Some((s.to_string(), p.to_string()))
+        })
+        .collect()
+}
+
+/// Whether the raw text of a wikilink names source `name` with an
+/// explicit `@name:` prefix.
+fn names_source(to_raw: &str, name: &str) -> bool {
+    tephra_parser::parse_wikilink_inner(to_raw)
+        .source_prefix
+        .as_deref()
+        == Some(name)
+}
+
+/// A pending row of a source rename: both sources named, neither path
+/// (it is no file's rename: every `@old:` link of the file changes).
+fn is_source_rename_row(row: &PendingFixRow) -> bool {
+    row.old_path.is_none()
+        && row.new_path.is_none()
+        && row.old_source.is_some()
+        && row.new_source.is_some()
+}
+
+/// The rel paths of `parent`'s cached units under `folder`, relative to
+/// the folder. After an unpromote these are the files the promoted source
+/// had.
+fn folder_units(cache: &Cache, parent: &str, folder: &str) -> Result<Vec<String>, FixError> {
+    let Some(parent) = cache.get_source(parent)? else {
+        return Ok(Vec::new());
+    };
+    let prefix = format!("{folder}/");
+    Ok(cache
+        .units_under_prefix(parent.id, folder)?
+        .into_iter()
+        .filter_map(|u| u.rel_path.strip_prefix(&prefix).map(str::to_string))
+        .collect())
+}
+
+/// The pending rows of an unpromote, read from `cache` as it will be once
+/// the promoted source is folded back: for each file that moves to the
+/// parent (`folder/<path>`), every file with a link that names it and has
+/// to change (rewrites 1 and 2 of a move, run in the opposite direction
+/// of a promote), and the file itself when links of its own have to
+/// change (rewrite 3, [`own_links_folded`]).
+fn unpromote_rows(cache: &Cache, spec: &UnpromoteSpec) -> Result<Vec<PlanRow>, FixError> {
+    let graph = UnitGraph::build_from_cache(cache)?;
+    let units = folder_units(cache, &spec.parent, &spec.folder)?;
+    let mut rows: BTreeSet<PlanRow> = BTreeSet::new();
+    for old in &units {
+        let new = format!("{}/{old}", spec.folder);
+        if let Ok(files) = linking_files(&graph, &spec.name, old, &spec.parent, &new) {
+            for file in files {
+                rows.insert(PlanRow {
+                    file,
+                    old: old.clone(),
+                    new: new.clone(),
+                });
+            }
+        }
+        let new_id = format!("@{}:{new}", spec.parent);
+        let own = own_links_folded(
+            &graph,
+            &spec.name,
+            &spec.parent,
+            &spec.folder,
+            &units,
+            &new_id,
+            false,
+        );
+        if !own.0.is_empty() {
+            rows.insert(PlanRow {
+                file: (spec.parent.clone(), new.clone()),
+                old: old.clone(),
+                new,
+            });
+        }
+    }
+    Ok(rows.into_iter().collect())
+}
+
+/// The pending rows of a promote, read from `cache` as it will be once
+/// the folder is its own source: for each file that moved (`moved`, the
+/// parent's rows under the folder), every file with a link that names it
+/// and has to change (rewrites 1 and 2), and the file itself when links
+/// of its own have to change (rewrite 3), all as the moves they are,
+/// from `(parent, path)` to `(name, path under the folder)`. A moved file
+/// that is no unit of the graph (nothing to link to) adds no work.
+fn promote_rows(
+    cache: &Cache,
+    spec: &PromoteSpec,
+    moved: &[tephra_cache::UnitRow],
+) -> Result<Vec<PlanRow>, FixError> {
+    let graph = UnitGraph::build_from_cache(cache)?;
+    let prefix = format!("{}/", spec.folder);
+    let mut rows: BTreeSet<PlanRow> = BTreeSet::new();
+    for unit in moved {
+        let old = unit.rel_path.clone();
+        let Some(new) = old.strip_prefix(&prefix).map(str::to_string) else {
+            continue;
+        };
+        if let Ok(files) = linking_files(&graph, &spec.parent, &old, &spec.name, &new) {
+            for file in files {
+                rows.insert(PlanRow {
+                    file,
+                    old: old.clone(),
+                    new: new.clone(),
+                });
+            }
+        }
+        let own = own_links(
+            &graph,
+            &spec.parent,
+            &old,
+            &spec.name,
+            &new,
+            Some(&spec.folder),
+            false,
+        );
+        if !own.1.is_empty() {
+            rows.insert(PlanRow {
+                file: (spec.name.clone(), new.clone()),
+                old,
+                new,
+            });
+        }
+    }
+    Ok(rows.into_iter().collect())
+}
+
+/// Finishes the re-owning of every promote the daemon was killed in the
+/// middle of: for each live `promoted_roots` row (a stale one, history of
+/// an unregistered parent, is skipped), any row its parent still
+/// holds under the folder goes to the promoted source. A no-op once a
+/// promote is complete. Called before anything reads the cache at start,
+/// because a pending fix of a promote is only valid once the files have
+/// moved.
+pub fn complete_promotes(cache: &Cache) -> Result<usize, FixError> {
+    let mut moved = 0;
+    for root in cache.live_promoted_roots()? {
+        let (Some(parent), Some(child)) = (
+            cache.get_source(&root.parent)?,
+            cache.get_source(&root.source)?,
+        ) else {
+            continue;
+        };
+        moved += cache.reown_units(parent.id, child.id, &root.rel_path)?;
+    }
+    Ok(moved)
+}
+
+/// What one pass over the pending rows did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunSummary {
+    pub written: usize,
+    /// Rows finished without a write (nothing to fix, or cancelled).
+    pub dropped: usize,
+    /// Rows left waiting for a later trigger (a transient failure).
+    pub deferred: usize,
+    pub needs_manual_fix: usize,
+    /// Rows left alone because their source is offline.
+    pub skipped_offline: usize,
+}
+
+/// What one run of the write loop leaves for an announcement.
+#[derive(Default)]
+struct Report {
+    /// Each entry the run worked on, as it stood before.
+    before: HashMap<i64, FixNotice>,
+    written: Vec<WrittenFile>,
+}
+
+impl Report {
+    /// The announcement for this run. `fresh` are the entries the run
+    /// itself began: one is announced when it wrote a file or left one
+    /// behind (a rename with nothing to rewrite is no news). Any other
+    /// entry (a retry's) is announced when the run changed it.
+    fn announcement(&self, cache: &Cache, fresh: &[i64]) -> Result<FixAnnouncement, FixError> {
+        let mut ids: Vec<i64> = self.before.keys().copied().collect();
+        ids.sort_unstable();
+        let mut notices = Vec::new();
+        for id in ids {
+            let Some(row) = cache.get_fix_log(id)? else {
+                continue;
+            };
+            let now = FixNotice::from_row(&row);
+            let news = if fresh.contains(&id) {
+                now.files_changed > 0 || now.deferred > 0
+            } else {
+                self.before.get(&id) != Some(&now)
+            };
+            if news {
+                notices.push(now);
+            }
+        }
+        Ok(FixAnnouncement {
+            notices,
+            written: self.written.clone(),
+        })
+    }
+}
+
+// ---------------------------------------------------------------
+// The engine
+// ---------------------------------------------------------------
+
+/// The fix log and the pending list over one cache file. One call at a
+/// time: the engine's own lock serializes them, so a watcher batch and
+/// a `source.rescan` never retry the same row twice at once.
+pub struct FixEngine {
+    cache_path: PathBuf,
+    writer: Arc<dyn FileWriter>,
+    clock: Arc<dyn Clock>,
+    stop_after_writes: Option<usize>,
+    stop_after_promote_commit: bool,
+    /// The `qualify_ambiguous_links` setting (G20), read from the config
+    /// once at start and the same for every fix this engine makes.
+    qualify_ambiguous: bool,
+    run_lock: Mutex<()>,
+    /// Held from the question "is this rename in the log already?" to
+    /// the entry that answers it (G4): the exact event and the watcher's
+    /// pairing of one rename, arriving together, never both start a fix.
+    /// Always taken before `run_lock`, never after it.
+    decision_lock: Mutex<()>,
+    /// Where a retry's announcement goes ([`FixSink`]). Unset in tests
+    /// that read the log only; then nothing is announced and the writer
+    /// does not record its writes as its own.
+    sink: RwLock<Option<Arc<dyn FixSink>>>,
+    /// The announcement each thread inside [`RenameFixer::start_batch`]
+    /// has so far: the renames of one watcher batch are fixed one after
+    /// the other on one thread, and make one push.
+    batches: Mutex<HashMap<std::thread::ThreadId, FixAnnouncement>>,
+}
+
+impl FixEngine {
+    pub fn new(cache_path: impl Into<PathBuf>, writer: Arc<dyn FileWriter>) -> Self {
+        FixEngine {
+            cache_path: cache_path.into(),
+            writer,
+            clock: Arc::new(SystemClock),
+            stop_after_writes: None,
+            stop_after_promote_commit: false,
+            qualify_ambiguous: false,
+            run_lock: Mutex::new(()),
+            decision_lock: Mutex::new(()),
+            sink: RwLock::new(None),
+            batches: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Sets where announcements go, and has the writer record each file
+    /// it writes as Tephra's own, so the watcher does not read that write
+    /// as a change (E17): the sink indexes the written files itself.
+    pub fn set_sink(&self, sink: Arc<dyn FixSink>) {
+        self.writer.record_own_writes(true);
+        *self.sink.write().unwrap_or_else(|p| p.into_inner()) = Some(sink);
+    }
+
+    /// What a fix started by the rename detector does with its
+    /// announcement: adds it to this thread's batch if one is open, and
+    /// otherwise announces it at once.
+    fn announce_or_collect(&self, announcement: FixAnnouncement) {
+        let mut batches = self.batches.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(open) = batches.get_mut(&std::thread::current().id()) {
+            open.merge(announcement);
+            return;
+        }
+        drop(batches);
+        self.announce(announcement);
+    }
+
+    /// Hands `announcement` to the sink, if there is one. A retry calls
+    /// this itself; a fix a caller starts returns its announcement
+    /// instead, so the caller can merge it with the push it is already
+    /// making.
+    pub fn announce(&self, announcement: FixAnnouncement) {
+        if announcement.is_empty() {
+            return;
+        }
+        let sink = self.sink.read().unwrap_or_else(|p| p.into_inner()).clone();
+        if let Some(sink) = sink {
+            sink.announce(announcement);
+        }
+    }
+
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Sets the Atlas fallback (G20): with `true`, a plain link whose
+    /// bare name also exists in another source is written as the full
+    /// same-source path. `tephrad` passes the config's
+    /// `qualify_ambiguous_links` once at start. Off by default, which
+    /// leaves every fix as it was before the setting existed.
+    pub fn with_qualify_ambiguous_links(mut self, on: bool) -> Self {
+        self.qualify_ambiguous = on;
+        self
+    }
+
+    /// Test hook: each call stops, with [`FixError::Stopped`], right
+    /// after the `n`-th file it writes has been recorded; with `n` of 0
+    /// it stops after the entry and its work list are stored and before
+    /// the first file is written. Nothing is rolled back or finished:
+    /// the cache and the disk are as a kill at that moment leaves them.
+    pub fn with_stop_after_writes(mut self, n: usize) -> Self {
+        self.stop_after_writes = Some(n);
+        self
+    }
+
+    /// Test hook: [`FixEngine::promote`] stops, with
+    /// [`FixError::Stopped`], right after its one transaction commits and
+    /// before the rows are re-owned: the cache is as a kill at that
+    /// moment leaves it.
+    pub fn with_stop_after_promote_commit(mut self) -> Self {
+        self.stop_after_promote_commit = true;
+        self
+    }
+
+    fn open(&self) -> Result<Cache, FixError> {
+        Ok(Cache::open(&self.cache_path)?)
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.run_lock.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    // -- the log ---------------------------------------------------
+
+    /// The log, newest first. `since` is epoch seconds; `limit` is
+    /// clamped to [`tephra_cache::MAX_LIST_LIMIT`].
+    pub fn list(&self, since: Option<i64>, limit: usize) -> Result<Vec<FixEntryWire>, FixError> {
+        let cache = self.open()?;
+        Ok(cache
+            .list_fix_log(since, limit)?
+            .iter()
+            .map(FixEntryWire::from)
+            .collect())
+    }
+
+    /// Logs a file that vanished with no certain pair: its links are
+    /// broken. No pending work is created for it (G10). Every call logs
+    /// an entry.
+    pub fn record_uncertain(&self, source: &str, path: &str) -> Result<FixEntryWire, FixError> {
+        let _decision = self.decision_guard();
+        self.record_uncertain_inner(source, path, MSG_UNCERTAIN, Dedupe::Never)
+    }
+
+    /// [`FixEngine::record_uncertain`] for a caller that holds the
+    /// [`FixEngine::decision_guard`] already, with its own message and
+    /// its own idea of what counts as the same vanishing seen twice.
+    pub(crate) fn record_uncertain_inner(
+        &self,
+        source: &str,
+        path: &str,
+        message: &str,
+        dedupe: Dedupe,
+    ) -> Result<FixEntryWire, FixError> {
+        let _guard = self.lock();
+        let cache = self.open()?;
+        let now = self.clock.now();
+        let same = cache
+            .fix_log_summaries(source)?
+            .into_iter()
+            .rev()
+            .find(|e| {
+                e.kind == KIND_UNCERTAIN
+                    && e.old_source.as_deref() == Some(source)
+                    && e.old_path.as_deref() == Some(path)
+            })
+            .filter(|e| now - e.created_at <= UNCERTAIN_DEDUPE_SECS);
+        if let Some(existing) = same {
+            let repeat = match dedupe {
+                Dedupe::Never => false,
+                // An exact event saying "moved outside" for a path that
+                // already has a recent entry: the same vanishing.
+                Dedupe::AnyRecent => true,
+                // The watcher's report of a path an exact event already
+                // logged as moved outside.
+                Dedupe::AfterOutsideEvent => cache
+                    .get_fix_log(existing.id)?
+                    .map(|row| {
+                        FixDetail::parse(row.detail_json.as_deref())
+                            .message
+                            .as_deref()
+                            == Some(event::MSG_MOVED_OUTSIDE)
+                    })
+                    .unwrap_or(false),
+            };
+            if repeat {
+                return entry(&cache, existing.id);
+            }
+        }
+        let detail = FixDetail {
+            message: Some(message.to_string()),
+            ..FixDetail::default()
+        };
+        let id = cache.insert_fix_log(&NewFixLog {
+            created_at: now,
+            kind: KIND_UNCERTAIN.to_string(),
+            status: STATUS_UNCERTAIN.to_string(),
+            old_source: Some(source.to_string()),
+            old_path: Some(path.to_string()),
+            new_source: None,
+            new_path: None,
+            files_changed: 0,
+            detail_json: Some(detail.to_json()),
+        })?;
+        entry(&cache, id)
+    }
+
+    /// Takes the lock that makes "is this rename in the log?" and the
+    /// entry that answers it one step ([`FixEngine::decision_lock`]).
+    pub(crate) fn decision_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.decision_lock.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    // -- starting a fix ---------------------------------------------
+
+    /// Fixes the links to `old_path` after it was renamed to
+    /// `new_path` inside `source`: finds the linking files in the graph
+    /// (as it is after the rename was indexed) and calls
+    /// [`FixEngine::begin_fix`].
+    pub fn begin_rename(
+        &self,
+        source: &str,
+        old_path: &str,
+        new_path: &str,
+    ) -> Result<FixEntryWire, FixError> {
+        self.begin_rename_announced(source, old_path, new_path)
+            .map(|(entry, _)| entry)
+    }
+
+    /// [`FixEngine::begin_rename`], and what the fix has to announce.
+    pub fn begin_rename_announced(
+        &self,
+        source: &str,
+        old_path: &str,
+        new_path: &str,
+    ) -> Result<(FixEntryWire, FixAnnouncement), FixError> {
+        let files = {
+            let cache = self.open()?;
+            let graph = UnitGraph::build_from_cache(&cache)?;
+            linking_files(&graph, source, old_path, source, new_path)?
+        };
+        self.begin_fix_announced(&FixSpec {
+            old_source: source.to_string(),
+            old_path: old_path.to_string(),
+            new_source: source.to_string(),
+            new_path: new_path.to_string(),
+            files,
+        })
+    }
+
+    /// Fixes the links to every file of a folder renamed from `old_dir`
+    /// to `new_dir` inside `source` (G1): `moves` are the `(old, new)`
+    /// paths of the files that moved. ONE entry is logged, with the
+    /// folder's own old and new path; each linking file is stored once
+    /// per moved file it links to, each row naming that file's old and
+    /// new path, because the write loop fixes one rename at a time.
+    /// `files_changed` counts the linking files written, not the files
+    /// that moved. A moved file that is not a unit, or that nothing
+    /// links to, adds no work.
+    pub fn begin_folder_rename(
+        &self,
+        source: &str,
+        old_dir: &str,
+        new_dir: &str,
+        moves: &[(String, String)],
+    ) -> Result<FixEntryWire, FixError> {
+        self.begin_folder_rename_announced(source, old_dir, new_dir, moves)
+            .map(|(entry, _)| entry)
+    }
+
+    /// [`FixEngine::begin_folder_rename`], and what the fix has to
+    /// announce.
+    pub fn begin_folder_rename_announced(
+        &self,
+        source: &str,
+        old_dir: &str,
+        new_dir: &str,
+        moves: &[(String, String)],
+    ) -> Result<(FixEntryWire, FixAnnouncement), FixError> {
+        let rows = {
+            let cache = self.open()?;
+            let graph = UnitGraph::build_from_cache(&cache)?;
+            let mut rows: BTreeSet<PlanRow> = BTreeSet::new();
+            for (old, new) in moves {
+                // A moved file that cannot be fixed (not a unit now, or
+                // its old path is one again) is left out; the rest
+                // still are.
+                let Ok(files) = linking_files(&graph, source, old, source, new) else {
+                    continue;
+                };
+                for file in files {
+                    rows.insert(PlanRow {
+                        file,
+                        old: old.clone(),
+                        new: new.clone(),
+                    });
+                }
+            }
+            rows.into_iter().collect::<Vec<_>>()
+        };
+        self.begin_plan(&Plan {
+            kind: KIND_RENAME,
+            old_source: source.to_string(),
+            new_source: source.to_string(),
+            entry_old: old_dir.to_string(),
+            entry_new: new_dir.to_string(),
+            rows,
+        })
+    }
+
+    /// Fixes the links of a file that went from `old_source` to
+    /// `new_source` (G6), as ONE entry of kind `move`: the links in the
+    /// old source (rewrite 1), the links in the new one (rewrite 2) and
+    /// the moved file's own links (rewrite 3). Every file is stored in
+    /// the pending list in one transaction before the first write.
+    /// `Refused` when `new_path` is not a unit of `new_source`, or the
+    /// old path still is one of `old_source` (the move was not indexed).
+    pub fn begin_move_announced(
+        &self,
+        old_source: &str,
+        old_path: &str,
+        new_source: &str,
+        new_path: &str,
+    ) -> Result<(FixEntryWire, FixAnnouncement), FixError> {
+        let rows = {
+            let cache = self.open()?;
+            let graph = UnitGraph::build_from_cache(&cache)?;
+            let files = linking_files(&graph, old_source, old_path, new_source, new_path)?;
+            let mut rows: BTreeSet<PlanRow> = files
+                .into_iter()
+                .map(|file| PlanRow {
+                    file,
+                    old: old_path.to_string(),
+                    new: new_path.to_string(),
+                })
+                .collect();
+            // The moved file's own links, when it has any that change.
+            let own = own_links(
+                &graph, old_source, old_path, new_source, new_path, None, false,
+            );
+            if !own.1.is_empty() {
+                rows.insert(PlanRow {
+                    file: (new_source.to_string(), new_path.to_string()),
+                    old: old_path.to_string(),
+                    new: new_path.to_string(),
+                });
+            }
+            rows.into_iter().collect::<Vec<_>>()
+        };
+        self.begin_plan(&Plan {
+            kind: KIND_MOVE,
+            old_source: old_source.to_string(),
+            new_source: new_source.to_string(),
+            entry_old: old_path.to_string(),
+            entry_new: new_path.to_string(),
+            rows,
+        })
+    }
+
+    /// Whether the log has this exact move already, and it still stands
+    /// (the watcher's pairing and an exact event are two signals of one
+    /// move, E7). It stands when no later `rename` or `move` entry took
+    /// the file away from the new place again, or brought a file back to
+    /// the old one: after `A -> B`, `B -> A`, a second `A -> B` is a new
+    /// move to fix, not the first one seen twice (the log chain, as for a
+    /// rename in `state::decide`).
+    pub(crate) fn move_logged(
+        &self,
+        old_source: &str,
+        old_path: &str,
+        new_source: &str,
+        new_path: &str,
+    ) -> Result<bool, FixError> {
+        let cache = self.open()?;
+        // Both sources' entries, oldest first (id order); a move names
+        // both, so a same-source pair is read twice and deduplicated.
+        let mut log = cache.fix_log_summaries(old_source)?;
+        if new_source != old_source {
+            log.extend(cache.fix_log_summaries(new_source)?);
+        }
+        log.sort_by_key(|e| e.id);
+        log.dedup_by_key(|e| e.id);
+
+        let at = |source: &Option<String>, path: &Option<String>, want: (&str, &str)| {
+            source.as_deref() == Some(want.0) && path.as_deref() == Some(want.1)
+        };
+        let Some(last) = log.iter().rev().find(|e| {
+            e.kind == KIND_MOVE
+                && at(&e.old_source, &e.old_path, (old_source, old_path))
+                && at(&e.new_source, &e.new_path, (new_source, new_path))
+        }) else {
+            return Ok(false);
+        };
+        let undone = log.iter().any(|e| {
+            e.id > last.id
+                && (e.kind == KIND_MOVE || e.kind == KIND_RENAME)
+                && (at(&e.old_source, &e.old_path, (new_source, new_path))
+                    || at(&e.new_source, &e.new_path, (old_source, old_path)))
+        });
+        Ok(!undone)
+    }
+
+    /// Whether the log has `path` of `source` leaving it by a recent
+    /// move to another source.
+    pub(crate) fn move_departed(&self, source: &str, path: &str) -> Result<bool, FixError> {
+        let cache = self.open()?;
+        let now = self.clock.now();
+        Ok(cache.fix_log_summaries(source)?.into_iter().any(|e| {
+            e.kind == KIND_MOVE
+                && e.old_source.as_deref() == Some(source)
+                && e.old_path.as_deref() == Some(path)
+                && now - e.created_at <= UNCERTAIN_DEDUPE_SECS
+        }))
+    }
+
+    /// Logs ONE entry for the rename and stores every linking file in
+    /// the pending list, in one transaction, before the first write.
+    /// Then works through the list. Returns the entry as it stands at
+    /// the end (`partial` while work is left).
+    pub fn begin_fix(&self, spec: &FixSpec) -> Result<FixEntryWire, FixError> {
+        self.begin_fix_announced(spec).map(|(entry, _)| entry)
+    }
+
+    /// [`FixEngine::begin_fix`], and what the fix has to announce.
+    pub fn begin_fix_announced(
+        &self,
+        spec: &FixSpec,
+    ) -> Result<(FixEntryWire, FixAnnouncement), FixError> {
+        let files: BTreeSet<&(String, String)> = spec.files.iter().collect();
+        self.begin_plan(&Plan {
+            kind: if spec.old_source == spec.new_source {
+                KIND_RENAME
+            } else {
+                KIND_MOVE
+            },
+            old_source: spec.old_source.clone(),
+            new_source: spec.new_source.clone(),
+            entry_old: spec.old_path.clone(),
+            entry_new: spec.new_path.clone(),
+            rows: files
+                .into_iter()
+                .map(|file| PlanRow {
+                    file: file.clone(),
+                    old: spec.old_path.clone(),
+                    new: spec.new_path.clone(),
+                })
+                .collect(),
+        })
+    }
+
+    /// The body of [`FixEngine::begin_fix_announced`] and
+    /// [`FixEngine::begin_folder_rename_announced`]: the entry and the
+    /// work list in one transaction, then the work. The log entry is
+    /// complete before this returns, so whoever announces it does so
+    /// after the entry is in `fix.list`.
+    fn begin_plan(&self, plan: &Plan) -> Result<(FixEntryWire, FixAnnouncement), FixError> {
+        let _guard = self.lock();
+        let cache = self.open()?;
+        let now = self.clock.now();
+        // One entry per linking file, however many moved files it links
+        // to.
+        let files: BTreeSet<&(String, String)> = plan.rows.iter().map(|r| &r.file).collect();
+        let detail = FixDetail {
+            files: files
+                .iter()
+                .map(|(s, p)| FileEntry::pending(s, p))
+                .collect(),
+            ..FixDetail::default()
+        };
+        let pending: Vec<NewPendingFix> = plan
+            .rows
+            .iter()
+            .map(|r| NewPendingFix {
+                source: r.file.0.clone(),
+                file_path: r.file.1.clone(),
+                old_source: Some(plan.old_source.clone()),
+                old_path: Some(r.old.clone()),
+                new_source: Some(plan.new_source.clone()),
+                new_path: Some(r.new.clone()),
+            })
+            .collect();
+        let (fix_id, _) = cache.start_fix(
+            &NewFixLog {
+                created_at: now,
+                kind: plan.kind.to_string(),
+                status: overall_status(&detail.files).to_string(),
+                old_source: Some(plan.old_source.clone()),
+                old_path: Some(plan.entry_old.clone()),
+                new_source: Some(plan.new_source.clone()),
+                new_path: Some(plan.entry_new.clone()),
+                files_changed: 0,
+                detail_json: Some(detail.to_json()),
+            },
+            &pending,
+        )?;
+        self.run_fix(&cache, fix_id)
+    }
+
+    /// The work of the entry `fix_id`, which has just been stored with
+    /// its pending list: every row is written (or finished without a
+    /// write). The entry as it stands at the end, and what to announce.
+    fn run_fix(
+        &self,
+        cache: &Cache,
+        fix_id: i64,
+    ) -> Result<(FixEntryWire, FixAnnouncement), FixError> {
+        let rows = cache.pending_fixes(None, Some(fix_id))?;
+        let picks = rows
+            .into_iter()
+            .map(|row| retry::Pick {
+                row,
+                prior_rounds: 0,
+            })
+            .collect();
+        let mut report = Report::default();
+        let run = self.run_picks(cache, picks, &mut report);
+        let announcement = report.announcement(cache, &[fix_id]);
+        if let Err(e) = run {
+            // A caller that gets an error has no announcement to merge
+            // into its own: whatever was written is announced now, so
+            // the files are indexed again.
+            if let Ok(a) = announcement {
+                self.announce(a);
+            }
+            return Err(e);
+        }
+        Ok((entry(cache, fix_id)?, announcement?))
+    }
+
+    // -- promoting a folder ----------------------------------------
+
+    /// Makes a folder of `spec.parent` its own source (FR22), in the
+    /// order the plan fixes:
+    ///
+    /// 1. the pending list is worked out against the cache as it WILL be
+    ///    (a savepoint that is always rolled back, [`Cache::simulate_promote`]),
+    ///    then ONE transaction writes the new source's row, the parent's
+    ///    exclusion, the log entry (kind `promote`) and that list;
+    /// 2. the parent's rows under the folder are re-owned, in place;
+    /// 3. `after_reown` runs (the caller makes its live watchers skip the
+    ///    folder from here on), then
+    /// 4. every pending file is rewritten, by the same write loop as any
+    ///    fix, so a file that changed under it or is read-only is
+    ///    retried or logged `needs_manual_fix` and the rest go on.
+    ///
+    /// The cache writes go through the writer gate, like every other
+    /// writer's. A crash after step 1 is finished by the next start:
+    /// [`complete_promotes`] re-owns what is left, then the pending list
+    /// is retried like any other.
+    pub fn promote(
+        &self,
+        spec: &PromoteSpec,
+        after_reown: &dyn Fn(),
+    ) -> Result<PromoteDone, FixError> {
+        use crate::registry::retry_cache_on_busy;
+        use tephra_cache::NewPromote;
+
+        let _guard = self.lock();
+        let cache = self.open()?;
+        let gate = crate::writer_gate::for_path(&self.cache_path);
+        let now = self.clock.now();
+        let parent = cache.get_source(&spec.parent)?.ok_or_else(|| {
+            FixError::Refused(format!("source {} is not registered", spec.parent))
+        })?;
+        let root = spec.root.to_string_lossy().into_owned();
+        let moved = cache.units_under_prefix(parent.id, &spec.folder)?;
+
+        let rows = retry_cache_on_busy(&gate, || {
+            cache.simulate_promote(parent.id, &spec.name, &root, &spec.folder, |after| {
+                promote_rows(after, spec, &moved)
+            })
+        })??;
+
+        let files: BTreeSet<&(String, String)> = rows.iter().map(|r| &r.file).collect();
+        let detail = FixDetail {
+            files: files
+                .iter()
+                .map(|(s, p)| FileEntry::pending(s, p))
+                .collect(),
+            ..FixDetail::default()
+        };
+        let pending: Vec<NewPendingFix> = rows
+            .iter()
+            .map(|r| NewPendingFix {
+                source: r.file.0.clone(),
+                file_path: r.file.1.clone(),
+                old_source: Some(spec.parent.clone()),
+                old_path: Some(r.old.clone()),
+                new_source: Some(spec.name.clone()),
+                new_path: Some(r.new.clone()),
+            })
+            .collect();
+        let log = NewFixLog {
+            created_at: now,
+            kind: KIND_PROMOTE.to_string(),
+            status: overall_status(&detail.files).to_string(),
+            old_source: Some(spec.parent.clone()),
+            old_path: Some(spec.folder.clone()),
+            new_source: Some(spec.name.clone()),
+            new_path: Some(format!("@{}:", spec.name)),
+            files_changed: 0,
+            detail_json: Some(detail.to_json()),
+        };
+        let begun = retry_cache_on_busy(&gate, || {
+            cache.begin_promote(&NewPromote {
+                name: &spec.name,
+                root: &root,
+                parent: &spec.parent,
+                rel_path: &spec.folder,
+                created_at: now,
+                log: &log,
+                pending: &pending,
+            })
+        })?;
+        if self.stop_after_promote_commit {
+            return Err(FixError::Stopped);
+        }
+        let units_moved = retry_cache_on_busy(&gate, || {
+            cache.reown_units(parent.id, begun.source_id, &spec.folder)
+        })?;
+        after_reown();
+        let (entry, announcement) = self.run_fix(&cache, begun.fix_id)?;
+        Ok(PromoteDone {
+            source_id: begun.source_id,
+            units_moved,
+            entry,
+            announcement,
+        })
+    }
+
+    // -- unpromoting a folder ---------------------------------------
+
+    /// Folds a promoted source back into the source it was promoted out
+    /// of (FR22's reverse), in the order [`FixEngine::promote`] uses:
+    ///
+    /// 1. the pending list is worked out against the cache as it WILL be
+    ///    ([`Cache::simulate_unpromote`], always rolled back), then ONE
+    ///    transaction moves the units back, removes the source's row and
+    ///    the folder's exclusion, and writes the log entry (kind
+    ///    `unpromote`) and that list;
+    /// 2. `after_fold` runs (the caller drops the promoted source's live
+    ///    watcher and lets the parent's see the folder again), then
+    /// 3. every pending file is rewritten by the same write loop as any
+    ///    fix, so links come out in canonical form for the parent.
+    ///
+    /// Unlike a promote the cache change is one transaction, so a crash
+    /// leaves the source whole or gone, and only step 3 is resumed by the
+    /// next start.
+    pub fn unpromote(
+        &self,
+        spec: &UnpromoteSpec,
+        after_fold: &dyn Fn(),
+    ) -> Result<UnpromoteDone, FixError> {
+        use crate::registry::retry_cache_on_busy;
+        use tephra_cache::NewUnpromote;
+
+        let _guard = self.lock();
+        let cache = self.open()?;
+        let gate = crate::writer_gate::for_path(&self.cache_path);
+        let now = self.clock.now();
+        if cache.get_source(&spec.parent)?.is_none() {
+            return Err(FixError::Refused(format!(
+                "source {} is not registered",
+                spec.parent
+            )));
+        }
+
+        let rows = retry_cache_on_busy(&gate, || {
+            cache.simulate_unpromote(&spec.name, &spec.parent, &spec.folder, |after| {
+                unpromote_rows(after, spec)
+            })
+        })??;
+
+        let files: BTreeSet<&(String, String)> = rows.iter().map(|r| &r.file).collect();
+        let detail = FixDetail {
+            files: files
+                .iter()
+                .map(|(s, p)| FileEntry::pending(s, p))
+                .collect(),
+            ..FixDetail::default()
+        };
+        let pending: Vec<NewPendingFix> = rows
+            .iter()
+            .map(|r| NewPendingFix {
+                source: r.file.0.clone(),
+                file_path: r.file.1.clone(),
+                old_source: Some(spec.name.clone()),
+                old_path: Some(r.old.clone()),
+                new_source: Some(spec.parent.clone()),
+                new_path: Some(r.new.clone()),
+            })
+            .collect();
+        let log = NewFixLog {
+            created_at: now,
+            kind: KIND_UNPROMOTE.to_string(),
+            status: overall_status(&detail.files).to_string(),
+            old_source: Some(spec.name.clone()),
+            old_path: Some(format!("@{}:", spec.name)),
+            new_source: Some(spec.parent.clone()),
+            new_path: Some(spec.folder.clone()),
+            files_changed: 0,
+            detail_json: Some(detail.to_json()),
+        };
+        let done = retry_cache_on_busy(&gate, || {
+            cache.begin_unpromote(&NewUnpromote {
+                name: &spec.name,
+                parent: &spec.parent,
+                rel_path: &spec.folder,
+                created_at: now,
+                log: &log,
+                pending: &pending,
+            })
+        })?;
+        after_fold();
+        let (entry, announcement) = self.run_fix(&cache, done.fix_id)?;
+        Ok(UnpromoteDone {
+            units_moved: done.units_moved,
+            entry,
+            announcement,
+        })
+    }
+
+    // -- renaming a source ------------------------------------------
+
+    /// Renames the source `spec.old_name` to `spec.new_name` (G13) and
+    /// rewrites every `@old:` link of every source, in the order a
+    /// promote uses:
+    ///
+    /// 1. the pending list is worked out from the graph as it is now (the
+    ///    links still resolve), then ONE transaction renames the row,
+    ///    everything that holds the name, writes the log entry (kind
+    ///    `source_rename`) and that list ([`Cache::begin_source_rename`]);
+    /// 2. `after_swap` runs (the caller moves its live watcher to the new
+    ///    name), then
+    /// 3. every pending file is rewritten by the same write loop as any
+    ///    fix, so a file that changed under it or is read-only is retried
+    ///    or logged `needs_manual_fix` and the rest go on.
+    ///
+    /// The caller has checked the names ([`crate::registry::validate_rename`]);
+    /// a rename that lost a race with another writer comes back as
+    /// [`FixError::NameTaken`] or [`FixError::UnknownSource`] with nothing
+    /// changed. A crash after step 1 is finished by the next start: the
+    /// pending list is retried like any other.
+    pub fn rename_source(
+        &self,
+        spec: &SourceRenameSpec,
+        after_swap: &dyn Fn(),
+    ) -> Result<SourceRenameDone, FixError> {
+        use crate::registry::retry_cache_on_busy;
+        use tephra_cache::{CacheError, NewSourceRename};
+
+        let _guard = self.lock();
+        let cache = self.open()?;
+        let gate = crate::writer_gate::for_path(&self.cache_path);
+        let now = self.clock.now();
+        let graph = UnitGraph::build_from_cache(&cache)?;
+        let files = source_rename_files(&graph, &spec.old_name, &spec.new_name);
+        drop(graph);
+
+        let detail = FixDetail {
+            files: files
+                .iter()
+                .map(|(s, p)| FileEntry::pending(s, p))
+                .collect(),
+            ..FixDetail::default()
+        };
+        let pending: Vec<NewPendingFix> = files
+            .iter()
+            .map(|(s, p)| NewPendingFix {
+                source: s.clone(),
+                file_path: p.clone(),
+                old_source: Some(spec.old_name.clone()),
+                old_path: None,
+                new_source: Some(spec.new_name.clone()),
+                new_path: None,
+            })
+            .collect();
+        let log = NewFixLog {
+            created_at: now,
+            kind: KIND_SOURCE_RENAME.to_string(),
+            status: overall_status(&detail.files).to_string(),
+            old_source: Some(spec.old_name.clone()),
+            old_path: Some(format!("@{}:", spec.old_name)),
+            new_source: Some(spec.new_name.clone()),
+            new_path: Some(format!("@{}:", spec.new_name)),
+            files_changed: 0,
+            detail_json: Some(detail.to_json()),
+        };
+        let done = retry_cache_on_busy(&gate, || {
+            cache.begin_source_rename(&NewSourceRename {
+                old_name: &spec.old_name,
+                new_name: &spec.new_name,
+                created_at: now,
+                log: &log,
+                pending: &pending,
+            })
+        })
+        .map_err(|e| match e {
+            CacheError::DuplicateSource(name) => FixError::NameTaken(name),
+            CacheError::SourceNotFound(name) => FixError::UnknownSource(name),
+            e => FixError::from(e),
+        })?;
+        after_swap();
+        let (entry, announcement) = self.run_fix(&cache, done.fix_id)?;
+        Ok(SourceRenameDone {
+            entry,
+            announcement,
+        })
+    }
+
+    // -- retrying ---------------------------------------------------
+
+    /// At start: every pending row of every source (G9).
+    pub fn resume(&self) -> Result<RunSummary, FixError> {
+        self.retry(&Trigger::Startup)
+    }
+
+    /// After `source.rescan` of `source`: every pending row of it.
+    pub fn after_rescan(&self, source: &str) -> Result<RunSummary, FixError> {
+        self.retry(&Trigger::Rescan {
+            source: source.to_string(),
+        })
+    }
+
+    /// After a watcher batch in `source` that changed `changed` (paths
+    /// on disk): the rows whose backoff has passed, and the rows that
+    /// need a person whose file is in the batch.
+    pub fn after_batch(&self, source: &str, changed: &[PathBuf]) -> Result<RunSummary, FixError> {
+        let rel = {
+            let cache = self.open()?;
+            relative_paths(&cache, source, changed)?
+        };
+        self.retry(&Trigger::Batch {
+            source: source.to_string(),
+            changed: rel,
+        })
+    }
+
+    /// One pass for `trigger`.
+    pub fn retry(&self, trigger: &Trigger) -> Result<RunSummary, FixError> {
+        let _guard = self.lock();
+        let cache = self.open()?;
+        let rows = cache.pending_fixes(None, None)?;
+        let picks = retry::select(rows, trigger, self.clock.now());
+        let mut report = Report::default();
+        let run = self.run_picks(&cache, picks, &mut report);
+        // A retry has no caller to return the announcement to (G25):
+        // what it finished goes out through the sink, as its own entry.
+        if let Ok(a) = report.announcement(&cache, &[]) {
+            self.announce(a);
+        }
+        run
+    }
+
+    // -- the work ---------------------------------------------------
+
+    fn run_picks(
+        &self,
+        cache: &Cache,
+        picks: Vec<retry::Pick>,
+        report: &mut Report,
+    ) -> Result<RunSummary, FixError> {
+        let mut summary = RunSummary::default();
+        if picks.is_empty() {
+            return Ok(summary);
+        }
+        // Each entry as it stands before this pass, to tell afterwards
+        // which ones it changed.
+        for pick in &picks {
+            if let Some(id) = pick.row.fix_id {
+                if let std::collections::hash_map::Entry::Vacant(slot) = report.before.entry(id) {
+                    if let Some(row) = cache.get_fix_log(id)? {
+                        slot.insert(FixNotice::from_row(&row));
+                    }
+                }
+            }
+        }
+        let graph = UnitGraph::build_from_cache(cache)?;
+        let mut writes = 0usize;
+        if self.stop_after_writes == Some(0) {
+            return Err(FixError::Stopped);
+        }
+        for pick in picks {
+            let wrote = self.process(cache, &graph, pick, &mut summary)?;
+            if let Some(file) = wrote {
+                report.written.push(file);
+                writes += 1;
+                if self.stop_after_writes == Some(writes) {
+                    return Err(FixError::Stopped);
+                }
+            }
+        }
+        Ok(summary)
+    }
+
+    /// One row, start to end. The file, when it was written.
+    fn process(
+        &self,
+        cache: &Cache,
+        graph: &UnitGraph,
+        pick: retry::Pick,
+        summary: &mut RunSummary,
+    ) -> Result<Option<WrittenFile>, FixError> {
+        let retry::Pick {
+            mut row,
+            prior_rounds,
+        } = pick;
+
+        let Some(source) = cache.get_source(&row.source)? else {
+            let why = format!("source {} is no longer registered", row.source);
+            self.finish(
+                cache,
+                &row,
+                Outcome::done(FILE_NOTHING_TO_FIX, why),
+                summary,
+            )?;
+            return Ok(None);
+        };
+        if source.status == SourceStatus::Offline {
+            // Its files cannot be written, and a retry now would only
+            // burn attempts: the row waits for the source.
+            summary.skipped_offline += 1;
+            return Ok(None);
+        }
+
+        if is_source_rename_row(&row) {
+            return self.process_source_rename(
+                cache,
+                graph,
+                row,
+                prior_rounds,
+                &source.path,
+                summary,
+            );
+        }
+
+        let (target_source, target_path, chain) = match pending::recheck(cache, graph, &row)? {
+            Verdict::Finish { status, reason } => {
+                let outcome = if status == FILE_NEEDS_MANUAL_FIX {
+                    Outcome::manual(reason, 0, 0, 0)
+                } else {
+                    Outcome::done(status, reason)
+                };
+                self.finish(cache, &row, outcome, summary)?;
+                return Ok(None);
+            }
+            Verdict::Proceed {
+                source,
+                path,
+                chain,
+            } => (source, path, chain),
+        };
+
+        // A chain A to B to C: the row now names C.
+        if row.new_path.as_deref() != Some(target_path.as_str()) {
+            cache.apply_fix_step(
+                row.id,
+                &PendingOp::Repoint {
+                    new_source: target_source.clone(),
+                    new_path: target_path.clone(),
+                },
+                self.clock.now(),
+                None,
+                |_| None,
+            )?;
+            row.new_source = Some(target_source.clone());
+            row.new_path = Some(target_path.clone());
+        }
+
+        let old_path = row.old_path.clone().unwrap_or_default();
+        let old_source = row.old_source.clone().unwrap_or_default();
+        let old_id = format!("@{old_source}:{old_path}");
+        let new_id = format!("@{target_source}:{target_path}");
+        let file_id = format!("@{}:{}", row.source, row.file_path);
+        // How a plain link to the target is spelled: decided in one place
+        // for a rename, a move, a promote and an unpromote (G20).
+        let spelling = FixSpelling::for_target(graph, &new_id, self.qualify_ambiguous);
+        // A file that went to another source is fixed by one of the three
+        // rewrites of a move, by where the linking file is (G6).
+        let (edges, mode) = if old_source == target_source {
+            (
+                file_edges(graph, &old_id, &new_id, &file_id),
+                spelling.rewrite_mode(),
+            )
+        } else if file_id == new_id {
+            let promoted = promoted_folder(cache, &row)?;
+            let (edges, links) = match unpromoted_folder(cache, &row)? {
+                Some(folder) => own_links_folded(
+                    graph,
+                    &old_source,
+                    &target_source,
+                    &folder,
+                    &folder_units(cache, &target_source, &folder)?,
+                    &new_id,
+                    self.qualify_ambiguous,
+                ),
+                None => own_links(
+                    graph,
+                    &old_source,
+                    &old_path,
+                    &target_source,
+                    &target_path,
+                    promoted.as_deref(),
+                    self.qualify_ambiguous,
+                ),
+            };
+            (
+                edges,
+                RewriteMode::Move(MoveRewrite::Own {
+                    new_path: target_path.clone(),
+                    bare_resolves: spelling.plain_bare(),
+                    links,
+                }),
+            )
+        } else if row.source == target_source {
+            (
+                file_edges(graph, &old_id, &new_id, &file_id),
+                RewriteMode::Move(MoveRewrite::NewSource {
+                    new_path: target_path.clone(),
+                    bare_resolves: spelling.plain_bare(),
+                }),
+            )
+        } else {
+            (
+                file_edges(graph, &old_id, &new_id, &file_id),
+                RewriteMode::Move(MoveRewrite::OldSource {
+                    new_source: target_source.clone(),
+                    new_path: target_path.clone(),
+                }),
+            )
+        };
+        if edges.is_empty() {
+            self.finish(
+                cache,
+                &row,
+                Outcome::done(FILE_NOTHING_TO_FIX, "the file has no link left to rewrite"),
+                summary,
+            )?;
+            return Ok(None);
+        }
+
+        let abs_path = Path::new(&source.path).join(&row.file_path);
+        let mut req = FileFixRequest::new(
+            file_id,
+            abs_path.clone(),
+            edges,
+            old_path,
+            target_path,
+            mode,
+        );
+        req.chain = chain.clone();
+        req.prior_rounds = prior_rounds;
+
+        let result = self.writer.write_file(&req);
+        let wrote = result.status == WriteStatus::Written;
+        let outcome = Outcome::from_write(&result, chain);
+        self.finish(cache, &row, outcome, summary)?;
+        Ok(wrote.then(|| WrittenFile {
+            source: row.source.clone(),
+            path: abs_path,
+        }))
+    }
+
+    /// One row of a source rename, start to end: the file's `@old:`
+    /// wikilinks become `@new:`, by the same write loop as any fix. No
+    /// re-check of the intent applies (a source rename is no unit's
+    /// rename: there is no old name to be reused and no target to
+    /// follow). A document is never opened for writing (F4): it is kept
+    /// as `needs_manual_fix`.
+    fn process_source_rename(
+        &self,
+        cache: &Cache,
+        graph: &UnitGraph,
+        row: PendingFixRow,
+        prior_rounds: u32,
+        source_root: &str,
+        summary: &mut RunSummary,
+    ) -> Result<Option<WrittenFile>, FixError> {
+        let old = row.old_source.clone().unwrap_or_default();
+        let new = row.new_source.clone().unwrap_or_default();
+        let abs_path = Path::new(source_root).join(&row.file_path);
+        if tephra_parser::DocumentFormat::from_path(&abs_path).is_some() {
+            self.finish(
+                cache,
+                &row,
+                Outcome::manual(DOCUMENT_READ_ONLY.to_string(), 0, 0, 0),
+                summary,
+            )?;
+            return Ok(None);
+        }
+        let file_id = format!("@{}:{}", row.source, row.file_path);
+        let edges: Vec<Edge> = graph
+            .get_forward_links_all(&file_id)
+            .into_iter()
+            .filter(|e| e.kind == tephra_parser::LINK_KIND_WIKILINK)
+            .filter(|e| names_source(&e.to_raw, &old))
+            .collect();
+        if edges.is_empty() {
+            self.finish(
+                cache,
+                &row,
+                Outcome::done(
+                    FILE_NOTHING_TO_FIX,
+                    format!("the file has no @{old}: link left to rewrite"),
+                ),
+                summary,
+            )?;
+            return Ok(None);
+        }
+        let mut req = FileFixRequest::new(
+            file_id,
+            abs_path.clone(),
+            edges,
+            format!("@{old}:"),
+            format!("@{new}:"),
+            RewriteMode::Move(MoveRewrite::SourceRename {
+                old_source: old,
+                new_source: new,
+            }),
+        );
+        req.prior_rounds = prior_rounds;
+        let result = self.writer.write_file(&req);
+        let wrote = result.status == WriteStatus::Written;
+        let outcome = Outcome::from_write(&result, Vec::new());
+        self.finish(cache, &row, outcome, summary)?;
+        Ok(wrote.then(|| WrittenFile {
+            source: row.source.clone(),
+            path: abs_path,
+        }))
+    }
+
+    /// Records one row's outcome: the row and the entry in one
+    /// transaction.
+    fn finish(
+        &self,
+        cache: &Cache,
+        row: &PendingFixRow,
+        outcome: Outcome,
+        summary: &mut RunSummary,
+    ) -> Result<(), FixError> {
+        match (&outcome.keep, outcome.file_status) {
+            (None, FILE_WRITTEN) => summary.written += 1,
+            (None, _) => summary.dropped += 1,
+            (Some(k), _) if k.state == STATE_NEEDS_MANUAL_FIX => summary.needs_manual_fix += 1,
+            (Some(_), _) => summary.deferred += 1,
+        }
+        let op = match &outcome.keep {
+            None => PendingOp::Delete,
+            Some(k) => PendingOp::Update {
+                state: k.state.to_string(),
+                reason: outcome.reason.clone(),
+                attempts: i64::from(k.rounds),
+            },
+        };
+        cache.apply_fix_step(row.id, &op, self.clock.now(), row.fix_id, |log| {
+            let mut detail = FixDetail::parse(log.detail_json.as_deref());
+            let file = detail.file_mut(&row.source, &row.file_path);
+            file.status = outcome.file_status.to_string();
+            file.links_changed = outcome.links_changed;
+            file.attempts = outcome.attempts;
+            file.reason = outcome.reason.clone();
+            file.recovered_edits += outcome.recovered_edits;
+            if outcome.chain.len() > 2 {
+                file.chain = outcome.chain.clone();
+            }
+            detail.recovered_edits += outcome.recovered_edits;
+            Some(FixLogChange {
+                status: overall_status(&detail.files).to_string(),
+                files_changed: detail.files_written(),
+                detail_json: Some(detail.to_json()),
+            })
+        })?;
+        Ok(())
+    }
+}
+
+/// What came of one row, ready to record.
+struct Outcome {
+    /// The file's status in the entry's detail.
+    file_status: &'static str,
+    reason: Option<String>,
+    links_changed: usize,
+    attempts: u32,
+    recovered_edits: u32,
+    chain: Vec<String>,
+    /// `Some` when the row stays in the list.
+    keep: Option<Keep>,
+}
+
+struct Keep {
+    state: &'static str,
+    /// Rounds that ended in a transient failure.
+    rounds: u32,
+}
+
+impl Outcome {
+    /// A row finished without a write.
+    fn done(status: &'static str, reason: impl Into<String>) -> Self {
+        Outcome {
+            file_status: status,
+            reason: Some(reason.into()),
+            links_changed: 0,
+            attempts: 0,
+            recovered_edits: 0,
+            chain: Vec::new(),
+            keep: None,
+        }
+    }
+
+    /// A row kept as needing a person.
+    fn manual(reason: String, rounds: u32, attempts: u32, recovered_edits: u32) -> Self {
+        Outcome {
+            file_status: FILE_NEEDS_MANUAL_FIX,
+            reason: Some(reason),
+            links_changed: 0,
+            attempts,
+            recovered_edits,
+            chain: Vec::new(),
+            keep: Some(Keep {
+                state: STATE_NEEDS_MANUAL_FIX,
+                rounds,
+            }),
+        }
+    }
+
+    fn from_write(result: &FileWriteResult, chain: Vec<String>) -> Self {
+        let base = |file_status: &'static str, keep: Option<Keep>| Outcome {
+            file_status,
+            reason: result.reason.clone(),
+            links_changed: result.links_changed,
+            attempts: result.attempts,
+            recovered_edits: result.recovered_edits,
+            chain,
+            keep,
+        };
+        match result.status {
+            WriteStatus::Written => base(FILE_WRITTEN, None),
+            WriteStatus::NothingToWrite => {
+                let mut o = base(FILE_NOTHING_TO_FIX, None);
+                o.reason = Some("the file has no link left to rewrite".to_string());
+                o
+            }
+            WriteStatus::NotFound => {
+                let mut o = base(FILE_NOTHING_TO_FIX, None);
+                o.reason = Some("the file no longer exists".to_string());
+                o
+            }
+            WriteStatus::Deferred => base(
+                FILE_PENDING,
+                Some(Keep {
+                    state: STATE_PENDING,
+                    rounds: result.rounds,
+                }),
+            ),
+            WriteStatus::NeedsManualFix => base(
+                FILE_NEEDS_MANUAL_FIX,
+                Some(Keep {
+                    state: STATE_NEEDS_MANUAL_FIX,
+                    rounds: result.rounds,
+                }),
+            ),
+        }
+    }
+}
+
+fn entry(cache: &Cache, id: i64) -> Result<FixEntryWire, FixError> {
+    cache
+        .get_fix_log(id)?
+        .map(|row| FixEntryWire::from(&row))
+        .ok_or_else(|| FixError::Cache(format!("fix log entry {id} is gone")))
+}
+
+/// The wikilink edges from `file_id` to the old target: those that
+/// dangle and those the rename handed to another file of the same name.
+/// A self-link of the renamed file recorded under the old id belongs to
+/// the file at the new one (as in [`crate::fix::fix_rename`]).
+fn file_edges(graph: &UnitGraph, old_id: &str, new_id: &str, file_id: &str) -> Vec<Edge> {
+    graph
+        .get_rename_backlinks(old_id, new_id)
+        .into_iter()
+        .filter(|e| e.kind == tephra_parser::LINK_KIND_WIKILINK)
+        .map(|mut e| {
+            if e.from == old_id {
+                e.from = new_id.to_string();
+            }
+            e
+        })
+        .filter(|e| e.from == file_id)
+        .collect()
+}
+
+/// Every file with a wikilink that named `old_path` of `old_source`,
+/// as `(source, path)`, after it was renamed (or moved to another source)
+/// to `new_path` of `new_source`.
+fn linking_files(
+    graph: &UnitGraph,
+    old_source: &str,
+    old_path: &str,
+    new_source: &str,
+    new_path: &str,
+) -> Result<Vec<(String, String)>, FixError> {
+    let old_id = format!("@{old_source}:{old_path}");
+    let new_id = format!("@{new_source}:{new_path}");
+    if old_source == new_source && old_path == new_path {
+        return Ok(Vec::new());
+    }
+    if graph.unit(&new_id).is_none() {
+        return Err(FixError::Refused(format!(
+            "'{new_path}' is not a unit in source '{new_source}'"
+        )));
+    }
+    if graph.unit(&old_id).is_some() {
+        return Err(FixError::Refused(format!(
+            "'{old_path}' is still a unit in source '{old_source}': the rename has not been indexed"
+        )));
+    }
+    let files: BTreeSet<(String, String)> = graph
+        .get_rename_backlinks(&old_id, &new_id)
+        .into_iter()
+        .filter(|e| e.kind == tephra_parser::LINK_KIND_WIKILINK)
+        .filter_map(|e| {
+            let from = if e.from == old_id {
+                new_id.clone()
+            } else {
+                e.from
+            };
+            let (s, p) = from.strip_prefix('@')?.split_once(':')?;
+            Some((s.to_string(), p.to_string()))
+        })
+        .collect();
+    Ok(files.into_iter().collect())
+}
+
+/// What the links of the moved file itself need when it went from
+/// `old_source` to `new_source` (rewrite 3): the file's wikilink edges
+/// that change, and what each changes to (see [`OwnLink`]). Every link
+/// of the file is looked at in the graph as it is after the move; where
+/// it pointed before is worked out by resolving it in the source the
+/// file left (the old file is no unit of it any more).
+///
+/// `promoted` is the folder of `old_source` that became `new_source`
+/// when this is a promote (FR22), else `None`: a link of the file that
+/// names another file of that folder by its path from `old_source`'s
+/// root is then respelled relative to the new root (FR23).
+///
+/// `qualify_ambiguous` is the Atlas fallback (G20), used for the text of
+/// a respelled link ([`FixSpelling::target_text`]). A caller that only
+/// asks whether any link changes, not to what, passes `false`: the
+/// answer is the same either way.
+fn own_links(
+    graph: &UnitGraph,
+    old_source: &str,
+    old_path: &str,
+    new_source: &str,
+    new_path: &str,
+    promoted: Option<&str>,
+    qualify_ambiguous: bool,
+) -> (Vec<Edge>, HashMap<String, OwnLink>) {
+    let new_id = format!("@{new_source}:{new_path}");
+    let (old_stem, _) = crate::refactor::strip_md_ext_pub(old_path);
+    let old_base = old_stem.rsplit('/').next().unwrap_or(old_stem);
+    let names_old_file = |target: &str| {
+        let (t, _) = crate::refactor::strip_md_ext_pub(target);
+        t.eq_ignore_ascii_case(old_stem) || t.eq_ignore_ascii_case(old_base)
+    };
+    let mut edges = Vec::new();
+    let mut links: HashMap<String, OwnLink> = HashMap::new();
+    for edge in graph.get_forward_links_all(&new_id) {
+        if edge.kind != tephra_parser::LINK_KIND_WIKILINK {
+            continue;
+        }
+        let w = tephra_parser::parse_wikilink_inner(&edge.to_raw);
+        if w.target.is_empty() {
+            continue;
+        }
+        let file_ref = |source: &str| format!("@{source}:{}", w.target);
+        let respelled = promoted.and_then(|folder| {
+            // Spelled from the old source: bare, or with its prefix.
+            if w.source_prefix.as_deref().is_some_and(|p| p != old_source) {
+                return None;
+            }
+            let rest = strip_folder(&w.target, folder)?;
+            let unit = graph
+                .resolve_link(&format!("@{new_source}:{rest}"), None)
+                .ok()?
+                .unit
+                .id;
+            FixSpelling::target_text(graph, &unit, qualify_ambiguous)
+        });
+        let action = match w.source_prefix.as_deref() {
+            _ if respelled.is_some() => respelled.map(OwnLink::Retarget),
+            None => match graph.resolve_link(&file_ref(old_source), None) {
+                Ok(_) => Some(OwnLink::AddPrefix(old_source.to_string())),
+                Err(_) if names_old_file(&w.target) => Some(OwnLink::SelfLink),
+                Err(_) => None,
+            },
+            Some(p) if p == old_source => {
+                // `@old:<own old path>`: the file itself. Anything else
+                // with that prefix still names the other source, right.
+                let full = crate::refactor::strip_md_ext_pub(&w.target).0;
+                full.eq_ignore_ascii_case(old_stem)
+                    .then_some(OwnLink::SelfLink)
+            }
+            Some(p) if p == new_source => {
+                let prefixed = graph.resolve_link(&file_ref(new_source), None);
+                let bare = graph.resolve_link(&w.target, Some(new_source));
+                match (prefixed, bare) {
+                    (Ok(a), Ok(b)) if a.unit.id == b.unit.id => Some(OwnLink::DropPrefix),
+                    _ => None,
+                }
+            }
+            Some(_) => None,
+        };
+        if let Some(action) = action {
+            links.insert(edge.to_raw.clone(), action);
+            edges.push(edge);
+        }
+    }
+    (edges, links)
+}
+
+/// `target` without its leading `folder/` (compared without regard to
+/// case), or `None` when it is not under that folder.
+fn strip_folder<'a>(target: &'a str, folder: &str) -> Option<&'a str> {
+    let n = folder.len();
+    let head = target.get(..n)?;
+    let rest = target.get(n..)?.strip_prefix('/')?;
+    (head.eq_ignore_ascii_case(folder) && !rest.is_empty()).then_some(rest)
+}
+
+/// What the links of a file that was in a promoted source `child` need
+/// now that `child` is folded back into `parent` (rewrite 3 of an
+/// unpromote): the wikilink edges of `new_id` that change, and what each
+/// changes to (see [`OwnLink`]). `units` are the paths, relative to the
+/// folder, of every file that moved back.
+///
+/// Where a link pointed is worked out from its text alone, the way the
+/// resolver read it in `child` (the source is gone from the graph, so it
+/// cannot be asked), against `units`:
+///
+/// - `[[@parent:x]]` (a prefix a promote added): the prefix goes when the
+///   bare text reaches the same file in the parent.
+/// - `[[src/x]]`, `[[x]]` or `[[@child:src/x]]` naming a file that moved:
+///   a link that still reaches that file is left alone (a bare name that
+///   is still unique); any other becomes the shortest unique target in
+///   the parent, with no prefix (FR23).
+/// - A link to any other source, or to nothing, is left alone.
+///
+/// `qualify_ambiguous` is the Atlas fallback (G20), as in [`own_links`].
+fn own_links_folded(
+    graph: &UnitGraph,
+    child: &str,
+    parent: &str,
+    folder: &str,
+    units: &[String],
+    new_id: &str,
+    qualify_ambiguous: bool,
+) -> (Vec<Edge>, HashMap<String, OwnLink>) {
+    let mut edges = Vec::new();
+    let mut links: HashMap<String, OwnLink> = HashMap::new();
+    for edge in graph.get_forward_links_all(new_id) {
+        if edge.kind != tephra_parser::LINK_KIND_WIKILINK {
+            continue;
+        }
+        let w = tephra_parser::parse_wikilink_inner(&edge.to_raw);
+        if w.target.is_empty() {
+            continue;
+        }
+        let action = match w.source_prefix.as_deref() {
+            Some(p) if p == parent => {
+                let prefixed = graph.resolve_link(&format!("@{parent}:{}", w.target), None);
+                let bare = graph.resolve_link(&w.target, Some(parent));
+                match (prefixed, bare) {
+                    (Ok(a), Ok(b)) if a.unit.id == b.unit.id => Some(OwnLink::DropPrefix),
+                    _ => None,
+                }
+            }
+            Some(p) if p != child => None,
+            prefix => {
+                // Spelled from the promoted source's root (bare, or with
+                // its own prefix): the file it named there.
+                child_target(units, &w.target).and_then(|rel| {
+                    let target_id = format!("@{parent}:{folder}/{rel}");
+                    let still_reaches = prefix.is_none()
+                        && graph
+                            .resolve_link(&w.target, Some(parent))
+                            .is_ok_and(|r| r.unit.id == target_id);
+                    if still_reaches {
+                        None
+                    } else {
+                        FixSpelling::target_text(graph, &target_id, qualify_ambiguous)
+                            .map(OwnLink::Retarget)
+                    }
+                })
+            }
+        };
+        if let Some(action) = action {
+            links.insert(edge.to_raw.clone(), action);
+            edges.push(edge);
+        }
+    }
+    (edges, links)
+}
+
+/// The file of `units` (paths relative to a folder) that the link text
+/// `target` named when that folder was a source of its own, or `None`:
+/// a text with a `/` is a full stem; one without is a file name, and the
+/// shortest stem wins, a tie being no file at all (the resolver's rule,
+/// without regard to case). The extension of a Markdown file is optional.
+fn child_target<'a>(units: &'a [String], target: &str) -> Option<&'a str> {
+    let key = crate::refactor::strip_md_ext_pub(target).0.to_lowercase();
+    let stem = |u: &'a str| crate::refactor::strip_md_ext_pub(u).0.to_lowercase();
+    let mut found: Vec<(&'a str, usize)> = units
+        .iter()
+        .map(String::as_str)
+        .filter(|u| {
+            let s = stem(u);
+            if key.contains('/') {
+                s == key
+            } else {
+                s.rsplit('/').next() == Some(key.as_str())
+            }
+        })
+        .map(|u| (u, stem(u).chars().count()))
+        .collect();
+    found.sort_by_key(|&(_, len)| len);
+    match found.as_slice() {
+        [(only, _)] => Some(only),
+        [(first, a), (_, b), ..] if a < b => Some(first),
+        _ => None,
+    }
+}
+
+/// The folder a pending row's fix promoted, or `None` when it is no
+/// promote.
+fn promoted_folder(cache: &Cache, row: &PendingFixRow) -> Result<Option<String>, FixError> {
+    let Some(fix_id) = row.fix_id else {
+        return Ok(None);
+    };
+    Ok(cache
+        .get_fix_log(fix_id)?
+        .filter(|e| e.kind == KIND_PROMOTE)
+        .and_then(|e| e.old_path))
+}
+
+/// The folder of the parent a pending row's fix folded a promoted source
+/// back into, or `None` when it is no unpromote.
+fn unpromoted_folder(cache: &Cache, row: &PendingFixRow) -> Result<Option<String>, FixError> {
+    let Some(fix_id) = row.fix_id else {
+        return Ok(None);
+    };
+    Ok(cache
+        .get_fix_log(fix_id)?
+        .filter(|e| e.kind == KIND_UNPROMOTE)
+        .and_then(|e| e.new_path))
+}
+
+/// `changed` (paths on disk) relative to the root of `source`. Paths
+/// outside the root are left out.
+fn relative_paths(
+    cache: &Cache,
+    source: &str,
+    changed: &[PathBuf],
+) -> Result<HashSet<String>, FixError> {
+    let Some(row) = cache.get_source(source)? else {
+        return Ok(HashSet::new());
+    };
+    let root = PathBuf::from(&row.path);
+    let canonical_root = root.canonicalize().ok();
+    Ok(changed
+        .iter()
+        .filter_map(|p| {
+            let strip = |p: &Path| {
+                p.strip_prefix(&root)
+                    .ok()
+                    .or_else(|| canonical_root.as_ref().and_then(|r| p.strip_prefix(r).ok()))
+                    .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+            };
+            // The path as given, else with its folder resolved (a
+            // symlinked temp folder; the file itself may be gone).
+            strip(p).or_else(|| {
+                let parent = p.parent()?.canonicalize().ok()?;
+                strip(&parent.join(p.file_name()?))
+            })
+        })
+        .collect())
+}
+
+impl crate::rename_detect::RenameFixer for FixEngine {
+    fn start_batch(&self) {
+        self.batches
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(std::thread::current().id(), FixAnnouncement::default());
+    }
+
+    fn finish_batch(&self) {
+        let open = self
+            .batches
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&std::thread::current().id());
+        if let Some(open) = open {
+            self.announce(open);
+        }
+    }
+
+    fn fix_rename(&self, source: &str, old: &str, new: &str) -> Result<(), String> {
+        // G4: the same rename may be in the log already (an exact event
+        // got there first). The pairing then does nothing.
+        let _decision = self.decision_guard();
+        let target = match self.decide_for_watcher(source, old, new) {
+            Ok(Some(target)) => target,
+            Ok(None) => return Ok(()),
+            Err(e) => return Err(e.to_string()),
+        };
+        self.begin_rename_announced(source, old, &target)
+            .map(|(e, a)| {
+                log_entry(&e);
+                self.announce_or_collect(a);
+            })
+            .map_err(|e| e.to_string())
+    }
+
+    fn fix_folder_rename(
+        &self,
+        source: &str,
+        old_dir: &str,
+        new_dir: &str,
+        moves: &[(String, String)],
+    ) -> Result<(), String> {
+        let _decision = self.decision_guard();
+        let moves = match self.watcher_folder_moves(source, old_dir, new_dir, moves) {
+            Ok(Some(moves)) => moves,
+            Ok(None) => return Ok(()),
+            Err(e) => return Err(e.to_string()),
+        };
+        self.begin_folder_rename_announced(source, old_dir, new_dir, &moves)
+            .map(|(e, a)| {
+                log_entry(&e);
+                self.announce_or_collect(a);
+            })
+            .map_err(|e| e.to_string())
+    }
+
+    fn fix_move(
+        &self,
+        old_source: &str,
+        old: &str,
+        new_source: &str,
+        new: &str,
+    ) -> Result<(), String> {
+        // E7: the same move may be in the log already (an exact event got
+        // there first). The pairing then does nothing.
+        let _decision = self.decision_guard();
+        if self
+            .move_logged(old_source, old, new_source, new)
+            .map_err(|e| e.to_string())?
+        {
+            return Ok(());
+        }
+        match self.begin_move_announced(old_source, old, new_source, new) {
+            Ok((e, a)) => {
+                log_entry(&e);
+                self.announce_or_collect(a);
+                Ok(())
+            }
+            // The new file is not a unit (ignored, not indexed) or the
+            // old one still is: the pair is no move Tephra can fix, and
+            // the vanished side is reported like any other.
+            Err(FixError::Refused(why)) => {
+                tracing::debug!(old_source, old, new_source, new, %why, "move refused by the engine");
+                self.record_uncertain_inner(
+                    old_source,
+                    old,
+                    MSG_UNCERTAIN,
+                    Dedupe::AfterOutsideEvent,
+                )
+                .map(|e| log_entry(&e))
+                .map_err(|e| e.to_string())
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    fn record_uncertain(&self, source: &str, path: &str) -> Result<(), String> {
+        // An exact event moved this file already: its links were fixed
+        // (or reported), so the vanishing is no news (G4).
+        let _decision = self.decision_guard();
+        if self
+            .log_says_departed(source, path)
+            .map_err(|e| e.to_string())?
+            || self
+                .move_departed(source, path)
+                .map_err(|e| e.to_string())?
+        {
+            return Ok(());
+        }
+        self.record_uncertain_inner(source, path, MSG_UNCERTAIN, Dedupe::AfterOutsideEvent)
+            .map(|e| log_entry(&e))
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// One info line in the daemon log for a fix-log entry the automatic
+/// fix just wrote (the entry itself is in `fix.list`).
+fn log_entry(e: &FixEntryWire) {
+    tracing::info!(
+        fix_id = e.id,
+        kind = %e.kind,
+        old = e.old.as_deref().unwrap_or(""),
+        new = e.new.as_deref().unwrap_or(""),
+        files_changed = e.files_changed,
+        status = %e.status,
+        "fix"
+    );
+}

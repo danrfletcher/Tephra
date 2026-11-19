@@ -835,6 +835,9 @@ mod symlinks {
                     kind: "text-other",
                     size: Some(1),
                     too_large: false,
+                    hash: None,
+                    inode: None,
+                    device: None,
                 })
                 .unwrap();
         }

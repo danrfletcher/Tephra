@@ -406,7 +406,12 @@ fn older_schema_cache_logs_the_rebuild_with_both_versions() {
     let lines = process.captured_stderr_lines();
     let rebuild_idx = lines
         .iter()
-        .position(|l| l.contains("schema rebuilt from v1 to v2"))
+        .position(|l| {
+            l.contains(&format!(
+                "schema rebuilt from v1 to v{}",
+                tephra_cache::CURRENT_SCHEMA_VERSION
+            ))
+        })
         .unwrap_or_else(|| panic!("no rebuild log line in: {lines:?}"));
     let ready_idx = lines
         .iter()
@@ -421,7 +426,7 @@ fn older_schema_cache_logs_the_rebuild_with_both_versions() {
     let v: i64 = conn
         .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(v, 2);
+    assert_eq!(v, tephra_cache::CURRENT_SCHEMA_VERSION);
 }
 
 /// A current-version cache logs no rebuild line.
@@ -1464,4 +1469,157 @@ fn restart_with_an_unreadable_source_root_lists_it_as_permission_denied_and_keep
     let listed = rpc(&second, list_body.to_string());
     assert!(listed.contains("\"status\":\"active\""), "{listed}");
     assert_eq!(second.terminate_and_wait(Duration::from_secs(5)), Some(0));
+}
+
+/// G5 through the binary: two registered sources, the daemon stopped, one
+/// note renamed and one source edited, and the next start catches up
+/// after the listener is up. The documented log order still holds, the
+/// catch-up comes after `listening on`, the rename is fixed on disk and
+/// logged once, and a start with nothing changed adds nothing.
+#[test]
+fn a_restart_over_a_changed_tree_catches_up_after_listening_and_keeps_the_log_order() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let config_path = home.path().join(".config/tephra/config.toml");
+    let data_dir = home.path().join(".local/share/tephra");
+    write_config(&config_path, &data_dir, EPHEMERAL_ADDR);
+
+    let notes = tempfile::tempdir().expect("notes tempdir");
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    fs::write(
+        notes.path().join("Training Plan.md"),
+        "# Training Plan\n\nRun.\n",
+    )
+    .unwrap();
+    fs::write(
+        notes.path().join("Weekly Review.md"),
+        "# Weekly Review\n\nThis week: [[Training Plan]].\n",
+    )
+    .unwrap();
+    fs::write(repo.path().join("README.md"), "# repo\n").unwrap();
+
+    let rpc = |process: &TephradProcess, body: String| -> String {
+        let line = process
+            .captured_stderr_lines()
+            .into_iter()
+            .find(|l| l.contains("listening on 127.0.0.1:"))
+            .expect("listening line");
+        let token = fs::read_to_string(data_dir.join("token")).unwrap();
+        send_rpc_request(&port_from_listening_line(&line), token.trim(), &body)
+    };
+    let register = |name: &str, root: &Path| {
+        format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"source.register\",\"params\":{{\"name\":\"{name}\",\"root\":\"{}\"}}}}",
+            root.display()
+        )
+    };
+
+    let mut first = start_and_wait_listening(home.path(), &config_path);
+    assert!(rpc(&first, register("notes", notes.path())).contains("units_written"));
+    assert!(rpc(&first, register("repo", repo.path())).contains("units_written"));
+    assert_eq!(first.terminate_and_wait(Duration::from_secs(5)), Some(0));
+
+    // While the daemon is down.
+    fs::rename(
+        notes.path().join("Training Plan.md"),
+        notes.path().join("Plan.md"),
+    )
+    .unwrap();
+    fs::write(
+        repo.path().join("README.md"),
+        "# repo\n\nedited while down\n",
+    )
+    .unwrap();
+
+    let mut second = start_and_wait_listening(home.path(), &config_path);
+    let fixed = || {
+        fs::read_to_string(notes.path().join("Weekly Review.md"))
+            .unwrap()
+            .contains("[[Plan]]")
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !fixed() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        fixed(),
+        "the rename made while down was not fixed: {:?}",
+        second.captured_stderr_lines()
+    );
+    assert!(
+        second.wait_for_line("catch_up_complete", Duration::from_secs(10)),
+        "{:?}",
+        second.captured_stderr_lines()
+    );
+    assert_eq!(second.terminate_and_wait(Duration::from_secs(5)), Some(0));
+
+    let lines = second.captured_stderr_lines();
+    let index_of =
+        |needle: &str| -> Option<usize> { lines.iter().position(|l| l.contains(needle)) };
+    let config_idx = index_of("loaded config").or_else(|| index_of("wrote default config"));
+    let dir_idx = index_of("data directory ready");
+    let token_idx = index_of("generated new auth token")
+        .or_else(|| index_of("reusing existing auth token"))
+        .or_else(|| index_of("token file permissions were loosened"));
+    let cache_idx = index_of("cache ready");
+    let listening_idx = index_of("listening on");
+    let catch_up_idx = index_of("catch_up_complete");
+    let (config_idx, dir_idx, token_idx, cache_idx, listening_idx, catch_up_idx) = (
+        config_idx.expect("config-stage log line"),
+        dir_idx.expect("directory-stage log line"),
+        token_idx.expect("token-stage log line"),
+        cache_idx.expect("cache-stage log line"),
+        listening_idx.expect("listening log line"),
+        catch_up_idx.expect("catch-up log line"),
+    );
+    assert!(
+        config_idx < dir_idx
+            && dir_idx < token_idx
+            && token_idx < cache_idx
+            && cache_idx < listening_idx
+            && listening_idx < catch_up_idx,
+        "expected config < directory < token < cache < listening < catch-up, got {config_idx}, {dir_idx}, {token_idx}, {cache_idx}, {listening_idx}, {catch_up_idx} in: {lines:?}"
+    );
+
+    // One rename entry; the edit is indexed.
+    let conn = rusqlite::Connection::open(data_dir.join("cache.db")).unwrap();
+    let renames: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM fix_log WHERE kind = 'rename'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(renames, 1);
+    drop(conn);
+
+    // A third start with nothing changed writes nothing.
+    let tree = || -> Vec<(std::path::PathBuf, Vec<u8>, std::time::SystemTime)> {
+        let mut out = Vec::new();
+        for root in [notes.path(), repo.path()] {
+            for entry in fs::read_dir(root).unwrap() {
+                let p = entry.unwrap().path();
+                out.push((
+                    p.clone(),
+                    fs::read(&p).unwrap(),
+                    fs::metadata(&p).unwrap().modified().unwrap(),
+                ));
+            }
+        }
+        out.sort();
+        out
+    };
+    let before = tree();
+    let mut third = start_and_wait_listening(home.path(), &config_path);
+    assert!(
+        third.wait_for_line("catch_up_complete", Duration::from_secs(10)),
+        "{:?}",
+        third.captured_stderr_lines()
+    );
+    assert_eq!(third.terminate_and_wait(Duration::from_secs(5)), Some(0));
+    assert_eq!(tree(), before, "bytes and mtimes unchanged");
+    let conn = rusqlite::Connection::open(data_dir.join("cache.db")).unwrap();
+    let entries: i64 = conn
+        .query_row("SELECT COUNT(*) FROM fix_log", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(entries, 1, "no new fix-log row");
 }

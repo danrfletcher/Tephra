@@ -13,8 +13,10 @@
 //! `unregister` themselves, and nothing called `unregister` twice to
 //! prove its documented idempotency. These tests close that gap.
 
+mod fix_world;
 mod fixtures;
 
+use fix_world::Daemon;
 use tephra_cache::{Cache, SourceStatus};
 use tephrad::registry::SourceRegistry;
 
@@ -157,4 +159,71 @@ fn unregister_on_a_name_that_was_never_registered_is_a_no_op() {
     registry
         .unregister("never-registered")
         .expect("unregister on an unknown name must not error");
+}
+
+// ---- after a promote (G15, F10) -----------------------------------
+
+fn promoted() -> Daemon {
+    let d = Daemon::start(
+        &[
+            ("proj/A.md", "# A\n\n[[Outside]]\n"),
+            ("proj/sub/B.md", "# B\n"),
+            ("Outside.md", "# O\n\n[[proj/A]]\n"),
+        ],
+        &[],
+        fix_world::real_writer(),
+        false,
+    );
+    d.registry
+        .promote("proj", d.notes_root().join("proj"), &d.engine)
+        .expect("promote");
+    d
+}
+
+#[test]
+fn register_after_promote_still_refuses_nested_and_ancestor_roots() {
+    let d = promoted();
+    let before = d.registry.list().unwrap().len();
+    assert!(d
+        .registry
+        .register("n", d.notes.root().join("proj/sub"))
+        .is_err());
+    assert!(d
+        .registry
+        .register("n", d.notes.root().join("proj"))
+        .is_err());
+    assert!(d
+        .registry
+        .register("n", d.notes.root().parent().unwrap())
+        .is_err());
+    assert_eq!(
+        d.registry.list().unwrap().len(),
+        before,
+        "nothing was added"
+    );
+    d.close();
+}
+
+#[test]
+fn unregistering_the_parent_after_a_promote_leaves_the_child_a_top_level_source_and_rewrites_nothing(
+) {
+    let d = promoted();
+    let before = std::fs::read(d.notes.root().join("proj/A.md")).unwrap();
+    d.registry
+        .unregister("notes")
+        .expect("unregister the parent");
+    let names: Vec<String> = d
+        .registry
+        .list()
+        .unwrap()
+        .into_iter()
+        .map(|r| r.name)
+        .collect();
+    assert!(names.contains(&"proj".to_string()), "{names:?}");
+    assert!(!names.contains(&"notes".to_string()), "{names:?}");
+    assert_eq!(
+        std::fs::read(d.notes.root().join("proj/A.md")).unwrap(),
+        before
+    );
+    d.close();
 }

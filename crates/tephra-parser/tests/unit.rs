@@ -27,6 +27,8 @@ mod documents_pptx;
 mod documents_support;
 #[path = "unit/frontmatter.rs"]
 mod frontmatter;
+#[path = "unit/frontmatter_links.rs"]
+mod frontmatter_links;
 #[path = "unit/headings.rs"]
 mod headings;
 #[path = "unit/index_rows.rs"]

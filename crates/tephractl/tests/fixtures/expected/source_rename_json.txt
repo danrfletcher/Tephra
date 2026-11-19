@@ -1,0 +1,7 @@
+{
+  "deferred": 0,
+  "files_changed": 3,
+  "name": "tephrad",
+  "new_name": "daemon",
+  "status": "applied"
+}

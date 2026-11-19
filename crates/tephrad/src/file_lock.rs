@@ -2,11 +2,12 @@
 //! rewrite of one source file.
 //!
 //! Every write Tephra makes to a user's file (`link.apply_refactor`'s
-//! link rewrites and `block.ensure_id`'s block marker) is a read of the
+//! link rewrites, `block.ensure_id`'s block marker and the automatic
+//! link fix's [`crate::refactor::fix_write`]) is a read of the
 //! file, a computed new content, then an atomic replace. Two of those on
 //! the same file at once would each start from the same old bytes and the
-//! later rename would silently drop the earlier one's change. Both writers
-//! take this lock around their read-to-rename window, so a second writer
+//! later rename would silently drop the earlier one's change. Each writer
+//! takes this lock around its read-to-rename window, so a second writer
 //! starts only after the first has finished, and then re-reads the file
 //! (and re-checks its mtime) as it now is.
 //!

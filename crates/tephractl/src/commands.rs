@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 
 use crate::cli::{BlockTarget, Command, InFileSearchScope};
 use crate::render;
+use crate::since::Since;
 use crate::transport::{RpcCallError, RpcClient};
 
 /// Everything `execute` produced: what to print to stdout/stderr and
@@ -89,6 +90,9 @@ pub fn execute_with_prompt_writer<R: BufRead, W: Write>(
 ) -> CommandOutcome {
     match command {
         Command::SourceAdd { name, path } => source_add(name, path, json, client),
+        Command::SourcePromote { name, path } => source_promote(name, path, json, client),
+        Command::SourceUnpromote { name } => source_unpromote(name, json, client),
+        Command::SourceRename { old, new } => source_rename(old, new, json, client),
         Command::SourceRemove { name } => source_remove(name, json, client),
         Command::SourceList => source_list(json, client),
         Command::Status => status(json, client),
@@ -107,6 +111,7 @@ pub fn execute_with_prompt_writer<R: BufRead, W: Write>(
         Command::SearchAllBlocks { query, limit } => search_all_blocks(query, *limit, json, client),
         Command::BlockId { unit, target } => block_id(unit, target, json, client),
         Command::Backlinks { id } => backlinks(id, json, client),
+        Command::Fixes { since } => fixes(*since, json, client),
         Command::LinkResolve {
             target,
             default_source,
@@ -156,6 +161,89 @@ fn source_add(name: &str, path: &str, json: bool, client: &RpcClient) -> Command
             || render::render_source_added(name, path, &stats),
             json,
         )),
+        Err(e) => CommandOutcome::err(describe_error(&e)),
+    }
+}
+
+/// `source promote <name> <path>` (G11): one `source.promote` call. A
+/// relative `<path>` is made absolute against this process's directory
+/// first, because the daemon's own working directory is not the user's.
+/// A refusal prints the daemon's message and its stable `reason` and
+/// exits 1; nothing has changed then.
+fn source_promote(name: &str, path: &str, json: bool, client: &RpcClient) -> CommandOutcome {
+    let root = match std::path::Path::new(path) {
+        p if p.is_absolute() => path.to_string(),
+        p => match std::env::current_dir() {
+            Ok(cwd) => cwd.join(p).display().to_string(),
+            Err(_) => path.to_string(),
+        },
+    };
+    match client.call("source.promote", json!({"name": name, "root": root})) {
+        Ok(result) => CommandOutcome::ok(json_or(
+            &result,
+            || render::render_source_promoted(&result),
+            json,
+        )),
+        Err(RpcCallError::Rpc { message, data, .. }) => {
+            let reason = data
+                .as_ref()
+                .and_then(|d| d.get("reason"))
+                .and_then(Value::as_str);
+            CommandOutcome::err(match reason {
+                Some(reason) => format!("{message} (reason: {reason})"),
+                None => message,
+            })
+        }
+        Err(e) => CommandOutcome::err(describe_error(&e)),
+    }
+}
+
+/// `source unpromote <name>` (G12): one `source.unpromote` call. A
+/// refusal prints the daemon's message and its stable `reason` and exits
+/// 1; nothing has changed then. This is a fold back, never an undo: the
+/// fix log keeps the promote entry.
+fn source_unpromote(name: &str, json: bool, client: &RpcClient) -> CommandOutcome {
+    match client.call("source.unpromote", json!({"name": name})) {
+        Ok(result) => CommandOutcome::ok(json_or(
+            &result,
+            || render::render_source_unpromoted(&result),
+            json,
+        )),
+        Err(RpcCallError::Rpc { message, data, .. }) => {
+            let reason = data
+                .as_ref()
+                .and_then(|d| d.get("reason"))
+                .and_then(Value::as_str);
+            CommandOutcome::err(match reason {
+                Some(reason) => format!("{message} (reason: {reason})"),
+                None => message,
+            })
+        }
+        Err(e) => CommandOutcome::err(describe_error(&e)),
+    }
+}
+
+/// `source rename <old> <new>` (G13): one `source.rename` call. A refusal
+/// prints the daemon's sentence and its stable `reason` and exits 1;
+/// nothing has changed then. Renaming to the same name is a success that
+/// changed nothing.
+fn source_rename(old: &str, new: &str, json: bool, client: &RpcClient) -> CommandOutcome {
+    match client.call("source.rename", json!({"name": old, "new_name": new})) {
+        Ok(result) => CommandOutcome::ok(json_or(
+            &result,
+            || render::render_source_renamed(&result),
+            json,
+        )),
+        Err(RpcCallError::Rpc { message, data, .. }) => {
+            let reason = data
+                .as_ref()
+                .and_then(|d| d.get("reason"))
+                .and_then(Value::as_str);
+            CommandOutcome::err(match reason {
+                Some(reason) => format!("{message} (reason: {reason})"),
+                None => message,
+            })
+        }
         Err(e) => CommandOutcome::err(describe_error(&e)),
     }
 }
@@ -357,6 +445,27 @@ fn backlinks(id: &str, json: bool, client: &RpcClient) -> CommandOutcome {
         }
         Err(e) => CommandOutcome::err(describe_error(&e)),
     }
+}
+
+/// `fixes`: `fix.list {since?}`, one request, read-only. `since` is
+/// worked out from the clock here (epoch seconds, as the verb takes).
+/// No `limit` is sent: the daemon's default (50, newest first) applies.
+fn fixes(since: Option<Since>, json: bool, client: &RpcClient) -> CommandOutcome {
+    let mut params = json!({});
+    if let Some(since) = since {
+        params["since"] = json!(since.epoch(now_epoch()));
+    }
+    match client.call("fix.list", params) {
+        Ok(result) => CommandOutcome::ok(json_or(&result, || render::render_fixes(&result), json)),
+        Err(e) => CommandOutcome::err(describe_error(&e)),
+    }
+}
+
+fn now_epoch() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn link_resolve(

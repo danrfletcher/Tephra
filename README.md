@@ -6,7 +6,7 @@ A federated graph and link engine for plain-text notes and code folders, written
 
 Everything described here is on `main`: the daemon with config and bearer-token auth; parsers for Markdown notes, code in 13 languages (tree-sitter) and the text of `.docx`, `.pptx` and PDF files; a SQLite cache (schema version 2); a source registry with a filesystem watcher; a link graph and resolver; block links (`[[path#^id]]`); an authenticated JSON-RPC server over HTTP and WebSocket; link refactoring on disk; search by name, heading, block and full text; and `tephractl` for all of it, including running the daemon as a macOS launchd agent.
 
-**Not built yet:** remote sources, promoting a folder to a nested source, `source.rename`, rename detection and automatic link fixes, links to a code symbol by name, OCR for scanned documents, and clients for Obsidian, VSCode and Chrome. No benchmark has been published. [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#not-built-yet) has the list.
+**Not built yet:** remote sources, rename detection and automatic link fixes, links to a code symbol by name, OCR for scanned documents, and clients for Obsidian, VSCode and Chrome. No benchmark has been published. [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#not-built-yet) has the list.
 
 ## Build and test
 
@@ -31,13 +31,42 @@ Every pull request had to pass those last three before it was opened.
 
 On a Mac, `tephractl daemon install` runs `tephrad` as a launchd agent instead (see [the daemon section](docs/ARCHITECTURE.md#running-the-daemon-on-macos)).
 
+## Linux `tephrad` for Atlas's tests
+
+Atlas's tests run against the real `tephrad` inside the Linux `desktop-<slug>` webtop container (aarch64 on an Apple-silicon Mac), where `inotify` is the file watcher. `scripts/linux-tephrad.sh` builds and runs it there. It needs Docker and nothing else on the Mac, and it changes nothing in the Atlas repo.
+
+```sh
+scripts/linux-tephrad.sh build               # cargo build --release in the official rust image -> target/linux/ (gitignored)
+scripts/linux-tephrad.sh start <slug>        # copy into desktop-<slug>, write a config, start tephrad in the background
+scripts/linux-tephrad.sh status <slug>       # up (exit 0) or down (exit 3)
+scripts/linux-tephrad.sh stop <slug>         # stops only that run's tephrad
+scripts/linux-tephrad.sh test [<slug>] [--repeat 50] [--all]   # the rename race tests, in the container
+```
+
+- `build` uses a named volume for the cargo cache (`tephra-linux-cargo`) and one for the build output (`tephra-linux-target`). The image is `rust:1-bookworm`; `TEPHRA_RUST_IMAGE` names another.
+- `start` keeps everything in `/tmp/tephra-linux/<slug>` on the container's own filesystem: its own config, `XDG_DATA_HOME` (so its own token and cache), `HOME`, log and pid file. The container user's real `~/.local/share/tephra` is never touched. `tephrad` listens on a free loopback port it picks itself (`--port <n>` asks for one; a port in use is reported, never reused). Run twice, it stops its own daemon by pid and starts one new one: there are never two. By default it seeds a vault with the golden-path notes and registers it as source `notes`; `--source <dir>` registers another folder instead (refused on a bind mount of the host, where inotify misses host-made changes) and `--no-source` registers none.
+- Before anything is replaced `start` runs `tephrad --help` in the container, so a binary that needs a newer glibc than the container has fails with the glibc message. It also refuses a container whose `fs.inotify.max_user_watches` is below 8192 and names that setting.
+- What Atlas's tests use to reach it: `start` prints it. From the host, with the address it printed:
+
+  ```sh
+  docker exec -e XDG_DATA_HOME=/tmp/tephra-linux/<slug>/xdg-data desktop-<slug> \
+    /tmp/tephra-linux/<slug>/bin/tephractl --addr 127.0.0.1:<port> source list
+  ```
+
+  The JSON-RPC address is `127.0.0.1:<port>` inside the container (HTTP `POST /rpc` or WebSocket `/rpc`), the bearer token is the file `/tmp/tephra-linux/<slug>/xdg-data/tephra/token`, and a raw call is `docker exec desktop-<slug> sh -c 'curl -s -H "Authorization: Bearer $(cat <token file>)" -d <json-rpc> http://127.0.0.1:<port>/rpc'`.
+
+The race tests are `crates/tephrad/tests/rename_races.rs`, six tests that start the real `tephrad` binary and race its watcher against the real `link.rename_event` RPC: event first, watcher first, both at once, event after the fix, event queued while down, and a conflicting event against a hash guess. They use real `rename(2)` calls, so the watcher side is real inotify; no test-only method exists. The file is Linux-only: on macOS `cargo test -p tephrad --test rename_races` compiles it and runs zero tests. The pairing and dedupe rules themselves (`rename_detect`) are OS-independent and their unit tests run the same on the Mac; only the adapter that turns inotify events into marks is Linux-specific. `test --repeat 50` runs every test fifty times over, each on a new daemon and vault (the flake check); `test --all` adds the edge and fence tests (E24, F5, F12). A FSEvents rename on a real Mac, a Finder rename and a `git pull` rename cannot be proved on Linux and are checked by hand.
+
 ## `tephractl` commands
 
 Every command takes `--json` (raw structured output) and `--addr <addr>` (daemon address, default `127.0.0.1:4812`).
 
 | Command | What it does |
 |---|---|
-| `source add <name> <path>`, `source remove <name>`, `source list` | Register, unregister and list sources. |
+| `source add <name> <path>`, `source remove <name>`, `source list` | Register, unregister and list sources. Adding or removing a source sends connected WebSocket clients a `graph:changed` push with a `sources_changed` list (`[{kind: "added"|"removed", name}]`), so a client need not wait for its next check. |
+| `source promote <name> <path>` | Make a folder of a registered source its own source (`source.promote`). The folder's files leave the parent, links that must change to keep resolving are rewritten for you (`@source:` prefixes), and connected clients get one `graph:changed` push with `sources_changed: [{kind: "promoted", name}]`. Refused, with nothing changed, when the folder is a source root or in no source, is a file, its source is offline, or the name is invalid or taken. `source add` still refuses a root nested in another. |
+| `source unpromote <name>` | Fold a promoted source back into the source it was promoted out of (`source.unpromote`). Its files return to the parent, the links the promote rewrote are rewritten back, and connected clients get one `graph:changed` push with `sources_changed: [{kind: "unpromoted", name}]`. `source remove` of a promoted source does the same thing. It is not an undo: the promote stays in `fixes`, with the unpromote above it. Refused, with nothing changed, when the source is unknown, was not promoted (or its parent was removed), or its parent is offline. |
+| `source rename <old> <new>` | Rename a source (`source.rename`). Every `@old:` link in every source is rewritten to `@new:` (anchors and aliases kept; code files change in comment text only; plain Markdown links are never touched; a link in a PDF or Office document is logged `needs_manual_fix` and not written), the registry row, the cache and the watcher move to the new name, `fixes` shows one `source_rename` entry, and connected clients get one `graph:changed` push with `sources_changed: [{kind: "renamed", name, old_name}]`. Renaming to the same name does nothing and succeeds. Refused, with nothing changed and the reason in `error.data.reason` (`invalid_name`, `name_taken`, `unknown_source` or `source_offline`; the same strings, with `not_inside_a_source`, `is_a_source_root`, `not_a_folder`, `nested_source` and `not_promoted`, are what `source add`, `source promote` and `source unpromote` refuse with), when the new name is empty, has a space, `/`, `@`, `:` or `*`, or is taken (compared without regard to case). |
 | `status` | Daemon and source status. |
 | `ls <source> [folder] [-r]` | List one folder of a source (works for an offline source, from the cache). |
 | `search <query> [--limit n]` | Find files by name, title or path across every source. |
@@ -48,6 +77,7 @@ Every command takes `--json` (raw structured output) and `--addr <addr>` (daemon
 | `link refactor --source <name> --old <path> --new <path> [--apply] [--yes]` | Preview or apply the link rewrites a file move needs. |
 | `block-id <unit-id> --line <n>` or `--symbol <name>` | Give a block an ID and print the link to it. |
 | `backlinks <id>` | The links to one file (`@s:path`) or one block (`@s:path#^id`), one row per link with its line. |
+| `fixes [--since <30m\|2h\|7d\|date>] [--json]` | The log of automatic link fixes (`fix.list`), newest first: `time kind old -> new (n files) status`; an `uncertain` line ends with ` - why`. It only reads. |
 | `daemon install`, `daemon uninstall`, `daemon status` | Run `tephrad` as a launchd agent (macOS only). |
 
 Searches never change how a link resolves: an unprefixed `[[Name]]` resolves only inside its own source.

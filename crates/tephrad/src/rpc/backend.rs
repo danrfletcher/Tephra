@@ -287,6 +287,14 @@ fn status_str(status: SourceStatus) -> &'static str {
 /// occurred over the wire).
 pub trait SourceBackend: Send + Sync {
     fn register(&self, name: &str, root: &str) -> Result<ScanStatsWire, String>;
+
+    /// [`SourceBackend::register`], with a refusal carrying its stable
+    /// `reason` (G14: `name_taken`, `nested_source`, ...). What the
+    /// dispatcher calls. The default has no reasons to give: a backend
+    /// that does overrides it.
+    fn register_checked(&self, name: &str, root: &str) -> Result<ScanStatsWire, PromoteRpcError> {
+        self.register(name, root).map_err(PromoteRpcError::Failed)
+    }
     fn unregister(&self, name: &str) -> Result<(), String>;
     fn list(&self) -> Result<Vec<SourceRowWire>, String>;
     fn rescan(&self, name: &str) -> Result<ScanStatsWire, String>;
@@ -351,6 +359,17 @@ impl SourceBackend for SourceRegistry {
         SourceRegistry::register(self, name, root)
             .map(ScanStatsWire::from)
             .map_err(registry_err_to_string)
+    }
+    fn register_checked(&self, name: &str, root: &str) -> Result<ScanStatsWire, PromoteRpcError> {
+        SourceRegistry::register(self, name, root)
+            .map(ScanStatsWire::from)
+            .map_err(|e| match e {
+                RegistryError::Validation(v) => PromoteRpcError::Refused {
+                    reason: v.reason(),
+                    message: v.to_string(),
+                },
+                e => PromoteRpcError::Failed(e.to_string()),
+            })
     }
     fn unregister(&self, name: &str) -> Result<(), String> {
         SourceRegistry::unregister(self, name).map_err(registry_err_to_string)
@@ -639,5 +658,304 @@ impl BlockBackend for UnsupportedBlockIds {
         Err(crate::block_id::BlockIdError::Refused(
             "block ID backend not configured for this test fixture".to_string(),
         ))
+    }
+}
+
+/// `source.promote`'s result (G11): what was made and what it took.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PromoteWire {
+    pub name: String,
+    /// The new source's canonical root.
+    pub root: String,
+    /// The source the folder left, and the folder's path in it.
+    pub parent: String,
+    pub folder: String,
+    /// Cached files that moved to the new source.
+    pub units_moved: usize,
+    /// Linking files rewritten.
+    pub files_changed: i64,
+    /// Linking files left for a retry or a person.
+    pub deferred: i64,
+    /// `applied`, `partial` or `needs_manual_fix`.
+    pub status: String,
+}
+
+impl From<crate::registry::PromoteOutcome> for PromoteWire {
+    fn from(o: crate::registry::PromoteOutcome) -> Self {
+        PromoteWire {
+            name: o.name,
+            root: o.root.display().to_string(),
+            parent: o.parent,
+            folder: o.folder,
+            units_moved: o.units_moved,
+            files_changed: o.files_changed,
+            deferred: o.deferred,
+            status: o.status,
+        }
+    }
+}
+
+/// `source.rename`'s result (G13): what was renamed and what it took.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RenameWire {
+    /// The name the source had, and the one it has now (the same when the
+    /// rename was a no-op).
+    pub name: String,
+    pub new_name: String,
+    /// Linking files rewritten.
+    pub files_changed: i64,
+    /// Linking files left for a retry or a person.
+    pub deferred: i64,
+    /// `applied`, `partial` or `needs_manual_fix`.
+    pub status: String,
+}
+
+impl From<crate::registry::RenameOutcome> for RenameWire {
+    fn from(o: crate::registry::RenameOutcome) -> Self {
+        RenameWire {
+            name: o.old_name,
+            new_name: o.new_name,
+            files_changed: o.files_changed,
+            deferred: o.deferred,
+            status: o.status,
+        }
+    }
+}
+
+/// `source.unpromote`'s result (G12): what was folded back and what it
+/// took.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnpromoteWire {
+    pub name: String,
+    /// The source that took the folder back, and the folder's path in it.
+    pub parent: String,
+    pub folder: String,
+    /// Cached files that moved back to the parent.
+    pub units_moved: usize,
+    /// Linking files rewritten.
+    pub files_changed: i64,
+    /// Linking files left for a retry or a person.
+    pub deferred: i64,
+    /// `applied`, `partial` or `needs_manual_fix`.
+    pub status: String,
+}
+
+impl From<crate::registry::UnpromoteOutcome> for UnpromoteWire {
+    fn from(o: crate::registry::UnpromoteOutcome) -> Self {
+        UnpromoteWire {
+            name: o.name,
+            parent: o.parent,
+            folder: o.folder,
+            units_moved: o.units_moved,
+            files_changed: o.files_changed,
+            deferred: o.deferred,
+            status: o.status,
+        }
+    }
+}
+
+/// Why `source.register`, `source.promote`, `source.unpromote` or
+/// `source.rename` did not succeed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromoteRpcError {
+    /// Refused with a stable `reason`; nothing was changed (E13).
+    Refused {
+        reason: &'static str,
+        message: String,
+    },
+    /// Failed for another reason.
+    Failed(String),
+}
+
+/// `fix.list` (G18), and the one non-RPC call the server makes after a
+/// `source.rescan`: pending fixes are retried then (G9). Behind a trait
+/// for the same reason as [`BlockBackend`].
+pub trait FixBackend: Send + Sync {
+    /// The fix log, newest first: the entries logged at or after
+    /// `since` (epoch seconds), at most `limit` of them. The caller has
+    /// already validated and clamped both.
+    fn list(
+        &self,
+        since: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<crate::fixes::FixEntryWire>, String>;
+
+    /// `source` was just rescanned: retry its pending fixes. Has no
+    /// answer to give; a failure is logged, never raised to the caller
+    /// of `source.rescan`.
+    fn after_rescan(&self, _source: &str) {}
+
+    /// `source.promote` (FR22): the folder `root` of a registered source
+    /// becomes the source `name`. Blocking: it scans and writes files.
+    fn promote(&self, _name: &str, _root: &str) -> Result<PromoteWire, PromoteRpcError> {
+        Err(PromoteRpcError::Failed(
+            "source.promote is not configured for this test fixture".to_string(),
+        ))
+    }
+
+    /// `source.unpromote` (FR22 reversed): the promoted source `name`
+    /// folds back into its parent. Blocking: it writes files.
+    fn unpromote(&self, _name: &str) -> Result<UnpromoteWire, PromoteRpcError> {
+        Err(PromoteRpcError::Failed(
+            "source.unpromote is not configured for this test fixture".to_string(),
+        ))
+    }
+
+    /// `source.rename` (G13): the source `name` is called `new_name` from
+    /// now on and every `@name:` link is rewritten. Blocking: it writes
+    /// files.
+    fn rename(&self, _name: &str, _new_name: &str) -> Result<RenameWire, PromoteRpcError> {
+        Err(PromoteRpcError::Failed(
+            "source.rename is not configured for this test fixture".to_string(),
+        ))
+    }
+
+    /// `source.unregister` of `name` when it is a promoted source: does
+    /// what [`FixBackend::unpromote`] does and answers `Ok(true)`.
+    /// `Ok(false)` when `name` is not promoted: the caller unregisters it
+    /// the plain way.
+    fn unregister_promoted(&self, _name: &str) -> Result<bool, PromoteRpcError> {
+        Ok(false)
+    }
+
+    /// `link.rename_event` (G3): Obsidian renamed `old_path` to
+    /// `new_path` (absolute paths). Fixes the links and answers with
+    /// what came of it. Blocking: it writes files.
+    fn rename_event(
+        &self,
+        _old_path: &str,
+        _new_path: &str,
+    ) -> Result<crate::fixes::event::RenameEventWire, crate::fixes::event::RenameEventError> {
+        Err(crate::fixes::event::RenameEventError::Failed(
+            "rename events are not configured for this test fixture".to_string(),
+        ))
+    }
+}
+
+/// The fix log and the engine of `link.rename_event` as one backend: the
+/// log and the retry are the engine's, the event handler is the one that
+/// also knows the sources.
+pub struct FixService {
+    engine: std::sync::Arc<crate::fixes::FixEngine>,
+    registry: std::sync::Arc<crate::registry::SourceRegistry>,
+    events: crate::fixes::event::RenameEvents,
+}
+
+impl FixService {
+    pub fn new(
+        engine: std::sync::Arc<crate::fixes::FixEngine>,
+        registry: std::sync::Arc<crate::registry::SourceRegistry>,
+    ) -> Self {
+        let events = crate::fixes::event::RenameEvents::new(registry.clone(), engine.clone());
+        FixService {
+            engine,
+            registry,
+            events,
+        }
+    }
+}
+
+impl FixBackend for FixService {
+    fn list(
+        &self,
+        since: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<crate::fixes::FixEntryWire>, String> {
+        FixBackend::list(&*self.engine, since, limit)
+    }
+
+    fn after_rescan(&self, source: &str) {
+        FixBackend::after_rescan(&*self.engine, source)
+    }
+
+    fn rename_event(
+        &self,
+        old_path: &str,
+        new_path: &str,
+    ) -> Result<crate::fixes::event::RenameEventWire, crate::fixes::event::RenameEventError> {
+        self.events.handle(old_path, new_path)
+    }
+
+    fn promote(&self, name: &str, root: &str) -> Result<PromoteWire, PromoteRpcError> {
+        match self.registry.promote(name, root, &self.engine) {
+            Ok(done) => Ok(PromoteWire::from(done)),
+            Err(RegistryError::Promote(e)) => Err(PromoteRpcError::Refused {
+                reason: e.reason(),
+                message: e.to_string(),
+            }),
+            Err(e) => Err(PromoteRpcError::Failed(e.to_string())),
+        }
+    }
+
+    fn unpromote(&self, name: &str) -> Result<UnpromoteWire, PromoteRpcError> {
+        self.registry
+            .unpromote(name, &self.engine)
+            .map(UnpromoteWire::from)
+            .map_err(unpromote_rpc_error)
+    }
+
+    fn rename(&self, name: &str, new_name: &str) -> Result<RenameWire, PromoteRpcError> {
+        self.registry
+            .rename(name, new_name, &self.engine)
+            .map(RenameWire::from)
+            .map_err(|e| match e {
+                RegistryError::Rename(r) => PromoteRpcError::Refused {
+                    reason: r.reason(),
+                    message: r.to_string(),
+                },
+                e => PromoteRpcError::Failed(e.to_string()),
+            })
+    }
+
+    fn unregister_promoted(&self, name: &str) -> Result<bool, PromoteRpcError> {
+        self.registry
+            .unregister_promoted(name, &self.engine)
+            .map_err(unpromote_rpc_error)
+    }
+}
+
+/// A refusal of an unpromote as the RPC layer reports it: an unknown
+/// name is `unknown_source`, the rest carry the reason they have.
+fn unpromote_rpc_error(e: RegistryError) -> PromoteRpcError {
+    match e {
+        RegistryError::NotFound(_) => PromoteRpcError::Refused {
+            reason: "unknown_source",
+            message: e.to_string(),
+        },
+        RegistryError::Unpromote(u) => PromoteRpcError::Refused {
+            reason: u.reason(),
+            message: u.to_string(),
+        },
+        e => PromoteRpcError::Failed(e.to_string()),
+    }
+}
+
+impl FixBackend for crate::fixes::FixEngine {
+    fn list(
+        &self,
+        since: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<crate::fixes::FixEntryWire>, String> {
+        crate::fixes::FixEngine::list(self, since, limit).map_err(|e| e.to_string())
+    }
+
+    fn after_rescan(&self, source: &str) {
+        if let Err(e) = crate::fixes::FixEngine::after_rescan(self, source) {
+            tracing::warn!(source, error = %e, "retrying pending fixes after a rescan failed");
+        }
+    }
+}
+
+/// A [`FixBackend`] that always refuses, for fixtures that never read
+/// the fix log.
+pub struct UnsupportedFixes;
+
+impl FixBackend for UnsupportedFixes {
+    fn list(
+        &self,
+        _since: Option<i64>,
+        _limit: usize,
+    ) -> Result<Vec<crate::fixes::FixEntryWire>, String> {
+        Err("fix log backend not configured for this test fixture".to_string())
     }
 }

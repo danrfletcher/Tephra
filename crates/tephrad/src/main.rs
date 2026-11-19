@@ -19,11 +19,9 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use cli::Action;
-use serde_json::json;
-use tephrad::registry::{DaemonEvent, SourceRegistry};
+use tephrad::registry::SourceRegistry;
 use tephrad::rpc::backend::{GraphBackend, RefactorBackend, SourceBackend};
 use tephrad::rpc::server::{build_router, AppState};
-use tokio::sync::broadcast::error::RecvError;
 
 /// Startup stage names used in `tephrad: <stage> failed: <reason>`
 /// messages, so failures are unambiguous about where they occurred.
@@ -192,7 +190,16 @@ fn main() -> ExitCode {
         Err(e) => tracing::warn!(error = %e, "failed to write access.json"),
     }
 
-    run_server(&cfg.listen_addr, &cache_path, &cfg.data_dir.join("token"))
+    if cfg.qualify_ambiguous_links {
+        tracing::info!("qualify_ambiguous_links is on: link fixes write the fuller same-source path for a name that also exists in another source");
+    }
+
+    run_server(
+        &cfg.listen_addr,
+        &cache_path,
+        &cfg.data_dir.join("token"),
+        cfg.qualify_ambiguous_links,
+    )
 }
 
 /// Stage 5 (listener bind), stage 5b (registry + initial graph build,
@@ -270,11 +277,17 @@ fn main() -> ExitCode {
 ///    `socket_tasks.wait_until_idle(..)` (bounded, in case some client
 ///    never acknowledges the close) immediately after joining the
 ///    forwarder above and before constructing the tuple handed back
-///    out, for the same reason as point 4.
+///    out, for the same reason as point 4. A connection is counted
+///    from the HTTP handler (`ws_rpc_handler`), before axum spawns its
+///    upgrade task, not from when that task first runs (T8): a task
+///    that started late, after a SIGTERM, had its `Arc<AppState>` in
+///    no count, so it was the last owner of the registry when
+///    `drop(runtime)` tore it down on a worker thread.
 fn run_server(
     listen_addr: &str,
     cache_path: &std::path::Path,
     token_path: &std::path::Path,
+    qualify_ambiguous_links: bool,
 ) -> ExitCode {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -436,21 +449,47 @@ fn run_server(
             cache_path.to_path_buf(),
         );
 
-        let state = Arc::new(AppState::with_shutdown(
-            token_path.to_path_buf(),
+        let refactor_engine = Arc::new(tephrad::refactor::RefactorEngine::new(
             shared_graph.clone() as Arc<dyn GraphBackend>,
             registry.clone() as Arc<dyn SourceBackend>,
-            Arc::new(tephrad::refactor::RefactorEngine::new(
-                shared_graph as Arc<dyn GraphBackend>,
-                registry.clone() as Arc<dyn SourceBackend>,
-                registry.clone() as Arc<dyn tephrad::refactor::WatcherPauseControl>,
-            )) as Arc<dyn RefactorBackend>,
-            Some(graph_refresh),
-            Some(shutdown_rx.clone()),
+            registry.clone() as Arc<dyn tephrad::refactor::WatcherPauseControl>,
+        ));
+        // G9/G10: the fix log and the pending-fixes engine, over the
+        // same cache file, writing through PR-4's write loop.
+        let fix_engine = Arc::new(tephrad::fixes::FixEngine::new(
+            cache_path.to_path_buf(),
+            Arc::new(tephrad::refactor::fix_write::FixWriter::new(
+                &refactor_engine,
+            )),
         )
-        .with_blocks(Arc::new(tephrad::block_id::BlockIdEngine::new(
-            registry.clone(),
-        ))));
+        // G20: the Atlas fallback, from the config as read at this start.
+        .with_qualify_ambiguous_links(qualify_ambiguous_links));
+        // G1: a rename a watcher sees is fixed by this engine, with no
+        // client involved.
+        registry.set_rename_fixer(fix_engine.clone());
+        // G17/E17: what a fix writes is indexed again by the registry and
+        // announced as one `graph:changed` with the `fixes` list; the
+        // engine's writes are recorded as Tephra's own, so the watcher
+        // does not see them as changes.
+        fix_engine.set_sink(registry.clone());
+
+        let state = Arc::new(
+            AppState::with_shutdown(
+                token_path.to_path_buf(),
+                shared_graph.clone() as Arc<dyn GraphBackend>,
+                registry.clone() as Arc<dyn SourceBackend>,
+                refactor_engine as Arc<dyn RefactorBackend>,
+                Some(graph_refresh),
+                Some(shutdown_rx.clone()),
+            )
+            .with_blocks(Arc::new(tephrad::block_id::BlockIdEngine::new(
+                registry.clone(),
+            )))
+            .with_fixes(Arc::new(tephrad::rpc::backend::FixService::new(
+                fix_engine.clone(),
+                registry.clone(),
+            ))),
+        );
 
         // Forwards every `DaemonEvent` the registry's watchers/rescans
         // produce (GP6) to connected WebSocket clients as a
@@ -479,46 +518,15 @@ fn run_server(
         // and `registry`'s refcount already back down to the single
         // reference this block is about to hand out, while still
         // inside `block_on` — never during `runtime`'s own shutdown.
-        let forward_state = state.clone();
-        let mut events = registry.subscribe();
-        let mut forwarder_shutdown_rx = shutdown_rx.clone();
-        let forwarder_handle = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = forwarder_shutdown_rx.changed() => {
-                        break;
-                    }
-                    recv = events.recv() => {
-                        match recv {
-                            Ok(DaemonEvent::SourceChanged { source, paths }) => {
-                                if let Some(refresh) = forward_state.graph_refresh.clone() {
-                                    let refreshed = tokio::task::spawn_blocking(move || refresh.refresh()).await;
-                                    match refreshed {
-                                        Ok(Ok(())) => {}
-                                        Ok(Err(e)) => {
-                                            tracing::warn!(error = %e, "failed to refresh the in-memory graph after a watcher event");
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(error = %e, "graph refresh task panicked");
-                                        }
-                                    }
-                                }
-                                let payload = json!({
-                                    "source": source,
-                                    "paths": paths
-                                        .iter()
-                                        .map(|p| p.display().to_string())
-                                        .collect::<Vec<_>>(),
-                                });
-                                forward_state.broadcast_graph_changed(payload);
-                            }
-                            Err(RecvError::Lagged(_)) => continue,
-                            Err(RecvError::Closed) => break,
-                        }
-                    }
-                }
-            }
-        });
+        // The forwarder (`tephrad::forward::run`) is a task this
+        // function waits for below, before it hands the registry back.
+        let events = registry.subscribe();
+        let forwarder_handle = tokio::spawn(tephrad::forward::run(
+            state.clone(),
+            fix_engine.clone(),
+            events,
+            shutdown_rx.clone(),
+        ));
 
         // E11: redo, from the top, every scan that started and never
         // finished (a kill mid-scan, or a source emptied by a schema
@@ -532,10 +540,27 @@ fn run_server(
         // on the next start.
         let rescan_registry = registry.clone();
         let rescan_shutdown_rx = shutdown_rx.clone();
+        let resume_fixes = fix_engine.clone();
         let rescan_handle = tokio::task::spawn_blocking(move || {
             let outcomes = rescan_registry.rescan_unfinished(|| *rescan_shutdown_rx.borrow());
+            // G5: with the unfinished scans redone, catch each source up
+            // with what changed on disk while the daemon was down, then
+            // watch it. Skipped on shutdown.
+            let started = if *rescan_shutdown_rx.borrow() {
+                Vec::new()
+            } else {
+                rescan_registry.start_all(|| *rescan_shutdown_rx.borrow())
+            };
+            let started_count = started.len();
             drop(rescan_registry);
-            outcomes.len()
+            // G9: with the scans done, retry every pending fix of every
+            // source. Rows of an offline source wait.
+            if !*rescan_shutdown_rx.borrow() {
+                if let Err(e) = resume_fixes.resume() {
+                    tracing::warn!(error = %e, "retrying pending fixes at startup failed");
+                }
+            }
+            outcomes.len() + started_count
         });
 
         let socket_tasks = state.socket_tasks.clone();

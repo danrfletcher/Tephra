@@ -1,0 +1,2 @@
+Renamed the source "tephrad" to "daemon"
+  files with links rewritten: 3

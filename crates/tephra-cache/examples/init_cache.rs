@@ -54,6 +54,9 @@ fn main() {
                 rel_path: "demo-note.md",
                 mtime: Some(0),
                 frontmatter_json: None,
+                hash: None,
+                inode: None,
+                device: None,
             })
             .expect("insert_unit");
         cache

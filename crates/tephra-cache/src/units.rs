@@ -32,6 +32,20 @@ pub struct UnitRow {
     /// guessed from the extension and `size` is unknown. Cleared by
     /// the source's next online rescan.
     pub needs_rescan: bool,
+    /// Lower-case hex SHA-256 of the file's bytes, as of the last time
+    /// the file was indexed. `None` for a file over the size cap
+    /// (`too_large`: identity only), for a file whose bytes could not be
+    /// read, and for a provisional row restored across a rebuild
+    /// (`needs_rescan`), until its next online scan.
+    pub hash: Option<String>,
+    /// The file's inode (`stat` `st_ino`) when it was last indexed.
+    /// `None` where the platform has no such thing (non-Unix), and for a
+    /// provisional restored row. Stored in SQLite's signed integer and
+    /// converted back bit for bit, so a value above `i64::MAX` survives.
+    pub inode: Option<u64>,
+    /// The volume the file was on (`stat` `st_dev`). Paired with
+    /// `inode`: an inode number is only unique within one volume.
+    pub device: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -44,11 +58,30 @@ pub struct NewUnit<'a> {
     pub kind: &'a str,
     pub size: Option<i64>,
     pub too_large: bool,
+    /// Hex SHA-256 of the file's bytes; `None` when the file is over the
+    /// size cap or could not be read. See [`UnitRow::hash`].
+    pub hash: Option<&'a str>,
+    /// See [`UnitRow::inode`].
+    pub inode: Option<u64>,
+    /// See [`UnitRow::device`].
+    pub device: Option<u64>,
 }
 
 /// The `units` columns [`unit_from_row`] reads, in order.
-const UNIT_COLUMNS: &str =
-    "id, source_id, rel_path, mtime, frontmatter_json, kind, size, too_large, needs_rescan";
+const UNIT_COLUMNS: &str = "id, source_id, rel_path, mtime, frontmatter_json, kind, size, \
+     too_large, needs_rescan, hash, inode, device";
+
+/// An unsigned 64-bit id as the signed integer SQLite stores. A
+/// wrapping cast, undone bit for bit by [`from_sql_id`], so an inode
+/// above `i64::MAX` comes back unchanged.
+pub(crate) fn to_sql_id(v: u64) -> i64 {
+    v as i64
+}
+
+/// The inverse of [`to_sql_id`].
+pub(crate) fn from_sql_id(v: i64) -> u64 {
+    v as u64
+}
 
 fn unit_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UnitRow> {
     Ok(UnitRow {
@@ -61,6 +94,9 @@ fn unit_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UnitRow> {
         size: row.get(6)?,
         too_large: row.get::<_, i64>(7)? != 0,
         needs_rescan: row.get::<_, i64>(8)? != 0,
+        hash: row.get(9)?,
+        inode: row.get::<_, Option<i64>>(10)?.map(from_sql_id),
+        device: row.get::<_, Option<i64>>(11)?.map(from_sql_id),
     })
 }
 
@@ -214,8 +250,9 @@ pub struct UnitWithSourceStatus {
 
 pub(crate) fn insert_unit(conn: &Connection, new: &NewUnit) -> Result<i64, CacheError> {
     conn.execute(
-        "INSERT INTO units (source_id, rel_path, mtime, frontmatter_json, kind, size, too_large) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO units \
+         (source_id, rel_path, mtime, frontmatter_json, kind, size, too_large, hash, inode, device) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         rusqlite::params![
             new.source_id,
             new.rel_path,
@@ -223,7 +260,10 @@ pub(crate) fn insert_unit(conn: &Connection, new: &NewUnit) -> Result<i64, Cache
             new.frontmatter_json,
             new.kind,
             new.size,
-            new.too_large as i64
+            new.too_large as i64,
+            new.hash,
+            new.inode.map(to_sql_id),
+            new.device.map(to_sql_id)
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -319,6 +359,77 @@ pub(crate) fn get_unit_by_rel_path(
     )
     .optional()
     .map_err(CacheError::from)
+}
+
+/// Every `units` row, in every source, whose stored content hash is
+/// `hash`, ordered by source then path. Several rows (two copies of a
+/// file, two empty files, the same file in two sources) are all
+/// returned; the caller decides what a pair means.
+pub(crate) fn units_by_hash(conn: &Connection, hash: &str) -> Result<Vec<UnitRow>, CacheError> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {UNIT_COLUMNS} FROM units WHERE hash = ?1 ORDER BY source_id, rel_path"
+    ))?;
+    let rows = stmt
+        .query_map([hash], unit_from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Every `units` row of `source_id` nested under the folder
+/// `rel_prefix` (`rel_path` starts with `rel_prefix/`), ordered by path.
+/// The folder's own path is not a row. The range is the same one
+/// [`delete_units_under_prefix`] deletes, so what this lists is exactly
+/// what that would remove.
+pub(crate) fn units_under_prefix(
+    conn: &Connection,
+    source_id: i64,
+    rel_prefix: &str,
+) -> Result<Vec<UnitRow>, CacheError> {
+    let lower = format!("{rel_prefix}/");
+    let upper = format!("{rel_prefix}0");
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {UNIT_COLUMNS} FROM units \
+         WHERE source_id = ?1 AND rel_path >= ?2 AND rel_path < ?3 ORDER BY rel_path"
+    ))?;
+    let rows = stmt
+        .query_map(rusqlite::params![source_id, lower, upper], unit_from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Every `units` row of `source_id`, ordered by path.
+pub(crate) fn units_of_source(
+    conn: &Connection,
+    source_id: i64,
+) -> Result<Vec<UnitRow>, CacheError> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {UNIT_COLUMNS} FROM units WHERE source_id = ?1 ORDER BY rel_path"
+    ))?;
+    let rows = stmt
+        .query_map([source_id], unit_from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Every `units` row whose stored file identity is `(device, inode)`,
+/// whatever its path or source, ordered by source then path. More than
+/// one row only for hard links to one file.
+pub(crate) fn units_by_identity(
+    conn: &Connection,
+    device: u64,
+    inode: u64,
+) -> Result<Vec<UnitRow>, CacheError> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {UNIT_COLUMNS} FROM units WHERE device = ?1 AND inode = ?2 \
+         ORDER BY source_id, rel_path"
+    ))?;
+    let rows = stmt
+        .query_map(
+            rusqlite::params![to_sql_id(device), to_sql_id(inode)],
+            unit_from_row,
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 /// Deletes one `units` row and everything that cascades from it:
@@ -482,14 +593,15 @@ pub(crate) fn units_with_status_for_source(
 ) -> Result<Vec<UnitWithSourceStatus>, CacheError> {
     let mut stmt = conn.prepare(
         "SELECT u.id, u.source_id, u.rel_path, u.mtime, u.frontmatter_json, \
-                u.kind, u.size, u.too_large, u.needs_rescan, s.status \
+                u.kind, u.size, u.too_large, u.needs_rescan, u.hash, u.inode, u.device, \
+                s.status \
          FROM units u JOIN sources s ON s.id = u.source_id \
          WHERE s.name = ?1 ORDER BY u.id",
     )?;
     let mut rows = stmt.query([source_name])?;
     let mut out = Vec::new();
     while let Some(row) = rows.next()? {
-        let status_raw: String = row.get(9)?;
+        let status_raw: String = row.get(12)?;
         let source_status = SourceStatus::parse(&status_raw)
             .ok_or_else(|| CacheError::CorruptStatus(status_raw.clone()))?;
         out.push(UnitWithSourceStatus {
@@ -717,7 +829,7 @@ pub(crate) fn links_from_unit(
 /// [`crate::Cache::table_row_count`] is `pub` and reachable from a
 /// future RPC layer, so an unexpected value must be rejected rather
 /// than merely asserted against in debug builds.
-const ALLOWED_TABLE_NAMES: [&str; 11] = [
+const ALLOWED_TABLE_NAMES: [&str; 14] = [
     "sources",
     "units",
     "links",
@@ -729,6 +841,9 @@ const ALLOWED_TABLE_NAMES: [&str; 11] = [
     "block_fts",
     "block_names",
     "scan_state",
+    "fix_log",
+    "pending_fixes",
+    "promoted_roots",
 ];
 
 pub(crate) fn count_rows(conn: &Connection, table: &str) -> Result<i64, CacheError> {

@@ -27,7 +27,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tephra_cache::{Cache, CacheError, SourceRow, SourceStatus};
 
+use crate::catch_up::{self, BootHooks};
 use crate::ignore::IgnoreRules;
+use crate::rename_detect::{self, RenameFixer, RenamePool, SourceRenames};
 use crate::scan::{self, ScanError, ScanStats};
 use crate::watcher::{self, WatchError, WatcherHandle};
 use crate::writer_gate::{self, WriterGate};
@@ -163,6 +165,27 @@ impl fmt::Display for RegisterError {
     }
 }
 
+impl RegisterError {
+    /// The stable reason string clients branch on (`data.reason`, G14):
+    /// a root nested in or above a registered one is `nested_source`
+    /// (F10), the same root is `is_a_source_root`.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            RegisterError::InvalidPath {
+                reason: PathProbe::Missing | PathProbe::NotADirectory,
+                ..
+            } => "not_a_folder",
+            RegisterError::InvalidPath { .. } => "not_readable",
+            RegisterError::DuplicateName(_) => "name_taken",
+            RegisterError::Conflict {
+                reason: ConflictReason::SameRoot,
+                ..
+            } => "is_a_source_root",
+            RegisterError::Conflict { .. } => "nested_source",
+        }
+    }
+}
+
 impl std::error::Error for RegisterError {}
 
 /// Validates a candidate `(name, root)` registration against the
@@ -226,6 +249,322 @@ pub fn validate_register<'a>(
     Ok(())
 }
 
+/// Why `source.promote` refused (E13). Each has a stable machine-readable
+/// [`PromoteError::reason`]; a refusal changes nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromoteError {
+    /// The path is not a folder: a file, or nothing at all.
+    NotAFolder { path: PathBuf },
+    /// The OS will not let `tephrad` read the folder.
+    Unreadable { path: PathBuf, reason: PathProbe },
+    /// The folder is the root of a registered source (a whole vault, or an
+    /// already-promoted folder).
+    IsASourceRoot { path: PathBuf, source: String },
+    /// The folder is inside no registered source.
+    NotInsideASource { path: PathBuf },
+    /// The source the folder is in is offline.
+    SourceOffline { source: String },
+    /// The new name breaks the name rules ([`check_source_name`]).
+    InvalidName { name: String, why: &'static str },
+    /// A source already has this name, compared without regard to case
+    /// (FR14).
+    NameTaken { name: String, with: String },
+}
+
+impl PromoteError {
+    /// The stable reason string clients branch on (`data.reason`).
+    pub fn reason(&self) -> &'static str {
+        match self {
+            PromoteError::NotAFolder { .. } => "not_a_folder",
+            PromoteError::Unreadable { .. } => "not_readable",
+            PromoteError::IsASourceRoot { .. } => "is_a_source_root",
+            PromoteError::NotInsideASource { .. } => "not_inside_a_source",
+            PromoteError::SourceOffline { .. } => "source_offline",
+            PromoteError::InvalidName { .. } => "invalid_name",
+            PromoteError::NameTaken { .. } => "name_taken",
+        }
+    }
+}
+
+impl fmt::Display for PromoteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PromoteError::NotAFolder { path } => {
+                write!(f, "{} is not a folder", path.display())
+            }
+            PromoteError::Unreadable { path, reason } => {
+                write!(f, "{} can't be read: {reason:?}", path.display())
+            }
+            PromoteError::IsASourceRoot { path, source } => write!(
+                f,
+                "{} is already the root of the source \"{source}\"",
+                path.display()
+            ),
+            PromoteError::NotInsideASource { path } => {
+                write!(f, "{} is not inside any registered source", path.display())
+            }
+            PromoteError::SourceOffline { source } => {
+                write!(f, "the source \"{source}\" is offline")
+            }
+            PromoteError::InvalidName { name, why } => {
+                write!(f, "invalid source name \"{name}\": {why}")
+            }
+            PromoteError::NameTaken { name, with } => {
+                write!(f, "the name \"{name}\" is taken by the source \"{with}\"")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PromoteError {}
+
+/// Why `source.unpromote` refused (G14). Each has a stable
+/// machine-readable [`UnpromoteError::reason`]; a refusal changes nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnpromoteError {
+    /// The source exists but was not made by a promote, or its parent
+    /// was unregistered (it is top-level now).
+    NotPromoted { name: String },
+    /// The source it would fold back into is offline.
+    SourceOffline { source: String },
+}
+
+impl UnpromoteError {
+    /// The stable reason string clients branch on (`data.reason`).
+    pub fn reason(&self) -> &'static str {
+        match self {
+            UnpromoteError::NotPromoted { .. } => "not_promoted",
+            UnpromoteError::SourceOffline { .. } => "source_offline",
+        }
+    }
+}
+
+impl fmt::Display for UnpromoteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            UnpromoteError::NotPromoted { name } => {
+                write!(f, "the source \"{name}\" was not promoted out of another")
+            }
+            UnpromoteError::SourceOffline { source } => {
+                write!(f, "the source \"{source}\" is offline")
+            }
+        }
+    }
+}
+
+impl std::error::Error for UnpromoteError {}
+
+/// Why `source.rename` refused (G13, G14). Each has a stable
+/// machine-readable [`RenameError::reason`]; a refusal changes nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenameError {
+    /// No source has the name to rename.
+    UnknownSource { name: String },
+    /// The new name breaks the name rules ([`check_source_name`]).
+    InvalidName { name: String, why: &'static str },
+    /// Another source has this name, compared without regard to case
+    /// (FR14).
+    NameTaken { name: String, with: String },
+    /// The source to rename is offline: its files cannot be reached.
+    SourceOffline { source: String },
+}
+
+impl RenameError {
+    /// The stable reason string clients branch on (`data.reason`).
+    pub fn reason(&self) -> &'static str {
+        match self {
+            RenameError::UnknownSource { .. } => "unknown_source",
+            RenameError::InvalidName { .. } => "invalid_name",
+            RenameError::NameTaken { .. } => "name_taken",
+            RenameError::SourceOffline { .. } => "source_offline",
+        }
+    }
+}
+
+impl fmt::Display for RenameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RenameError::UnknownSource { name } => {
+                write!(f, "there is no source named \"{name}\"")
+            }
+            RenameError::InvalidName { name, why } => {
+                write!(f, "\"{name}\" is not a valid source name: {why}")
+            }
+            RenameError::NameTaken { name, with } => {
+                write!(f, "the name \"{name}\" is taken by the source \"{with}\"")
+            }
+            RenameError::SourceOffline { source } => {
+                write!(
+                    f,
+                    "the source \"{source}\" is offline, so its links cannot be rewritten"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for RenameError {}
+
+/// What a valid `source.rename` comes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenameCheck {
+    /// The new name is the source's own: nothing to do, and nothing is
+    /// rewritten, logged or pushed.
+    Unchanged,
+    /// Rename the source.
+    Rename,
+}
+
+/// Validates a `source.rename {name, new_name}` against the registered
+/// `existing` sources. Pure, like [`validate_register`]: no filesystem, no
+/// SQLite. `offline` says whether the source `name` is offline.
+///
+/// Checked in this order: the source must exist (`unknown_source`); the
+/// same name is a no-op success whatever the name rules say (an existing
+/// name is never re-checked, FR14); then the new name (`invalid_name`,
+/// then `name_taken`, compared without regard to case, the source's own
+/// name not counting); then `source_offline`.
+pub fn validate_rename(
+    existing: &[Source],
+    offline: bool,
+    name: &str,
+    new_name: &str,
+) -> Result<RenameCheck, RenameError> {
+    if !existing.iter().any(|s| s.name == name) {
+        return Err(RenameError::UnknownSource {
+            name: name.to_string(),
+        });
+    }
+    if name == new_name {
+        return Ok(RenameCheck::Unchanged);
+    }
+    if let Err(why) = check_source_name(new_name) {
+        return Err(RenameError::InvalidName {
+            name: new_name.to_string(),
+            why,
+        });
+    }
+    let lower = new_name.to_lowercase();
+    if let Some(taken) = existing
+        .iter()
+        .find(|s| s.name != name && s.name.to_lowercase() == lower)
+    {
+        return Err(RenameError::NameTaken {
+            name: new_name.to_string(),
+            with: taken.name.clone(),
+        });
+    }
+    if offline {
+        return Err(RenameError::SourceOffline {
+            source: name.to_string(),
+        });
+    }
+    Ok(RenameCheck::Rename)
+}
+
+/// The most characters a new source name may have.
+pub const MAX_SOURCE_NAME_CHARS: usize = 64;
+
+/// The name rules for a NEW source name (FR14: an existing name is never
+/// re-checked): not empty, at most [`MAX_SOURCE_NAME_CHARS`] characters,
+/// no whitespace or control character, none of the characters that mean
+/// something in a link or a glob (`/ \\ @ : # ^ | [ ] *`), and not `.` or
+/// `..`. Used by `source.promote` and `source.rename`.
+pub fn check_source_name(name: &str) -> Result<(), &'static str> {
+    if name.is_empty() {
+        return Err("it must not be empty");
+    }
+    if name.chars().count() > MAX_SOURCE_NAME_CHARS {
+        return Err("it must be at most 64 characters");
+    }
+    if name == "." || name == ".." {
+        return Err("it must not be '.' or '..'");
+    }
+    if name.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("it must not contain spaces or control characters");
+    }
+    if name.chars().any(|c| {
+        matches!(
+            c,
+            '/' | '\\' | '@' | ':' | '#' | '^' | '|' | '[' | ']' | '*'
+        )
+    }) {
+        return Err("it must not contain any of / \\ @ : # ^ | [ ] *");
+    }
+    Ok(())
+}
+
+/// The registered source that owns `path`: the one with the deepest root
+/// that contains it (a file belongs to the deepest registered root above
+/// it). `path` equal to a root is that source's own root.
+pub fn deepest_owner<'a>(existing: &'a [Source], path: &Path) -> Option<&'a Source> {
+    existing
+        .iter()
+        .filter(|s| path.starts_with(&s.root))
+        .max_by_key(|s| s.root.components().count())
+}
+
+/// Validates a `source.promote {name, root}` against the registered
+/// `existing` sources and a pre-computed `probe` of `root`. Pure, like
+/// [`validate_register`]: no filesystem, no SQLite. `root` must be
+/// canonical (see [`SourceRegistry::promote`]). On success returns the
+/// name of the source the folder is in, the one that gives it up.
+///
+/// Checked in this order: the folder itself (a file or a path that is
+/// not there: `not_a_folder`; one the OS will not list), whether it is a
+/// registered root (`is_a_source_root`), whether it is inside a source
+/// at all (`not_inside_a_source`), then the name (`invalid_name`, then
+/// `name_taken`, case-insensitively). A folder that already holds a
+/// promoted source is fine: the inner source stays its own.
+pub fn validate_promote(
+    existing: &[Source],
+    name: &str,
+    root: &Path,
+    probe: PathProbe,
+) -> Result<String, PromoteError> {
+    match probe {
+        PathProbe::Ok => {}
+        PathProbe::Missing | PathProbe::NotADirectory => {
+            return Err(PromoteError::NotAFolder {
+                path: root.to_path_buf(),
+            })
+        }
+        PathProbe::NotReadable | PathProbe::NotReadablePrivacy => {
+            return Err(PromoteError::Unreadable {
+                path: root.to_path_buf(),
+                reason: probe,
+            })
+        }
+    }
+    if let Some(src) = existing.iter().find(|s| s.root == root) {
+        return Err(PromoteError::IsASourceRoot {
+            path: root.to_path_buf(),
+            source: src.name.clone(),
+        });
+    }
+    let Some(parent) = deepest_owner(existing, root) else {
+        return Err(PromoteError::NotInsideASource {
+            path: root.to_path_buf(),
+        });
+    };
+    if let Err(why) = check_source_name(name) {
+        return Err(PromoteError::InvalidName {
+            name: name.to_string(),
+            why,
+        });
+    }
+    if let Some(taken) = existing
+        .iter()
+        .find(|s| s.name.to_lowercase() == name.to_lowercase())
+    {
+        return Err(PromoteError::NameTaken {
+            name: name.to_string(),
+            with: taken.name.clone(),
+        });
+    }
+    Ok(parent.name.clone())
+}
+
 // ---- orchestration ----------------------------------------------------
 
 /// One internal `source_changed` event (GP6) — the seam a later
@@ -239,7 +578,77 @@ pub fn validate_register<'a>(
 /// it carries each source's offline flag.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DaemonEvent {
-    SourceChanged { source: String, paths: Vec<PathBuf> },
+    /// `fixes` is empty for every event but Tephra's own link fix (G17):
+    /// then `paths` are the files it rewrote, already indexed again, and
+    /// `fixes` the log entries of the renames fixed. The forwarder
+    /// refreshes the graph and sends ONE `graph:changed`; the entries
+    /// were written to the fix log before the event was sent. `paths` is
+    /// empty when no file could be written.
+    SourceChanged {
+        source: String,
+        paths: Vec<PathBuf>,
+        fixes: Vec<crate::fixes::FixNotice>,
+    },
+    /// The list of sources changed (G16, FR12): a source was added,
+    /// removed, renamed, promoted or un-promoted. Sent only by
+    /// [`SourceRegistry::announce_sources_changed`], after the change is
+    /// made, and never for a file change or a fix. The forwarder refreshes
+    /// the graph and sends ONE `graph:changed` carrying `sources_changed`.
+    ///
+    /// `fixes` is empty for every change but a promote (FR22), whose link
+    /// rewrites go out in the same push: the log entry of kind `promote`,
+    /// with its `files_changed`.
+    SourceListChanged {
+        changes: Vec<SourceChange>,
+        fixes: Vec<crate::fixes::FixNotice>,
+    },
+}
+
+/// How the source list changed (FR12). The wire name is the lowercase
+/// variant name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceChangeKind {
+    Added,
+    Removed,
+    Renamed,
+    Promoted,
+    Unpromoted,
+}
+
+/// One entry of the `sources_changed` list on `graph:changed`: `kind`
+/// and `name`, plus `old_name` for a rename (`name` is then the new name,
+/// an additive wire detail).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SourceChange {
+    pub kind: SourceChangeKind,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_name: Option<String>,
+}
+
+impl SourceChange {
+    pub fn new(kind: SourceChangeKind, name: impl Into<String>) -> Self {
+        SourceChange {
+            kind,
+            name: name.into(),
+            old_name: None,
+        }
+    }
+
+    /// A rename: `name` is the new name, `old_name` the old one.
+    pub fn renamed(old_name: impl Into<String>, new_name: impl Into<String>) -> Self {
+        SourceChange {
+            kind: SourceChangeKind::Renamed,
+            name: new_name.into(),
+            old_name: Some(old_name.into()),
+        }
+    }
+
+    /// The JSON object sent in `sources_changed`.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::to_value(self).expect("SourceChange always serializes")
+    }
 }
 
 #[derive(Debug)]
@@ -250,6 +659,15 @@ pub enum RegistryError {
     Watch(WatchError),
     Scan(ScanError),
     NotFound(String),
+    /// `source.promote` refused (E13): nothing was changed.
+    Promote(PromoteError),
+    /// `source.unpromote` refused (G14): nothing was changed.
+    Unpromote(UnpromoteError),
+    /// `source.rename` refused (G13, G14): nothing was changed.
+    Rename(RenameError),
+    /// The link rewrites of a promote or an unpromote failed after it was
+    /// recorded; what is left is finished at the next start.
+    Fix(String),
 }
 
 impl fmt::Display for RegistryError {
@@ -261,6 +679,10 @@ impl fmt::Display for RegistryError {
             RegistryError::Watch(e) => write!(f, "{e}"),
             RegistryError::Scan(e) => write!(f, "{e}"),
             RegistryError::NotFound(name) => write!(f, "no source named \"{name}\""),
+            RegistryError::Promote(e) => write!(f, "{e}"),
+            RegistryError::Unpromote(e) => write!(f, "{e}"),
+            RegistryError::Rename(e) => write!(f, "{e}"),
+            RegistryError::Fix(m) => write!(f, "{m}"),
         }
     }
 }
@@ -270,6 +692,21 @@ impl std::error::Error for RegistryError {}
 impl From<RegisterError> for RegistryError {
     fn from(e: RegisterError) -> Self {
         RegistryError::Validation(e)
+    }
+}
+impl From<RenameError> for RegistryError {
+    fn from(e: RenameError) -> Self {
+        RegistryError::Rename(e)
+    }
+}
+impl From<UnpromoteError> for RegistryError {
+    fn from(e: UnpromoteError) -> Self {
+        RegistryError::Unpromote(e)
+    }
+}
+impl From<PromoteError> for RegistryError {
+    fn from(e: PromoteError) -> Self {
+        RegistryError::Promote(e)
     }
 }
 impl From<CacheError> for RegistryError {
@@ -308,6 +745,34 @@ struct RunningSource {
     /// reflects the rescan's rules immediately, rather than only the
     /// stale rules captured when the watcher was first started.
     ignore_rules: Arc<RwLock<IgnoreRules>>,
+    /// `true` while the source is registered. Every `SourceChanged` the
+    /// watcher's batch or root-gone callback sends is sent holding this
+    /// lock and only while it is `true`; [`SourceRegistry::unregister`]
+    /// sets it `false` before it announces the removal, so a batch that
+    /// was mid-flight cannot send an event for the name after `removed`.
+    live: Arc<Mutex<bool>>,
+}
+
+/// Sends `event` unless the source it belongs to has been unregistered.
+fn send_if_live(
+    live: &Mutex<bool>,
+    tx: &tokio::sync::broadcast::Sender<DaemonEvent>,
+    event: DaemonEvent,
+) {
+    let alive = live.lock().unwrap_or_else(|p| p.into_inner());
+    if *alive {
+        let _ = tx.send(event);
+    }
+}
+
+/// Aborts its task when dropped, so the task cannot outlive the source
+/// that owns it however the source is removed.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 fn now_unix() -> i64 {
@@ -366,7 +831,7 @@ fn is_cache_busy(err: &CacheError) -> bool {
 /// in `tests/register_busy_retry.rs`) never also blocks some other,
 /// unrelated source's writes against the same gate for the whole
 /// retry window.
-fn retry_cache_on_busy<T>(
+pub(crate) fn retry_cache_on_busy<T>(
     gate: &WriterGate,
     mut attempt: impl FnMut() -> Result<T, CacheError>,
 ) -> Result<T, CacheError> {
@@ -434,6 +899,95 @@ pub struct SourceRegistry {
     /// (`link.apply_refactor`, `block.ensure_id`) goes through this one
     /// count, see [`SourceRegistry::pause_for_write`].
     write_pause: Mutex<WritePause>,
+    /// What a certain rename seen by a watcher is handed to (G1): the
+    /// fix engine, set once by the daemon. While unset, watchers index
+    /// a rename as a delete and a create, as before.
+    rename_fixer: Arc<RwLock<Option<Arc<dyn RenameFixer>>>>,
+    /// The pending-delete pool every source's watcher feeds: what
+    /// vanished and appeared and is not paired yet, across ALL sources
+    /// (G6), and where each source is. The hold a rename the OS did not
+    /// identify waits is [`watcher::RENAME_HOLD`] unless a test shortens
+    /// it ([`SourceRegistry::set_rename_hold`]).
+    renames: Arc<RenamePool>,
+    /// Held for the whole of a `source.promote`: two promotes, however
+    /// they overlap, run one after the other.
+    promote_lock: Mutex<()>,
+    /// The one task that wakes the pool's detector when a hold ends
+    /// ([`rename_detect::run_holds`]).
+    _hold_task: AbortOnDrop,
+}
+
+/// What a `source.promote` did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromoteOutcome {
+    pub name: String,
+    /// The new source's canonical root.
+    pub root: PathBuf,
+    /// The source that gave the folder up, and the folder's path in it.
+    pub parent: String,
+    pub folder: String,
+    /// Cached rows that moved to the new source.
+    pub units_moved: usize,
+    /// Linking files rewritten.
+    pub files_changed: i64,
+    /// Linking files left for a retry or a person.
+    pub deferred: i64,
+    /// The fix-log status: `applied`, `partial` or `needs_manual_fix`.
+    pub status: String,
+}
+
+/// What a `source.unpromote` did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnpromoteOutcome {
+    /// The source that was folded back.
+    pub name: String,
+    /// The source that took the folder back, and the folder's path in it.
+    pub parent: String,
+    pub folder: String,
+    /// Cached rows that moved back to the parent.
+    pub units_moved: usize,
+    /// Linking files rewritten.
+    pub files_changed: i64,
+    /// Linking files left for a retry or a person.
+    pub deferred: i64,
+    /// The fix-log status: `applied`, `partial` or `needs_manual_fix`.
+    pub status: String,
+}
+
+/// What a `source.rename` did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenameOutcome {
+    pub old_name: String,
+    pub new_name: String,
+    /// `true` when the new name was the source's own: nothing was done.
+    pub unchanged: bool,
+    /// Linking files rewritten.
+    pub files_changed: i64,
+    /// Linking files left for a retry or a person.
+    pub deferred: i64,
+    /// The fix-log status: `applied`, `partial` or `needs_manual_fix`
+    /// (`applied` when nothing was done).
+    pub status: String,
+}
+
+/// What [`SourceRegistry::start_all`] did with one source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BootOutcome {
+    /// Compared with the cache (`paths` files brought up to date) and
+    /// watched from now on.
+    CaughtUp { paths: usize },
+    /// Watched from now on, with no comparison: the source has no
+    /// finished scan to compare with, or it was already watched.
+    Watching,
+    /// Skipped: its root is missing. Marked `offline`, rows kept.
+    Offline,
+    /// Skipped: the OS will not list its root. Rows kept.
+    PermissionDenied,
+    /// Skipped: its watcher could not be started (or its root could
+    /// not be read). Nothing was written for it.
+    Failed(String),
+    /// A shutdown arrived first: nothing was written for it.
+    Stopped,
 }
 
 /// The writers currently holding the watchers paused, and the paths
@@ -478,6 +1032,32 @@ impl SourceRegistry {
         let (events_tx, _rx) = tokio::sync::broadcast::channel(1024);
         let cache_path = cache.path().to_path_buf();
         let gate = writer_gate::for_path(&cache_path);
+        let renames = Arc::new(RenamePool::new(watcher::RENAME_HOLD));
+        let rename_fixer: Arc<RwLock<Option<Arc<dyn RenameFixer>>>> = Arc::new(RwLock::new(None));
+        // G2, G6: a rename the OS did not identify waits a hold. The
+        // task that ends it runs on the registry's runtime and hands the
+        // fix to the blocking pool, like a batch. Its clock stands still
+        // while a pause or the writer gate is active.
+        let hold_task = {
+            let pool = Arc::clone(&renames);
+            let pool_for_blocked = Arc::clone(&renames);
+            let fixer_slot = Arc::clone(&rename_fixer);
+            let blocking = runtime.handle().clone();
+            let gate = Arc::clone(&gate);
+            runtime.spawn(rename_detect::run_holds(
+                Arc::clone(&renames.detector),
+                Arc::clone(&renames.wake),
+                move || pool_for_blocked.any_paused() || gate.is_busy(),
+                move |decisions| {
+                    let fixer = fixer_slot.read().unwrap_or_else(|p| p.into_inner()).clone();
+                    let Some(fixer) = fixer else { return };
+                    let pool = Arc::clone(&pool);
+                    drop(blocking.spawn_blocking(move || {
+                        pool.dispatch(&*fixer, decisions);
+                    }));
+                },
+            ))
+        };
         Ok(SourceRegistry {
             cache: Arc::new(Mutex::new(cache)),
             cache_path,
@@ -487,7 +1067,18 @@ impl SourceRegistry {
             events_tx,
             permission_denied: Mutex::new(HashSet::new()),
             write_pause: Mutex::new(WritePause::default()),
+            rename_fixer,
+            renames,
+            promote_lock: Mutex::new(()),
+            _hold_task: AbortOnDrop(hold_task),
         })
+    }
+
+    /// Replaces the hold a hash-only rename waits ([`watcher::RENAME_HOLD`]),
+    /// for the one pool every source shares. For a test that cannot
+    /// wait the real two seconds.
+    pub fn set_rename_hold(&self, hold: std::time::Duration) {
+        self.renames.set_hold(hold);
     }
 
     /// Subscribes to this registry's internal `source_changed` event
@@ -562,6 +1153,14 @@ impl SourceRegistry {
                     root = %canonical_root.display(),
                     "source_registered"
                 );
+                // G16: one push, after the row, the scan and the watcher
+                // are in place (the forwarder refreshes the graph before it
+                // broadcasts). A failed register returns above and sends
+                // nothing.
+                self.announce_sources_changed(vec![SourceChange::new(
+                    SourceChangeKind::Added,
+                    name,
+                )]);
                 Ok(stats)
             }
             Err(e) => {
@@ -580,6 +1179,534 @@ impl SourceRegistry {
         }
     }
 
+    /// `source.promote` (FR22): the folder `root` of a registered source
+    /// becomes the source `name`. The order is the plan's:
+    ///
+    /// 1. validate ([`validate_promote`], on the canonical root, like
+    ///    `register`), and refuse an offline parent;
+    /// 2. the watchers are paused, so nothing interleaves;
+    /// 3. [`FixEngine::promote`]: ONE transaction (the registry row, the
+    ///    parent's exclusion, the log entry, every crossing link), the
+    ///    units re-owned, the parent's live watcher told to skip the
+    ///    folder, then the link rewrites;
+    /// 4. the files written are indexed, and the new source is scanned
+    ///    and watched;
+    /// 5. the watchers resume (a change made meanwhile is applied now,
+    ///    except Tephra's own writes), and ONE push goes out.
+    ///
+    /// A refusal ([`PromoteError`]) changes nothing and sends nothing.
+    pub fn promote(
+        &self,
+        name: &str,
+        root: impl AsRef<Path>,
+        engine: &crate::fixes::FixEngine,
+    ) -> Result<PromoteOutcome, RegistryError> {
+        let _one_at_a_time = self.promote_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let root = root.as_ref();
+        let probe = probe_path(root);
+        // Canonical before validating, as `register` does: stored roots
+        // are canonical, and a symlink out of the parent must be seen
+        // for where it really goes.
+        let canonical_root = if probe == PathProbe::Ok {
+            root.canonicalize()?
+        } else {
+            root.to_path_buf()
+        };
+
+        let (parent, folder) = {
+            let cache = self.cache.lock().unwrap();
+            let rows = cache.list_sources()?;
+            let existing: Vec<Source> = rows
+                .iter()
+                .map(|r| Source {
+                    name: r.name.clone(),
+                    root: PathBuf::from(&r.path),
+                })
+                .collect();
+            let parent_name = validate_promote(&existing, name, &canonical_root, probe)?;
+            let parent = rows
+                .into_iter()
+                .find(|r| r.name == parent_name)
+                .ok_or_else(|| RegistryError::NotFound(parent_name.clone()))?;
+            if parent.status == SourceStatus::Offline {
+                return Err(PromoteError::SourceOffline {
+                    source: parent.name,
+                }
+                .into());
+            }
+            let folder = canonical_root
+                .strip_prefix(&parent.path)
+                .map_err(|_| PromoteError::NotInsideASource {
+                    path: canonical_root.clone(),
+                })?
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/");
+            (parent, folder)
+        };
+
+        let spec = crate::fixes::PromoteSpec {
+            parent: parent.name.clone(),
+            name: name.to_string(),
+            root: canonical_root.clone(),
+            folder: folder.clone(),
+        };
+
+        self.pause_for_write();
+        let result = self.promote_paused(&spec, &parent, engine);
+        // No path is discarded on resume (FR24): the rewrites are indexed
+        // here and recorded with size and mtime by the write loop's sink
+        // (`FixEngine::set_sink`), so the watcher drops the event of
+        // exactly those bytes and no other. A discard by path alone would
+        // also throw away a user's save made after Tephra's write.
+        self.resume_after_write(&HashSet::new());
+        let (done, scanned) = result?;
+
+        let mut outcome = PromoteOutcome {
+            name: name.to_string(),
+            root: canonical_root,
+            parent: parent.name,
+            folder,
+            units_moved: done.units_moved,
+            files_changed: done.entry.files_changed,
+            deferred: 0,
+            status: done.entry.status.clone(),
+        };
+        outcome.deferred = done
+            .announcement
+            .notices
+            .iter()
+            .map(|n| n.deferred)
+            .sum::<i64>();
+        // ONE push: the source-list change and the fix entry together.
+        let _ = self.events_tx.send(DaemonEvent::SourceListChanged {
+            changes: vec![SourceChange::new(SourceChangeKind::Promoted, name)],
+            fixes: done.announcement.notices,
+        });
+        tracing::info!(
+            source = %name,
+            parent = %outcome.parent,
+            folder = %outcome.folder,
+            units_moved = outcome.units_moved,
+            files_changed = outcome.files_changed,
+            "source_promoted"
+        );
+        scanned?;
+        Ok(outcome)
+    }
+
+    /// The part of [`SourceRegistry::promote`] that runs with the
+    /// watchers paused. `Err` only when the promote did not get past the
+    /// link rewrites; a failure of the new source's own scan or watcher
+    /// (the promote is recorded and the rewrites are done) comes back
+    /// beside the result, so the caller still pushes the change.
+    fn promote_paused(
+        &self,
+        spec: &crate::fixes::PromoteSpec,
+        parent: &SourceRow,
+        engine: &crate::fixes::FixEngine,
+    ) -> Result<(crate::fixes::PromoteDone, Result<(), RegistryError>), RegistryError> {
+        let parent_root = PathBuf::from(&parent.path);
+        let skip_folder = || {
+            // From here the parent's live watcher drops every event in
+            // the folder, and every load of its rules skips it.
+            let rules = self.load_rules(&parent.name, &parent_root);
+            let running = self.running.lock().unwrap();
+            if let (Some(running), Ok(rules)) = (running.get(&parent.name), rules) {
+                *running
+                    .ignore_rules
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner()) = rules;
+            }
+        };
+        let done = engine
+            .promote(spec, &skip_folder)
+            .map_err(|e| RegistryError::Fix(e.to_string()))?;
+        for file in &done.announcement.written {
+            if let Err(e) = self.reindex_quietly(&file.source, &file.path) {
+                tracing::warn!(source = %file.source, path = %file.path.display(), error = %e, "could not index a file the promote rewrote");
+            }
+        }
+        let scanned = self
+            .scan_and_watch(&spec.name, done.source_id, &spec.root)
+            .map(|_| ());
+        Ok((done, scanned))
+    }
+
+    /// `true` when `name` is a source made by a promote and still tied to
+    /// the parent it was promoted out of: a LIVE `promoted_roots` row
+    /// (`Cache::live_promoted_roots`: the parent is registered and
+    /// `name`'s root is the parent's root plus the row's folder). The
+    /// cache keeps the row after the parent is unregistered, as history;
+    /// such a source is top-level, also when another source has since
+    /// taken the parent's name.
+    pub fn is_promoted(&self, name: &str) -> Result<bool, RegistryError> {
+        let cache = self.cache.lock().unwrap();
+        Ok(cache
+            .live_promoted_roots()?
+            .iter()
+            .any(|root| root.source == name))
+    }
+
+    /// `source.unpromote` (FR22 reversed): the promoted source `name`
+    /// folds back into the source it was promoted out of. The order is
+    /// the promote's:
+    ///
+    /// 1. validate: `name` is a source, is promoted and its parent is
+    ///    online ([`UnpromoteError`]; a refusal changes nothing);
+    /// 2. the watchers are paused, so nothing interleaves;
+    /// 3. [`FixEngine::unpromote`]: ONE transaction (the units back in
+    ///    the parent, the registry row and the exclusion gone, the log
+    ///    entry, every crossing link), the promoted source's watcher
+    ///    stopped and the parent's told to read the folder again, then
+    ///    the link rewrites;
+    /// 4. the files written are indexed;
+    /// 5. the watchers resume (a change made meanwhile is applied now,
+    ///    except Tephra's own writes), and ONE push goes out.
+    ///
+    /// A crash after step 3's transaction leaves the pending list; the
+    /// next start finishes the rewrites.
+    pub fn unpromote(
+        &self,
+        name: &str,
+        engine: &crate::fixes::FixEngine,
+    ) -> Result<UnpromoteOutcome, RegistryError> {
+        let _one_at_a_time = self.promote_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let (parent, folder) = {
+            let cache = self.cache.lock().unwrap();
+            if cache.get_source(name)?.is_none() {
+                return Err(RegistryError::NotFound(name.to_string()));
+            }
+            let not_promoted = || UnpromoteError::NotPromoted {
+                name: name.to_string(),
+            };
+            let root = cache
+                .live_promoted_roots()?
+                .into_iter()
+                .find(|r| r.source == name)
+                .ok_or_else(not_promoted)?;
+            let parent = cache.get_source(&root.parent)?.ok_or_else(not_promoted)?;
+            if parent.status == SourceStatus::Offline {
+                return Err(UnpromoteError::SourceOffline {
+                    source: parent.name,
+                }
+                .into());
+            }
+            (parent, root.rel_path)
+        };
+
+        let spec = crate::fixes::UnpromoteSpec {
+            name: name.to_string(),
+            parent: parent.name.clone(),
+            folder: folder.clone(),
+        };
+        self.pause_for_write();
+        let result = self.unpromote_paused(&spec, &parent, engine);
+        // As in `promote`: no path is discarded on resume (FR24).
+        self.resume_after_write(&HashSet::new());
+        let done = result?;
+
+        let mut outcome = UnpromoteOutcome {
+            name: name.to_string(),
+            parent: parent.name,
+            folder,
+            units_moved: done.units_moved,
+            files_changed: done.entry.files_changed,
+            deferred: 0,
+            status: done.entry.status.clone(),
+        };
+        outcome.deferred = done
+            .announcement
+            .notices
+            .iter()
+            .map(|n| n.deferred)
+            .sum::<i64>();
+        // ONE push: the source-list change and the fix entry together.
+        let _ = self.events_tx.send(DaemonEvent::SourceListChanged {
+            changes: vec![SourceChange::new(SourceChangeKind::Unpromoted, name)],
+            fixes: done.announcement.notices,
+        });
+        tracing::info!(
+            source = %name,
+            parent = %outcome.parent,
+            folder = %outcome.folder,
+            units_moved = outcome.units_moved,
+            files_changed = outcome.files_changed,
+            "source_unpromoted"
+        );
+        Ok(outcome)
+    }
+
+    /// The part of [`SourceRegistry::unpromote`] that runs with the
+    /// watchers paused.
+    fn unpromote_paused(
+        &self,
+        spec: &crate::fixes::UnpromoteSpec,
+        parent: &SourceRow,
+        engine: &crate::fixes::FixEngine,
+    ) -> Result<crate::fixes::UnpromoteDone, RegistryError> {
+        let parent_root = PathBuf::from(&parent.path);
+        let fold = || {
+            // The promoted source is gone from the cache: its watcher
+            // stops for good, and the parent's reads the folder again.
+            if let Some(running) = self.running.lock().unwrap().remove(&spec.name) {
+                running.handle.stop();
+                *running.live.lock().unwrap_or_else(|p| p.into_inner()) = false;
+            }
+            self.renames.remove_source(&spec.name);
+            self.set_permission_denied(&spec.name, false);
+            let rules = self.load_rules(&parent.name, &parent_root);
+            let running = self.running.lock().unwrap();
+            if let (Some(running), Ok(rules)) = (running.get(&parent.name), rules) {
+                *running
+                    .ignore_rules
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner()) = rules;
+            }
+        };
+        let done = engine
+            .unpromote(spec, &fold)
+            .map_err(|e| RegistryError::Fix(e.to_string()))?;
+        for file in &done.announcement.written {
+            if let Err(e) = self.reindex_quietly(&file.source, &file.path) {
+                tracing::warn!(source = %file.source, path = %file.path.display(), error = %e, "could not index a file the unpromote rewrote");
+            }
+        }
+        Ok(done)
+    }
+
+    /// `source.unregister` of a promoted source behaves as
+    /// [`SourceRegistry::unpromote`] (FR22): the same rewrites, the same
+    /// log entry, the same push. `Ok(true)` when it did that, `Ok(false)`
+    /// when `name` is not promoted (a normal source, an unknown name, or
+    /// one already unregistered): nothing was done and the caller
+    /// unregisters it the plain way. A refusal of the unpromote (the
+    /// parent is offline) is an error and changes nothing.
+    pub fn unregister_promoted(
+        &self,
+        name: &str,
+        engine: &crate::fixes::FixEngine,
+    ) -> Result<bool, RegistryError> {
+        if !self.is_promoted(name)? {
+            return Ok(false);
+        }
+        match self.unpromote(name, engine) {
+            Ok(_) => Ok(true),
+            // Another call unpromoted it between the check and here.
+            Err(RegistryError::NotFound(_))
+            | Err(RegistryError::Unpromote(UnpromoteError::NotPromoted { .. })) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `source.rename` (G13): the source `name` is called `new_name` from
+    /// now on, and every `@name:` link of every source is rewritten to
+    /// `@new_name:`. The order is a promote's:
+    ///
+    /// 1. validate ([`validate_rename`]; a refusal changes nothing and
+    ///    sends nothing; the same name is a no-op success, and so is a
+    ///    repeat of a rename that already committed, `name` gone and
+    ///    `new_name` registered with a logged `source_rename` between
+    ///    the two);
+    /// 2. the watchers are paused, so nothing interleaves (and the rename
+    ///    is serialised with every promote, unpromote and other rename);
+    /// 3. [`FixEngine::rename_source`]: ONE transaction (the registry row,
+    ///    everything that holds the name, the log entry, every file to
+    ///    rewrite), the source's live watcher moved to the new name, then
+    ///    the link rewrites;
+    /// 4. the files written are indexed;
+    /// 5. the watchers resume (a change made meanwhile is applied now,
+    ///    except Tephra's own writes), and ONE push goes out.
+    ///
+    /// A crash after step 3's transaction leaves the pending list; the
+    /// next start finishes the rewrites.
+    pub fn rename(
+        &self,
+        name: &str,
+        new_name: &str,
+        engine: &crate::fixes::FixEngine,
+    ) -> Result<RenameOutcome, RegistryError> {
+        let _one_at_a_time = self.promote_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let check = {
+            let cache = self.cache.lock().unwrap();
+            let rows = cache.list_sources()?;
+            let existing: Vec<Source> = rows
+                .iter()
+                .map(|r| Source {
+                    name: r.name.clone(),
+                    root: PathBuf::from(&r.path),
+                })
+                .collect();
+            let offline = rows
+                .iter()
+                .any(|r| r.name == name && r.status == SourceStatus::Offline);
+            // A retry of a rename that already committed (a client that
+            // never saw the answer, E9): `name` is gone and `new_name` is
+            // the source the logged rename made of it. Same answer as
+            // the first time, so it is a no-op success. A name that was
+            // simply unregistered has no such log entry and stays
+            // `unknown_source`.
+            let retry = !existing.iter().any(|s| s.name == name)
+                && existing.iter().any(|s| s.name == new_name)
+                && cache.source_rename_logged(name, new_name)?;
+            if retry {
+                RenameCheck::Unchanged
+            } else {
+                validate_rename(&existing, offline, name, new_name)?
+            }
+        };
+        if check == RenameCheck::Unchanged {
+            return Ok(RenameOutcome {
+                old_name: name.to_string(),
+                new_name: new_name.to_string(),
+                unchanged: true,
+                files_changed: 0,
+                deferred: 0,
+                status: crate::fixes::log::STATUS_APPLIED.to_string(),
+            });
+        }
+
+        let spec = crate::fixes::SourceRenameSpec {
+            old_name: name.to_string(),
+            new_name: new_name.to_string(),
+        };
+        self.pause_for_write();
+        let result = self.rename_paused(&spec, engine);
+        // As in `promote`: no path is discarded on resume (FR24).
+        self.resume_after_write(&HashSet::new());
+        let done = result?;
+
+        let deferred = done
+            .announcement
+            .notices
+            .iter()
+            .map(|n| n.deferred)
+            .sum::<i64>();
+        let outcome = RenameOutcome {
+            old_name: name.to_string(),
+            new_name: new_name.to_string(),
+            unchanged: false,
+            files_changed: done.entry.files_changed,
+            deferred,
+            status: done.entry.status.clone(),
+        };
+        // ONE push: the source-list change and the fix entry together.
+        let _ = self.events_tx.send(DaemonEvent::SourceListChanged {
+            changes: vec![SourceChange::renamed(name, new_name)],
+            fixes: done.announcement.notices,
+        });
+        tracing::info!(
+            source = %name,
+            new_name = %new_name,
+            files_changed = outcome.files_changed,
+            "source_renamed"
+        );
+        Ok(outcome)
+    }
+
+    /// The part of [`SourceRegistry::rename`] that runs with the
+    /// watchers paused.
+    fn rename_paused(
+        &self,
+        spec: &crate::fixes::SourceRenameSpec,
+        engine: &crate::fixes::FixEngine,
+    ) -> Result<crate::fixes::SourceRenameDone, RegistryError> {
+        use crate::fixes::FixError;
+
+        let swap = || self.move_watcher(&spec.old_name, &spec.new_name);
+        let done = engine.rename_source(spec, &swap).map_err(|e| match e {
+            FixError::NameTaken(name) => RegistryError::Rename(RenameError::NameTaken {
+                with: name.clone(),
+                name,
+            }),
+            FixError::UnknownSource(name) => {
+                RegistryError::Rename(RenameError::UnknownSource { name })
+            }
+            e => RegistryError::Fix(e.to_string()),
+        })?;
+        for file in &done.announcement.written {
+            if let Err(e) = self.reindex_quietly(&file.source, &file.path) {
+                tracing::warn!(source = %file.source, path = %file.path.display(), error = %e, "could not index a file the rename rewrote");
+            }
+        }
+        Ok(done)
+    }
+
+    /// Moves the live watcher of `old` to the name `new`, after the cache
+    /// row was renamed: the old one stops for good and one under the new
+    /// name starts on the same root, paused like every other watcher
+    /// while a writer is working (it is resumed with them). Nothing is
+    /// scanned: no unit changed. A source with no live watcher (it never
+    /// started, or failed to) gets none now.
+    fn move_watcher(&self, old: &str, new: &str) {
+        let was_running = match self.running.lock().unwrap().remove(old) {
+            Some(running) => {
+                running.handle.stop();
+                *running.live.lock().unwrap_or_else(|p| p.into_inner()) = false;
+                true
+            }
+            None => false,
+        };
+        self.renames.remove_source(old);
+        if self.is_permission_denied(old) {
+            self.set_permission_denied(old, false);
+            self.set_permission_denied(new, true);
+        }
+        if !was_running {
+            return;
+        }
+        let row = Cache::open_read_only(&self.cache_path)
+            .and_then(|cache| cache.get_source(new))
+            .ok()
+            .flatten();
+        let Some(row) = row else {
+            tracing::warn!(source = %new, "renamed source has no row; no watcher started");
+            return;
+        };
+        let root = PathBuf::from(&row.path);
+        let started = self
+            .load_rules(new, &root)
+            .map_err(RegistryError::from)
+            .and_then(|rules| {
+                let rules = Arc::new(RwLock::new(rules));
+                let tap = watcher::start(root.clone(), Arc::clone(&rules))?;
+                self.start_watcher(new.to_string(), row.id, root.clone(), rules, tap)?;
+                Ok(())
+            });
+        match started {
+            Ok(()) => {
+                if let Some(running) = self.running.lock().unwrap().get(new) {
+                    running.pause.pause();
+                }
+            }
+            Err(e) => {
+                tracing::warn!(source = %new, error = %e, "could not start the watcher of a renamed source")
+            }
+        }
+    }
+
+    /// Finishes the re-owning of any promote that was recorded and not
+    /// completed (a kill between its transaction and the move of the
+    /// rows). Idempotent; run before anything compares the cache with a
+    /// disk, since the parent no longer reads the folder and would
+    /// otherwise see its rows as deleted.
+    pub fn complete_promotes(&self) {
+        let result = {
+            let cache = self.cache.lock().unwrap();
+            let _permit = self.gate.acquire();
+            crate::fixes::complete_promotes(&cache)
+        };
+        match result {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(
+                units = n,
+                "finished the re-owning of an interrupted promote"
+            ),
+            Err(e) => tracing::warn!(error = %e, "could not finish an interrupted promote"),
+        }
+    }
+
     /// The rest of `register`'s work once the source row exists:
     /// initial scan, then start the watcher. Split out so `register`
     /// can roll the row back on any failure from this point on (R2).
@@ -589,7 +1716,7 @@ impl SourceRegistry {
         source_id: i64,
         root: &Path,
     ) -> Result<ScanStats, RegistryError> {
-        let ignore_rules = Arc::new(RwLock::new(IgnoreRules::load(root)?));
+        let ignore_rules = Arc::new(RwLock::new(self.load_rules(name, root)?));
 
         // R13: subscribe the real watcher *before* the walk, not
         // after. `watcher::start` returns as soon as the OS-level
@@ -640,6 +1767,25 @@ impl SourceRegistry {
         Ok(stats)
     }
 
+    /// The ignore rules of source `name` at `root`: the defaults, its
+    /// `.tephraignore`, and the folders it gave up to a source of their
+    /// own (`promoted_roots`, FR22), which it never scans, watches or
+    /// lists. Read from the cache each time, so a promote that has
+    /// committed is honored by every load after it.
+    fn load_rules(&self, name: &str, root: &Path) -> std::io::Result<IgnoreRules> {
+        let rules = IgnoreRules::load(root)?;
+        let promoted = Cache::open_read_only(&self.cache_path)
+            .and_then(|cache| cache.promoted_roots_of(name))
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        Ok(rules.with_promoted(promoted.iter().map(|r| r.rel_path.as_str())))
+    }
+
+    /// Hands every certain rename a watcher sees to `fixer` from now
+    /// on, in every running source and every one started later (G1).
+    pub fn set_rename_fixer(&self, fixer: Arc<dyn RenameFixer>) {
+        *self.rename_fixer.write().unwrap_or_else(|p| p.into_inner()) = Some(fixer);
+    }
+
     fn start_watcher(
         &self,
         name: String,
@@ -647,7 +1793,7 @@ impl SourceRegistry {
         root: PathBuf,
         ignore_rules: Arc<RwLock<IgnoreRules>>,
         tap: watcher::WatcherTap,
-    ) -> Result<(), RegistryError> {
+    ) -> Result<Arc<SourceRenames>, RegistryError> {
         // A dedicated connection, guarded by its own mutex, for this
         // source's debounced batch-apply path (R8): independent of
         // `self.cache` and of every other source's own dedicated
@@ -656,12 +1802,26 @@ impl SourceRegistry {
         // the shared registry cache.
         let batch_cache = Arc::new(Mutex::new(Cache::open(&self.cache_path)?));
         let events_tx = self.events_tx.clone();
+        let live = Arc::new(Mutex::new(true));
+        let live_for_batch = Arc::clone(&live);
         let source_name = name.clone();
         let source_root = root.clone();
         let blocking_handle = self.runtime.handle().clone();
         let ignore_for_batch = Arc::clone(&ignore_rules);
+        let hints = tap.hints();
+        let renames = Arc::new(SourceRenames::new(
+            name.clone(),
+            root.clone(),
+            Arc::clone(&self.renames),
+        ));
+        let renames_for_batch = Arc::clone(&renames);
+        let fixer_for_batch = Arc::clone(&self.rename_fixer);
 
         let on_batch = move |mut changed: std::collections::HashSet<PathBuf>| {
+            // What the OS said about the paths of this batch, taken now
+            // so an event that arrives while it is applied belongs to
+            // the next one.
+            let os_marks = hints.take();
             // G19: the file events of Tephra's own duplicate ID rename
             // are not changes to react to: the file was indexed again
             // as part of the rename. A batch made only of them stops
@@ -679,9 +1839,12 @@ impl SourceRegistry {
 
             let batch_cache = Arc::clone(&batch_cache);
             let events_tx = events_tx.clone();
+            let live = Arc::clone(&live_for_batch);
             let source_name = source_name.clone();
             let source_root = source_root.clone();
             let ignore_for_batch = Arc::clone(&ignore_for_batch);
+            let renames = Arc::clone(&renames_for_batch);
+            let fixer_slot = Arc::clone(&fixer_for_batch);
 
             // Offloaded to tokio's dedicated blocking thread pool
             // (R8): this closure is invoked synchronously from the
@@ -733,15 +1896,33 @@ impl SourceRegistry {
                                 paths = ?outcome.changed_paths,
                                 "source_changed"
                             );
-                            let _ = events_tx.send(DaemonEvent::SourceChanged {
-                                source: source_name.clone(),
-                                paths: outcome.changed_paths.clone(),
-                            });
+                            send_if_live(
+                                &live,
+                                &events_tx,
+                                DaemonEvent::SourceChanged {
+                                    source: source_name.clone(),
+                                    paths: outcome.changed_paths.clone(),
+                                    fixes: Vec::new(),
+                                },
+                            );
                         }
                     },
                 );
-                if let Err(e) = result {
-                    tracing::warn!(source = %source_name, error = %e, "failed to apply change batch");
+                match result {
+                    Ok(total) => {
+                        // G1: what this batch found gone and new is
+                        // matched up, and a certain rename fixed.
+                        let fixer = fixer_slot
+                            .read()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .clone();
+                        if let Some(fixer) = fixer {
+                            renames.on_batch(&*fixer, &os_marks, total.vanished, total.appeared);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(source = %source_name, error = %e, "failed to apply change batch");
+                    }
                 }
             });
             // Fire-and-forget: `on_batch` itself is a synchronous
@@ -759,6 +1940,7 @@ impl SourceRegistry {
         let name_for_offline = name.clone();
         let gate_for_offline = Arc::clone(&self.gate);
         let events_for_offline = self.events_tx.clone();
+        let live_for_offline = Arc::clone(&live);
         let on_root_removed = move || {
             let cache = cache_for_offline.lock().unwrap();
             if let Err(e) = retry_cache_on_busy(&gate_for_offline, || {
@@ -772,10 +1954,15 @@ impl SourceRegistry {
                 // reach it the way a file change does: announce it, and
                 // the daemon refreshes the graph and tells clients.
                 // `paths` is empty because no file changed.
-                let _ = events_for_offline.send(DaemonEvent::SourceChanged {
-                    source: name_for_offline.clone(),
-                    paths: Vec::new(),
-                });
+                send_if_live(
+                    &live_for_offline,
+                    &events_for_offline,
+                    DaemonEvent::SourceChanged {
+                        source: name_for_offline.clone(),
+                        paths: Vec::new(),
+                        fixes: Vec::new(),
+                    },
+                );
             }
         };
 
@@ -788,6 +1975,8 @@ impl SourceRegistry {
         // window — only deferring it past the matching `resume_all`.
         let pause = watcher::WatcherPause::new(on_batch);
         let pause_for_handler = pause.clone();
+
+        self.renames.add_source(&name, root.clone(), pause.clone());
 
         let handle = watcher::spawn_debounce(
             tap,
@@ -802,9 +1991,10 @@ impl SourceRegistry {
                 handle,
                 pause,
                 ignore_rules,
+                live,
             },
         );
-        Ok(())
+        Ok(renames)
     }
 
     /// GP8: pauses every currently-running source's watcher batch
@@ -836,6 +2026,12 @@ impl SourceRegistry {
         for running in self.running.lock().unwrap().values() {
             running.pause.resume_except(written_paths);
         }
+    }
+
+    /// Whether a watcher is running for `name`: started by
+    /// [`SourceRegistry::register`] or by [`SourceRegistry::start_all`].
+    pub fn is_watching(&self, name: &str) -> bool {
+        self.running.lock().unwrap().contains_key(name)
     }
 
     /// Whether any running source's watcher is currently paused.
@@ -881,15 +2077,50 @@ impl SourceRegistry {
     /// running — it may not be, e.g. for a source whose watcher
     /// failed to start) and removes the source's rows from the cache.
     /// Idempotent: calling this twice on an already-removed source
-    /// returns `Ok(())` both times rather than erroring.
+    /// returns `Ok(())` both times rather than erroring. Only a call that
+    /// really removed a registered source announces it (G16): one `removed`
+    /// event, and none for an unknown name, since nothing changed.
     pub fn unregister(&self, name: &str) -> Result<(), RegistryError> {
         if let Some(running) = self.running.lock().unwrap().remove(name) {
             running.handle.stop();
+            // A batch already running for this source can no longer send
+            // an event once this is set, so none follows `removed`.
+            *running.live.lock().unwrap_or_else(|p| p.into_inner()) = false;
         }
+        self.renames.remove_source(name);
         self.set_permission_denied(name, false);
-        let cache = self.cache.lock().unwrap();
-        retry_cache_on_busy(&self.gate, || cache.delete_source(name))?;
+        let existed = {
+            let cache = self.cache.lock().unwrap();
+            let existed = cache.get_source(name)?.is_some();
+            retry_cache_on_busy(&self.gate, || cache.delete_source(name))?;
+            existed
+        };
+        if existed {
+            self.announce_sources_changed(vec![SourceChange::new(SourceChangeKind::Removed, name)]);
+        }
         Ok(())
+    }
+
+    /// The one way a change to the source list reaches clients (G16): sends
+    /// ONE [`DaemonEvent::SourceListChanged`] for `changes`, which the
+    /// forwarder turns into one `graph:changed` with `sources_changed`,
+    /// through the same path as the `fixes` push. `register` and
+    /// `unregister` call it; the `renamed`, `promoted` and `unpromoted`
+    /// kinds are for the rename, promote and un-promote work to call, once
+    /// the change is made. An empty list sends nothing. With nobody
+    /// subscribed the event is dropped, not buffered.
+    ///
+    /// Every caller of `register`/`unregister` pushes, the
+    /// `register_sources` bin included; that bin has no forwarder, so
+    /// there the event goes to no one.
+    pub fn announce_sources_changed(&self, changes: Vec<SourceChange>) {
+        if changes.is_empty() {
+            return;
+        }
+        let _ = self.events_tx.send(DaemonEvent::SourceListChanged {
+            changes,
+            fixes: Vec::new(),
+        });
     }
 
     /// `source.list` (G1): the stored rows, with their stored status.
@@ -1013,6 +2244,330 @@ impl SourceRegistry {
         Ok(marked)
     }
 
+    /// The boot's last two steps (G5), after
+    /// [`SourceRegistry::rescan_unfinished`]: for every registered
+    /// source that is online and readable, a startup catch-up (what
+    /// changed on disk while `tephrad` was down, found by comparing the
+    /// disk with the cached rows, a certain rename fixed under the live
+    /// rules), then a watcher, in the same `running` map
+    /// [`SourceRegistry::register`] fills.
+    ///
+    /// Per source, in this order: the OS watch is subscribed first (an
+    /// edit made while the catch-up runs queues and is indexed once the
+    /// watcher drains it, never missed); the source is compared with its
+    /// cache and the new files that could be a vanished file's twin are
+    /// hashed; then, one source at a time, the changed files are indexed
+    /// in one transaction (through the writer gate, so an RPC that
+    /// arrives meanwhile waits its turn), one `source_changed` is sent
+    /// if anything changed, the watcher is started, and what vanished
+    /// and appeared is handed to the source's rename detector, which
+    /// applies a unique hash pair after the hold
+    /// ([`SourceRegistry::set_rename_hold`]) and logs the vanished that
+    /// got no pair as `uncertain`. `rescan_source` is never used: it
+    /// deletes the rows first, which would leave nothing to compare.
+    ///
+    /// Skipped, with nothing written and no watcher: a source whose root
+    /// is missing (marked `offline`, rows kept) and one the OS will not
+    /// list. A source whose scan never finished has no baseline to
+    /// compare with, so it is only watched. A source stored as `offline`
+    /// whose root is back is compared like any other and goes
+    /// `offline` -> `stale` -> `active` around the catch-up. A source whose watcher
+    /// cannot start is logged and skipped; the others carry on.
+    /// `should_stop` is checked before each source; one already being
+    /// indexed finishes, since its batch is a single transaction.
+    pub fn start_all(&self, should_stop: impl Fn() -> bool) -> Vec<(String, BootOutcome)> {
+        self.start_all_with(should_stop, &BootHooks::default())
+    }
+
+    /// [`SourceRegistry::start_all`] with how a new file is hashed and
+    /// how a source's watcher is started supplied by the caller.
+    pub fn start_all_with(
+        &self,
+        should_stop: impl Fn() -> bool,
+        hooks: &BootHooks<'_>,
+    ) -> Vec<(String, BootOutcome)> {
+        /// One online source on its way to a watcher.
+        struct Boot {
+            row: SourceRow,
+            root: PathBuf,
+            ignore_rules: Arc<RwLock<IgnoreRules>>,
+            tap: watcher::WatcherTap,
+            /// `None` when there is no baseline to compare with.
+            diff: Option<catch_up::Diff>,
+            vanished: Vec<crate::rename_detect::Vanished>,
+            appeared: Vec<crate::rename_detect::Appeared>,
+        }
+
+        self.complete_promotes();
+        let rows = match self.list() {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not list the sources to start their watchers");
+                return Vec::new();
+            }
+        };
+        let mut outcomes: Vec<(String, BootOutcome)> = Vec::new();
+        let mut boots: Vec<Boot> = Vec::new();
+
+        // 1. Which sources are online, and their OS watch.
+        for row in rows {
+            if should_stop() {
+                outcomes.push((row.name, BootOutcome::Stopped));
+                continue;
+            }
+            if self.running.lock().unwrap().contains_key(&row.name) {
+                outcomes.push((row.name, BootOutcome::Watching));
+                continue;
+            }
+            let root = PathBuf::from(&row.path);
+            match probe_path(&root) {
+                PathProbe::Ok => self.set_permission_denied(&row.name, false),
+                PathProbe::NotReadable | PathProbe::NotReadablePrivacy => {
+                    tracing::warn!(source = %row.name, root = %root.display(), "source root can't be read (permission denied); no catch-up and no watcher");
+                    self.set_permission_denied(&row.name, true);
+                    outcomes.push((row.name, BootOutcome::PermissionDenied));
+                    continue;
+                }
+                PathProbe::Missing | PathProbe::NotADirectory => {
+                    self.mark_offline(&row);
+                    outcomes.push((row.name, BootOutcome::Offline));
+                    continue;
+                }
+            }
+            let ignore_rules = match self.load_rules(&row.name, &root) {
+                Ok(rules) => Arc::new(RwLock::new(rules)),
+                Err(e) => {
+                    tracing::warn!(source = %row.name, error = %e, "could not read the source's ignore rules; no catch-up and no watcher");
+                    outcomes.push((row.name, BootOutcome::Failed(e.to_string())));
+                    continue;
+                }
+            };
+            let tap = match (hooks.start_tap)(&root, Arc::clone(&ignore_rules)) {
+                Ok(tap) => tap,
+                Err(e) => {
+                    tracing::warn!(source = %row.name, error = %e, "the source's watcher could not be started; skipping the source");
+                    outcomes.push((row.name, BootOutcome::Failed(e.to_string())));
+                    continue;
+                }
+            };
+            boots.push(Boot {
+                row,
+                root,
+                ignore_rules,
+                tap,
+                diff: None,
+                vanished: Vec::new(),
+                appeared: Vec::new(),
+            });
+        }
+
+        // 2. Compare each source with its cache (reads only).
+        let mut stopped = false;
+        let mut failed: Vec<usize> = Vec::new();
+        for (i, boot) in boots.iter_mut().enumerate() {
+            if should_stop() {
+                stopped = true;
+                break;
+            }
+            let compared = (|| -> Result<Option<catch_up::Diff>, String> {
+                let cache = Cache::open_read_only(&self.cache_path).map_err(|e| e.to_string())?;
+                if !cache
+                    .scan_finished(boot.row.id)
+                    .map_err(|e| e.to_string())?
+                {
+                    tracing::info!(source = %boot.row.name, "no finished scan to compare with; watching only");
+                    return Ok(None);
+                }
+                let cached =
+                    catch_up::cached_files(&cache, &boot.row.name).map_err(|e| e.to_string())?;
+                let rules = boot.ignore_rules.read().unwrap().clone();
+                let disk = catch_up::list_disk(&boot.root, &rules).map_err(|e| e.to_string())?;
+                Ok(Some(catch_up::diff(cached, disk, |rel| {
+                    catch_up::is_gone(&boot.root, rel)
+                })))
+            })();
+            match compared {
+                Ok(diff) => boot.diff = diff,
+                Err(e) => {
+                    tracing::warn!(source = %boot.row.name, error = %e, "catch-up could not compare the source with its cache; skipping the source");
+                    outcomes.push((boot.row.name.clone(), BootOutcome::Failed(e)));
+                    failed.push(i);
+                }
+            }
+        }
+
+        // 3. Hash the new files that could be a vanished file's twin
+        // (size equal to a vanished file's, in any source). Whether a
+        // hash is unique across the sources (FR21) is for the pool the
+        // sources share ([`rename_detect::pair`]).
+        if !stopped {
+            let sizes = catch_up::size_matches(boots.iter().filter_map(|b| b.diff.as_ref()));
+            for boot in boots.iter_mut() {
+                let Some(diff) = &boot.diff else { continue };
+                let hashes = catch_up::hash_new_files(diff, &boot.root, &sizes, hooks.hash_file);
+                boot.vanished = catch_up::vanished_facts(diff);
+                boot.appeared = catch_up::appeared_facts(diff, &hashes);
+            }
+        }
+
+        // 4. One source at a time: index what changed, start the watcher,
+        // hand the rename detector what vanished and appeared.
+        for (i, boot) in boots.into_iter().enumerate() {
+            if failed.contains(&i) {
+                continue;
+            }
+            if stopped || should_stop() {
+                stopped = true;
+                outcomes.push((boot.row.name, BootOutcome::Stopped));
+                continue;
+            }
+            let Boot {
+                row,
+                root,
+                ignore_rules,
+                tap,
+                diff,
+                vanished,
+                appeared,
+            } = boot;
+            let mut paths = 0;
+            if let Some(diff) = &diff {
+                if row.status == SourceStatus::Offline {
+                    // The root is back and its cached rows are the
+                    // baseline just compared: stale while they are
+                    // brought up to date (offline cannot go straight
+                    // to active).
+                    self.set_status(&row, SourceStatus::Stale);
+                }
+                let changed = diff.changed_paths(&root);
+                if !changed.is_empty() {
+                    match self.index_catch_up(&row, &root, &ignore_rules, changed) {
+                        Ok(n) => paths = n,
+                        Err(e) => {
+                            tracing::warn!(source = %row.name, error = %e, "catch-up could not bring the cache up to date; skipping the source");
+                            outcomes.push((row.name, BootOutcome::Failed(e)));
+                            continue;
+                        }
+                    }
+                }
+            }
+            if diff.is_some() && row.status != SourceStatus::Active {
+                self.set_status(&row, SourceStatus::Active);
+            }
+            let renames = match self.start_watcher(
+                row.name.clone(),
+                row.id,
+                root,
+                ignore_rules,
+                tap,
+            ) {
+                Ok(renames) => renames,
+                Err(e) => {
+                    tracing::warn!(source = %row.name, error = %e, "the source's watcher could not be started");
+                    outcomes.push((row.name, BootOutcome::Failed(e.to_string())));
+                    continue;
+                }
+            };
+            if diff.is_some() {
+                let fixer = self
+                    .rename_fixer
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone();
+                if let Some(fixer) = fixer {
+                    renames.on_batch(&*fixer, &HashMap::new(), vanished, appeared);
+                }
+                tracing::info!(source = %row.name, paths, "catch_up_complete");
+                outcomes.push((row.name, BootOutcome::CaughtUp { paths }));
+            } else {
+                outcomes.push((row.name, BootOutcome::Watching));
+            }
+        }
+        outcomes
+    }
+
+    /// Brings the cache up to date with `changed` in one transaction, as
+    /// a watcher batch does, and announces it as one `source_changed`.
+    /// Returns how many paths changed.
+    fn index_catch_up(
+        &self,
+        row: &SourceRow,
+        root: &Path,
+        ignore_rules: &Arc<RwLock<IgnoreRules>>,
+        changed: HashSet<PathBuf>,
+    ) -> Result<usize, String> {
+        let cache = Cache::open(&self.cache_path).map_err(|e| e.to_string())?;
+        let rules = ignore_rules.read().unwrap().clone();
+        let total = scan::settle_deferred(
+            changed,
+            scan::DEFER_RETRY_DELAY,
+            |paths, can_defer| {
+                scan::apply_change_batch_deferring(
+                    &cache,
+                    row.id,
+                    root,
+                    paths,
+                    &rules,
+                    &crate::refactor::RealFs,
+                    can_defer,
+                )
+            },
+            |_| {},
+        )
+        .map_err(|e| e.to_string())?;
+        let n = total.changed_paths.len();
+        if n > 0 {
+            let _ = self.events_tx.send(DaemonEvent::SourceChanged {
+                source: row.name.clone(),
+                paths: total.changed_paths,
+                fixes: Vec::new(),
+            });
+        }
+        Ok(n)
+    }
+
+    /// A source whose root is missing: stored as `offline` (its rows
+    /// stay), and the graph told, as the watcher does when a root goes.
+    fn mark_offline(&self, row: &SourceRow) {
+        if row.status == SourceStatus::Offline {
+            return;
+        }
+        let cache = self.cache.lock().unwrap();
+        match retry_cache_on_busy(&self.gate, || {
+            cache.transition_source_status(&row.name, SourceStatus::Offline)
+        }) {
+            Ok(()) => {
+                tracing::warn!(source = %row.name, "source root is missing; marked offline");
+                let _ = self.events_tx.send(DaemonEvent::SourceChanged {
+                    source: row.name.clone(),
+                    paths: Vec::new(),
+                    fixes: Vec::new(),
+                });
+            }
+            Err(e) => {
+                tracing::warn!(source = %row.name, error = %e, "failed to mark source offline");
+            }
+        }
+    }
+
+    /// Moves a source's stored status along one valid edge and tells the
+    /// graph, logging (not failing) when the edge is refused.
+    fn set_status(&self, row: &SourceRow, to: SourceStatus) {
+        let cache = self.cache.lock().unwrap();
+        match retry_cache_on_busy(&self.gate, || cache.transition_source_status(&row.name, to)) {
+            Ok(()) => {
+                let _ = self.events_tx.send(DaemonEvent::SourceChanged {
+                    source: row.name.clone(),
+                    paths: Vec::new(),
+                    fixes: Vec::new(),
+                });
+            }
+            Err(e) => {
+                tracing::warn!(source = %row.name, error = %e, status = ?to, "failed to change the source's status");
+            }
+        }
+    }
+
     /// E11: rescans from the top every source whose last scan started
     /// and never finished (the daemon was killed mid-scan, or a schema
     /// rebuild emptied it). Called once at startup. There is no resume
@@ -1033,6 +2588,7 @@ impl SourceRegistry {
         &self,
         should_stop: impl Fn() -> bool,
     ) -> Vec<(String, Result<ScanStats, RegistryError>)> {
+        self.complete_promotes();
         let unfinished = {
             let cache = self.cache.lock().unwrap();
             match cache.sources_with_unfinished_scan() {
@@ -1069,6 +2625,7 @@ impl SourceRegistry {
                     let _ = self.events_tx.send(DaemonEvent::SourceChanged {
                         source: row.name.clone(),
                         paths: Vec::new(),
+                        fixes: Vec::new(),
                     });
                 }
                 Err(e) => {
@@ -1151,7 +2708,7 @@ impl SourceRegistry {
             }
         }
 
-        let ignore_rules = IgnoreRules::load(&root)?;
+        let ignore_rules = self.load_rules(name, &root)?;
 
         // R12: push the freshly-reloaded rules into the live
         // watcher's shared lock (if one is currently running for this
@@ -1247,21 +2804,113 @@ impl SourceRegistry {
     /// push still happen even though the caller discards the watcher's own
     /// event for this write.
     pub fn reindex_file(&self, source: &str, abs_path: &Path) -> Result<(), RegistryError> {
+        let changed_paths = self.reindex_quietly(source, abs_path)?;
+        if !changed_paths.is_empty() {
+            let _ = self.events_tx.send(DaemonEvent::SourceChanged {
+                source: source.to_string(),
+                paths: changed_paths,
+                fixes: Vec::new(),
+            });
+        }
+        Ok(())
+    }
+
+    /// [`SourceRegistry::reindex_file`] without the event: the paths
+    /// that were upserted or deleted, for a caller that announces them
+    /// itself.
+    fn reindex_quietly(
+        &self,
+        source: &str,
+        abs_path: &Path,
+    ) -> Result<Vec<PathBuf>, RegistryError> {
+        self.reindex_paths(source, &[abs_path.to_path_buf()])
+    }
+
+    /// Brings the cache up to date with `paths` of `source` (files or
+    /// folders, still there or gone) in one batch, as a watcher batch
+    /// does, and announces nothing: the paths upserted or deleted, for a
+    /// caller that announces them itself. What `link.rename_event` uses
+    /// so the graph it fixes from already shows the rename.
+    pub fn reindex_paths(
+        &self,
+        source: &str,
+        paths: &[PathBuf],
+    ) -> Result<Vec<PathBuf>, RegistryError> {
         let cache = Cache::open(&self.cache_path)?;
         let row = cache
             .get_source(source)?
             .ok_or_else(|| RegistryError::NotFound(source.to_string()))?;
         let root = PathBuf::from(&row.path);
-        let ignore_rules = IgnoreRules::load(&root)?;
-        let changed: HashSet<PathBuf> = HashSet::from([abs_path.to_path_buf()]);
-        let outcome = scan::apply_change_batch(&cache, row.id, &root, &changed, &ignore_rules)?;
-        if !outcome.changed_paths.is_empty() {
-            let _ = self.events_tx.send(DaemonEvent::SourceChanged {
-                source: source.to_string(),
-                paths: outcome.changed_paths,
-            });
+        let ignore_rules = self.load_rules(source, &root)?;
+        let changed: HashSet<PathBuf> = paths.iter().cloned().collect();
+        Ok(scan::apply_change_batch(&cache, row.id, &root, &changed, &ignore_rules)?.changed_paths)
+    }
+
+    /// Drops the cached rows of the files at `rels` (source-relative,
+    /// exactly as spelled) and of everything below them. For a name the
+    /// disk no longer has but still answers to: on a case-insensitive
+    /// disk `Plan.md` stats fine after a rename to `plan.md`, so
+    /// [`SourceRegistry::reindex_paths`] would index the old spelling
+    /// again instead of removing it.
+    pub fn forget_spellings(&self, source: &str, rels: &[String]) -> Result<(), RegistryError> {
+        let cache = Cache::open(&self.cache_path)?;
+        let row = cache
+            .get_source(source)?
+            .ok_or_else(|| RegistryError::NotFound(source.to_string()))?;
+        for rel in rels {
+            if let Some(unit) = cache.get_unit_by_rel_path(row.id, rel)? {
+                cache.delete_unit(unit.id)?;
+            }
+            cache.delete_units_under_prefix(row.id, rel)?;
         }
         Ok(())
+    }
+}
+
+/// The fix engine's announcements (G17): every file it rewrote is indexed
+/// again here (its watcher event is dropped as Tephra's own, so nothing
+/// else would), then ONE event per source goes out, carrying the files
+/// and the entries. A batch whose files and entries are all in one
+/// source, which is every rename within one source, makes one event.
+impl crate::fixes::FixSink for SourceRegistry {
+    fn announce(&self, announcement: crate::fixes::FixAnnouncement) {
+        use std::collections::BTreeMap;
+        let mut by_source: BTreeMap<String, (Vec<PathBuf>, Vec<crate::fixes::FixNotice>)> =
+            BTreeMap::new();
+        for file in &announcement.written {
+            match self.reindex_quietly(&file.source, &file.path) {
+                Ok(paths) => {
+                    let slot = by_source.entry(file.source.clone()).or_default();
+                    for p in paths {
+                        if !slot.0.contains(&p) {
+                            slot.0.push(p);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(source = %file.source, path = %file.path.display(), error = %e, "could not index a file the fix rewrote");
+                    // Still named: the file did change on disk.
+                    let slot = by_source.entry(file.source.clone()).or_default();
+                    if !slot.0.contains(&file.path) {
+                        slot.0.push(file.path.clone());
+                    }
+                }
+            }
+        }
+        for notice in announcement.notices {
+            by_source
+                .entry(notice.source.clone())
+                .or_default()
+                .1
+                .push(notice);
+        }
+        for (source, (paths, fixes)) in by_source {
+            let _ = self.events_tx.send(DaemonEvent::SourceChanged {
+                source,
+                paths,
+                fixes,
+            });
+        }
     }
 }
 
@@ -1292,6 +2941,394 @@ mod tests {
     }
 
     // ---- register: path validity --------------------------------------
+
+    fn promote_fixtures() -> Vec<Source> {
+        vec![
+            source("vault", "/home/dan/Vault"),
+            source("tephra", "/home/dan/Developer/Tephra"),
+            source("inner", "/home/dan/Developer/Tephra/crates/tephrad/inner"),
+        ]
+    }
+
+    /// E13: every refusal, with its stable reason, in one table.
+    #[test]
+    fn validate_promote_refuses_each_case_with_its_reason() {
+        let existing = promote_fixtures();
+        let cases: &[(&str, &str, PathProbe, &str)] = &[
+            // The folder is a registered root: a vault, or a promoted source.
+            ("x", "/home/dan/Vault", PathProbe::Ok, "is_a_source_root"),
+            (
+                "x",
+                "/home/dan/Developer/Tephra",
+                PathProbe::Ok,
+                "is_a_source_root",
+            ),
+            (
+                "x",
+                "/home/dan/Developer/Tephra/crates/tephrad/inner",
+                PathProbe::Ok,
+                "is_a_source_root",
+            ),
+            // In no source, and above one.
+            (
+                "x",
+                "/home/dan/Documents/Notes",
+                PathProbe::Ok,
+                "not_inside_a_source",
+            ),
+            (
+                "x",
+                "/home/dan/Developer",
+                PathProbe::Ok,
+                "not_inside_a_source",
+            ),
+            ("x", "/", PathProbe::Ok, "not_inside_a_source"),
+            // A file, or nothing there.
+            (
+                "x",
+                "/home/dan/Vault/a.md",
+                PathProbe::NotADirectory,
+                "not_a_folder",
+            ),
+            (
+                "x",
+                "/home/dan/Vault/gone",
+                PathProbe::Missing,
+                "not_a_folder",
+            ),
+            (
+                "x",
+                "/home/dan/Vault/locked",
+                PathProbe::NotReadable,
+                "not_readable",
+            ),
+            // Names.
+            ("", "/home/dan/Vault/notes", PathProbe::Ok, "invalid_name"),
+            (
+                "my notes",
+                "/home/dan/Vault/notes",
+                PathProbe::Ok,
+                "invalid_name",
+            ),
+            (
+                "my/notes",
+                "/home/dan/Vault/notes",
+                PathProbe::Ok,
+                "invalid_name",
+            ),
+            (
+                "@notes",
+                "/home/dan/Vault/notes",
+                PathProbe::Ok,
+                "invalid_name",
+            ),
+            (
+                "a:b",
+                "/home/dan/Vault/notes",
+                PathProbe::Ok,
+                "invalid_name",
+            ),
+            (
+                "a]b",
+                "/home/dan/Vault/notes",
+                PathProbe::Ok,
+                "invalid_name",
+            ),
+            ("..", "/home/dan/Vault/notes", PathProbe::Ok, "invalid_name"),
+            (
+                "tab\there",
+                "/home/dan/Vault/notes",
+                PathProbe::Ok,
+                "invalid_name",
+            ),
+            (
+                "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+                "/home/dan/Vault/notes",
+                PathProbe::Ok,
+                "invalid_name",
+            ),
+            (
+                "vault",
+                "/home/dan/Vault/notes",
+                PathProbe::Ok,
+                "name_taken",
+            ),
+            (
+                "VAULT",
+                "/home/dan/Vault/notes",
+                PathProbe::Ok,
+                "name_taken",
+            ),
+            (
+                "Tephra",
+                "/home/dan/Vault/notes",
+                PathProbe::Ok,
+                "name_taken",
+            ),
+        ];
+        for (name, root, probe, reason) in cases {
+            let err = validate_promote(&existing, name, Path::new(root), *probe)
+                .expect_err(&format!("{name:?} at {root:?} must be refused"));
+            assert_eq!(err.reason(), *reason, "{name:?} at {root:?}: {err}");
+        }
+    }
+
+    // ---- rename (G13, G14) ---------------------------------------------
+
+    fn rename_fixtures() -> Vec<Source> {
+        vec![
+            source("notes", "/home/dan/Vault"),
+            source("tephrad", "/home/dan/Developer/Tephra/crates/tephrad"),
+            // Registered before the name rules widened: never re-checked (FR14).
+            source("old*name", "/home/dan/Old"),
+        ]
+    }
+
+    /// G13/G14: every rule on the new name and every reason of
+    /// `source.rename`, in one table: `(name, new_name, offline, reason)`.
+    #[test]
+    fn validate_rename_refuses_each_case_with_its_reason() {
+        let existing = rename_fixtures();
+        let too_long = "x".repeat(MAX_SOURCE_NAME_CHARS + 1);
+        let cases: &[(&str, &str, bool, &str)] = &[
+            ("tephrad", "", false, "invalid_name"),
+            ("tephrad", " ", false, "invalid_name"),
+            ("tephrad", "a b", false, "invalid_name"),
+            ("tephrad", "a\tb", false, "invalid_name"),
+            ("tephrad", "a/b", false, "invalid_name"),
+            ("tephrad", "a\\b", false, "invalid_name"),
+            ("tephrad", "@a", false, "invalid_name"),
+            ("tephrad", "a:b", false, "invalid_name"),
+            ("tephrad", "a*b", false, "invalid_name"),
+            ("tephrad", "a#b", false, "invalid_name"),
+            ("tephrad", "a^b", false, "invalid_name"),
+            ("tephrad", "a|b", false, "invalid_name"),
+            ("tephrad", "a[b]", false, "invalid_name"),
+            ("tephrad", ".", false, "invalid_name"),
+            ("tephrad", "..", false, "invalid_name"),
+            ("tephrad", too_long.as_str(), false, "invalid_name"),
+            // Taken: exactly, and without regard to case (FR14).
+            ("tephrad", "notes", false, "name_taken"),
+            ("tephrad", "Notes", false, "name_taken"),
+            ("tephrad", "NOTES", false, "name_taken"),
+            ("tephrad", "OLD*NAME", false, "invalid_name"),
+            // The source to rename does not exist (the case counts).
+            ("ghost", "daemon", false, "unknown_source"),
+            ("Tephrad", "daemon", false, "unknown_source"),
+            ("", "daemon", false, "unknown_source"),
+            // Offline: its files cannot be reached.
+            ("tephrad", "daemon", true, "source_offline"),
+        ];
+        for (name, new_name, offline, reason) in cases {
+            let err = validate_rename(&existing, *offline, name, new_name)
+                .expect_err(&format!("{name:?} -> {new_name:?} must be refused"));
+            assert_eq!(err.reason(), *reason, "{name:?} -> {new_name:?}: {err}");
+            assert!(!err.to_string().is_empty());
+        }
+    }
+
+    /// The order of the checks: the source must exist before the name is
+    /// looked at, and the name before the source's state.
+    #[test]
+    fn validate_rename_checks_in_a_fixed_order() {
+        let existing = rename_fixtures();
+        // Unknown source beats a bad name.
+        assert_eq!(
+            validate_rename(&existing, false, "ghost", "a/b")
+                .unwrap_err()
+                .reason(),
+            "unknown_source"
+        );
+        // A bad name beats an offline source.
+        assert_eq!(
+            validate_rename(&existing, true, "tephrad", "a/b")
+                .unwrap_err()
+                .reason(),
+            "invalid_name"
+        );
+        // A taken name beats an offline source.
+        assert_eq!(
+            validate_rename(&existing, true, "tephrad", "notes")
+                .unwrap_err()
+                .reason(),
+            "name_taken"
+        );
+    }
+
+    /// G13: valid names, the same name as a no-op (even for a name that
+    /// would not pass the rules today, FR14), and a case-only change of the
+    /// source's own name, which is a rename and not a clash with itself.
+    #[test]
+    fn validate_rename_accepts_good_names_and_treats_the_same_name_as_a_no_op() {
+        let existing = rename_fixtures();
+        for good in [
+            "daemon",
+            "démon☃",
+            "d-1_x.y",
+            "a",
+            &"x".repeat(MAX_SOURCE_NAME_CHARS),
+        ] {
+            assert_eq!(
+                validate_rename(&existing, false, "tephrad", good),
+                Ok(RenameCheck::Rename),
+                "{good:?}"
+            );
+        }
+        assert_eq!(
+            validate_rename(&existing, false, "tephrad", "tephrad"),
+            Ok(RenameCheck::Unchanged)
+        );
+        // Whatever the rules say about the name, the same name is a no-op,
+        // and an offline source still answers it without a refusal.
+        assert_eq!(
+            validate_rename(&existing, false, "old*name", "old*name"),
+            Ok(RenameCheck::Unchanged)
+        );
+        assert_eq!(
+            validate_rename(&existing, true, "tephrad", "tephrad"),
+            Ok(RenameCheck::Unchanged)
+        );
+        assert_eq!(
+            validate_rename(&existing, false, "tephrad", "Tephrad"),
+            Ok(RenameCheck::Rename)
+        );
+        // The name rules apply to the new name only: a source with a legacy
+        // name can be renamed to a good one.
+        assert_eq!(
+            validate_rename(&existing, false, "old*name", "fresh"),
+            Ok(RenameCheck::Rename)
+        );
+    }
+
+    /// G14: the register reasons, including `nested_source` for a root
+    /// inside or above a registered one (F10).
+    #[test]
+    fn register_refusals_carry_their_stable_reason() {
+        let existing = vec![source("vault", "/home/dan/Vault")];
+        let reason = |name: &str, root: &str, probe: PathProbe| {
+            validate_register(&existing, name, Path::new(root), probe)
+                .expect_err("must be refused")
+                .reason()
+        };
+        assert_eq!(
+            reason("x", "/home/dan/Vault", PathProbe::Ok),
+            "is_a_source_root"
+        );
+        assert_eq!(
+            reason("x", "/home/dan/Vault/inner", PathProbe::Ok),
+            "nested_source"
+        );
+        assert_eq!(reason("x", "/home/dan", PathProbe::Ok), "nested_source");
+        assert_eq!(
+            reason("vault", "/home/dan/Other", PathProbe::Ok),
+            "name_taken"
+        );
+        assert_eq!(
+            reason("x", "/home/dan/Nope", PathProbe::Missing),
+            "not_a_folder"
+        );
+        assert_eq!(
+            reason("x", "/home/dan/f.txt", PathProbe::NotADirectory),
+            "not_a_folder"
+        );
+    }
+
+    #[test]
+    fn validate_promote_allows_any_depth_and_names_the_source_that_gives_the_folder_up() {
+        let existing = promote_fixtures();
+        let ok = |name: &str, root: &str| {
+            validate_promote(&existing, name, Path::new(root), PathProbe::Ok)
+        };
+        // A folder in a vault, at any depth, and a source's own top folder.
+        assert_eq!(ok("notes", "/home/dan/Vault/Notes").unwrap(), "vault");
+        assert_eq!(ok("deep", "/home/dan/Vault/a/b/c/d").unwrap(), "vault");
+        assert_eq!(
+            ok("tephrad", "/home/dan/Developer/Tephra/crates/tephrad").unwrap(),
+            "tephra"
+        );
+        // A multi-byte folder name, and a name that is not ASCII.
+        assert_eq!(ok("café", "/home/dan/Vault/café notes").unwrap(), "vault");
+        // E14: a folder that holds a promoted source is allowed; the inner
+        // source stays its own.
+        assert_eq!(
+            ok("outer", "/home/dan/Developer/Tephra/crates").unwrap(),
+            "tephra"
+        );
+        // A folder inside the promoted source belongs to that source.
+        assert_eq!(
+            ok("sub", "/home/dan/Developer/Tephra/crates/tephrad/inner/src").unwrap(),
+            "inner"
+        );
+        // A sibling whose name only starts like a root is not inside it.
+        assert_eq!(
+            validate_promote(
+                &existing,
+                "x",
+                Path::new("/home/dan/Vault2/notes"),
+                PathProbe::Ok
+            )
+            .unwrap_err()
+            .reason(),
+            "not_inside_a_source"
+        );
+    }
+
+    #[test]
+    fn a_refused_promote_carries_its_reason_and_a_plain_message() {
+        let existing = promote_fixtures();
+        let err = validate_promote(&existing, "x", Path::new("/home/dan/Vault"), PathProbe::Ok)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "/home/dan/Vault is already the root of the source \"vault\""
+        );
+        let err = validate_promote(
+            &existing,
+            "VAULT",
+            Path::new("/home/dan/Vault/n"),
+            PathProbe::Ok,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "the name \"VAULT\" is taken by the source \"vault\""
+        );
+    }
+
+    /// F10: `register` is untouched by promoted sources: a root nested in,
+    /// or above, an existing one is still refused, whatever else exists.
+    #[test]
+    fn register_still_refuses_nested_and_ancestor_roots_when_promoted_roots_exist() {
+        let existing = promote_fixtures();
+        let nested = validate_register(
+            &existing,
+            "n",
+            Path::new("/home/dan/Developer/Tephra/docs"),
+            PathProbe::Ok,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            nested,
+            RegisterError::Conflict {
+                reason: ConflictReason::NestedInsideExisting,
+                ..
+            }
+        ));
+        let above = validate_register(
+            &existing,
+            "a",
+            Path::new("/home/dan/Developer"),
+            PathProbe::Ok,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            above,
+            RegisterError::Conflict {
+                reason: ConflictReason::ExistingIsNestedInside,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn register_rejects_a_missing_path() {
@@ -1656,6 +3693,344 @@ mod tests {
         assert_eq!(
             calls, 1,
             "a non-busy error must be returned immediately on the first attempt"
+        );
+    }
+
+    // ---- start_all: behind the writer gate ---------------------------
+
+    /// G5: the catch-up's write is one of the gate's writes, so an RPC
+    /// write that is already holding the gate is not overtaken: the
+    /// catch-up waits for it, then goes ahead.
+    #[test]
+    fn start_all_writes_behind_the_writer_gate() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.md"), "# A\n").unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache_path = cache_dir.path().join("cache.db");
+        {
+            let registry = SourceRegistry::new(Cache::open(&cache_path).unwrap()).unwrap();
+            registry.register("notes", root.path()).unwrap();
+        }
+        std::fs::write(root.path().join("a.md"), "# A\n\nedited while down\n").unwrap();
+        let registry = Arc::new(SourceRegistry::new(Cache::open(&cache_path).unwrap()).unwrap());
+
+        let gate = writer_gate::for_path(&cache_path);
+        let held = gate.acquire();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread = {
+            let (registry, done) = (registry.clone(), done.clone());
+            std::thread::spawn(move || {
+                let outcomes = registry.start_all(|| false);
+                done.store(true, std::sync::atomic::Ordering::SeqCst);
+                outcomes
+            })
+        };
+
+        // A bounded negative wait: the catch-up must still be waiting.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(
+            !done.load(std::sync::atomic::Ordering::SeqCst),
+            "the catch-up wrote while another writer held the gate"
+        );
+        drop(held);
+        let outcomes = thread.join().unwrap();
+        assert!(
+            matches!(outcomes[0].1, BootOutcome::CaughtUp { paths: 1 }),
+            "{outcomes:?}"
+        );
+        registry.unregister("notes").unwrap();
+    }
+
+    // ---- the source-list push (G16, FR12) -----------------------------
+
+    fn change_kinds() -> Vec<(SourceChange, serde_json::Value)> {
+        use serde_json::json;
+        vec![
+            (
+                SourceChange::new(SourceChangeKind::Added, "notes"),
+                json!({"kind": "added", "name": "notes"}),
+            ),
+            (
+                SourceChange::new(SourceChangeKind::Removed, "notes"),
+                json!({"kind": "removed", "name": "notes"}),
+            ),
+            (
+                SourceChange::renamed("notes", "journal"),
+                json!({"kind": "renamed", "name": "journal", "old_name": "notes"}),
+            ),
+            (
+                SourceChange::new(SourceChangeKind::Promoted, "docs"),
+                json!({"kind": "promoted", "name": "docs"}),
+            ),
+            (
+                SourceChange::new(SourceChangeKind::Unpromoted, "docs"),
+                json!({"kind": "unpromoted", "name": "docs"}),
+            ),
+        ]
+    }
+
+    #[test]
+    fn every_kind_builds_exact_json_and_only_a_rename_has_old_name() {
+        for (change, want) in change_kinds() {
+            assert_eq!(change.to_json(), want, "{change:?}");
+        }
+    }
+
+    #[test]
+    fn every_kind_builds_one_graph_changed_payload_keeping_source_and_empty_paths() {
+        use serde_json::json;
+        for (change, want) in change_kinds() {
+            let name = change.name.clone();
+            let payload = crate::forward::payload(&DaemonEvent::SourceListChanged {
+                changes: vec![change],
+                fixes: Vec::new(),
+            });
+            assert_eq!(
+                payload,
+                json!({"source": name, "paths": [], "sources_changed": [want]}),
+            );
+        }
+        // Several changes in one push keep their order.
+        let payload = crate::forward::payload(&DaemonEvent::SourceListChanged {
+            changes: change_kinds().into_iter().map(|(c, _)| c).collect(),
+            fixes: Vec::new(),
+        });
+        assert_eq!(payload["sources_changed"].as_array().unwrap().len(), 5);
+        assert_eq!(payload["sources_changed"][2]["old_name"], "notes");
+    }
+
+    fn registry_in(dir: &Path) -> SourceRegistry {
+        SourceRegistry::new(Cache::open(dir.join("cache.db")).unwrap()).unwrap()
+    }
+
+    fn source_dir(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for (rel, text) in files {
+            std::fs::write(dir.path().join(rel), text).unwrap();
+        }
+        dir
+    }
+
+    /// Every source-list event waiting on `rx`.
+    fn list_events(
+        rx: &mut tokio::sync::broadcast::Receiver<DaemonEvent>,
+    ) -> Vec<Vec<SourceChange>> {
+        let mut out = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let DaemonEvent::SourceListChanged { changes, .. } = event {
+                out.push(changes);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn register_and_unregister_each_send_exactly_one_event_naming_the_source() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let src = source_dir(&[("a.md", "# A\n"), ("b.md", "[[a]]\n"), ("c.md", "# C\n")]);
+        let registry = registry_in(cache_dir.path());
+        let mut rx = registry.subscribe();
+
+        registry.register("notes", src.path()).unwrap();
+        assert_eq!(
+            list_events(&mut rx),
+            vec![vec![SourceChange::new(SourceChangeKind::Added, "notes")]]
+        );
+
+        registry.unregister("notes").unwrap();
+        assert_eq!(
+            list_events(&mut rx),
+            vec![vec![SourceChange::new(SourceChangeKind::Removed, "notes")]]
+        );
+    }
+
+    #[test]
+    fn the_event_comes_after_the_scan_and_the_row_so_a_requery_sees_the_change() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let src = source_dir(&[("a.md", "# A\n"), ("b.md", "# B\n")]);
+        let registry = registry_in(cache_dir.path());
+        let mut rx = registry.subscribe();
+
+        registry.register("notes", src.path()).unwrap();
+        // The event is already waiting when `register` returns, and what
+        // it announces is already true: listed, and scanned.
+        assert_eq!(list_events(&mut rx).len(), 1);
+        let listed = registry.list().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(registry.is_watching("notes"));
+        let verify = Cache::open(cache_dir.path().join("cache.db")).unwrap();
+        assert_eq!(
+            verify.units_with_status_for_source("notes").unwrap().len(),
+            2
+        );
+
+        registry.unregister("notes").unwrap();
+        assert_eq!(list_events(&mut rx).len(), 1);
+        assert!(registry.list().unwrap().is_empty());
+        assert!(!registry.is_watching("notes"));
+    }
+
+    #[test]
+    fn a_register_that_fails_validation_sends_no_event() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let src = source_dir(&[("a.md", "# A\n")]);
+        let nested = src.path().join("sub");
+        std::fs::create_dir(&nested).unwrap();
+        let other = source_dir(&[("o.md", "# O\n")]);
+        let a_file = src.path().join("a.md");
+        let registry = registry_in(cache_dir.path());
+        registry.register("notes", src.path()).unwrap();
+        let mut rx = registry.subscribe();
+
+        // Missing path, not a folder, duplicate name, duplicate root,
+        // nested root, ancestor root.
+        assert!(registry.register("x", "/no/such/path/for/tephra").is_err());
+        assert!(registry.register("x", &a_file).is_err());
+        assert!(registry.register("notes", other.path()).is_err());
+        assert!(registry.register("again", src.path()).is_err());
+        assert!(registry.register("inner", &nested).is_err());
+        let parent = src.path().parent().unwrap();
+        assert!(registry.register("outer", parent).is_err());
+
+        assert!(list_events(&mut rx).is_empty());
+        assert_eq!(registry.list().unwrap().len(), 1);
+        registry.unregister("notes").unwrap();
+    }
+
+    #[test]
+    fn a_register_whose_scan_fails_rolls_back_and_sends_no_added_event() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        // A `.tephraignore` that is a folder cannot be read: the row has
+        // been inserted by then, so this takes the rollback path.
+        let src = source_dir(&[("a.md", "# A\n")]);
+        std::fs::create_dir(src.path().join(".tephraignore")).unwrap();
+        let registry = registry_in(cache_dir.path());
+        let mut rx = registry.subscribe();
+
+        assert!(registry.register("notes", src.path()).is_err());
+
+        assert!(list_events(&mut rx).is_empty());
+        assert!(
+            registry.list().unwrap().is_empty(),
+            "the row was rolled back"
+        );
+    }
+
+    #[test]
+    fn unregistering_a_name_that_is_not_registered_is_ok_and_sends_nothing() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let src = source_dir(&[("a.md", "# A\n")]);
+        let registry = registry_in(cache_dir.path());
+        let mut rx = registry.subscribe();
+
+        registry.unregister("ghost").unwrap();
+        assert!(list_events(&mut rx).is_empty());
+
+        // Twice on a source that was removed: one event in all.
+        registry.register("notes", src.path()).unwrap();
+        registry.unregister("notes").unwrap();
+        registry.unregister("notes").unwrap();
+        let events = list_events(&mut rx);
+        assert_eq!(events.len(), 2, "one added and one removed: {events:?}");
+        assert_eq!(events[1][0].kind, SourceChangeKind::Removed);
+    }
+
+    #[test]
+    fn the_emitter_accepts_renamed_promoted_and_unpromoted_and_ignores_an_empty_list() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let registry = registry_in(cache_dir.path());
+        let mut rx = registry.subscribe();
+
+        registry.announce_sources_changed(Vec::new());
+        assert!(list_events(&mut rx).is_empty());
+
+        for (change, _) in change_kinds() {
+            registry.announce_sources_changed(vec![change.clone()]);
+            assert_eq!(list_events(&mut rx), vec![vec![change]]);
+        }
+    }
+
+    #[test]
+    fn announcing_with_nobody_subscribed_is_dropped_without_error() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let src = source_dir(&[("a.md", "# A\n")]);
+        let registry = registry_in(cache_dir.path());
+        // No `subscribe()` anywhere: register and unregister still succeed.
+        registry.register("notes", src.path()).unwrap();
+        registry.unregister("notes").unwrap();
+        // A receiver that joins later hears nothing of what was dropped.
+        let mut late = registry.subscribe();
+        assert!(list_events(&mut late).is_empty());
+    }
+
+    #[test]
+    fn a_restart_and_the_catch_up_announce_no_source_as_added() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let src = source_dir(&[("a.md", "# A\n")]);
+        {
+            let registry = registry_in(cache_dir.path());
+            registry.register("notes", src.path()).unwrap();
+            registry.unregister("notes").unwrap();
+            registry.register("notes", src.path()).unwrap();
+        }
+        // The daemon restarts: a new registry over the same cache.
+        let registry = registry_in(cache_dir.path());
+        let mut rx = registry.subscribe();
+        registry.start_all(|| false);
+        assert!(list_events(&mut rx).is_empty());
+        registry.unregister("notes").unwrap();
+    }
+
+    #[test]
+    fn a_rescan_and_a_file_change_are_not_list_changes() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let src = source_dir(&[("a.md", "# A\n")]);
+        let registry = registry_in(cache_dir.path());
+        registry.register("notes", src.path()).unwrap();
+        let mut rx = registry.subscribe();
+
+        std::fs::write(src.path().join("new.md"), "# New\n").unwrap();
+        registry.rescan("notes").unwrap();
+
+        assert!(list_events(&mut rx).is_empty());
+        registry.unregister("notes").unwrap();
+    }
+
+    #[test]
+    fn a_batch_still_running_when_its_source_is_unregistered_sends_nothing_after_removed() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let src = source_dir(&[("a.md", "# A\n")]);
+        let registry = registry_in(cache_dir.path());
+        registry.register("notes", src.path()).unwrap();
+        // What a batch captured before the unregister: the live flag.
+        let live = Arc::clone(&registry.running.lock().unwrap().get("notes").unwrap().live);
+        let mut rx = registry.subscribe();
+        let stale = || DaemonEvent::SourceChanged {
+            source: "notes".into(),
+            paths: vec![src.path().join("a.md")],
+            fixes: Vec::new(),
+        };
+
+        // Before: the batch's event goes out.
+        send_if_live(&live, &registry.events_tx, stale());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(DaemonEvent::SourceChanged { .. })
+        ));
+
+        registry.unregister("notes").unwrap();
+        // After: `removed` is the last event for the name.
+        send_if_live(&live, &registry.events_tx, stale());
+        let mut seen = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            seen.push(e);
+        }
+        assert_eq!(
+            seen,
+            vec![DaemonEvent::SourceListChanged {
+                changes: vec![SourceChange::new(SourceChangeKind::Removed, "notes")],
+                fixes: Vec::new(),
+            }]
         );
     }
 }

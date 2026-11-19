@@ -453,3 +453,173 @@ pub fn expected_rows(e: &ProseExpect) -> UnitRows {
             .collect(),
     }
 }
+
+/// E26: file names whose multi-byte characters sit close to the
+/// extension, the kind `strip_markdown_extension` / `strip_md_ext` used
+/// to cut in the middle of a character. The first entry is a real
+/// `.docx`, the rest are text. Each is also linked from
+/// `Linker—.md` by the link text in the second column.
+pub const MULTIBYTE_NAMES: [(&str, &str); 7] = [
+    ("Résumé—v2.docx", "Résumé—v2.docx"),
+    ("Todo…ab", "Todo…ab"),
+    ("日本x", "日本x"),
+    ("Plan…ab.md", "Plan…ab"),
+    ("dé/日本/Notes—.txt", "dé/日本/Notes—.txt"),
+    ("Notes😀ab.txt", "Notes😀ab.txt"),
+    ("Plan—.markdown", "Plan—"),
+];
+
+/// A source holding every [`MULTIBYTE_NAMES`] file plus `Linker—.md`,
+/// which links to each of them: the one shared helper that builds the
+/// crash-class names for the E26 tests. Real files in a temp dir, no
+/// mocks; cleaned up on drop.
+pub fn multibyte_source() -> TempSource {
+    let src = empty_source();
+    let docx = fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tephra-parser/tests/fixtures/documents/headings.docx"),
+    )
+    .expect("read the docx fixture");
+    let mut linker = String::from("# Linker\n\n");
+    for (name, link) in MULTIBYTE_NAMES {
+        if name.ends_with(".docx") {
+            src.write_bytes(name, &docx);
+        } else {
+            src.write(name, "# Heading\n\nA line of text.\n");
+        }
+        linker.push_str(&format!("- [[{link}]]\n"));
+    }
+    src.write("Linker—.md", &linker);
+    src
+}
+
+// ---------------------------------------------------------------
+// The fix writer's world (PR-4)
+// ---------------------------------------------------------------
+
+/// The PR-3 fixture (GP1): `Training Plan.md` is linked from
+/// `Weekly Review.md`, `Goals.md` and `Ideas/Rename Notes.md`;
+/// `Unrelated.md` mentions it in prose only.
+pub const GP1_FILES: [(&str, &str); 5] = [
+    ("Training Plan.md", "# Training Plan\n\n## Goals\n\nRun.\n"),
+    (
+        "Weekly Review.md",
+        "# Weekly Review\n\nThis week: [[Training Plan]].\n",
+    ),
+    ("Goals.md", "# Goals\n\nSee [[Training Plan|plan]] first.\n"),
+    (
+        "Ideas/Rename Notes.md",
+        "# Rename notes\n\n![[Training Plan]]\n",
+    ),
+    (
+        "Unrelated.md",
+        "# Unrelated\n\nNo links, mentions Training Plan in prose.\n",
+    ),
+];
+
+/// A real registry, cache and graph over one temp source `notes`, and the
+/// requests the fix writer is handed for a rename already made on disk.
+pub struct FixWorld {
+    pub notes: TempSource,
+    pub cache_path: std::path::PathBuf,
+    pub registry: tephrad::registry::SourceRegistry,
+    _cache_dir: TempDir,
+}
+
+impl FixWorld {
+    pub fn new(files: &[(&str, &str)]) -> Self {
+        let notes = empty_source();
+        for (rel, text) in files {
+            notes.write(rel, text);
+        }
+        let cache_dir = tempfile::tempdir().expect("cache tempdir");
+        let cache_path = cache_dir.path().join("cache.db");
+        let registry = tephrad::registry::SourceRegistry::new(
+            tephra_cache::Cache::open(&cache_path).expect("open cache"),
+        )
+        .expect("registry");
+        registry.register("notes", notes.root()).expect("register");
+        FixWorld {
+            notes,
+            cache_path,
+            registry,
+            _cache_dir: cache_dir,
+        }
+    }
+
+    pub fn graph(&self) -> tephra_graph::UnitGraph {
+        let cache = tephra_cache::Cache::open(&self.cache_path).expect("open cache for graph");
+        tephra_graph::UnitGraph::build_from_cache(&cache).expect("build graph")
+    }
+
+    /// Renames `old` to `new` on disk and indexes the result.
+    pub fn rename(&self, old: &str, new: &str) {
+        let to = self.notes.root().join(new);
+        fs::create_dir_all(to.parent().unwrap()).unwrap();
+        fs::rename(self.notes.root().join(old), to).expect("rename on disk");
+        self.registry.rescan("notes").expect("rescan");
+    }
+
+    pub fn text(&self, rel: &str) -> String {
+        fs::read_to_string(self.notes.root().join(rel)).expect("read notes file")
+    }
+
+    /// One request per linking file for the rename `old` to `new`, built
+    /// from the graph as `fix_rename` builds it (a self-link recorded
+    /// under the old id belongs to the file at the new one).
+    pub fn requests(
+        &self,
+        old: &str,
+        new: &str,
+    ) -> Vec<tephrad::refactor::fix_write::FileFixRequest> {
+        use tephrad::refactor::fix_write::{FileFixRequest, RewriteMode};
+        let graph = self.graph();
+        let old_id = format!("@notes:{old}");
+        let new_id = format!("@notes:{new}");
+        let bare_resolves = graph
+            .shortest_unique_target(&new_id)
+            .is_some_and(|t| !t.contains('/'));
+        let mut by_file: std::collections::BTreeMap<String, Vec<tephra_graph::Edge>> =
+            Default::default();
+        for mut edge in graph.get_rename_backlinks(&old_id, &new_id) {
+            if edge.from == old_id {
+                edge.from = new_id.clone();
+            }
+            by_file.entry(edge.from.clone()).or_default().push(edge);
+        }
+        by_file
+            .into_iter()
+            .map(|(file, edges)| {
+                let rel = file.strip_prefix("@notes:").unwrap().to_string();
+                FileFixRequest::new(
+                    file,
+                    self.notes.root().join(rel),
+                    edges,
+                    old,
+                    new,
+                    RewriteMode::Fix { bare_resolves },
+                )
+            })
+            .collect()
+    }
+}
+
+/// Names of the leftover `.tephra-tmp-*` files anywhere under `root`.
+pub fn tmp_files(root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.to_string_lossy().contains(".tephra-tmp-") {
+                out.push(path.display().to_string());
+            }
+        }
+    }
+    out
+}

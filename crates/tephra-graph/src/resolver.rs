@@ -182,6 +182,11 @@ const MARKDOWN_EXTENSIONS: [&str; 2] = [".md", ".markdown"];
 
 /// Strips a trailing `.md`/`.markdown` (case-insensitive) from
 /// `rel_path`, if present; returns `rel_path` unchanged otherwise.
+/// Never panics, whatever the string: the extensions are ASCII, so a
+/// name that ends in one has a char boundary exactly `ext.len()` bytes
+/// from its end. When that offset falls inside a multi-byte character
+/// (`Todo…ab`, `Résumé—v2.docx`) the name cannot end in the extension
+/// and is returned unchanged.
 /// Applied to both sides of every match (R1): a stored unit's own
 /// path *and* an incoming link's target, since a standard markdown
 /// link (`[x](B.md)`) or an extension-qualified wikilink (`[[B.md]]`)
@@ -190,7 +195,11 @@ const MARKDOWN_EXTENSIONS: [&str; 2] = [".md", ".markdown"];
 pub(crate) fn strip_markdown_extension(rel_path: &str) -> &str {
     for ext in MARKDOWN_EXTENSIONS {
         if rel_path.len() > ext.len() {
-            let (base, suffix) = rel_path.split_at(rel_path.len() - ext.len());
+            let cut = rel_path.len() - ext.len();
+            if !rel_path.is_char_boundary(cut) {
+                continue;
+            }
+            let (base, suffix) = rel_path.split_at(cut);
             if suffix.eq_ignore_ascii_case(ext) {
                 return base;
             }
@@ -208,6 +217,13 @@ pub(crate) fn strip_markdown_extension(rel_path: &str) -> &str {
 /// rather than the byte-exact comparison this crate started with.
 pub(crate) fn normalize_key(s: &str) -> String {
     s.nfc().collect()
+}
+
+/// The key under which the unit at `rel_path` is filed in
+/// [`crate::UnitGraph::basename_index`]: its file name, without a
+/// Markdown extension, in NFC.
+pub(crate) fn bare_name_key(rel_path: &str) -> String {
+    normalize_key(basename_of(strip_markdown_extension(rel_path)))
 }
 
 /// `target`'s normalized full-stem match key (NFC, extension
@@ -550,6 +566,80 @@ pub(crate) fn resolve_edge_target(
     }
 }
 
+/// The shortest wikilink target that resolves to the unit `id`, written
+/// the way a user would type it (no extension for a Markdown file, the
+/// file's own case): the bare name when [`resolve_in_scope`] maps it to
+/// `id`, otherwise the full source-relative stem. Nothing in between is
+/// tried: the resolver matches a bare name or a full stem and does no
+/// suffix matching. `None` when `id` is not in the graph.
+///
+/// Every target this returns resolves, through [`resolve_in_scope`] in
+/// the unit's own source, to `id` (checked by the round trip in
+/// `tests/unit/resolver.rs`). A full stem that two units share (`Plan.md`
+/// and `Plan.markdown` in one folder) cannot be told apart by any link
+/// text, so for those the stem is returned and does not resolve uniquely.
+pub(crate) fn shortest_unique_target(graph: &crate::UnitGraph, id: &str) -> Option<String> {
+    let facts = graph.nodes.get(id)?;
+    let stem = strip_markdown_extension(&facts.rel_path);
+    let base = basename_of(stem);
+    let key = normalize_key(base);
+    match resolve_in_scope(&graph.index(), &facts.source, &key, true) {
+        ResolveOutcome::Unique(found) if found == id => Some(base.to_string()),
+        _ => Some(stem.to_string()),
+    }
+}
+
+/// Whether a wikilink whose normalized match key is `key` (in scope
+/// `source`) resolved to the file at `old_rel_path` *before* it was
+/// renamed to `new_id`, judged from the graph as it is after the rename.
+///
+/// It replays [`resolve_in_scope`]'s rule on the pre-rename file set:
+/// the candidates now indexed under `key` (a full stem when `key`
+/// contains `/`, else a basename), without `new_id` (that is the old
+/// file under its new name), plus the old file when its stem (or
+/// basename) is `key`. The old file won when it has the one shortest
+/// stem; a tie with another file means the link was ambiguous and never
+/// resolved to it.
+pub(crate) fn old_path_won_before_rename(
+    graph: &crate::UnitGraph,
+    source: &str,
+    old_rel_path: &str,
+    new_id: &str,
+    key: &str,
+) -> bool {
+    let old_stem = normalize_key(strip_markdown_extension(old_rel_path));
+    let by_stem = key.contains('/');
+    let old_matches = if by_stem {
+        old_stem == key
+    } else {
+        basename_of(&old_stem) == key
+    };
+    if !old_matches {
+        return false;
+    }
+    let index = if by_stem {
+        &graph.stem_index
+    } else {
+        &graph.basename_index
+    };
+    let old_len = old_stem.chars().count();
+    let others = index
+        .get(source)
+        .and_then(|m| m.get(key))
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
+    others
+        .iter()
+        .filter(|id| id.as_str() != new_id)
+        .filter_map(|id| graph.nodes.get(id))
+        .all(|facts| {
+            normalize_key(strip_markdown_extension(&facts.rel_path))
+                .chars()
+                .count()
+                > old_len
+        })
+}
+
 /// Strips one optional surrounding `[[`/`]]` pair from `raw`, so
 /// [`crate::UnitGraph::resolve_link`] accepts both the full wikilink
 /// syntax GP5's example uses (`"[[@atlas-repo:README]]"`) and the bare
@@ -855,5 +945,191 @@ pub(crate) fn resolve_link_impl(
             source: scope,
             target: wikilink.target.clone(),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One character of each UTF-8 width the fix has to survive: 2
+    /// bytes (`é`), 3 bytes (`—`, `…`, a CJK character) and 4 bytes
+    /// (an emoji).
+    const MULTIBYTE: [&str; 5] = ["é", "—", "…", "日", "😀"];
+
+    /// The expected result computed a different way from the code under
+    /// test: lower-case the name (ASCII only, so every byte offset is
+    /// kept) and let `strip_suffix`, which is boundary-safe by
+    /// construction, find the extension. The stem must be non-empty
+    /// (`.md` alone stays as it is).
+    fn oracle(name: &str) -> &str {
+        let lower = name.to_ascii_lowercase();
+        for ext in [".md", ".markdown"] {
+            if let Some(stem) = lower.strip_suffix(ext) {
+                if !stem.is_empty() {
+                    return &name[..stem.len()];
+                }
+            }
+        }
+        name
+    }
+
+    #[test]
+    fn markdown_extensions_are_stripped_exactly_as_before() {
+        let cases = [
+            ("Plan.md", "Plan"),
+            ("Plan.MD", "Plan"),
+            ("Plan.Md", "Plan"),
+            ("Plan.markdown", "Plan"),
+            ("Plan.MARKDOWN", "Plan"),
+            ("Plan.MarkDown", "Plan"),
+            ("dir/Plan.md", "dir/Plan"),
+            ("Plan.md.md", "Plan.md"),
+            ("Plan.txt", "Plan.txt"),
+            ("Plan", "Plan"),
+            // An extension with no stem in front of it stays as it is.
+            (".md", ".md"),
+            (".markdown", ".markdown"),
+            ("md", "md"),
+            ("markdown", "markdown"),
+            ("", ""),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(strip_markdown_extension(input), expected, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn a_name_ending_in_a_multibyte_char_and_ascii_letters_is_returned_unchanged() {
+        for c in MULTIBYTE {
+            for letters in 1..=8 {
+                let name = format!("Todo{c}{}", "a".repeat(letters));
+                assert_eq!(strip_markdown_extension(&name), name, "{name:?}");
+                let name = format!("Résumé—v2{c}{}", "z".repeat(letters));
+                assert_eq!(strip_markdown_extension(&name), name, "{name:?}");
+            }
+        }
+        // The names from the bug report.
+        for name in ["Résumé—v2.docx", "Todo…ab", "日本x", "Résumé—v2.markdowñ"] {
+            assert_eq!(strip_markdown_extension(name), name);
+        }
+    }
+
+    #[test]
+    fn multibyte_names_with_a_real_markdown_extension_are_still_stripped() {
+        let cases = [
+            ("Plan…ab.md", "Plan…ab"),
+            ("Résumé—v2.MD", "Résumé—v2"),
+            ("日本.markdown", "日本"),
+            ("😀.Markdown", "😀"),
+            ("dé/日本/Plan—.md", "dé/日本/Plan—"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(strip_markdown_extension(input), expected, "{input:?}");
+        }
+    }
+
+    /// Each of a 2-, 3- and 4-byte character at every distance from 0 to
+    /// 12 bytes before the end of the name (so the 3-byte `.md` cut and
+    /// the 9-byte `.markdown` cut each land inside the character, on
+    /// either side of it, and on a boundary), alone, at the start and
+    /// doubled. Nothing may panic and the result must be the oracle's.
+    #[test]
+    fn cut_position_table_never_panics() {
+        let mut checked = 0;
+        for c in MULTIBYTE {
+            for pad in 0..=12 {
+                let ascii = "a".repeat(pad);
+                let names = [
+                    format!("{c}{ascii}"),
+                    format!("x{c}{ascii}"),
+                    format!("{c}{c}{ascii}"),
+                    format!("ab{c}{ascii}"),
+                    // The extension itself sitting `pad` bytes before the end.
+                    format!("{c}.md{ascii}"),
+                    format!("{c}.markdown{ascii}"),
+                    format!("{c}{ascii}.md"),
+                    format!("{c}{ascii}.markdown"),
+                ];
+                for name in names {
+                    assert_eq!(strip_markdown_extension(&name), oracle(&name), "{name:?}");
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 5 * 13 * 8);
+    }
+
+    #[test]
+    fn a_name_exactly_as_long_as_the_extension_empty_or_only_multibyte_does_not_panic() {
+        for name in [
+            "",
+            ".md",
+            ".MD",
+            ".markdown",
+            ".MARKDOWN",
+            // Exactly 3 and 9 bytes, but not the extension.
+            "日",
+            "é—",
+            "…ab",
+            "日本語",
+            "😀😀😀😀😀😀",
+            "ééééé—",
+            "é",
+            "—",
+            "😀",
+        ] {
+            assert_eq!(strip_markdown_extension(name), name, "{name:?}");
+        }
+    }
+
+    /// Every string of up to six tokens over a small alphabet that mixes
+    /// the extension's own letters with characters of every width:
+    /// 8^6 strings, none may panic, and each must give the oracle's
+    /// answer.
+    #[test]
+    fn exhaustive_short_strings_never_panic() {
+        const TOKENS: [&str; 8] = ["a", ".", "md", "MD", "markdown", "é", "—", "😀"];
+        fn walk(prefix: &mut String, depth: usize, count: &mut usize) {
+            assert_eq!(
+                strip_markdown_extension(prefix),
+                oracle(prefix),
+                "{prefix:?}"
+            );
+            *count += 1;
+            if depth == 0 {
+                return;
+            }
+            for t in TOKENS {
+                let len = prefix.len();
+                prefix.push_str(t);
+                walk(prefix, depth - 1, count);
+                prefix.truncate(len);
+            }
+        }
+        let mut count = 0;
+        walk(&mut String::new(), 6, &mut count);
+        assert_eq!(count, (0..=6).map(|n| 8usize.pow(n)).sum::<usize>());
+    }
+
+    #[test]
+    fn normalize_wikilink_target_handles_multibyte_input() {
+        let nfc = "Résumé—v2.docx";
+        let nfd = "Re\u{301}sume\u{301}—v2.docx";
+        assert_ne!(nfc, nfd);
+        let cases = [
+            (nfc, nfc),
+            (nfd, nfc),
+            ("Todo…ab", "Todo…ab"),
+            ("日本x", "日本x"),
+            ("Plan…ab.md", "Plan…ab"),
+            ("caf\u{e9}\u{2014}v2.MD", "caf\u{e9}\u{2014}v2"),
+            ("cafe\u{301}—v2.markdown", "caf\u{e9}—v2"),
+            ("dé/日本/Todo…ab", "dé/日本/Todo…ab"),
+            ("", ""),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(normalize_wikilink_target(input), expected, "{input:?}");
+        }
     }
 }

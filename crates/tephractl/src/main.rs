@@ -25,7 +25,9 @@ fn main() -> ExitCode {
         Err(e) => {
             eprintln!("tephractl: {e}");
             eprint!("{}", cli::USAGE);
-            return ExitCode::FAILURE;
+            // A usage error (a bad argument, a bad `--since`) is exit 2,
+            // apart from a command that ran and failed, which is 1.
+            return ExitCode::from(2);
         }
     };
 

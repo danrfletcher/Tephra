@@ -1,9 +1,15 @@
 //! SQL DDL and the single drop-and-recreate rebuild path (F2).
 //!
 //! Two groups of tables:
-//! - Bootstrap tables (`sources`, `schema_version`, `scan_state`) are
-//!   created once with `CREATE TABLE IF NOT EXISTS` and are never
-//!   dropped, not even by a schema-version rebuild.
+//! - Bootstrap tables (`sources`, `schema_version`, `scan_state`) and
+//!   the durable history tables (`fix_log`, `pending_fixes`,
+//!   `promoted_roots`) are created once with `CREATE TABLE IF NOT
+//!   EXISTS` and are never dropped, not even by a schema-version
+//!   rebuild. The history tables are not derived from the files, so a
+//!   rebuild must not lose them; they name sources and paths as text and
+//!   hold no foreign key into `sources` or `units` (which is dropped and
+//!   recreated), so a rebuild never trips a foreign-key check on them
+//!   and unregistering a source leaves its history.
 //! - Core tables (`units`, `links`, `tags`, `blocks`, `headings`,
 //!   `symbols`, the `block_fts` FTS5 index and its `block_names`
 //!   exact-name table) hold derived,
@@ -25,13 +31,14 @@
 //!
 //! The snapshot reads only the column set every schema version has
 //! had (the v1 columns): anything a newer schema added (`kind`,
-//! `size`, `too_large`, `needs_rescan`, `blocks.end_line`, the
-//! `headings`/`symbols`/`block_fts` tables) is not read, because an
-//! offline source cannot be re-read from disk. Restored `units` rows
-//! get a `kind` inferred from the extension alone (via the
-//! [`KindInferrer`] the [`crate::Cache`] was opened with), a `NULL`
-//! `size`, and `needs_rescan = 1`, so the next online rescan knows to
-//! fill them in (E10).
+//! `size`, `too_large`, `needs_rescan`, `hash`, `inode`, `device`,
+//! `blocks.end_line`, the `headings`/`symbols`/`block_fts` tables) is
+//! not read, because an offline source cannot be re-read from disk.
+//! Restored `units` rows get a `kind` inferred from the extension alone
+//! (via the [`KindInferrer`] the [`crate::Cache`] was opened with), a
+//! `NULL` `size`, `NULL` `hash`, `inode` and `device`, and
+//! `needs_rescan = 1`, so the next online rescan knows to fill them in
+//! (E10).
 //!
 //! That carry-over is itself gated by [`offline_rows_are_carryable`]:
 //! an older cache file, opened by a newer build after the schema
@@ -96,7 +103,74 @@ const CREATE_UNITS: &str = "\
         size INTEGER, \
         too_large INTEGER NOT NULL DEFAULT 0, \
         needs_rescan INTEGER NOT NULL DEFAULT 0, \
+        hash TEXT, \
+        inode INTEGER, \
+        device INTEGER, \
         UNIQUE(source_id, rel_path) \
+    )";
+
+/// The record of every automatic link fix and of every vanished file no
+/// fix could be made for. Durable like `sources`: created `IF NOT
+/// EXISTS` and never dropped by a rebuild, because it is history, not a
+/// parse of the files. Names its sources and paths as text and has no
+/// foreign key into `sources` or `units`, so it survives both a rebuild
+/// (which drops `units`) and the unregistering of a source.
+///
+/// `kind` and `status` are free text (the engine that writes the rows
+/// owns the vocabulary), `old_source`/`old_path` and
+/// `new_source`/`new_path` name the two ends (the same source for a
+/// rename inside one), `files_changed` is how many linking files were
+/// rewritten and `detail_json` carries the per-file results.
+const CREATE_FIX_LOG: &str = "\
+    CREATE TABLE IF NOT EXISTS fix_log (\
+        id INTEGER PRIMARY KEY AUTOINCREMENT, \
+        created_at INTEGER NOT NULL, \
+        kind TEXT NOT NULL, \
+        status TEXT NOT NULL, \
+        old_source TEXT, \
+        old_path TEXT, \
+        new_source TEXT, \
+        new_path TEXT, \
+        files_changed INTEGER NOT NULL DEFAULT 0, \
+        detail_json TEXT \
+    )";
+
+/// The work list of link rewrites still to do: one row per linking
+/// file, so a crash halfway through a fix resumes from it. Durable and
+/// foreign-key free, like [`CREATE_FIX_LOG`]. A row is intent (the
+/// file, the target it named and the target it should now name), not a
+/// recorded edit. `fix_id` is the `fix_log` row it belongs to, held as
+/// a plain number with no foreign key.
+const CREATE_PENDING_FIXES: &str = "\
+    CREATE TABLE IF NOT EXISTS pending_fixes (\
+        id INTEGER PRIMARY KEY AUTOINCREMENT, \
+        fix_id INTEGER, \
+        source TEXT NOT NULL, \
+        file_path TEXT NOT NULL, \
+        old_source TEXT, \
+        old_path TEXT, \
+        new_source TEXT, \
+        new_path TEXT, \
+        state TEXT NOT NULL DEFAULT 'pending', \
+        reason TEXT, \
+        attempts INTEGER NOT NULL DEFAULT 0, \
+        created_at INTEGER NOT NULL, \
+        updated_at INTEGER NOT NULL \
+    )";
+
+/// The folders that were made their own source: `parent` (a source
+/// name) skips `rel_path` (relative to its root) when it scans, because
+/// `source` owns it. Durable and foreign-key free, like
+/// [`CREATE_FIX_LOG`], so the parent's scan exclusions outlive a
+/// rebuild. One row per `(parent, rel_path)`.
+const CREATE_PROMOTED_ROOTS: &str = "\
+    CREATE TABLE IF NOT EXISTS promoted_roots (\
+        id INTEGER PRIMARY KEY AUTOINCREMENT, \
+        parent TEXT NOT NULL, \
+        rel_path TEXT NOT NULL, \
+        source TEXT NOT NULL, \
+        created_at INTEGER NOT NULL, \
+        UNIQUE(parent, rel_path) \
     )";
 
 /// One row per link occurrence. `line` is the link's 1-based line in
@@ -259,6 +333,13 @@ const CREATE_IDX_BLOCK_NAMES_NAME: &str =
 const CREATE_IDX_BLOCKS_BLOCK_ID: &str =
     "CREATE INDEX IF NOT EXISTS idx_blocks_block_id ON blocks(block_id)";
 
+/// Backs the hash lookup ([`crate::Cache::units_by_hash`]): every file
+/// with these bytes, across all sources.
+const CREATE_IDX_UNITS_HASH: &str = "CREATE INDEX IF NOT EXISTS idx_units_hash ON units(hash)";
+/// Backs the identity lookup ([`crate::Cache::units_by_identity`]).
+const CREATE_IDX_UNITS_IDENTITY: &str =
+    "CREATE INDEX IF NOT EXISTS idx_units_identity ON units(device, inode)";
+
 /// Creates (or confirms, if already present) every index in this
 /// module. Idempotent: safe to call on every open, whether or not the
 /// tables were just freshly created.
@@ -271,16 +352,22 @@ pub(crate) fn create_core_indexes(conn: &Connection) -> Result<(), CacheError> {
     conn.execute(CREATE_IDX_SYMBOLS_UNIT_ID, [])?;
     conn.execute(CREATE_IDX_BLOCKS_BLOCK_ID, [])?;
     conn.execute(CREATE_IDX_BLOCK_NAMES_NAME, [])?;
+    conn.execute(CREATE_IDX_UNITS_HASH, [])?;
+    conn.execute(CREATE_IDX_UNITS_IDENTITY, [])?;
     Ok(())
 }
 
-/// Creates `sources`, `schema_version` and `scan_state` if absent.
-/// Idempotent and safe to call on every open: never drops or
-/// truncates any of them.
+/// Creates `sources`, `schema_version`, `scan_state` and the durable
+/// history tables (`fix_log`, `pending_fixes`, `promoted_roots`) if
+/// absent. Idempotent and safe to call on every open: never drops or
+/// truncates any of them, so none of them is touched by a rebuild.
 pub(crate) fn create_bootstrap_tables(conn: &Connection) -> Result<(), CacheError> {
     conn.execute(CREATE_SOURCES, [])?;
     conn.execute(CREATE_SCHEMA_VERSION, [])?;
     conn.execute(CREATE_SCAN_STATE, [])?;
+    conn.execute(CREATE_FIX_LOG, [])?;
+    conn.execute(CREATE_PENDING_FIXES, [])?;
+    conn.execute(CREATE_PROMOTED_ROOTS, [])?;
     Ok(())
 }
 
@@ -314,7 +401,8 @@ fn core_table_ddls_if_not_exists() -> [String; 8] {
 
 /// Drops every core table (children first, parents last, though
 /// `DROP TABLE` in SQLite does not itself enforce foreign keys).
-/// Never touches `sources`, `schema_version` or `scan_state`.
+/// Never touches `sources`, `schema_version`, `scan_state`, `fix_log`,
+/// `pending_fixes` or `promoted_roots`.
 pub(crate) fn drop_core_tables(conn: &Connection) -> Result<(), CacheError> {
     conn.execute("DROP TABLE IF EXISTS block_fts", [])?;
     conn.execute("DROP TABLE IF EXISTS block_names", [])?;

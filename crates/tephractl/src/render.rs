@@ -370,6 +370,80 @@ pub fn render_source_added(name: &str, path: &str, stats: &Value) -> String {
     out
 }
 
+/// `source promote` success (G11): the new source, where it came from,
+/// and what it took. A line is added only when some linking file is
+/// still waiting for a retry or a person.
+pub fn render_source_promoted(result: &Value) -> String {
+    let name = str_field(result, "name");
+    let root = str_field(result, "root");
+    let parent = str_field(result, "parent");
+    let folder = str_field(result, "folder");
+    let count = |key: &str| result.get(key).and_then(Value::as_i64).unwrap_or(0);
+    let mut out =
+        format!("Promoted {root} to the source \"{name}\" (it was \"{folder}\" in \"{parent}\")\n");
+    out.push_str(&format!(
+        "  files moved: {}, files with links rewritten: {}\n",
+        count("units_moved"),
+        count("files_changed"),
+    ));
+    let deferred = count("deferred");
+    if deferred > 0 {
+        out.push_str(&format!(
+            "  {deferred} file(s) still need a link fix; see `tephractl fixes`\n"
+        ));
+    }
+    out
+}
+
+/// `source unpromote` success (G12): the source folded back, where it
+/// went and what it took. A line is added only when some linking file is
+/// still waiting for a retry or a person.
+pub fn render_source_unpromoted(result: &Value) -> String {
+    let name = str_field(result, "name");
+    let parent = str_field(result, "parent");
+    let folder = str_field(result, "folder");
+    let count = |key: &str| result.get(key).and_then(Value::as_i64).unwrap_or(0);
+    let mut out = format!(
+        "Unpromoted the source \"{name}\" (its files are \"{folder}\" in \"{parent}\" again)\n"
+    );
+    out.push_str(&format!(
+        "  files moved: {}, files with links rewritten: {}\n",
+        count("units_moved"),
+        count("files_changed"),
+    ));
+    let deferred = count("deferred");
+    if deferred > 0 {
+        out.push_str(&format!(
+            "  {deferred} file(s) still need a link fix; see `tephractl fixes`\n"
+        ));
+    }
+    out
+}
+
+/// `source rename` success (G13): what was renamed and what it took. The
+/// same name twice says nothing was done. A line is added only when some
+/// linking file is still waiting for a retry or a person.
+pub fn render_source_renamed(result: &Value) -> String {
+    let name = str_field(result, "name");
+    let new_name = str_field(result, "new_name");
+    if name == new_name {
+        return format!("The source \"{name}\" already has that name; nothing changed\n");
+    }
+    let count = |key: &str| result.get(key).and_then(Value::as_i64).unwrap_or(0);
+    let mut out = format!("Renamed the source \"{name}\" to \"{new_name}\"\n");
+    out.push_str(&format!(
+        "  files with links rewritten: {}\n",
+        count("files_changed")
+    ));
+    let deferred = count("deferred");
+    if deferred > 0 {
+        out.push_str(&format!(
+            "  {deferred} file(s) still need a link fix; see `tephractl fixes`\n"
+        ));
+    }
+    out
+}
+
 pub fn render_source_removed(name: &str) -> String {
     format!("Removed source \"{name}\"\n")
 }
@@ -635,6 +709,76 @@ pub fn render_backlinks(result: &Value) -> String {
         }
         out.push_str(&row);
         out.push('\n');
+    }
+    out
+}
+
+// ---- fix.list ---------------------------------------------------------
+
+/// `fixes`' output (G18): one line per entry, in the daemon's order
+/// (newest first): `time kind old -> new (n files) status`, where `time`
+/// is local `YYYY-MM-DD HH:MM`. An `uncertain` entry has no new name:
+/// its line is `time kind old (no pair) (n files) status`, followed by
+/// ` - message` when the entry carries one (why it has no fix). An entry that
+/// touched files of two sources names them as `@source:path`. An empty
+/// log prints `no fixes`. A `source_rename` entry already names both
+/// sources in full (`@old:` and `@new:`), so it is printed as it is.
+///
+/// Paths come from file names, so control characters in them are shown
+/// as `?`.
+pub fn render_fixes(result: &Value) -> String {
+    let entries = result.as_array().map(Vec::as_slice).unwrap_or_default();
+    if entries.is_empty() {
+        return "no fixes\n".to_string();
+    }
+    let mut out = String::new();
+    for entry in entries {
+        let time = entry
+            .get("time")
+            .and_then(Value::as_i64)
+            .map(local_time)
+            .unwrap_or_default();
+        let sources: Vec<&str> = entry
+            .get("sources")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        // The two names of a source rename are already `@source:` forms.
+        let whole = str_field(entry, "kind") == "source_rename";
+        let name = |field: &str| {
+            entry.get(field).and_then(Value::as_str).map(|path| {
+                if sources.len() > 1 && !whole {
+                    printable(&format!("@{}:{path}", sources[0]))
+                } else {
+                    printable(path)
+                }
+            })
+        };
+        let old = name("old").unwrap_or_else(|| "?".to_string());
+        let pair = match entry.get("new").and_then(Value::as_str) {
+            Some(new) if sources.len() > 1 && !whole => {
+                format!(
+                    "{old} -> {}",
+                    printable(&format!("@{}:{new}", sources[sources.len() - 1]))
+                )
+            }
+            Some(new) => format!("{old} -> {}", printable(new)),
+            None => format!("{old} (no pair)"),
+        };
+        let files = entry
+            .get("files_changed")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let why = match entry.get("message").and_then(Value::as_str) {
+            Some(message) if !message.is_empty() => format!(" - {}", printable(message)),
+            _ => String::new(),
+        };
+        out.push_str(&format!(
+            "{time} {} {pair} ({files} {}) {}{why}\n",
+            printable(str_field(entry, "kind")),
+            if files == 1 { "file" } else { "files" },
+            printable(str_field(entry, "status")),
+        ));
     }
     out
 }

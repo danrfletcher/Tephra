@@ -12,11 +12,12 @@
 //! F5-adjacent without a per-method opt-in.
 
 use serde_json::Value;
-use tephra_cache::InFileScope;
+use tephra_cache::{InFileScope, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT};
 
 use crate::rpc::auth::Authenticated;
 use crate::rpc::backend::{
-    BlockBackend, GraphBackend, RefactorBackend, SearchError, SourceBackend, UnitListError,
+    BlockBackend, FixBackend, GraphBackend, RefactorBackend, SearchError, SourceBackend,
+    UnitListError,
 };
 use crate::rpc::protocol::{
     BLOCK_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND, REFACTOR_ERROR, RESOLVE_ERROR, SOURCE_ERROR,
@@ -37,11 +38,16 @@ pub const METHOD_NAMES: &[&str] = &[
     "source.unregister",
     "source.list",
     "source.rescan",
+    "source.promote",
+    "source.unpromote",
+    "source.rename",
     "link.preview_refactor",
     "link.apply_refactor",
     "unit.list",
     "unit.search",
     "block.ensure_id",
+    "fix.list",
+    "link.rename_event",
 ];
 
 /// The three backends one `dispatch` call reads through, bundled so
@@ -52,6 +58,7 @@ pub struct Backends<'a> {
     pub sources: &'a dyn SourceBackend,
     pub refactor: &'a dyn RefactorBackend,
     pub blocks: &'a dyn BlockBackend,
+    pub fixes: &'a dyn FixBackend,
 }
 
 /// `(code, message, optional structured data)` — the shape every
@@ -93,14 +100,19 @@ pub fn dispatch(
         "graph.get_forward_links" => graph_get_forward_links(params, backends.graph),
         "graph.get_edges" => graph_get_edges(backends.graph),
         "source.register" => source_register(params, backends.sources),
-        "source.unregister" => source_unregister(params, backends.sources),
+        "source.unregister" => source_unregister(params, backends.sources, backends.fixes),
         "source.list" => source_list(backends.sources),
         "source.rescan" => source_rescan(params, backends.sources),
+        "source.promote" => source_promote(params, backends.fixes),
+        "source.unpromote" => source_unpromote(params, backends.fixes),
+        "source.rename" => source_rename(params, backends.fixes),
         "link.preview_refactor" => link_preview_refactor(params, backends.refactor),
         "link.apply_refactor" => link_apply_refactor(params, backends.refactor),
         "unit.list" => unit_list(params, backends.sources),
         "unit.search" => unit_search(params, backends.sources),
         "block.ensure_id" => block_ensure_id(params, backends.blocks),
+        "fix.list" => fix_list(params, backends.fixes),
+        "link.rename_event" => link_rename_event(params, backends.fixes),
         other => Err((
             METHOD_NOT_FOUND,
             format!("unknown method \"{other}\""),
@@ -139,13 +151,50 @@ fn source_register(params: &Value, sources: &dyn SourceBackend) -> DispatchResul
     let name = require_str(params, "name")?;
     let root = require_str(params, "root")?;
     sources
-        .register(name, root)
+        .register_checked(name, root)
         .map(|stats| serde_json::to_value(stats).expect("ScanStatsWire always serializes"))
-        .map_err(|e| (SOURCE_ERROR, e, None))
+        .map_err(source_refusal)
 }
 
-fn source_unregister(params: &Value, sources: &dyn SourceBackend) -> DispatchResult {
+/// A refusal or failure of a source call as a dispatch error: always a
+/// `SOURCE_ERROR`, with `data.reason` set to the stable reason when the
+/// call was refused (G14).
+fn source_refusal(e: crate::rpc::backend::PromoteRpcError) -> DispatchError {
+    use crate::rpc::backend::PromoteRpcError;
+    match e {
+        PromoteRpcError::Refused { reason, message } => (
+            SOURCE_ERROR,
+            message,
+            Some(serde_json::json!({ "reason": reason })),
+        ),
+        PromoteRpcError::Failed(message) => (SOURCE_ERROR, message, None),
+    }
+}
+
+/// `source.unregister {name}` (G1). A promoted source is folded back into
+/// its parent, exactly as `source.unpromote` does it (G12); any other
+/// source (or an unknown or already removed name) is unregistered the
+/// plain way.
+fn source_unregister(
+    params: &Value,
+    sources: &dyn SourceBackend,
+    fixes: &dyn FixBackend,
+) -> DispatchResult {
+    use crate::rpc::backend::PromoteRpcError;
+
     let name = require_str(params, "name")?;
+    match fixes.unregister_promoted(name) {
+        Ok(true) => return Ok(Value::Null),
+        Ok(false) => {}
+        Err(PromoteRpcError::Refused { reason, message }) => {
+            return Err((
+                SOURCE_ERROR,
+                message,
+                Some(serde_json::json!({ "reason": reason })),
+            ))
+        }
+        Err(PromoteRpcError::Failed(message)) => return Err((SOURCE_ERROR, message, None)),
+    }
     sources
         .unregister(name)
         .map(|_| Value::Null)
@@ -165,6 +214,58 @@ fn source_rescan(params: &Value, sources: &dyn SourceBackend) -> DispatchResult 
         .rescan(name)
         .map(|stats| serde_json::to_value(stats).expect("ScanStatsWire always serializes"))
         .map_err(|e| (SOURCE_ERROR, e, None))
+}
+
+/// `source.promote {name, root}` (G11): both non-empty strings. A refusal
+/// is a `SOURCE_ERROR` whose `data.reason` is the stable reason (E13).
+fn source_promote(params: &Value, fixes: &dyn FixBackend) -> DispatchResult {
+    use crate::rpc::backend::PromoteRpcError;
+
+    let name = require_str(params, "name")?;
+    let root = require_str(params, "root")?;
+    match fixes.promote(name, root) {
+        Ok(done) => Ok(serde_json::to_value(done).expect("PromoteWire always serializes")),
+        Err(PromoteRpcError::Refused { reason, message }) => Err((
+            SOURCE_ERROR,
+            message,
+            Some(serde_json::json!({ "reason": reason })),
+        )),
+        Err(PromoteRpcError::Failed(message)) => Err((SOURCE_ERROR, message, None)),
+    }
+}
+
+/// `source.rename {name, new_name}` (G13): both non-empty strings (an empty
+/// `new_name` is a refusal with the reason `invalid_name`, not a bad
+/// parameter, so a client shows the same sentence for it as for any bad
+/// name). A refusal is a `SOURCE_ERROR` whose `data.reason` is the stable
+/// reason (G14).
+fn source_rename(params: &Value, fixes: &dyn FixBackend) -> DispatchResult {
+    let name = require_str(params, "name")?;
+    let new_name = params
+        .get("new_name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_params("\"new_name\" (string) is required"))?;
+    fixes
+        .rename(name, new_name)
+        .map(|done| serde_json::to_value(done).expect("RenameWire always serializes"))
+        .map_err(source_refusal)
+}
+
+/// `source.unpromote {name}` (G12): `name` a non-empty string. A refusal
+/// is a `SOURCE_ERROR` whose `data.reason` is the stable reason (G14).
+fn source_unpromote(params: &Value, fixes: &dyn FixBackend) -> DispatchResult {
+    use crate::rpc::backend::PromoteRpcError;
+
+    let name = require_str(params, "name")?;
+    match fixes.unpromote(name) {
+        Ok(done) => Ok(serde_json::to_value(done).expect("UnpromoteWire always serializes")),
+        Err(PromoteRpcError::Refused { reason, message }) => Err((
+            SOURCE_ERROR,
+            message,
+            Some(serde_json::json!({ "reason": reason })),
+        )),
+        Err(PromoteRpcError::Failed(message)) => Err((SOURCE_ERROR, message, None)),
+    }
 }
 
 /// `unit.list {source, folder?, recursive?}` (G1). `source` is a
@@ -374,6 +475,58 @@ fn block_ensure_id(params: &Value, blocks: &dyn BlockBackend) -> DispatchResult 
         })
 }
 
+/// `fix.list {since?, limit?}` (G18). `since` is epoch seconds from the
+/// client: a non-negative integer. `limit` is an integer from 1, default
+/// [`DEFAULT_LIST_LIMIT`], clamped to [`MAX_LIST_LIMIT`]. `null` counts
+/// as absent; anything else (zero, negative, fraction, string) is
+/// refused here as `invalid_params`.
+fn fix_list(params: &Value, fixes: &dyn FixBackend) -> DispatchResult {
+    let given = |key: &str| params.get(key).filter(|v| !v.is_null());
+    let since = match given("since") {
+        None => None,
+        Some(v) => Some(
+            v.as_u64()
+                .and_then(|n| i64::try_from(n).ok())
+                .ok_or_else(|| {
+                    invalid_params("\"since\" must be epoch seconds (an integer, 0 or more)")
+                })?,
+        ),
+    };
+    let limit = match given("limit") {
+        None => DEFAULT_LIST_LIMIT,
+        Some(v) => v
+            .as_u64()
+            .filter(|n| *n >= 1)
+            .map(|n| usize::try_from(n).unwrap_or(usize::MAX).min(MAX_LIST_LIMIT))
+            .ok_or_else(|| invalid_params("\"limit\" must be an integer, 1 or more"))?,
+    };
+    fixes
+        .list(since, limit)
+        .map(|entries| serde_json::to_value(entries).expect("FixEntryWire always serializes"))
+        .map_err(|e| (SOURCE_ERROR, e, None))
+}
+
+/// `link.rename_event {old_path, new_path}` (G3, G4, G21). Both are
+/// non-empty absolute paths; anything else is `invalid_params`. A path in
+/// no source is a `SOURCE_ERROR` whose `data.reason` is
+/// `not_inside_a_source`, never an acknowledgement.
+fn link_rename_event(params: &Value, fixes: &dyn FixBackend) -> DispatchResult {
+    use crate::fixes::event::RenameEventError;
+
+    let old_path = require_str(params, "old_path")?;
+    let new_path = require_str(params, "new_path")?;
+    match fixes.rename_event(old_path, new_path) {
+        Ok(reply) => Ok(serde_json::to_value(reply).expect("RenameEventWire always serializes")),
+        Err(RenameEventError::InvalidParams(m)) => Err(invalid_params(m)),
+        Err(e) => {
+            let data = e
+                .reason()
+                .map(|reason| serde_json::json!({ "reason": reason }));
+            Err((SOURCE_ERROR, e.to_string(), data))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,11 +552,16 @@ mod tests {
                 "source.unregister",
                 "source.list",
                 "source.rescan",
+                "source.promote",
+                "source.unpromote",
+                "source.rename",
                 "link.preview_refactor",
                 "link.apply_refactor",
                 "unit.list",
                 "unit.search",
                 "block.ensure_id",
+                "fix.list",
+                "link.rename_event",
             ]
         );
     }

@@ -30,7 +30,8 @@ use tokio::sync::{broadcast, watch, Notify};
 
 use crate::rpc::auth::{self, Authenticated};
 use crate::rpc::backend::{
-    BlockBackend, GraphBackend, GraphRefresh, RefactorBackend, SourceBackend, UnsupportedBlockIds,
+    BlockBackend, FixBackend, GraphBackend, GraphRefresh, RefactorBackend, SourceBackend,
+    UnsupportedBlockIds, UnsupportedFixes,
 };
 use crate::rpc::dispatch::{self, Backends};
 use crate::rpc::protocol;
@@ -61,6 +62,13 @@ const MUTATING_SOURCE_METHODS: &[&str] = &[
     "source.register",
     "source.unregister",
     "source.rescan",
+    // FR22: a promote re-owns files and rewrites links; the push it sends
+    // refreshes the graph too, but the reply must already see it.
+    "source.promote",
+    // FR22 reversed: an unpromote moves the files back and rewrites links.
+    "source.unpromote",
+    // G13: a rename moves the source's name and rewrites every `@old:` link.
+    "source.rename",
     // GP8: a successful `link.apply_refactor` writes directly to the
     // affected files' content (not through `source.rescan`'s RPC
     // path) and synchronously re-scans every touched source itself
@@ -110,6 +118,16 @@ impl SocketTasks {
         }
     }
 
+    /// Counts `value` as a running connection from now until it is
+    /// dropped, and drops `value` strictly before the count falls (T8):
+    /// see [`Tracked`].
+    fn track<T>(&self, value: T) -> Tracked<T> {
+        Tracked {
+            value,
+            _guard: self.enter(),
+        }
+    }
+
     /// Waits until every currently-tracked task has finished, or
     /// `timeout` elapses, whichever comes first. A bounded wait, not
     /// an unconditional one: a misbehaving client that never responds
@@ -147,6 +165,31 @@ impl Drop for SocketTaskGuard {
     }
 }
 
+/// A value (in production, one WebSocket connection's `Arc<AppState>`)
+/// counted in [`SocketTasks`] for as long as it lives, with the value
+/// dropped strictly before the count falls. Made in [`ws_rpc_handler`]
+/// — before `on_upgrade` — and not when [`handle_socket`] starts.
+///
+/// T8: the upgrade callback holds the `Arc<AppState>` from the moment
+/// the 101 response is built, but axum runs it in a spawned task that
+/// can start late (under load, after the client has the 101 and a
+/// SIGTERM has arrived). While it had not started, the connection was
+/// in no count, so `socket_tasks.wait_until_idle` returned at once,
+/// `block_on` ended, and that task's clone became the last reference to
+/// the registry: it was dropped on a tokio worker thread, which panics
+/// ("Cannot drop a runtime in a context where blocking is not
+/// allowed"). Counting the connection from the handler closes that
+/// window.
+///
+/// Field order is the drop order: the value goes first, the guard
+/// last, also when the callback is dropped without ever running.
+struct Tracked<T> {
+    value: T,
+    _guard: SocketTaskGuard,
+}
+
+type TrackedConnection = Tracked<Arc<AppState>>;
+
 /// Shared state behind every request handler in this module. Always
 /// held as `Arc<AppState>` — never cloned field-by-field — so every
 /// connection/request sees the same token path and backend instances.
@@ -159,6 +202,11 @@ pub struct AppState {
     /// request; production (and the tests of that verb) set the real
     /// one with [`AppState::with_blocks`].
     pub blocks: Arc<dyn BlockBackend>,
+    /// `fix.list`'s backend, and the retry of pending fixes after a
+    /// `source.rescan`. Defaults to one that refuses every request;
+    /// production (and the tests of that verb) set the real one with
+    /// [`AppState::with_fixes`].
+    pub fixes: Arc<dyn FixBackend>,
     events_tx: broadcast::Sender<Value>,
     /// `Some` only in production (`main.rs`'s real `SharedGraph`-backed
     /// wiring); `None` in every test that uses a canned/mocked
@@ -209,6 +257,7 @@ impl AppState {
             sources,
             refactor,
             blocks: Arc::new(UnsupportedBlockIds),
+            fixes: Arc::new(UnsupportedFixes),
             events_tx,
             graph_refresh,
             shutdown_rx,
@@ -219,6 +268,12 @@ impl AppState {
     /// Replaces the `block.ensure_id` backend.
     pub fn with_blocks(mut self, blocks: Arc<dyn BlockBackend>) -> Self {
         self.blocks = blocks;
+        self
+    }
+
+    /// Replaces the `fix.list` backend.
+    pub fn with_fixes(mut self, fixes: Arc<dyn FixBackend>) -> Self {
+        self.fixes = fixes;
         self
     }
 
@@ -310,6 +365,7 @@ async fn handle_single_request(proof: Authenticated, raw: Value, state: Arc<AppS
     let sources = state.sources.clone();
     let refactor = state.refactor.clone();
     let blocks = state.blocks.clone();
+    let fixes = state.fixes.clone();
     let refresh = state.graph_refresh.clone();
     let method = req.method.clone();
     let params = req.params.clone();
@@ -320,6 +376,7 @@ async fn handle_single_request(proof: Authenticated, raw: Value, state: Arc<AppS
             sources: sources.as_ref(),
             refactor: refactor.as_ref(),
             blocks: blocks.as_ref(),
+            fixes: fixes.as_ref(),
         };
         let result = dispatch::dispatch(&proof, &method, &params, &backends);
         if result.is_ok() && MUTATING_SOURCE_METHODS.contains(&method.as_str()) {
@@ -331,6 +388,13 @@ async fn handle_single_request(proof: Authenticated, raw: Value, state: Arc<AppS
                         "failed to refresh the in-memory graph after a source mutation"
                     );
                 }
+            }
+        }
+        // G9: a successful `source.rescan` is a trigger to retry the
+        // pending fixes of that source.
+        if result.is_ok() && method == "source.rescan" {
+            if let Some(source) = params.get("name").and_then(Value::as_str) {
+                fixes.after_rescan(source);
             }
         }
         result
@@ -390,7 +454,10 @@ async fn ws_rpc_handler(
             let ws = ws
                 .max_message_size(MAX_BODY_BYTES)
                 .max_frame_size(MAX_BODY_BYTES);
-            ws.on_upgrade(move |socket| handle_socket(socket, state, bearer))
+            // Counted from here (T8), not from when the upgrade task
+            // first runs: see [`TrackedConnection`].
+            let connection = state.socket_tasks.clone().track(state);
+            ws.on_upgrade(move |socket| handle_socket(socket, connection, bearer))
         }
         Err(_) => (
             StatusCode::UNAUTHORIZED,
@@ -418,23 +485,27 @@ async fn ws_rpc_handler(
 /// already-open socket is therefore rejected on this socket's very
 /// next message, not just on the next new handshake, matching G6/E11.
 ///
-/// R10 fix: this is a thin wrapper around [`run_socket_loop`] that
-/// registers one entry in `state.socket_tasks` for as long as *any*
-/// `Arc<AppState>` clone tied to this connection could still be
-/// alive, and only releases it after that — never concurrently with
-/// it. `run_socket_loop` takes `state` *by value*, so by the time its
-/// `.await` resolves here, every local binding inside it (including
-/// its own `Arc<AppState>` parameter) has already, synchronously,
-/// finished dropping as an ordinary consequence of that function
-/// returning; this wrapper itself never holds a second clone past
-/// that point; only `_task_guard`, which carries no reference to
-/// `AppState` at all, is live in this frame, so there is no ordering
-/// ambiguity for `shutdown`'s caller (`main.rs`'s
-/// `socket_tasks.wait_until_idle`) to race against. The guard still
-/// decrements (and wakes any waiter) on every exit path, including a
-/// panic inside `run_socket_loop`, since it's a plain `Drop` impl.
-async fn handle_socket(socket: WebSocket, state: Arc<AppState>, bearer: String) {
-    let _task_guard = state.socket_tasks.enter();
+/// R10/T8 fix: this is a thin wrapper around [`run_socket_loop`]. The
+/// connection's entry in `state.socket_tasks` was taken earlier, in
+/// [`ws_rpc_handler`] (see [`TrackedConnection`]), and is only released
+/// after every `Arc<AppState>` clone tied to this connection is gone —
+/// never concurrently with it. `run_socket_loop` takes `state` *by
+/// value*, so by the time its `.await` resolves here, every local
+/// binding inside it (including its own `Arc<AppState>` parameter) has
+/// already, synchronously, finished dropping as an ordinary
+/// consequence of that function returning; this wrapper itself never
+/// holds a second clone past that point; only `_task_guard`, which
+/// carries no reference to `AppState` at all, is live in this frame,
+/// so there is no ordering ambiguity for `shutdown`'s caller
+/// (`main.rs`'s `socket_tasks.wait_until_idle`) to race against. The
+/// guard still decrements (and wakes any waiter) on every exit path,
+/// including a panic inside `run_socket_loop`, since it's a plain
+/// `Drop` impl.
+async fn handle_socket(socket: WebSocket, connection: TrackedConnection, bearer: String) {
+    let Tracked {
+        value: state,
+        _guard: _task_guard,
+    } = connection;
     run_socket_loop(socket, state, bearer).await;
 }
 
@@ -573,5 +644,91 @@ async fn run_socket_loop(mut socket: WebSocket, state: Arc<AppState>, bearer: St
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Records, when it is dropped, how many connections the tracker
+    /// still counted.
+    struct CountOnDrop {
+        tasks: SocketTasks,
+        seen: Arc<AtomicUsize>,
+    }
+
+    impl Drop for CountOnDrop {
+        fn drop(&mut self) {
+            self.seen
+                .store(self.tasks.count.load(Ordering::SeqCst), Ordering::SeqCst);
+        }
+    }
+
+    /// T8: a connection is counted the moment it is tracked, before any
+    /// task that will run it has started, so shutdown's
+    /// `wait_until_idle` cannot return while it is pending.
+    #[tokio::test]
+    async fn a_tracked_connection_is_counted_before_its_task_runs_and_holds_up_idle() {
+        let tasks = SocketTasks::new();
+        let tracked = tasks.track(());
+        assert_eq!(tasks.count.load(Ordering::SeqCst), 1);
+
+        let started = std::time::Instant::now();
+        tasks.wait_until_idle(Duration::from_millis(150)).await;
+        assert!(
+            started.elapsed() >= Duration::from_millis(140),
+            "wait_until_idle returned while a tracked connection was still alive"
+        );
+
+        drop(tracked);
+        let started = std::time::Instant::now();
+        tasks.wait_until_idle(Duration::from_secs(5)).await;
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(tasks.count.load(Ordering::SeqCst), 0);
+    }
+
+    /// T8: the tracked value (the `Arc<AppState>`, and through it the
+    /// registry's runtime) is dropped while the connection is still
+    /// counted, so a waiter that sees zero knows the value is gone.
+    /// Holds when the value is dropped unused, as when the upgrade
+    /// callback never runs.
+    #[test]
+    fn a_tracked_value_is_dropped_before_the_count_falls() {
+        let tasks = SocketTasks::new();
+        let seen = Arc::new(AtomicUsize::new(usize::MAX));
+        let tracked = tasks.track(CountOnDrop {
+            tasks: tasks.clone(),
+            seen: Arc::clone(&seen),
+        });
+        drop(tracked);
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            1,
+            "the value must be dropped while the connection is still counted"
+        );
+        assert_eq!(tasks.count.load(Ordering::SeqCst), 0);
+    }
+
+    /// The same, through the unpacking `handle_socket` does: the value
+    /// moves out and is dropped first; the guard stays to the end.
+    #[test]
+    fn unpacked_value_drops_before_the_guard_that_stays_behind() {
+        let tasks = SocketTasks::new();
+        let seen = Arc::new(AtomicUsize::new(usize::MAX));
+        let tracked = tasks.track(CountOnDrop {
+            tasks: tasks.clone(),
+            seen: Arc::clone(&seen),
+        });
+        let Tracked {
+            value,
+            _guard: guard,
+        } = tracked;
+        drop(value);
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+        assert_eq!(tasks.count.load(Ordering::SeqCst), 1);
+        drop(guard);
+        assert_eq!(tasks.count.load(Ordering::SeqCst), 0);
     }
 }

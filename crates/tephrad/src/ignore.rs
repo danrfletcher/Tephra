@@ -134,6 +134,12 @@ pub struct IgnoreRules {
     /// compares equal on both sides). `None` disables the
     /// `$HOME`-relative rule.
     home_rule: Option<HomeRule>,
+    /// Folders of this source that were made their own source (FR22),
+    /// each as its path components under the root. Not a pattern and not
+    /// read from any file: the registry hands them in from the cache's
+    /// `promoted_roots` ([`IgnoreRules::with_promoted`]). Everything at
+    /// or under one is another source's.
+    promoted: Vec<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,7 +183,27 @@ impl IgnoreRules {
         Ok(IgnoreRules {
             patterns,
             home_rule,
+            promoted: Vec::new(),
         })
+    }
+
+    /// These rules, and also everything at or under each of `rel_dirs`
+    /// (paths relative to the source root, forward slashes): the folders
+    /// the source gave up to a source of their own. The parent never
+    /// scans, watches or lists them.
+    pub fn with_promoted<S: AsRef<str>>(mut self, rel_dirs: impl IntoIterator<Item = S>) -> Self {
+        self.promoted = rel_dirs
+            .into_iter()
+            .map(|d| {
+                d.as_ref()
+                    .split('/')
+                    .filter(|c| !c.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|c| !c.is_empty())
+            .collect();
+        self
     }
 
     /// Whether some component of `components` is a
@@ -202,8 +228,9 @@ impl IgnoreRules {
 
     /// Whether `rel` (relative to the source root, using forward
     /// slashes) is ignored: a default name match, a `$HOME`-relative
-    /// match, the `.tephraignore` file itself, or one of this source's
-    /// extra patterns.
+    /// match, a folder the source gave up to a source of its own
+    /// ([`IgnoreRules::with_promoted`]), the `.tephraignore` file itself,
+    /// or one of this source's extra patterns.
     pub fn is_ignored(&self, rel: &Path) -> bool {
         if rel.as_os_str().is_empty() {
             return false;
@@ -215,6 +242,12 @@ impl IgnoreRules {
             .collect();
 
         if components.iter().any(|c| DEFAULT_IGNORED_NAMES.contains(c)) {
+            return true;
+        }
+
+        if self.promoted.iter().any(|dir| {
+            components.len() >= dir.len() && components.iter().zip(dir).all(|(a, b)| a == b)
+        }) {
             return true;
         }
 
@@ -276,6 +309,7 @@ mod tests {
                 .filter_map(|l| Pattern::parse(l))
                 .collect(),
             home_rule: None,
+            promoted: Vec::new(),
         }
     }
 
@@ -476,6 +510,30 @@ mod tests {
         assert!(rules.is_ignored(Path::new("Library/Caches")));
         assert!(rules.is_ignored(Path::new(".Trash")));
         assert!(!rules.is_ignored(Path::new("Notes/Library")));
+    }
+
+    #[test]
+    fn a_promoted_folder_and_everything_under_it_is_ignored_and_nothing_beside_it() {
+        let rules = IgnoreRules::default().with_promoted(["crates/tephrad", "café notes/"]);
+        for rel in [
+            "crates/tephrad",
+            "crates/tephrad/src/registry.rs",
+            "café notes/a.md",
+            "café notes",
+        ] {
+            assert!(rules.is_ignored(Path::new(rel)), "{rel}");
+        }
+        for rel in [
+            "crates",
+            "crates/tephra-cache/src/lib.rs",
+            "crates/tephrad2/x.md",
+            "sub/crates/tephrad/x.md",
+            "café notes 2/a.md",
+            "README.md",
+        ] {
+            assert!(!rules.is_ignored(Path::new(rel)), "{rel}");
+        }
+        assert!(!IgnoreRules::default().is_ignored(Path::new("crates/tephrad/x.md")));
     }
 
     #[test]

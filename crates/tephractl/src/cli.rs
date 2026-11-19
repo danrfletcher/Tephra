@@ -11,11 +11,16 @@
 
 use std::fmt;
 
+use crate::since::Since;
+
 pub const USAGE: &str = "\
 tephractl - command-line client for the tephrad daemon
 
 USAGE:
     tephractl source add <name> <path> [--json]
+    tephractl source promote <name> <path> [--json]
+    tephractl source unpromote <name> [--json]
+    tephractl source rename <old> <new> [--json]
     tephractl source remove <name> [--json]
     tephractl source list [--json]
     tephractl status [--json]
@@ -25,6 +30,7 @@ USAGE:
     tephractl search \"^^<query>\" [--limit <n>] [--json]
     tephractl block-id <unit-id> --line <n> | --symbol <name> [--json]
     tephractl backlinks <id> [--json]
+    tephractl fixes [--since <30m|2h|7d|date>] [--json]
     tephractl link resolve [--source <name>] <target> [--json]
     tephractl link refactor --source <name> --old <path> --new <path> [--apply] [--yes] [--json]
     tephractl daemon install [--from <path>] [--json]
@@ -67,6 +73,16 @@ BACKLINKS:
                           another file (it moved) still counts, once it finds the block there.
                           An id nothing links to prints \"no backlinks\" and exits 0.
 
+FIXES:
+    fixes                 The log of automatic link fixes (fix.list), newest first, one line per
+                          fix: time kind old -> new (n files) status. status is applied, partial,
+                          needs_manual_fix or uncertain. An uncertain line has no new name: the
+                          file vanished with no certain pair and its links are broken. Shows the
+                          newest 50. It only reads: nothing is undone or replayed.
+    --since <when>        Only fixes from <when> on: 30m, 2h or 7d ago, or a date such as
+                          2026-11-16 or 2026-11-16T09:30 (your local time; add Z or +hh:mm for
+                          another zone).
+
 LINK RESOLVE:
     link resolve <target> A block link [[@source:path#^blockid]] prints the block: its id, its
                           line, and \"moved\" when it was found in another file of the source.
@@ -104,6 +120,9 @@ GLOBAL OPTIONS:
     --json          Print raw structured JSON instead of human-readable text
     --addr <addr>   Daemon address to connect to (default: 127.0.0.1:4812)
     -h, --help      Print this help and exit
+
+EXIT CODES:
+    0 done, 1 the command ran and failed, 2 a usage error (nothing was sent)
 ";
 
 /// Which in-file search a sigil asks for: `#` is `headings`, `^` is
@@ -140,6 +159,23 @@ pub enum Command {
     },
     SourceRemove {
         name: String,
+    },
+    /// `source promote <name> <path>`: a folder of a registered source
+    /// becomes the source `name`.
+    SourcePromote {
+        name: String,
+        path: String,
+    },
+    /// `source unpromote <name>`: the promoted source `name` folds back
+    /// into the source it was promoted out of.
+    SourceUnpromote {
+        name: String,
+    },
+    /// `source rename <old> <new>`: the source `old` is called `new` from
+    /// now on and every `@old:` link is rewritten to `@new:`.
+    SourceRename {
+        old: String,
+        new: String,
     },
     SourceList,
     Status,
@@ -191,6 +227,10 @@ pub enum Command {
     Backlinks {
         id: String,
     },
+    /// `fixes [--since <when>]`: `fix.list`. Read-only (F9).
+    Fixes {
+        since: Option<Since>,
+    },
     LinkResolve {
         target: String,
         default_source: Option<String>,
@@ -237,11 +277,12 @@ pub enum Action {
 }
 
 /// Characters a source name must never contain (edge case: "a name
-/// containing invalid characters (spaces, `/`, `@`) is rejected
+/// containing invalid characters (spaces, `/`, `@`, `:`, `*`) is rejected
 /// client-side"). Whitespace is checked separately via
 /// `char::is_whitespace` so it covers more than just the literal
-/// space character.
-const SOURCE_NAME_FORBIDDEN_CHARS: [char; 2] = ['/', '@'];
+/// space character. `:` and `*` join the set with `source rename` (G13):
+/// the daemon refuses them in a new name too.
+const SOURCE_NAME_FORBIDDEN_CHARS: [char; 4] = ['/', '@', ':', '*'];
 
 fn validate_source_name(name: &str) -> Result<(), ArgsError> {
     if name.is_empty() {
@@ -253,7 +294,7 @@ fn validate_source_name(name: &str) -> Result<(), ArgsError> {
             .any(|c| SOURCE_NAME_FORBIDDEN_CHARS.contains(&c))
     {
         return Err(ArgsError(format!(
-            "invalid source name \"{name}\": must not contain spaces, '/', or '@'"
+            "invalid source name \"{name}\": must not contain spaces, '/', '@', ':' or '*'"
         )));
     }
     Ok(())
@@ -328,6 +369,7 @@ where
         "link" => parse_link(&mut iter)?,
         "block-id" => parse_block_id(&mut iter)?,
         "backlinks" => parse_backlinks(&mut iter)?,
+        "fixes" => parse_fixes(&mut iter)?,
         "daemon" => parse_daemon(&mut iter)?,
         other => return Err(ArgsError(format!("unrecognized command: {other}"))),
     };
@@ -362,7 +404,10 @@ fn parse_source<'a>(
     iter: &mut impl Iterator<Item = &'a str>,
 ) -> Result<(Command, bool, Option<String>), ArgsError> {
     let sub = iter.next().ok_or_else(|| {
-        ArgsError("expected a source subcommand: add, remove, or list".to_string())
+        ArgsError(
+            "expected a source subcommand: add, promote, unpromote, rename, remove, or list"
+                .to_string(),
+        )
     })?;
 
     match sub {
@@ -379,6 +424,42 @@ fn parse_source<'a>(
             let (json, addr) = parse_trailing_flags(iter)?;
             Ok((Command::SourceAdd { name, path }, json, addr))
         }
+        "promote" => {
+            let name = iter
+                .next()
+                .ok_or_else(|| ArgsError("source promote requires <name> <path>".to_string()))?
+                .to_string();
+            validate_source_name(&name)?;
+            let path = iter
+                .next()
+                .ok_or_else(|| ArgsError("source promote requires <name> <path>".to_string()))?
+                .to_string();
+            let (json, addr) = parse_trailing_flags(iter)?;
+            Ok((Command::SourcePromote { name, path }, json, addr))
+        }
+        "unpromote" => {
+            let name = iter
+                .next()
+                .ok_or_else(|| ArgsError("source unpromote requires <name>".to_string()))?
+                .to_string();
+            let (json, addr) = parse_trailing_flags(iter)?;
+            Ok((Command::SourceUnpromote { name }, json, addr))
+        }
+        "rename" => {
+            let old = iter
+                .next()
+                .ok_or_else(|| ArgsError("source rename requires <old> <new>".to_string()))?
+                .to_string();
+            // The name rules apply to the new name only: an existing name is
+            // never re-checked (FR14), so `<old>` goes to the daemon as typed.
+            let new = iter
+                .next()
+                .ok_or_else(|| ArgsError("source rename requires <old> <new>".to_string()))?
+                .to_string();
+            validate_source_name(&new)?;
+            let (json, addr) = parse_trailing_flags(iter)?;
+            Ok((Command::SourceRename { old, new }, json, addr))
+        }
         "remove" => {
             let name = iter
                 .next()
@@ -392,7 +473,7 @@ fn parse_source<'a>(
             Ok((Command::SourceList, json, addr))
         }
         other => Err(ArgsError(format!(
-            "unrecognized source subcommand: {other} (expected add, remove, or list)"
+            "unrecognized source subcommand: {other} (expected add, promote, unpromote, rename, remove, or list)"
         ))),
     }
 }
@@ -779,6 +860,36 @@ fn parse_backlinks<'a>(
     Ok((Command::Backlinks { id }, json, addr))
 }
 
+/// `fixes [--since <when>] [--json] [--addr <addr>]`. A bad `--since` is
+/// a usage error, decided here, before any request.
+fn parse_fixes<'a>(
+    iter: &mut impl Iterator<Item = &'a str>,
+) -> Result<(Command, bool, Option<String>), ArgsError> {
+    let mut since: Option<Since> = None;
+    let mut json = false;
+    let mut addr = None;
+
+    while let Some(arg) = iter.next() {
+        match arg {
+            "--json" => json = true,
+            "--addr" => addr = Some(take_value(iter, "--addr")?),
+            "--since" => {
+                if since.is_some() {
+                    return Err(ArgsError("--since was given twice".to_string()));
+                }
+                let value = take_value(iter, "--since")?;
+                since = Some(Since::parse(&value).map_err(|e| ArgsError(e.0))?);
+            }
+            other => {
+                return Err(ArgsError(format!(
+                "fixes takes no arguments besides --since, --json and --addr; unexpected: {other}"
+            )))
+            }
+        }
+    }
+    Ok((Command::Fixes { since }, json, addr))
+}
+
 fn parse_link<'a>(
     iter: &mut impl Iterator<Item = &'a str>,
 ) -> Result<(Command, bool, Option<String>), ArgsError> {
@@ -988,6 +1099,105 @@ mod tests {
     fn source_add_rejects_name_with_at_sign() {
         let err = parse_args(["source", "add", "my@notes", "/path"]).unwrap_err();
         assert!(err.0.contains("invalid source name"));
+    }
+
+    #[test]
+    fn source_unpromote_parses_a_name_and_flags_and_needs_the_name() {
+        let parsed = run(&["source", "unpromote", "tephrad"]).unwrap();
+        assert_eq!(
+            parsed.command,
+            Command::SourceUnpromote {
+                name: "tephrad".to_string()
+            }
+        );
+        let json = run(&["source", "unpromote", "tephrad", "--json"]).unwrap();
+        assert!(json.json);
+        assert!(parse_args(["source", "unpromote"]).is_err());
+        assert!(parse_args(["source", "unpromote", "a", "b"]).is_err());
+    }
+
+    #[test]
+    fn source_rename_parses_both_names_and_flags_and_needs_both() {
+        let parsed = run(&["source", "rename", "tephrad", "daemon"]).unwrap();
+        assert_eq!(
+            parsed.command,
+            Command::SourceRename {
+                old: "tephrad".to_string(),
+                new: "daemon".to_string()
+            }
+        );
+        assert!(!parsed.json);
+        let json = run(&["source", "rename", "tephrad", "daemon", "--json"]).unwrap();
+        assert!(json.json);
+        // Missing arguments.
+        let err = parse_args(["source", "rename"]).unwrap_err();
+        assert!(
+            err.0.contains("source rename requires <old> <new>"),
+            "{}",
+            err.0
+        );
+        let err = parse_args(["source", "rename", "tephrad"]).unwrap_err();
+        assert!(
+            err.0.contains("source rename requires <old> <new>"),
+            "{}",
+            err.0
+        );
+        // A third name is not accepted.
+        assert!(parse_args(["source", "rename", "a", "b", "c"]).is_err());
+    }
+
+    /// The new name is checked client-side with the widened rule (`:` and
+    /// `*` join `/`, `@` and whitespace); the old name never is (FR14).
+    #[test]
+    fn source_rename_checks_the_new_name_only_and_with_the_widened_rule() {
+        for bad in ["", "bad/name", "a@b", "a:b", "a*b", "a b", "a\tb"] {
+            let err = parse_args(["source", "rename", "tephrad", bad]).unwrap_err();
+            let want = if bad.is_empty() {
+                "source name must not be empty"
+            } else {
+                "invalid source name"
+            };
+            assert!(err.0.contains(want), "{bad:?}: {}", err.0);
+        }
+        let err = parse_args(["source", "rename", "tephrad", "a:b"]).unwrap_err();
+        assert!(err.0.contains("':'") && err.0.contains("'*'"), "{}", err.0);
+        // An existing name that breaks today's rules can still be renamed away.
+        let parsed = run(&["source", "rename", "old*name", "fresh"]).unwrap();
+        assert_eq!(
+            parsed.command,
+            Command::SourceRename {
+                old: "old*name".to_string(),
+                new: "fresh".to_string()
+            }
+        );
+        // `source add` and `source promote` take the widened rule too.
+        assert!(parse_args(["source", "add", "a:b", "/p"]).is_err());
+        assert!(parse_args(["source", "add", "a*b", "/p"]).is_err());
+        assert!(parse_args(["source", "promote", "a:b", "/p"]).is_err());
+    }
+
+    #[test]
+    fn source_promote_parses_name_and_path_and_validates_the_name() {
+        let parsed = run(&[
+            "source",
+            "promote",
+            "tephrad",
+            "/home/dan/Tephra/crates/tephrad",
+        ])
+        .unwrap();
+        assert_eq!(
+            parsed.command,
+            Command::SourcePromote {
+                name: "tephrad".to_string(),
+                path: "/home/dan/Tephra/crates/tephrad".to_string(),
+            }
+        );
+        let json = run(&["source", "promote", "t", "/p", "--json"]).unwrap();
+        assert!(json.json);
+        assert!(parse_args(["source", "promote", "t"]).is_err());
+        assert!(parse_args(["source", "promote"]).is_err());
+        assert!(parse_args(["source", "promote", "my notes", "/p"]).is_err());
+        assert!(parse_args(["source", "promote", "a@b", "/p"]).is_err());
     }
 
     #[test]

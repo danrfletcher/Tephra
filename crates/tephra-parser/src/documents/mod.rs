@@ -318,6 +318,9 @@ impl ParsedDocument {
             kind: "document",
             size: None,
             too_large: false,
+            hash: None,
+            inode: None,
+            device: None,
         }
     }
 

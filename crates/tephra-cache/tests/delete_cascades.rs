@@ -146,6 +146,9 @@ fn delete_units_under_prefix_clears_only_the_nested_rel_paths() {
             rel_path: "dir/a.md",
             mtime: None,
             frontmatter_json: None,
+            hash: None,
+            inode: None,
+            device: None,
         })
         .expect("insert dir/a.md");
     cache
@@ -166,6 +169,9 @@ fn delete_units_under_prefix_clears_only_the_nested_rel_paths() {
             rel_path: "dir/sub/b.md",
             mtime: None,
             frontmatter_json: None,
+            hash: None,
+            inode: None,
+            device: None,
         })
         .expect("insert dir/sub/b.md");
     let dir2_c = cache
@@ -177,6 +183,9 @@ fn delete_units_under_prefix_clears_only_the_nested_rel_paths() {
             rel_path: "dir2/c.md",
             mtime: None,
             frontmatter_json: None,
+            hash: None,
+            inode: None,
+            device: None,
         })
         .expect("insert dir2/c.md");
     let top = cache
@@ -188,6 +197,9 @@ fn delete_units_under_prefix_clears_only_the_nested_rel_paths() {
             rel_path: "top.md",
             mtime: None,
             frontmatter_json: None,
+            hash: None,
+            inode: None,
+            device: None,
         })
         .expect("insert top.md");
 
@@ -238,6 +250,9 @@ fn delete_units_under_prefix_does_not_match_on_underscore_percent_or_case() {
                 rel_path,
                 mtime: None,
                 frontmatter_json: None,
+                hash: None,
+                inode: None,
+                device: None,
             })
             .unwrap_or_else(|_| panic!("insert {rel_path}"))
     };

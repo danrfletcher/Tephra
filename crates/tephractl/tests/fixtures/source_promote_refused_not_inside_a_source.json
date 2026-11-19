@@ -1,0 +1,11 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "error": {
+    "code": -32011,
+    "message": "/home/dan/Documents/Notes is not inside any registered source",
+    "data": {
+      "reason": "not_inside_a_source"
+    }
+  }
+}

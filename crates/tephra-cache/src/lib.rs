@@ -2,7 +2,8 @@
 //!
 //! Owns `cache.db` (WAL mode), its schema (`sources`, `units`, `links`,
 //! `tags`, `blocks`, `headings`, `symbols`, the `block_fts` FTS5 index,
-//! `scan_state`, `schema_version`), the single drop-and-rebuild
+//! `scan_state`, `schema_version`, and the durable `fix_log`,
+//! `pending_fixes` and `promoted_roots`), the single drop-and-rebuild
 //! path triggered by a schema-version mismatch (F2 — no migration
 //! scripts), and per-source status bookkeeping
 //! (`active`/`stale`/`offline`) so an unmounted or offline source's
@@ -13,17 +14,24 @@
 //! typed helpers exposed here.
 
 mod cache;
+mod fix_log;
 mod fts;
 mod in_file;
 mod listing;
+mod pending_fixes;
+mod promote;
 mod schema;
 mod search;
+mod source_rename;
 mod sources;
 mod units;
 
 use std::fmt;
 
 pub use cache::{Cache, FaultInjector};
+pub use fix_log::{
+    FixLogChange, FixLogRow, FixLogSummary, NewFixLog, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT,
+};
 pub use fts::{
     make_snippet, BlockHit, NewFtsRow, FTS_ROWS_PER_UNIT, MAX_RANK_CANDIDATES, MIN_TRIGRAM_CHARS,
 };
@@ -31,8 +39,13 @@ pub use in_file::{InFileCandidate, InFileScope};
 pub use listing::{
     compare_entries, compare_names, FolderEntry, FolderListing, FolderState, FOLDER_KIND,
 };
+pub use pending_fixes::{
+    NewPendingFix, PendingFixRow, PendingOp, STATE_NEEDS_MANUAL_FIX, STATE_PENDING,
+};
+pub use promote::{NewPromote, NewUnpromote, Promoted, PromotedRootRow, Unpromoted};
 pub use schema::KindInferrer;
 pub use search::{compare_hits, file_stem, resolve_title, NameCandidate, NameHit, NAME_SEARCH_SQL};
+pub use source_rename::{NewSourceRename, SourceRenamed};
 pub use sources::{validate_transition, InvalidTransition, SourceRow, SourceStatus};
 pub use units::{
     BlockOccurrence, BlockRow, HeadingRow, IdBlockText, LinkRow, NewBlock, NewHeading, NewLink,
@@ -43,8 +56,8 @@ pub use units::{
 /// constant is the *only* way the on-disk schema ever changes shape:
 /// on next open, [`Cache::open`] compares the stored `schema_version`
 /// row against this value and, on mismatch, drops and recreates
-/// every core table (never `sources`, `schema_version` or
-/// `scan_state`) — see [`Cache::rebuild`]. There is no
+/// every core table (never `sources`, `schema_version`,
+/// `scan_state`, `fix_log`, `pending_fixes` or `promoted_roots`) — see [`Cache::rebuild`]. There is no
 /// migration-file mechanism or version-ladder anywhere in this crate
 /// (F2).
 ///
@@ -55,7 +68,14 @@ pub use units::{
 /// index. Builds of v2 before the last two have another table shape
 /// at the same version number; the open path spots that and rebuilds
 /// (see `schema::core_shape_is_stale`).
-pub const CURRENT_SCHEMA_VERSION: i64 = 2;
+///
+/// Version 3 added `units.hash` (SHA-256 of the file's bytes),
+/// `units.inode` and `units.device` (the file's identity on disk), and
+/// the durable `fix_log`, `pending_fixes` and `promoted_roots` tables,
+/// which a rebuild never drops. The first start after the upgrade
+/// rebuilds the core tables and rescans every source, filling the hashes
+/// and identities.
+pub const CURRENT_SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug)]
 pub enum CacheError {
@@ -85,6 +105,10 @@ pub enum CacheError {
     /// This SQLite build has no FTS5 with the `trigram` tokenizer, which
     /// the `^^` search needs. Carries a message saying what is missing.
     Fts5Unavailable(String),
+    /// [`Cache::begin_unpromote`] (or its simulation) named a source that
+    /// has no `promoted_roots` row for the given parent and folder: it
+    /// was never promoted out of that folder.
+    NotPromoted(String),
 }
 
 impl fmt::Display for CacheError {
@@ -112,6 +136,9 @@ impl fmt::Display for CacheError {
                 write!(f, "\"{name}\" is not a recognized cache table name")
             }
             CacheError::Fts5Unavailable(message) => write!(f, "{message}"),
+            CacheError::NotPromoted(name) => {
+                write!(f, "the source \"{name}\" was not promoted out of a folder")
+            }
         }
     }
 }

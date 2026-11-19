@@ -1,0 +1,52 @@
+[
+  {
+    "files_changed": 0,
+    "id": 3,
+    "kind": "uncertain",
+    "message": "vanished, no certain pair: links broken",
+    "new": null,
+    "old": "Gone.md",
+    "sources": [
+      "notes"
+    ],
+    "status": "uncertain",
+    "time": 1794790000
+  },
+  {
+    "files_changed": 2,
+    "id": 2,
+    "kind": "rename",
+    "new": "Single.md",
+    "old": "Solo\u001b[2J.md",
+    "sources": [
+      "notes"
+    ],
+    "status": "partial",
+    "time": 1794789000
+  },
+  {
+    "files_changed": 3,
+    "id": 1,
+    "kind": "rename",
+    "new": "Plan.md",
+    "old": "Training Plan.md",
+    "sources": [
+      "notes"
+    ],
+    "status": "applied",
+    "time": 1794788000
+  },
+  {
+    "files_changed": 1,
+    "id": 0,
+    "kind": "rename",
+    "new": "Ideas/Uno.md",
+    "old": "Ideas/One.md",
+    "sources": [
+      "notes",
+      "work"
+    ],
+    "status": "needs_manual_fix",
+    "time": 1794787000
+  }
+]

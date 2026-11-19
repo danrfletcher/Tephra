@@ -130,6 +130,7 @@ fn call(sources: &dyn SourceBackend, params: Value) -> Result<Value, (i64, Strin
         sources,
         refactor: &REFACTOR,
         blocks: &tephrad::rpc::backend::UnsupportedBlockIds,
+        fixes: &tephrad::rpc::backend::UnsupportedFixes,
     };
     dispatch(&proof(), "unit.search", &params, &backends)
         .map_err(|(code, message, _)| (code, message))

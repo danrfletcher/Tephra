@@ -18,6 +18,7 @@ use std::time::{Duration, Instant, SystemTime};
 use tephra_cache::{Cache, SourceStatus};
 use tephra_graph::UnitGraph;
 use tephrad::file_kind::MAX_INDEXED_BYTES;
+use tephrad::fix::{fix_rename, FixStatus};
 use tephrad::ignore::IgnoreRules;
 use tephrad::refactor::{ApplyOutcome, RefactorEngine, WatcherPauseControl, DOCUMENT_READ_ONLY};
 use tephrad::registry::SourceRegistry;
@@ -666,6 +667,56 @@ fn f4_documents_keep_their_bytes_and_mtime_through_scan_watcher_churn_and_a_refa
         .unwrap()
         .contains("Renamed"));
 
+    for (d, b) in docs.iter().zip(&before) {
+        let now = stamp(&w.notes.root().join(d));
+        assert!(now.bytes == b.bytes, "{d} bytes changed");
+        assert_eq!(now.mtime, b.mtime, "{d} mtime changed");
+    }
+    w.finish();
+}
+
+#[test]
+fn g7_a_rename_fix_reports_each_linking_document_needs_manual_fix_and_never_touches_it() {
+    let w = world();
+    w.notes.write("churn.md", "# churn\n\nSee [[Target]].\n");
+    w.registry.rescan("notes").unwrap();
+    let docs = ["report.docx", "deck.pptx", "text.pdf", "scanned.pdf"];
+    let before: Vec<Stamp> = docs
+        .iter()
+        .map(|d| stamp(&w.notes.root().join(d)))
+        .collect();
+
+    std::fs::rename(
+        w.notes.root().join("Target.md"),
+        w.notes.root().join("Renamed.md"),
+    )
+    .unwrap();
+    w.registry.rescan("notes").unwrap();
+
+    let result = fix_rename(&w.graph(), &*w.registry, "notes", "Target.md", "Renamed.md")
+        .expect("fix_rename");
+
+    // The note is rewritten; every document that links to it is named,
+    // not written. The scanned PDF has no links, so it is not named.
+    assert_eq!(result.files_changed, 1, "{result:?}");
+    let mut manual: Vec<&str> = result
+        .with_status(FixStatus::NeedsManualFix)
+        .iter()
+        .map(|f| f.file.as_str())
+        .collect();
+    manual.sort();
+    assert_eq!(
+        manual,
+        vec!["@notes:deck.pptx", "@notes:report.docx", "@notes:text.pdf"]
+    );
+    assert!(result
+        .with_status(FixStatus::NeedsManualFix)
+        .iter()
+        .all(|f| f.reason.as_deref() == Some(DOCUMENT_READ_ONLY)));
+    assert_eq!(
+        std::fs::read_to_string(w.notes.root().join("churn.md")).unwrap(),
+        "# churn\n\nSee [[Renamed]].\n"
+    );
     for (d, b) in docs.iter().zip(&before) {
         let now = stamp(&w.notes.root().join(d));
         assert!(now.bytes == b.bytes, "{d} bytes changed");

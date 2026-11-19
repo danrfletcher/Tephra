@@ -125,11 +125,13 @@ fn names(cols: &[(String, String, bool, Option<String>)]) -> Vec<&str> {
 
 #[test]
 fn v2_ddl_has_every_table_and_column() {
+    // Kept under its v2 name: it still pins every v2 table and column,
+    // and now the v3 additions (hash and identity, the durable tables).
     let dir = tempfile::tempdir().expect("tempdir");
     let cache = common::open_temp_cache(&dir);
     let conn = cache.connection();
 
-    assert_eq!(CURRENT_SCHEMA_VERSION, 2);
+    assert_eq!(CURRENT_SCHEMA_VERSION, 3);
 
     let units = columns(conn, "units");
     assert_eq!(
@@ -143,10 +145,19 @@ fn v2_ddl_has_every_table_and_column() {
             "kind",
             "size",
             "too_large",
-            "needs_rescan"
+            "needs_rescan",
+            "hash",
+            "inode",
+            "device"
         ]
     );
     let col = |name: &str| units.iter().find(|c| c.0 == name).unwrap().clone();
+    for nullable in ["hash", "inode", "device"] {
+        assert!(!col(nullable).2, "{nullable} is nullable");
+    }
+    assert_eq!(col("hash").1, "TEXT");
+    assert_eq!(col("inode").1, "INTEGER");
+    assert_eq!(col("device").1, "INTEGER");
     assert!(col("kind").2, "kind is NOT NULL");
     assert!(!col("size").2, "size is nullable");
     assert_eq!(
@@ -191,6 +202,55 @@ fn v2_ddl_has_every_table_and_column() {
         ["source_id", "started_at", "finished_at"]
     );
 
+    // v3: the durable tables, and no foreign key out of any of them.
+    assert_eq!(
+        names(&columns(conn, "fix_log")),
+        [
+            "id",
+            "created_at",
+            "kind",
+            "status",
+            "old_source",
+            "old_path",
+            "new_source",
+            "new_path",
+            "files_changed",
+            "detail_json"
+        ]
+    );
+    assert_eq!(
+        names(&columns(conn, "pending_fixes")),
+        [
+            "id",
+            "fix_id",
+            "source",
+            "file_path",
+            "old_source",
+            "old_path",
+            "new_source",
+            "new_path",
+            "state",
+            "reason",
+            "attempts",
+            "created_at",
+            "updated_at"
+        ]
+    );
+    assert_eq!(
+        names(&columns(conn, "promoted_roots")),
+        ["id", "parent", "rel_path", "source", "created_at"]
+    );
+    for table in common::DURABLE_TABLES {
+        let fks: i64 = conn
+            .query_row(
+                &format!("SELECT count(*) FROM pragma_foreign_key_list('{table}')"),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fks, 0, "{table} must have no foreign key");
+    }
+
     // block_fts is an FTS5 table with the trigram tokenizer.
     let fts_sql: String = conn
         .query_row(
@@ -210,6 +270,8 @@ fn v2_ddl_has_every_table_and_column() {
         "idx_symbols_unit_id",
         "idx_blocks_unit_id",
         "idx_blocks_block_id",
+        "idx_units_hash",
+        "idx_units_identity",
     ] {
         let n: i64 = conn
             .query_row(
@@ -237,6 +299,9 @@ fn units_kind_check_rejects_an_unknown_kind() {
         kind: "markdown",
         size: None,
         too_large: false,
+        hash: None,
+        inode: None,
+        device: None,
     });
     assert!(err.is_err(), "the CHECK must reject an unknown kind");
 }
@@ -352,18 +417,18 @@ fn deleting_a_unit_removes_its_headings_symbols_and_fts_rows() {
 }
 
 #[test]
-fn a_v1_fixture_database_rebuilds_to_v2_on_first_open() {
+fn a_v1_fixture_database_rebuilds_to_the_current_version_on_first_open() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("cache.db");
     common::write_v1_cache(&db_path);
 
-    let cache = Cache::open(&db_path).expect("open v1 cache with the v2 build");
-    assert_eq!(cache.schema_version().unwrap(), Some(2));
+    let cache = Cache::open(&db_path).expect("open v1 cache with the current build");
+    assert_eq!(cache.schema_version().unwrap(), Some(3));
     let conn = cache.connection();
     let version: i64 = conn
         .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     assert!(names(&columns(conn, "units")).contains(&"needs_rescan"));
     assert!(!columns(conn, "block_fts").is_empty());
     // Both sources' rows in `sources` survive; the scan_state bootstrap
@@ -375,6 +440,89 @@ fn a_v1_fixture_database_rebuilds_to_v2_on_first_open() {
     drop(cache);
     let cache = Cache::open(&db_path).expect("reopen");
     assert_eq!(cache.table_row_count("units").unwrap(), 2);
+}
+
+/// The v3 upgrade of a real v2 file: opened once it is rebuilt to v3,
+/// keeping `sources` and `scan_state`, the offline source's rows (with
+/// no hash or identity and `needs_rescan = 1`) and giving the online
+/// source's rows up to the rescan; a second open changes nothing.
+#[test]
+fn a_v2_fixture_database_upgrades_to_v3_once_and_the_second_open_is_a_no_op() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("cache.db");
+    common::write_v2_cache(&db_path);
+    let sources_before = {
+        let conn = Connection::open(&db_path).unwrap();
+        common::dump_table(&conn, "sources")
+    };
+
+    let cache = Cache::open(&db_path).expect("open v2 cache with the v3 build");
+    assert_eq!(cache.rebuilt_from_version(), Some(2));
+    assert_eq!(cache.schema_version().unwrap(), Some(3));
+    let conn = cache.connection();
+    let units = names(&columns(conn, "units")).join(",");
+    assert!(units.ends_with("needs_rescan,hash,inode,device"), "{units}");
+    for table in common::DURABLE_TABLES {
+        assert!(!columns(conn, table).is_empty(), "{table} created");
+        assert_eq!(cache.table_row_count(table).unwrap(), 0);
+    }
+
+    // `sources` and `scan_state` are kept as they were.
+    assert_eq!(common::dump_table(conn, "sources"), sources_before);
+    assert_eq!(cache.source_row_count().unwrap(), 2);
+    let scans: Vec<(i64, Option<i64>)> = conn
+        .prepare("SELECT source_id, finished_at FROM scan_state ORDER BY source_id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    // The offline source keeps its record; the online one is flagged to
+    // be rescanned from the top, which is what fills its hashes.
+    assert_eq!(scans, vec![(1, Some(1_700_000_005)), (2, None)]);
+    let unfinished: Vec<String> = cache
+        .sources_with_unfinished_scan()
+        .unwrap()
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+    assert_eq!(unfinished, vec!["online-repo".to_string()]);
+
+    // The online source's rows went; the offline source's came across
+    // with nothing to say about their bytes.
+    assert!(cache
+        .units_with_status_for_source("online-repo")
+        .unwrap()
+        .is_empty());
+    let offline = cache.units_with_status_for_source("offline-notes").unwrap();
+    assert_eq!(offline.len(), 2);
+    for u in &offline {
+        assert_eq!(
+            (u.unit.hash.as_deref(), u.unit.inode, u.unit.device),
+            (None, None, None),
+            "{}",
+            u.unit.rel_path
+        );
+        assert!(u.unit.needs_rescan, "{}", u.unit.rel_path);
+    }
+
+    // A second open is a no-op: not a rebuild, nothing lost, nothing
+    // re-flagged.
+    let after_first = (
+        common::dump_table(cache.connection(), "units"),
+        common::dump_table(cache.connection(), "scan_state"),
+    );
+    drop(cache);
+    let cache = Cache::open(&db_path).expect("second open");
+    assert_eq!(cache.rebuilt_from_version(), None);
+    assert_eq!(cache.schema_version().unwrap(), Some(3));
+    assert_eq!(
+        (
+            common::dump_table(cache.connection(), "units"),
+            common::dump_table(cache.connection(), "scan_state")
+        ),
+        after_first
+    );
 }
 
 #[test]

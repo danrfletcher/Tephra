@@ -17,6 +17,15 @@ pub struct Config {
     pub listen_addr: String,
     pub data_dir: PathBuf,
     pub log_level: String,
+    /// The Atlas fallback (G20, FR16): when `true`, a link fix that
+    /// rewrites a plain wikilink whose bare name also exists in another
+    /// registered source writes the fuller same-source path
+    /// (`[[docs/Plan]]`) instead of the bare name, so Obsidian cannot
+    /// pick the wrong file when several sources are linked into one
+    /// vault. Read from this file only, once, at start. `serde(default)`
+    /// so a file written before the key existed still loads, as `false`.
+    #[serde(default)]
+    pub qualify_ambiguous_links: bool,
 }
 
 impl Config {
@@ -27,6 +36,7 @@ impl Config {
             listen_addr: "127.0.0.1:4812".to_string(),
             data_dir,
             log_level: "info".to_string(),
+            qualify_ambiguous_links: false,
         }
     }
 }
@@ -96,7 +106,10 @@ fn validate_log_level(level: &str) -> Result<(), ConfigError> {
 /// Validates every field of `config` that load-time checks can catch
 /// before the rest of startup proceeds: `listen_addr` must be a
 /// loopback socket address, and `log_level` must be one of the
-/// documented values.
+/// documented values. `qualify_ambiguous_links` needs no check here: a
+/// boolean has no invalid value, and a value of any other TOML type
+/// (`"yes"`, `1`) never reaches this function, because it fails to
+/// deserialize as [`ConfigError::Parse`], naming the key.
 fn validate_config(config: &Config) -> Result<(), ConfigError> {
     validate_listen_addr(&config.listen_addr)?;
     validate_log_level(&config.log_level)?;
@@ -144,10 +157,19 @@ pub fn render_default_toml(cfg: &Config) -> String {
          \n\
          # log_level: verbosity for tephrad's structured logs.\n\
          # One of: trace, debug, info, warn, error.\n\
-         log_level = \"{log_level}\"\n",
+         log_level = \"{log_level}\"\n\
+         \n\
+         # qualify_ambiguous_links: the Atlas fallback. Leave false unless\n\
+         # Atlas asks for it. When true, a link fix that rewrites a plain\n\
+         # [[Name]] whose name also exists in another registered source\n\
+         # writes the fuller same-source path ([[docs/Name]]), so Obsidian\n\
+         # cannot open the same-named file in the other source. Read at\n\
+         # start; changing it affects only fixes made after the next start.\n\
+         qualify_ambiguous_links = {qualify_ambiguous_links}\n",
         listen_addr = cfg.listen_addr,
         data_dir = data_dir_literal,
         log_level = cfg.log_level,
+        qualify_ambiguous_links = cfg.qualify_ambiguous_links,
     )
 }
 
@@ -333,5 +355,116 @@ mod tests {
         let rendered = render_default_toml(&cfg);
         let parsed: Config = toml::from_str(&rendered).expect("generated config must parse");
         assert_eq!(parsed.data_dir, cfg.data_dir);
+    }
+
+    // --- qualify_ambiguous_links (G20) ---
+
+    /// The three original keys, as a file written before G20 had them.
+    const THREE_KEYS: &str = "listen_addr = \"127.0.0.1:4812\"\n\
+                              data_dir = \"/tmp/tephra-data\"\n\
+                              log_level = \"info\"\n";
+
+    /// Loads `contents` as a config file; returns the result and the file
+    /// text as it is afterwards.
+    fn load_text(contents: &str) -> (Result<Loaded, ConfigError>, String) {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        fs::write(&config_path, contents).unwrap();
+        let result = load_or_create(&config_path, dir.path().join("data"));
+        (result, fs::read_to_string(&config_path).unwrap())
+    }
+
+    #[test]
+    fn qualify_key_absent_parses_to_false() {
+        let (result, after) = load_text(THREE_KEYS);
+        assert!(
+            !result
+                .expect("a file without the key loads")
+                .config
+                .qualify_ambiguous_links
+        );
+        assert_eq!(after, THREE_KEYS, "the file is not rewritten");
+    }
+
+    #[test]
+    fn qualify_key_true_and_false_parse() {
+        for (text, want) in [("true", true), ("false", false)] {
+            let (result, _) = load_text(&format!("{THREE_KEYS}qualify_ambiguous_links = {text}\n"));
+            let loaded = result.expect("load");
+            assert_eq!(loaded.config.qualify_ambiguous_links, want, "{text}");
+            assert!(!loaded.defaults_written);
+        }
+    }
+
+    #[test]
+    fn qualify_key_of_another_type_fails_with_a_parse_error_naming_the_key() {
+        for value in ["\"yes\"", "1", "0", "\"true\"", "[true]"] {
+            let text = format!("{THREE_KEYS}qualify_ambiguous_links = {value}\n");
+            let (result, after) = load_text(&text);
+            match result {
+                Err(ConfigError::Parse(e)) => assert!(
+                    e.to_string().contains("qualify_ambiguous_links"),
+                    "{value}: the error must name the key, got: {e}"
+                ),
+                other => panic!("{value}: expected ConfigError::Parse, got {other:?}"),
+            }
+            assert_eq!(after, text, "{value}: the user's file is left untouched");
+        }
+    }
+
+    #[test]
+    fn qualify_key_is_accepted_beside_the_three_existing_keys_and_a_misspelling_is_not() {
+        let (ok, _) = load_text(&format!("{THREE_KEYS}qualify_ambiguous_links = true\n"));
+        let cfg = ok.expect("four keys load").config;
+        assert_eq!(cfg.listen_addr, "127.0.0.1:4812");
+        assert_eq!(cfg.log_level, "info");
+        assert!(cfg.qualify_ambiguous_links);
+
+        let text = format!("{THREE_KEYS}qualify_ambiguous_link = true\n");
+        let (bad, after) = load_text(&text);
+        match bad {
+            Err(ConfigError::Parse(e)) => {
+                assert!(e.to_string().contains("qualify_ambiguous_link"), "{e}")
+            }
+            other => panic!("expected ConfigError::Parse, got {other:?}"),
+        }
+        assert_eq!(after, text);
+    }
+
+    #[test]
+    fn qualify_default_is_false_and_round_trips() {
+        let cfg = Config::defaults(PathBuf::from("/tmp/tephra-data"));
+        assert!(!cfg.qualify_ambiguous_links);
+        let on = Config {
+            qualify_ambiguous_links: true,
+            ..cfg.clone()
+        };
+        for c in [cfg, on] {
+            let back: Config = toml::from_str(&toml::to_string(&c).unwrap()).unwrap();
+            assert_eq!(back, c);
+        }
+    }
+
+    #[test]
+    fn generated_config_has_the_key_off_with_its_comment_and_parses_back_equal() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let loaded = load_or_create(&config_path, dir.path().join("data")).expect("load");
+        let raw = fs::read_to_string(&config_path).unwrap();
+        assert!(raw.contains("qualify_ambiguous_links = false\n"), "{raw}");
+        assert!(
+            raw.contains("# qualify_ambiguous_links: the Atlas fallback."),
+            "{raw}"
+        );
+        assert_eq!(toml::from_str::<Config>(&raw).unwrap(), loaded.config);
+
+        // Rendered with the key on, the file says so and parses back the same.
+        let on = Config {
+            qualify_ambiguous_links: true,
+            ..loaded.config
+        };
+        let rendered = render_default_toml(&on);
+        assert!(rendered.contains("qualify_ambiguous_links = true\n"));
+        assert_eq!(toml::from_str::<Config>(&rendered).unwrap(), on);
     }
 }

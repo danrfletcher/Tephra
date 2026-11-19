@@ -159,6 +159,15 @@ pub struct ChangeOutcome {
     pub stats: ScanStats,
     pub changed_paths: Vec<PathBuf>,
     pub deferred: Vec<PathBuf>,
+    /// The tracked files this batch found gone, as their cached rows
+    /// held them before the batch deleted them (the file itself, or
+    /// every file under a folder that is gone). `os` is unset: the
+    /// caller adds what the OS said about the path. Only the rename
+    /// detector reads this ([`crate::rename_detect`]).
+    pub vanished: Vec<crate::rename_detect::Vanished>,
+    /// The files this batch found that had no cached row, as they were
+    /// indexed. Same reader, same unset `os`.
+    pub appeared: Vec<crate::rename_detect::Appeared>,
 }
 
 #[derive(Debug)]
@@ -369,7 +378,7 @@ fn cached_ids_of_file(
 /// Relative path, normalized to forward slashes regardless of
 /// platform, for storage in `units.rel_path` and for matching against
 /// [`IgnoreRules`].
-fn to_rel_string(root: &Path, abs: &Path) -> Option<String> {
+pub(crate) fn to_rel_string(root: &Path, abs: &Path) -> Option<String> {
     let rel = abs.strip_prefix(root).ok()?;
     let joined: Vec<&str> = rel
         .components()
@@ -383,10 +392,58 @@ fn to_rel_string(root: &Path, abs: &Path) -> Option<String> {
 }
 
 /// Seconds since the epoch of `metadata`'s modification time.
-fn metadata_mtime(metadata: &fs::Metadata) -> Option<i64> {
+pub(crate) fn metadata_mtime(metadata: &fs::Metadata) -> Option<i64> {
     let modified = metadata.modified().ok()?;
     let since_epoch = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
     Some(since_epoch.as_secs() as i64)
+}
+
+/// What a scan records about a file besides its parse: the SHA-256 of
+/// its bytes and its identity on disk (inode and volume), the two facts
+/// a rename can later be recognised by. Read from the local filesystem
+/// only (`std::fs` metadata and the file's own bytes).
+///
+/// The hash is `None` for a file over [`MAX_INDEXED_BYTES`] (identity
+/// only, never read) and for one whose bytes could not be read. The
+/// identity is `None` on a platform with no inode and device numbers
+/// (anything not Unix).
+#[derive(Debug, Default)]
+struct ContentStamp {
+    hash: Option<String>,
+    inode: Option<u64>,
+    device: Option<u64>,
+}
+
+impl ContentStamp {
+    /// The identity half, from a `stat` of the file.
+    #[cfg(unix)]
+    fn of(metadata: &fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        ContentStamp {
+            hash: None,
+            inode: Some(metadata.ino()),
+            device: Some(metadata.dev()),
+        }
+    }
+
+    /// No inode or device number to read: identity stays `None`.
+    #[cfg(not(unix))]
+    fn of(_metadata: &fs::Metadata) -> Self {
+        ContentStamp::default()
+    }
+
+    /// The hash half: SHA-256 of the file's raw bytes, with no text
+    /// conversion, so a non-UTF-8 file and a binary hash like any other.
+    /// For a UTF-8 file this is the parser's `ParsedUnit::content_hash`.
+    fn set_hash(&mut self, bytes: &[u8]) {
+        self.hash = Some(tephra_parser::content_hash_bytes(bytes));
+    }
+
+    fn apply<'a>(&'a self, unit: &mut NewUnit<'a>) {
+        unit.hash = self.hash.as_deref();
+        unit.inode = self.inode;
+        unit.device = self.device;
+    }
 }
 
 /// Reads at most `MAX_INDEXED_BYTES + 1` bytes of `path`: enough to
@@ -510,6 +567,10 @@ fn write_unit(
     let mtime = metadata_mtime(&metadata);
     let mut size = metadata.len();
     let mut too_large = size > MAX_INDEXED_BYTES;
+    // The file's identity (inode and volume) comes from the same `stat`
+    // as its size, so it is there even for a file over the cap. The hash
+    // is filled in below, from the bytes each branch reads.
+    let mut stamp = ContentStamp::of(&metadata);
 
     // The kind comes from the name and the first 8 KB, for a too-large
     // file too (G7: it keeps its real kind). `read_head` is bounded, so
@@ -546,6 +607,7 @@ fn write_unit(
             // Grew past the cap between the stat and the read.
             too_large = true;
         } else {
+            stamp.set_hash(&bytes);
             parsed_doc = parse_document(abs_path, &bytes);
         }
     }
@@ -572,6 +634,7 @@ fn write_unit(
             // Grew past the cap between the stat and the read.
             too_large = true;
         } else {
+            stamp.set_hash(&bytes);
             match parse_file(kind, abs_path, file_name, &head, &bytes) {
                 Ok(Some((unit, rows))) => {
                     // G19: an ID the file had in the cache that an
@@ -656,13 +719,37 @@ fn write_unit(
                 size = bytes.len() as u64;
                 if size > MAX_INDEXED_BYTES {
                     too_large = true;
-                } else if let Some(text) = text_of(&bytes) {
-                    index_rows = tephra_parser::text_other_rows(&text);
+                } else {
+                    stamp.set_hash(&bytes);
+                    if let Some(text) = text_of(&bytes) {
+                        index_rows = tephra_parser::text_other_rows(&text);
+                    }
                 }
             }
             Err(e) => {
                 tracing::warn!(path = %abs_path.display(), error = %e, "failed to read file during scan; skipping");
                 return Ok(None);
+            }
+        }
+    }
+    if !too_large && stamp.hash.is_none() {
+        // No branch above read this file (a binary: it is indexed by
+        // name only, so nothing parsed it). Read it for its hash alone. A
+        // prose or code file found not to be UTF-8 was hashed already,
+        // from the bytes it was read as. A read that fails costs the hash
+        // and nothing else: the file is still indexed by name.
+        match read_capped(abs_path) {
+            Ok(bytes) if bytes.len() as u64 > MAX_INDEXED_BYTES => {
+                // Grew past the cap between the stat and the read.
+                size = bytes.len() as u64;
+                too_large = true;
+            }
+            Ok(bytes) => {
+                size = bytes.len() as u64;
+                stamp.set_hash(&bytes);
+            }
+            Err(e) => {
+                tracing::warn!(path = %abs_path.display(), error = %e, "failed to read file for its content hash; indexed without one");
             }
         }
     }
@@ -689,7 +776,8 @@ fn write_unit(
     };
 
     if let Some(doc) = &parsed_doc {
-        return write_document(cache, source_id, &rel_path, mtime, size, doc, stats).map(Some);
+        return write_document(cache, source_id, &rel_path, mtime, size, &stamp, doc, stats)
+            .map(Some);
     }
 
     let Some(parsed) = parsed else {
@@ -701,6 +789,9 @@ fn write_unit(
             kind: kind.as_str(),
             size: Some(size as i64),
             too_large,
+            hash: stamp.hash.as_deref(),
+            inode: stamp.inode,
+            device: stamp.device,
         })?;
         insert_index_rows(cache, unit_id, &index_rows)?;
         return Ok(Some(stats));
@@ -736,6 +827,7 @@ fn write_unit(
     // `to_new_unit` says `prose`; a code unit says `code`.
     new_unit.kind = kind.as_str();
     new_unit.size = Some(size as i64);
+    stamp.apply(&mut new_unit);
     let unit_id = cache.insert_unit(&new_unit)?;
 
     for link in parsed.to_new_links(unit_id) {
@@ -843,18 +935,21 @@ fn parse_document(abs_path: &Path, bytes: &[u8]) -> Option<tephra_parser::Parsed
 /// `line` is the page, slide or paragraph number. They also go into the
 /// `^^` index (G10) with that place and their position within it.
 /// Nothing is written to the document itself (F4).
+#[allow(clippy::too_many_arguments)]
 fn write_document(
     cache: &Cache,
     source_id: i64,
     rel_path: &str,
     mtime: Option<i64>,
     size: u64,
+    stamp: &ContentStamp,
     doc: &tephra_parser::ParsedDocument,
     mut stats: ScanStats,
 ) -> Result<ScanStats, ScanError> {
     let mut new_unit = doc.to_new_unit(source_id, rel_path, mtime);
     new_unit.kind = FileKind::Document.as_str();
     new_unit.size = Some(size as i64);
+    stamp.apply(&mut new_unit);
     let unit_id = cache.insert_unit(&new_unit)?;
     for link in doc.to_new_links(unit_id) {
         cache.insert_link(&link)?;
@@ -1352,6 +1447,8 @@ pub fn settle_deferred(
         total.stats.files_seen += outcome.stats.files_seen;
         total.stats.files_ignored += outcome.stats.files_ignored;
         total.changed_paths.extend(outcome.changed_paths);
+        total.vanished.extend(outcome.vanished);
+        total.appeared.extend(outcome.appeared);
         if outcome.deferred.is_empty() {
             return Ok(total);
         }
@@ -1374,7 +1471,7 @@ fn upsert_directory(
     abs_dir: &Path,
     ignore: &IgnoreRules,
     stats: &mut ScanStats,
-    touched_paths: &mut Vec<PathBuf>,
+    found: &mut DirFound<'_>,
 ) -> Result<(), ScanError> {
     let walker = walkdir::WalkDir::new(abs_dir)
         .follow_links(false)
@@ -1423,11 +1520,71 @@ fn upsert_directory(
             wrote_unit = true;
         }
         if had_existing || wrote_unit {
-            touched_paths.push(entry.path().to_path_buf());
+            found.touched.push(entry.path().to_path_buf());
+        }
+        if wrote_unit && !had_existing {
+            note_appeared(cache, source_id, &rel_path, found.appeared)?;
         }
     }
 
     Ok(())
+}
+
+/// What [`upsert_directory`] reports back to its batch: the paths it
+/// changed, and the files that had no row before.
+struct DirFound<'a> {
+    touched: &'a mut Vec<PathBuf>,
+    appeared: &'a mut Vec<crate::rename_detect::Appeared>,
+}
+
+/// Records the file at `rel_path` as new to the index, from the row
+/// that was just written for it.
+fn note_appeared(
+    cache: &Cache,
+    source_id: i64,
+    rel_path: &str,
+    appeared: &mut Vec<crate::rename_detect::Appeared>,
+) -> Result<(), ScanError> {
+    if let Some(row) = cache.get_unit_by_rel_path(source_id, rel_path)? {
+        appeared.push(crate::rename_detect::Appeared {
+            // The registry names the source when it takes the facts in.
+            source: String::new(),
+            path: rel_path.to_string(),
+            identity: identity_of(&row),
+            hash: row.hash,
+            os: None,
+        });
+    }
+    Ok(())
+}
+
+/// Records the cached rows of what is about to be deleted: `rel_path`
+/// itself, and everything under it when it was a folder.
+fn note_vanished(
+    cache: &Cache,
+    source_id: i64,
+    rel_path: &str,
+    vanished: &mut Vec<crate::rename_detect::Vanished>,
+) -> Result<(), ScanError> {
+    let mut rows = cache.units_under_prefix(source_id, rel_path)?;
+    if let Some(own) = cache.get_unit_by_rel_path(source_id, rel_path)? {
+        rows.insert(0, own);
+    }
+    vanished.extend(rows.into_iter().map(|row| crate::rename_detect::Vanished {
+        source: String::new(),
+        identity: identity_of(&row),
+        path: row.rel_path,
+        hash: row.hash,
+        os: None,
+    }));
+    Ok(())
+}
+
+fn identity_of(row: &tephra_cache::UnitRow) -> Option<crate::rename_detect::Identity> {
+    match (row.device, row.inode) {
+        (Some(device), Some(inode)) => Some(crate::rename_detect::Identity { device, inode }),
+        _ => None,
+    }
 }
 
 /// Applies one debounce-coalesced batch of changed absolute paths
@@ -1550,6 +1707,8 @@ fn apply_change_batch_once(
     let mut stats = ScanStats::default();
     let mut touched_paths: Vec<PathBuf> = Vec::new();
     let mut deferred_paths: Vec<PathBuf> = Vec::new();
+    let mut vanished: Vec<crate::rename_detect::Vanished> = Vec::new();
+    let mut appeared: Vec<crate::rename_detect::Appeared> = Vec::new();
 
     // Brackets the whole batch in one BEGIN IMMEDIATE/COMMIT (E5):
     // `cache`'s typed insert/delete helpers below still operate
@@ -1605,7 +1764,10 @@ fn apply_change_batch_once(
                     abs_path,
                     ignore,
                     &mut stats,
-                    &mut touched_paths,
+                    &mut DirFound {
+                        touched: &mut touched_paths,
+                        appeared: &mut appeared,
+                    },
                 )?;
             }
             Ok(meta) if meta.is_file() => {
@@ -1639,12 +1801,16 @@ fn apply_change_batch_once(
                     None => {
                         // Nothing to index (it vanished, is a symlink,
                         // or cannot be read): its old row goes.
+                        note_vanished(cache, source_id, &rel_path, &mut vanished)?;
                         delete_existing_unit(cache, source_id, &rel_path)?;
                         false
                     }
                 };
                 if had_existing || wrote_unit {
                     touched_paths.push(abs_path.clone());
+                }
+                if wrote_unit && !had_existing {
+                    note_appeared(cache, source_id, &rel_path, &mut appeared)?;
                 }
             }
             Ok(_) => {
@@ -1662,6 +1828,7 @@ fn apply_change_batch_once(
                 // trying both means a directory's full subtree is
                 // reliably reclaimed without having to know in
                 // advance which one it used to be.
+                note_vanished(cache, source_id, &rel_path, &mut vanished)?;
                 let had_existing = delete_existing_unit(cache, source_id, &rel_path)?;
                 let nested_deleted = cache.delete_units_under_prefix(source_id, &rel_path)?;
                 // A file that is gone has no rename to wait for.
@@ -1679,5 +1846,53 @@ fn apply_change_batch_once(
         stats,
         changed_paths: touched_paths,
         deferred: deferred_paths,
+        vanished,
+        appeared,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    /// E26 (pinned, unchanged by the char-boundary fix): a path component
+    /// that is not valid UTF-8 is dropped by `to_rel_string`, not
+    /// repaired, so a file whose own name is invalid has no relative path
+    /// (it is skipped) and one under an invalid directory is stored
+    /// without that directory. Valid multi-byte names pass through as
+    /// they are.
+    #[test]
+    fn to_rel_string_pins_todays_handling_of_a_non_utf8_name() {
+        let root = Path::new("/vault");
+        let join = |parts: &[&[u8]]| {
+            let mut p = root.to_path_buf();
+            for part in parts {
+                p.push(OsStr::from_bytes(part));
+            }
+            p
+        };
+        assert_eq!(
+            to_rel_string(root, &join(&["Résumé—v2.docx".as_bytes()])),
+            Some("Résumé—v2.docx".to_string())
+        );
+        assert_eq!(
+            to_rel_string(root, &join(&[b"bad\xff.md"])),
+            None,
+            "a file whose own name is not UTF-8 is skipped"
+        );
+        assert_eq!(
+            to_rel_string(root, &join(&[b"d\xff", b"inner.md"])),
+            Some("inner.md".to_string()),
+            "an invalid directory component is dropped from the stored path"
+        );
+        assert_eq!(
+            to_rel_string(
+                root,
+                &join(&["日本".as_bytes(), b"d\xff", "Todo…ab".as_bytes()])
+            ),
+            Some("日本/Todo…ab".to_string())
+        );
+    }
 }

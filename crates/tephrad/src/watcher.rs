@@ -44,16 +44,19 @@
 //! watcher event from that point on, not just by the rescan's own
 //! one-off walk.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::event::{ModifyKind, RenameMode};
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 
 use crate::ignore::IgnoreRules;
+use crate::rename_detect::OsMark;
 
 /// The hardcoded debounce window (G2): no per-source override in v1.
 pub const DEBOUNCE_WINDOW: Duration = Duration::from_millis(250);
@@ -68,6 +71,18 @@ pub const DEBOUNCE_WINDOW: Duration = Duration::from_millis(250);
 /// frequently-rewritten log) is still indexed at a predictable cadence
 /// instead of being postponed indefinitely.
 pub const DEBOUNCE_MAX_WAIT: Duration = Duration::from_millis(1000);
+
+/// How long a rename the OS did not identify waits before it is applied
+/// (G2). A vanished file and a new file that share an exact content
+/// hash are held this long, in case a second twin turns up and makes
+/// the pair ambiguous; a file that is still unpaired when its hold ends
+/// is given up as a plain delete or create, and the vanished one is
+/// logged `uncertain`. A pair the OS itself identified (the rename flag
+/// or an inotify cookie, and the same inode) has no hold: it is applied
+/// after the ordinary debounce batch. The hold does not run down while a
+/// pause or the writer gate is active
+/// ([`crate::rename_detect::run_holds`]).
+pub const RENAME_HOLD: Duration = Duration::from_secs(2);
 
 /// Coalesces a stream of changed-path events arriving on `rx` into
 /// batches: a batch accumulates every path received, and fires (via
@@ -177,6 +192,107 @@ impl From<notify::Error> for WatchError {
 pub struct WatcherTap {
     watcher: RecommendedWatcher,
     rx: mpsc::UnboundedReceiver<PathBuf>,
+    hints: OsHints,
+}
+
+impl WatcherTap {
+    /// The OS's own rename marks this watcher has seen since they were
+    /// last taken (see [`OsHints`]). A clone shares the same store.
+    pub fn hints(&self) -> OsHints {
+        self.hints.clone()
+    }
+}
+
+// ---------------------------------------------------------------
+// The per-OS adapter over `notify` (G1)
+// ---------------------------------------------------------------
+
+/// What the OS said about the paths of a rename, kept from the moment
+/// `notify` reported it to the batch that handles it. The debounce
+/// channel carries bare paths, so this is the one place the pairing
+/// facts the OS gave survive; `crate::rename_detect` reads them from
+/// here and nowhere else.
+///
+/// Only paths that passed the ignore filter are recorded, and every
+/// batch takes the lot ([`OsHints::take`]), so the store never grows
+/// past one batch's worth of events.
+#[derive(Clone, Default)]
+pub struct OsHints {
+    marks: Arc<Mutex<HashMap<PathBuf, OsMark>>>,
+}
+
+impl OsHints {
+    pub fn record(&self, path: PathBuf, mark: OsMark) {
+        self.marks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(path, mark);
+    }
+
+    /// Everything recorded so far, leaving the store empty.
+    pub fn take(&self) -> HashMap<PathBuf, OsMark> {
+        std::mem::take(&mut *self.marks.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+}
+
+/// The mark for `abs` in `marks`: its own, else its nearest marked
+/// folder's below `root`. A folder renamed on Linux produces events for
+/// the folder only, never for the files in it, so a file inherits the
+/// folder's cookie.
+pub fn mark_of(marks: &HashMap<PathBuf, OsMark>, root: &Path, abs: &Path) -> Option<OsMark> {
+    abs.ancestors()
+        .take_while(|a| *a != root)
+        .find_map(|a| marks.get(a).copied())
+}
+
+/// Cookies for a `Both` event whose backend gave no tracker (not
+/// inotify). Counted from a high number so one can never equal an
+/// inotify cookie.
+static SYNTHETIC_COOKIE: AtomicU64 = AtomicU64::new(1 << 40);
+
+/// The pairing facts one `notify` event carries, per path (G1):
+///
+/// - `Name(Both)` with two paths: the old and the new path of one
+///   rename, as inotify reports it after matching the two halves by
+///   cookie. Both get the same cookie.
+/// - `Name(From)` / `Name(To)` with a tracker: one half of a rename,
+///   marked with its cookie; the other half, when it comes, has the
+///   same one.
+/// - `Name(Any)` / `Name(Other)`: FSEvents says only that the path took
+///   part in a rename ([`OsMark::Flag`]).
+///
+/// Anything else says nothing about a rename.
+pub fn os_marks(event: &Event) -> Vec<(PathBuf, OsMark)> {
+    let EventKind::Modify(ModifyKind::Name(mode)) = event.kind else {
+        return Vec::new();
+    };
+    match mode {
+        RenameMode::Both if event.paths.len() == 2 => {
+            let cookie = event
+                .tracker()
+                .map(|t| t as u64)
+                .unwrap_or_else(|| SYNTHETIC_COOKIE.fetch_add(1, Ordering::Relaxed));
+            event
+                .paths
+                .iter()
+                .map(|p| (p.clone(), OsMark::Cookie(cookie)))
+                .collect()
+        }
+        RenameMode::From | RenameMode::To => match event.tracker() {
+            Some(t) => event
+                .paths
+                .iter()
+                .map(|p| (p.clone(), OsMark::Cookie(t as u64)))
+                .collect(),
+            None => Vec::new(),
+        },
+        RenameMode::Any | RenameMode::Other => event
+            .paths
+            .iter()
+            .map(|p| (p.clone(), OsMark::Flag))
+            .collect(),
+        RenameMode::Both => Vec::new(),
+    }
 }
 
 /// Subscribes a real recursive `notify` watch on `root`, filtering a
@@ -200,9 +316,12 @@ pub struct WatcherTap {
 pub fn start(root: PathBuf, ignore: Arc<RwLock<IgnoreRules>>) -> Result<WatcherTap, WatchError> {
     let (tx, rx) = mpsc::unbounded_channel::<PathBuf>();
     let root_for_watch = root.clone();
+    let hints = OsHints::default();
+    let hints_for_watch = hints.clone();
 
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
         let Ok(event) = res else { return };
+        let marks: HashMap<PathBuf, OsMark> = os_marks(&event).into_iter().collect();
         for path in event.paths {
             let rel = match path.strip_prefix(&root_for_watch) {
                 Ok(r) => r,
@@ -222,13 +341,16 @@ pub fn start(root: PathBuf, ignore: Arc<RwLock<IgnoreRules>>) -> Result<WatcherT
             if ignored {
                 continue;
             }
+            if let Some(mark) = marks.get(&path) {
+                hints_for_watch.record(path.clone(), *mark);
+            }
             let _ = tx.send(path);
         }
     })?;
 
     watcher.watch(&root, RecursiveMode::Recursive)?;
 
-    Ok(WatcherTap { watcher, rx })
+    Ok(WatcherTap { watcher, rx, hints })
 }
 
 /// A running source's watcher: the real OS-level `notify` watcher
@@ -278,7 +400,7 @@ where
     B: Fn(HashSet<PathBuf>) + Send + Sync + 'static,
     R: Fn() + Send + Sync + 'static,
 {
-    let WatcherTap { watcher, rx } = tap;
+    let WatcherTap { watcher, rx, .. } = tap;
     let task = runtime.spawn(async move {
         let root_check = root;
         let on_batch_checked = move |batch: HashSet<PathBuf>| {

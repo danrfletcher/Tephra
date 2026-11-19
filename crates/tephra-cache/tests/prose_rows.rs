@@ -20,6 +20,9 @@ fn unit(cache: &Cache, source_id: i64, rel_path: &str) -> i64 {
             rel_path,
             mtime: None,
             frontmatter_json: None,
+            hash: None,
+            inode: None,
+            device: None,
         })
         .expect("insert_unit")
 }

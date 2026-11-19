@@ -26,6 +26,9 @@ fn unit(cache: &Cache, source: &str, rel: &str) -> i64 {
             kind: "prose",
             size: Some(10),
             too_large: false,
+            hash: None,
+            inode: None,
+            device: None,
         })
         .unwrap()
 }
@@ -585,6 +588,9 @@ fn seed_large(cache: &Cache, units: usize) {
                 kind: "prose",
                 size: Some(10),
                 too_large: false,
+                hash: None,
+                inode: None,
+                device: None,
             })
             .unwrap();
         let text = |n: usize| format!("the paragraph number {n} of file {i} about the translation");

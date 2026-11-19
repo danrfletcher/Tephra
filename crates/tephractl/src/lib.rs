@@ -21,5 +21,6 @@ pub mod commands;
 pub mod daemon;
 pub mod paths;
 pub mod render;
+pub mod since;
 pub mod token;
 pub mod transport;

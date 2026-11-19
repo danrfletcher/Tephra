@@ -942,4 +942,142 @@ mod tests {
         assert_eq!(drop_self_writes(&mut batch), 0);
         assert_eq!(batch.len(), 1);
     }
+
+    // --- the fix engine's writes (E17) ---------------------------------
+
+    /// A request for the one link in `Weekly Review.md`, as the fix
+    /// engine builds it, and a writer that records its own writes.
+    fn fix_request(dir: &Path) -> crate::refactor::fix_write::FileFixRequest {
+        use crate::refactor::fix_write::{FileFixRequest, RewriteMode};
+        let edge = tephra_graph::Edge {
+            from: "@notes:Weekly Review.md".to_string(),
+            to: tephra_graph::EdgeTarget::Resolved("@notes:Plan.md".to_string()),
+            to_raw: "Training Plan".to_string(),
+            kind: tephra_parser::LINK_KIND_WIKILINK.to_string(),
+            offline: false,
+            line: None,
+        };
+        FileFixRequest::new(
+            "@notes:Weekly Review.md",
+            dir.join("Weekly Review.md"),
+            vec![edge],
+            "Training Plan.md",
+            "Plan.md",
+            RewriteMode::Fix {
+                bare_resolves: true,
+            },
+        )
+    }
+
+    fn fix_writer(record: bool) -> crate::refactor::fix_write::FixWriter {
+        let writer = crate::refactor::fix_write::FixWriter::with_parts(
+            std::sync::Arc::new(Mutex::new(())),
+            std::sync::Arc::new(crate::refactor::RealFs),
+            std::sync::Arc::new(crate::refactor::fix_write::ThreadSleeper),
+        );
+        writer.record_own_writes(record);
+        writer
+    }
+
+    #[test]
+    fn the_record_accepts_a_write_from_the_fix_engine_and_it_is_consumed_once() {
+        use crate::refactor::fix_write::WriteStatus;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("Weekly Review.md");
+        std::fs::write(&file, "See [[Training Plan]].\n").unwrap();
+
+        let result = fix_writer(true).write_file(&fix_request(dir.path()));
+        assert_eq!(result.status, WriteStatus::Written, "{result:?}");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "See [[Plan]].\n",
+            "the file was really rewritten"
+        );
+
+        // The write's event: the file, and the temp file beside it.
+        let temp = dir.path().join(".Weekly Review.md.tephra-tmp-1");
+        let mut batch: HashSet<PathBuf> = [file.clone(), temp].into();
+        assert_eq!(drop_self_writes(&mut batch), 1);
+        assert!(batch.is_empty(), "the temp file goes with it: {batch:?}");
+
+        // Consumed: a second external change to the same path is real.
+        let mut batch: HashSet<PathBuf> = [file.clone()].into();
+        assert_eq!(drop_self_writes(&mut batch), 0);
+        assert_eq!(batch, HashSet::from([file]));
+    }
+
+    #[test]
+    fn a_writer_not_asked_to_record_leaves_no_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("Weekly Review.md");
+        std::fs::write(&file, "See [[Training Plan]].\n").unwrap();
+        fix_writer(false).write_file(&fix_request(dir.path()));
+        let mut batch: HashSet<PathBuf> = [file].into();
+        assert_eq!(drop_self_writes(&mut batch), 0);
+        assert_eq!(batch.len(), 1);
+    }
+
+    #[test]
+    fn a_record_is_discarded_when_the_size_differs() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("size.md");
+        std::fs::write(&file, "one").unwrap();
+        note_self_write(&file);
+        std::fs::write(&file, "one and more").unwrap();
+        let mut batch: HashSet<PathBuf> = [file.clone()].into();
+        assert_eq!(drop_self_writes(&mut batch), 0);
+        assert_eq!(batch.len(), 1);
+        // And the record went with it: putting the old bytes back does
+        // not make the file Tephra's again.
+        std::fs::write(&file, "one").unwrap();
+        let mut batch: HashSet<PathBuf> = [file].into();
+        assert_eq!(drop_self_writes(&mut batch), 0);
+    }
+
+    #[test]
+    fn a_record_is_discarded_when_the_mtime_differs_at_the_same_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("mtime.md");
+        std::fs::write(&file, "same size").unwrap();
+        note_self_write(&file);
+        // Dan saves again: same length, a later mtime tick.
+        std::fs::write(&file, "SAME SIZE").unwrap();
+        filetime::set_file_mtime(
+            &file,
+            filetime::FileTime::from_system_time(SystemTime::now() + Duration::from_secs(5)),
+        )
+        .unwrap();
+        let mut batch: HashSet<PathBuf> = [file].into();
+        assert_eq!(drop_self_writes(&mut batch), 0);
+        assert_eq!(batch.len(), 1);
+    }
+
+    #[test]
+    fn the_known_limit_an_edit_with_the_same_size_and_mtime_cannot_be_told_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("limit.md");
+        std::fs::write(&file, "same size").unwrap();
+        note_self_write(&file);
+        let written = std::fs::metadata(&file).unwrap().modified().unwrap();
+        // An edit of the same length, with the mtime put back to the
+        // tick the record holds (what a coarse clock can produce).
+        std::fs::write(&file, "SAME SIZE").unwrap();
+        filetime::set_file_mtime(&file, filetime::FileTime::from_system_time(written)).unwrap();
+        let mut batch: HashSet<PathBuf> = [file].into();
+        // The path + size + mtime rule reads it as Tephra's own write.
+        // This is the limit of the rule, as it is for the duplicate ID
+        // rename.
+        assert_eq!(drop_self_writes(&mut batch), 1);
+        assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn a_path_without_a_record_or_a_missing_file_is_never_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("gone.md");
+        note_self_write(&missing);
+        let mut batch: HashSet<PathBuf> = [missing].into();
+        assert_eq!(drop_self_writes(&mut batch), 0);
+        assert_eq!(batch.len(), 1);
+    }
 }

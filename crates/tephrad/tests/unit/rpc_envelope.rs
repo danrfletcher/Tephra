@@ -189,6 +189,7 @@ fn backends<'a>(graph: &'a NullGraph, sources: &'a NullSources) -> Backends<'a> 
         sources,
         refactor: &NULL_REFACTOR,
         blocks: &tephrad::rpc::backend::UnsupportedBlockIds,
+        fixes: &tephrad::rpc::backend::UnsupportedFixes,
     }
 }
 
@@ -210,9 +211,11 @@ fn unknown_method_returns_method_not_found() {
 
 /// The closed set: the ten verbs before the file-types ticket, then
 /// `unit.list` (PR-3.F1), `unit.search` (PR-8.F1) and `block.ensure_id`
-/// (PR-11.F1). Adding a method
+/// (PR-11.F1), then `fix.list` (atlas-25 PR-5, G18) and `link.rename_event`
+/// (atlas-25 PR-8, G3), `source.promote` / `source.unpromote` (PR-12, PR-13)
+/// and `source.rename` (PR-14, G13). Adding a method
 /// means changing this list on purpose.
-const EXPECTED_METHODS: [&str; 13] = [
+const EXPECTED_METHODS: [&str; 18] = [
     "unit.resolve_link",
     "graph.get_backlinks",
     "graph.get_forward_links",
@@ -221,21 +224,87 @@ const EXPECTED_METHODS: [&str; 13] = [
     "source.unregister",
     "source.list",
     "source.rescan",
+    "source.promote",
+    "source.unpromote",
+    "source.rename",
     "link.preview_refactor",
     "link.apply_refactor",
     "unit.list",
     "unit.search",
     "block.ensure_id",
+    "fix.list",
+    "link.rename_event",
 ];
 
 #[test]
-fn method_table_is_exactly_the_thirteen_named_verbs() {
+fn method_table_is_exactly_the_eighteen_named_verbs() {
     assert_eq!(METHOD_NAMES, EXPECTED_METHODS);
     // No duplicates either.
     let mut sorted = METHOD_NAMES.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
     assert_eq!(sorted.len(), METHOD_NAMES.len());
+}
+
+/// F9: the fix log is a record, never an undo. Unpromote folds a source
+/// back (a forward fix of its own); no method undoes or reverts a fix.
+#[test]
+fn there_is_no_undo_or_revert_method() {
+    for method in METHOD_NAMES {
+        assert!(
+            !method.contains("undo") && !method.contains("revert"),
+            "{method}"
+        );
+    }
+}
+
+/// G13: `source.rename` needs a string `name` and a string `new_name`;
+/// either missing or not a string is `INVALID_PARAMS` (-32602), and an
+/// invented near-miss is still `METHOD_NOT_FOUND` (F12).
+#[test]
+fn source_rename_params_are_validated_and_near_misses_are_not_methods() {
+    let graph = NullGraph;
+    let sources = NullSources;
+    let p = proof();
+
+    for params in [
+        json!({}),
+        json!({"name": "notes"}),
+        json!({"new_name": "x"}),
+        json!({"name": 7, "new_name": "x"}),
+        json!({"name": "notes", "new_name": 7}),
+        json!({"name": "notes", "new_name": null}),
+        json!({"name": "", "new_name": "x"}),
+    ] {
+        let err = dispatch(&p, "source.rename", &params, &backends(&graph, &sources)).unwrap_err();
+        assert_eq!(err.0, INVALID_PARAMS, "{params}");
+    }
+    // Both strings: routed (the default backend refuses, with a source error).
+    let err = dispatch(
+        &p,
+        "source.rename",
+        &json!({"name": "notes", "new_name": ""}),
+        &backends(&graph, &sources),
+    )
+    .unwrap_err();
+    assert_ne!(err.0, METHOD_NOT_FOUND);
+    assert_ne!(err.0, INVALID_PARAMS);
+
+    for typo in [
+        "source.rename_",
+        "source.rename_preview",
+        "source.set_name",
+        "source.Rename",
+    ] {
+        let err = dispatch(
+            &p,
+            typo,
+            &json!({"name": "notes", "new_name": "x"}),
+            &backends(&graph, &sources),
+        )
+        .unwrap_err();
+        assert_eq!(err.0, METHOD_NOT_FOUND, "{typo}");
+    }
 }
 
 /// `unit.search` is routed (it reaches the sources backend, which here
@@ -568,6 +637,7 @@ fn search_all_blocks_dispatch(
             sources,
             refactor: &NULL_REFACTOR,
             blocks: &tephrad::rpc::backend::UnsupportedBlockIds,
+            fixes: &tephrad::rpc::backend::UnsupportedFixes,
         },
     )
     .map_err(|(code, message, _)| (code, message))

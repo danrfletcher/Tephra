@@ -748,6 +748,162 @@ async fn unicode_and_space_filenames_round_trip_through_preview_and_apply() {
     daemon.stop();
 }
 
+/// E26: a `.docx`-style target whose name has multi-byte characters
+/// close to the extension (`Résumé—v2.docx`) used to panic in the path
+/// stripping and drop the connection. Preview then apply over the real
+/// transport: a normal reply, and the linking file's exact bytes after
+/// the apply (only the link text changed).
+#[tokio::test]
+async fn multibyte_docx_target_round_trips_through_preview_and_apply() {
+    let daemon = TestDaemon::start().await;
+    let notes = fixtures::empty_source();
+    let docx = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tephra-parser/tests/fixtures/documents/headings.docx"),
+    )
+    .expect("read the docx fixture");
+    notes.write_bytes("dé/日本/Résumé—v2.docx", &docx);
+    notes.write_bytes("Résumé—v2.docx", &docx);
+    notes.write(
+        "Journal—.md",
+        "# Journal\n\nCV: [[Résumé—v2.docx]] and [[dé/日本/Résumé—v2.docx|nested]].\n",
+    );
+
+    let register = daemon
+        .call(
+            "source.register",
+            json!({"name": "notes", "root": notes.root().to_string_lossy()}),
+        )
+        .await;
+    assert!(register.get("error").is_none(), "{register:?}");
+
+    let params = json!({
+        "source": "notes",
+        "old_path": "Résumé—v2.docx",
+        "new_path": "Résumé—v3.docx",
+    });
+
+    // F2: an apply with no prior preview is still refused, with a reply.
+    let early = daemon.call("link.apply_refactor", params.clone()).await;
+    assert!(early.get("error").is_some(), "{early:?}");
+
+    let preview = daemon.call("link.preview_refactor", params.clone()).await;
+    assert!(preview.get("error").is_none(), "{preview:?}");
+    let changes = preview["result"]["changes"].as_array().unwrap();
+    assert_eq!(changes.len(), 1, "{preview:?}");
+    assert_eq!(changes[0]["before"], json!("[[Résumé—v2.docx]]"));
+    assert_eq!(changes[0]["after"], json!("[[Résumé—v3.docx]]"));
+
+    let apply = daemon.call("link.apply_refactor", params).await;
+    assert_eq!(apply["result"]["status"], json!("applied"), "{apply:?}");
+    assert_eq!(apply["result"]["files_changed"], json!(1));
+    assert_eq!(
+        std::fs::read(notes.root().join("Journal—.md")).unwrap(),
+        "# Journal\n\nCV: [[Résumé—v3.docx]] and [[dé/日本/Résumé—v2.docx|nested]].\n".as_bytes(),
+        "only the link text of the renamed file changes"
+    );
+
+    // The same, for the nested file with a full path and an alias.
+    let params = json!({
+        "source": "notes",
+        "old_path": "dé/日本/Résumé—v2.docx",
+        "new_path": "dé/日本/Résumé—v3.docx",
+    });
+    let preview = daemon.call("link.preview_refactor", params.clone()).await;
+    assert_eq!(preview["result"]["changes"].as_array().unwrap().len(), 1);
+    let apply = daemon.call("link.apply_refactor", params).await;
+    assert_eq!(apply["result"]["status"], json!("applied"), "{apply:?}");
+    assert_eq!(
+        std::fs::read(notes.root().join("Journal—.md")).unwrap(),
+        "# Journal\n\nCV: [[Résumé—v3.docx]] and [[dé/日本/Résumé—v3.docx|nested]].\n".as_bytes(),
+    );
+
+    daemon.stop();
+}
+
+/// E26: a bare wikilink to a multi-byte target, with an anchor and an
+/// alias (`[[Todo…ab#^k3f9a2|plan]]`), next to a link typed with the
+/// extension in another case and an unrelated unresolved one. Exact
+/// bytes after the apply: only the link text of the renamed file moves.
+#[tokio::test]
+async fn bare_multibyte_wikilink_keeps_anchor_and_alias_through_preview_and_apply() {
+    let daemon = TestDaemon::start().await;
+    let notes = fixtures::empty_source();
+    notes.write("Todo…ab.md", "# Todo\n\nThe plan. ^k3f9a2\n");
+    notes.write(
+        "Journal.md",
+        "Start [[Todo…ab#^k3f9a2|plan]] mid [[Todo…ab.MD]] end.\nNext [[Todo…ab.md#^k3f9a2]]\n",
+    );
+    notes.write("Other.md", "Keep [[日本x]] and [[Todo…zz]] as they are.\n");
+
+    let register = daemon
+        .call(
+            "source.register",
+            json!({"name": "notes", "root": notes.root().to_string_lossy()}),
+        )
+        .await;
+    assert!(register.get("error").is_none(), "{register:?}");
+
+    let params = json!({
+        "source": "notes",
+        "old_path": "Todo…ab.md",
+        "new_path": "Todo…ac.md",
+    });
+    let preview = daemon.call("link.preview_refactor", params.clone()).await;
+    assert!(preview.get("error").is_none(), "{preview:?}");
+    assert_eq!(
+        preview["result"]["changes"].as_array().unwrap().len(),
+        3,
+        "{preview:?}"
+    );
+
+    let apply = daemon.call("link.apply_refactor", params).await;
+    assert_eq!(apply["result"]["status"], json!("applied"), "{apply:?}");
+    assert_eq!(apply["result"]["files_changed"], json!(1));
+    assert_eq!(
+        std::fs::read(notes.root().join("Journal.md")).unwrap(),
+        "Start [[Todo…ac#^k3f9a2|plan]] mid [[Todo…ac.MD]] end.\nNext [[Todo…ac.md#^k3f9a2]]\n"
+            .as_bytes()
+    );
+    assert_eq!(
+        std::fs::read(notes.root().join("Other.md")).unwrap(),
+        "Keep [[日本x]] and [[Todo…zz]] as they are.\n".as_bytes()
+    );
+
+    daemon.stop();
+}
+
+/// E26: an extensionless multi-byte target (`日本x`, `Todo…ab`): the
+/// rewrite adds no extension.
+#[tokio::test]
+async fn extensionless_multibyte_target_round_trips_through_preview_and_apply() {
+    let daemon = TestDaemon::start().await;
+    let notes = fixtures::empty_source();
+    notes.write("日本x", "plain text, no extension\n");
+    notes.write("Journal.md", "See [[日本x]] and [[日本x|alias]].\n");
+
+    let register = daemon
+        .call(
+            "source.register",
+            json!({"name": "notes", "root": notes.root().to_string_lossy()}),
+        )
+        .await;
+    assert!(register.get("error").is_none(), "{register:?}");
+
+    let params = json!({"source": "notes", "old_path": "日本x", "new_path": "日本y"});
+    let preview = daemon.call("link.preview_refactor", params.clone()).await;
+    assert!(preview.get("error").is_none(), "{preview:?}");
+    assert_eq!(preview["result"]["changes"].as_array().unwrap().len(), 2);
+    let apply = daemon.call("link.apply_refactor", params).await;
+    assert_eq!(apply["result"]["status"], json!("applied"), "{apply:?}");
+    assert_eq!(
+        std::fs::read(notes.root().join("Journal.md")).unwrap(),
+        "See [[日本y]] and [[日本y|alias]].\n".as_bytes()
+    );
+
+    daemon.stop();
+}
+
 /// R12 review finding, end-to-end: a markdown link renamed to a
 /// unicode- and space-containing path round-trips through the real
 /// daemon's preview and apply, across a bare, a titled, and a

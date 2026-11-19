@@ -270,7 +270,7 @@ fn offline_rows_of_a_v1_cache_survive_the_v2_rebuild_with_needs_rescan() {
         cache.schema_version().unwrap(),
         Some(tephra_cache::CURRENT_SCHEMA_VERSION)
     );
-    assert_eq!(tephra_cache::CURRENT_SCHEMA_VERSION, 2);
+    assert_eq!(tephra_cache::CURRENT_SCHEMA_VERSION, 3);
 
     let offline = cache.units_with_status_for_source("offline-notes").unwrap();
     assert_eq!(offline.len(), 2, "offline v1 units must survive");
@@ -357,6 +357,9 @@ fn offline_rows_keep_link_lines_and_every_block_occurrence_through_a_rebuild() {
                     rel_path,
                     mtime: Some(1),
                     frontmatter_json: None,
+                    hash: None,
+                    inode: None,
+                    device: None,
                 })
                 .unwrap(),
         );
@@ -411,4 +414,66 @@ fn offline_rows_keep_link_lines_and_every_block_occurrence_through_a_rebuild() {
         occurrences,
         vec![(unit_ids[0], 2), (unit_ids[0], 6), (unit_ids[1], 3)]
     );
+}
+
+/// v3: an offline source's rows come back from a rebuild with a NULL
+/// hash and NULL identity (it cannot be read to refill them) and
+/// `needs_rescan = 1`, while an online source's rows are simply gone
+/// (its rescan refills them). The offline file's old hash and identity
+/// are deliberately not carried: they may be stale by the time the source
+/// is back.
+#[test]
+fn offline_rows_come_back_with_no_hash_or_identity_and_needs_rescan() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut cache = common::open_temp_cache(&dir);
+    let offline_id = cache
+        .register_source("gone", "/mnt/gone", SourceStatus::Active)
+        .unwrap();
+    let online_id = cache
+        .register_source("here", "/here", SourceStatus::Active)
+        .unwrap();
+    for (source_id, rel_path) in [(offline_id, "a.md"), (online_id, "b.md")] {
+        cache
+            .insert_unit(&tephra_cache::NewUnit {
+                source_id,
+                rel_path,
+                mtime: Some(1_700_000_000),
+                frontmatter_json: None,
+                kind: "prose",
+                size: Some(10),
+                too_large: false,
+                hash: Some("ab".repeat(32).as_str()),
+                inode: Some(u64::MAX - 5),
+                device: Some(16_777_231),
+            })
+            .unwrap();
+    }
+    cache
+        .transition_source_status("gone", SourceStatus::Offline)
+        .unwrap();
+
+    cache.rebuild(&FaultInjector::none()).expect("rebuild");
+
+    let row = cache
+        .get_unit_by_rel_path(offline_id, "a.md")
+        .unwrap()
+        .expect("the offline source's row survives");
+    assert_eq!(
+        (row.hash.clone(), row.inode, row.device),
+        (None, None, None)
+    );
+    assert!(row.needs_rescan);
+    assert_eq!(row.size, None);
+    assert!(
+        cache.units_by_hash(&"ab".repeat(32)).unwrap().is_empty(),
+        "nothing is found by the old hash"
+    );
+    assert!(cache
+        .units_by_identity(16_777_231, u64::MAX - 5)
+        .unwrap()
+        .is_empty());
+    assert!(cache
+        .get_unit_by_rel_path(online_id, "b.md")
+        .unwrap()
+        .is_none());
 }

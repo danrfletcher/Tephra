@@ -33,6 +33,9 @@ fn inserting_a_unit_with_nonexistent_source_id_is_rejected() {
         rel_path: "ghost.md",
         mtime: None,
         frontmatter_json: None,
+        hash: None,
+        inode: None,
+        device: None,
     });
     assert!(
         result.is_err(),

@@ -1,0 +1,11 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "error": {
+    "code": -32011,
+    "message": "the source \"tephra\" is offline",
+    "data": {
+      "reason": "source_offline"
+    }
+  }
+}

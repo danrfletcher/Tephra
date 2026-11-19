@@ -1,0 +1,3 @@
+Promoted /home/dan/Developer/Tephra/crates/tephrad to the source "tephrad" (it was "crates/tephrad" in "tephra")
+  files moved: 12, files with links rewritten: 2
+  1 file(s) still need a link fix; see `tephractl fixes`

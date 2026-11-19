@@ -132,6 +132,30 @@ pub(crate) fn scan(
     (out, spans)
 }
 
+/// The `[[wikilinks]]` in a note's frontmatter properties, in file
+/// order, each with its exact absolute byte span (the YAML text is
+/// scanned as it is written, so a quoted string, a list item, an
+/// unquoted `up: [[Note]]` and a value nested in a map all count).
+/// Text in a YAML comment is not a link. A match with a bracket in its
+/// inner text (`[[1, 2], [3, 4]]`, a nested YAML list) is a list of
+/// numbers or words, not a link. Problems are not reported: a
+/// frontmatter line that merely looks like a link is not a diagnostic.
+pub(crate) fn scan_frontmatter(fm: &crate::frontmatter::Frontmatter) -> Vec<WikiLink> {
+    let comments = crate::frontmatter::comment_ranges(&fm.raw);
+    let mut ignored = Vec::new();
+    let (links, _) = scan(
+        &fm.raw,
+        fm.start_line + 1,
+        fm.raw_start_byte,
+        &comments,
+        &mut ignored,
+    );
+    links
+        .into_iter()
+        .filter(|w| !w.raw.contains(['[', ']']))
+        .collect()
+}
+
 fn parse_inner(inner: &str, line: usize, span: (usize, usize)) -> WikiLink {
     let (before_alias, alias) = match inner.split_once('|') {
         Some((a, b)) => (a, Some(b.to_string())),

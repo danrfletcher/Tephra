@@ -10,12 +10,17 @@
 //! test needs to call directly.
 pub mod access;
 pub mod block_id;
+pub mod catch_up;
 pub mod dup_ids;
 pub mod file_kind;
 pub mod file_lock;
+pub mod fix;
+pub mod fixes;
+pub mod forward;
 pub mod ignore;
 pub mod refactor;
 pub mod registry;
+pub mod rename_detect;
 pub mod rpc;
 pub mod scan;
 pub mod search;
