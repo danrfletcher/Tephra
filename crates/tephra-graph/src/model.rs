@@ -583,6 +583,35 @@ impl UnitGraph {
         crate::resolver::shortest_unique_target(self, id)
     }
 
+    /// The fullest wikilink target text for unit `id`: its path from
+    /// its source's root, without a Markdown extension. The resolver
+    /// matches a bare name or this full stem and nothing in between, so
+    /// this is also the longest spelling there is. `None` when `id` is
+    /// not in the graph.
+    pub fn full_target(&self, id: &str) -> Option<String> {
+        let facts = self.nodes.get(id)?;
+        Some(crate::resolver::strip_markdown_extension(&facts.rel_path).to_string())
+    }
+
+    /// Whether another registered source holds a unit whose bare link
+    /// name is the same as unit `id`'s: the same file name, without a
+    /// Markdown extension, compared as the resolver compares (NFC,
+    /// case-sensitive). `false` when `id` is not in the graph.
+    ///
+    /// A fact about the index, nothing more: it never resolves a link
+    /// and a bare link still reaches only the file of its own source
+    /// (F11). Units of an offline source count (their rows stay cached);
+    /// files in an ignored directory are not units, so never count.
+    pub fn name_in_other_source(&self, id: &str) -> bool {
+        let Some(facts) = self.nodes.get(id) else {
+            return false;
+        };
+        let key = crate::resolver::bare_name_key(&facts.rel_path);
+        self.basename_index.iter().any(|(source, names)| {
+            *source != facts.source && names.get(&key).is_some_and(|ids| !ids.is_empty())
+        })
+    }
+
     /// The raw, not-yet-deduplicated edge set [`UnitGraph::get_backlinks`]
     /// and [`UnitGraph::get_backlinks_all`] both start from. For a
     /// block id, the edges anchored on that block that resolve to it

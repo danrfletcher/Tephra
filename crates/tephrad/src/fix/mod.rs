@@ -10,7 +10,7 @@
 //! incoming links are dangling, and the renamed file is a unit at
 //! `new_path`.
 //!
-//! What it reuses from [`crate::refactor`]: [`compute_fix_changes`]
+//! What it reuses from [`crate::refactor`]: [`crate::refactor::compute_fix_changes`]
 //! (which spans change and to what), [`apply_changes_to_content`] and
 //! the same atomic write ([`rewrite_links_atomic`]) the manual
 //! `link.apply_refactor` goes through, under the same per-file lock
@@ -24,6 +24,9 @@
 //! - A bare target is written as the new file name only when the graph
 //!   says that name reaches the renamed file; otherwise as the full
 //!   source-relative stem ([`tephra_graph::UnitGraph::shortest_unique_target`]).
+//!   With the Atlas fallback on (`qualify_ambiguous_links`, G20) a plain
+//!   link whose name also exists in another source is the full stem too.
+//!   [`FixSpelling`] decides both, here and for every later fix kind.
 //! - A docx, pptx or PDF is never opened for writing. It is named in
 //!   the result as [`FixStatus::NeedsManualFix`].
 //! - A file that is read-only, or a symlink, is not written and is
@@ -44,9 +47,8 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use tephra_graph::{Edge, UnitGraph};
 
-use crate::refactor::{
-    apply_changes_to_content, compute_fix_changes, rewrite_links_atomic, DOCUMENT_READ_ONLY,
-};
+use crate::refactor::fix_write::RewriteMode;
+use crate::refactor::{apply_changes_to_content, rewrite_links_atomic, DOCUMENT_READ_ONLY};
 use crate::rpc::backend::SourceBackend;
 
 /// What happened to one file that has a link to the renamed file.
@@ -91,6 +93,86 @@ impl FixResult {
     }
 }
 
+/// How the automatic fix spells a plain link (no `@source:` prefix) to
+/// one target. **The one place that decides it:** the rename fix
+/// ([`fix_rename_with`]) and every later fix kind (the engine's move,
+/// promote and unpromote in `crate::fixes`) get their spelling here and
+/// nowhere else, so the Atlas fallback (G20, `qualify_ambiguous_links`)
+/// is a single branch ([`FixSpelling::for_target`]) and no other code
+/// spells a link target.
+///
+/// Two facts, kept apart because a link with a prefix is not affected by
+/// the second:
+///
+/// - `bare_resolves`: the bare file name reaches the target inside its
+///   own source (the resolver's own rule).
+/// - `qualify`: the Atlas fallback is on, the target has a folder, and
+///   another registered source holds a file of the same bare name, so a
+///   plain link is written as the full source-relative stem
+///   (`docs/Plan`) even though the bare name would resolve in the
+///   linking file's own source. Case-sensitive, like the resolver.
+///
+/// The fallback changes how a target is spelled, never what it targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FixSpelling {
+    pub bare_resolves: bool,
+    pub qualify: bool,
+}
+
+impl FixSpelling {
+    /// The spelling for target unit `id` in `graph`. `qualify_ambiguous`
+    /// is the `qualify_ambiguous_links` setting.
+    pub fn for_target(graph: &UnitGraph, id: &str, qualify_ambiguous: bool) -> Self {
+        let bare_resolves = graph
+            .shortest_unique_target(id)
+            .is_some_and(|t| !t.contains('/'));
+        // The only branch of the Atlas fallback. A target at its source
+        // root has no fuller same-source path: it stays the bare name.
+        let qualify = qualify_ambiguous && has_folder(id) && graph.name_in_other_source(id);
+        FixSpelling {
+            bare_resolves,
+            qualify,
+        }
+    }
+
+    /// Whether a link with no `@source:` prefix may be written as the
+    /// bare file name.
+    pub fn plain_bare(self) -> bool {
+        self.bare_resolves && !self.qualify
+    }
+
+    /// The rewrite of a rename within one source ([`RewriteMode`]).
+    pub fn rewrite_mode(self) -> RewriteMode {
+        if self.qualify {
+            RewriteMode::FixQualifying {
+                bare_resolves: self.bare_resolves,
+            }
+        } else {
+            RewriteMode::Fix {
+                bare_resolves: self.bare_resolves,
+            }
+        }
+    }
+
+    /// The text of a link with no prefix to unit `id`: the shortest
+    /// that resolves, or the full stem when [`FixSpelling::qualify`].
+    /// `None` when `id` is not in `graph`.
+    pub fn target_text(graph: &UnitGraph, id: &str, qualify_ambiguous: bool) -> Option<String> {
+        if Self::for_target(graph, id, qualify_ambiguous).qualify {
+            graph.full_target(id)
+        } else {
+            graph.shortest_unique_target(id)
+        }
+    }
+}
+
+/// Whether the unit `id` (`@source:rel_path`) is inside a folder of its
+/// source, so a fuller same-source path than its bare name exists.
+fn has_folder(id: &str) -> bool {
+    id.split_once(':')
+        .is_some_and(|(_, rel)| crate::refactor::strip_md_ext_pub(rel).0.contains('/'))
+}
+
 /// Rewrites every wikilink that named `old_path` of `source` so it
 /// names `new_path`. `graph` is the graph after the rename was indexed
 /// (see the module doc) and `sources` gives each source's root on disk.
@@ -105,6 +187,22 @@ pub fn fix_rename(
     source: &str,
     old_path: &str,
     new_path: &str,
+) -> Result<FixResult, String> {
+    fix_rename_with(graph, sources, source, old_path, new_path, false)
+}
+
+/// [`fix_rename`] with the Atlas fallback (G20) as the caller's
+/// `qualify_ambiguous_links` setting says: when `qualify_ambiguous` is
+/// `true`, a plain link whose bare name also exists in another source is
+/// written as the full same-source path. See [`FixSpelling`]; `false`
+/// is exactly [`fix_rename`].
+pub fn fix_rename_with(
+    graph: &UnitGraph,
+    sources: &dyn SourceBackend,
+    source: &str,
+    old_path: &str,
+    new_path: &str,
+    qualify_ambiguous: bool,
 ) -> Result<FixResult, String> {
     let roots: HashMap<String, String> = sources
         .list()?
@@ -129,10 +227,9 @@ pub fn fix_rename(
     }
 
     // The bare file name is kept only when it still reaches the renamed
-    // file; otherwise every bare link gets the full stem.
-    let bare_resolves = graph
-        .shortest_unique_target(&new_id)
-        .is_some_and(|t| !t.contains('/'));
+    // file (and the Atlas fallback does not ask for more); otherwise
+    // every bare link gets the full stem.
+    let spelling = FixSpelling::for_target(graph, &new_id, qualify_ambiguous);
 
     // Every link that named the old path: those that now dangle, and
     // those the rename handed to another file of the same name (they
@@ -161,7 +258,7 @@ pub fn fix_rename(
             &roots,
             old_path,
             new_path,
-            bare_resolves,
+            spelling,
         );
         if let Some(fix) = outcome {
             if fix.status == FixStatus::Changed {
@@ -181,7 +278,7 @@ fn fix_one_file(
     roots: &HashMap<String, String>,
     old_path: &str,
     new_path: &str,
-    bare_resolves: bool,
+    spelling: FixSpelling,
 ) -> Option<FileFix> {
     let report = |status, links_changed, reason: Option<String>| {
         Some(FileFix {
@@ -232,7 +329,9 @@ fn fix_one_file(
     // Computed from what was just read: a link the file no longer
     // contains is not found, so it gives no change and no error.
     let contents = HashMap::from([(file_id.to_string(), content.clone())]);
-    let changes = compute_fix_changes(edges, &contents, old_path, new_path, bare_resolves);
+    let changes = spelling
+        .rewrite_mode()
+        .changes(edges, &contents, old_path, new_path);
     if changes.is_empty() {
         return None;
     }

@@ -138,8 +138,26 @@ impl Daemon {
         writer: Arc<dyn FileWriter>,
         detect_renames: bool,
     ) -> Daemon {
+        Self::start_with(notes_files, other_files, writer, detect_renames, false)
+    }
+
+    /// [`Daemon::start`] with the config's `qualify_ambiguous_links` (G20)
+    /// as `main.rs` hands it to the engine.
+    pub fn start_with(
+        notes_files: &[(&str, &str)],
+        other_files: &[(&str, &str)],
+        writer: Arc<dyn FileWriter>,
+        detect_renames: bool,
+        qualify_ambiguous_links: bool,
+    ) -> Daemon {
         for attempt in 1..=3 {
-            let d = Self::build(notes_files, other_files, writer.clone(), detect_renames);
+            let d = Self::build(
+                notes_files,
+                other_files,
+                writer.clone(),
+                detect_renames,
+                qualify_ambiguous_links,
+            );
             if d.watcher_live {
                 return d;
             }
@@ -148,7 +166,13 @@ impl Daemon {
         }
         // Still deaf: carry on. A test that needs the watcher fails on its
         // own bounded wait; one that does not need it is not held back.
-        Self::build(notes_files, other_files, writer, detect_renames)
+        Self::build(
+            notes_files,
+            other_files,
+            writer,
+            detect_renames,
+            qualify_ambiguous_links,
+        )
     }
 
     fn build(
@@ -156,6 +180,7 @@ impl Daemon {
         other_files: &[(&str, &str)],
         writer: Arc<dyn FileWriter>,
         detect_renames: bool,
+        qualify_ambiguous_links: bool,
     ) -> Daemon {
         let notes = fixtures::empty_source();
         for (rel, text) in notes_files {
@@ -175,7 +200,10 @@ impl Daemon {
             SourceRegistry::new(Cache::open(&cache_path).expect("registry cache"))
                 .expect("registry"),
         );
-        let engine = Arc::new(FixEngine::new(&cache_path, writer));
+        let engine = Arc::new(
+            FixEngine::new(&cache_path, writer)
+                .with_qualify_ambiguous_links(qualify_ambiguous_links),
+        );
         if detect_renames {
             registry.set_rename_fixer(engine.clone());
         }

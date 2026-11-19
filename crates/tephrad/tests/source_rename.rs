@@ -601,7 +601,11 @@ fn e9_killed_after_the_transaction_the_rest_resume_and_a_second_rename_is_a_no_o
     let again = rename(&d, "tephrad", "daemon").expect("a no-op success");
     assert!(again.unchanged);
     assert_eq!(
-        (again.old_name.as_str(), again.new_name.as_str(), again.files_changed),
+        (
+            again.old_name.as_str(),
+            again.new_name.as_str(),
+            again.files_changed
+        ),
         ("tephrad", "daemon", 0)
     );
     d.engine.resume().expect("resume again");

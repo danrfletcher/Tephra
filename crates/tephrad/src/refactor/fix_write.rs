@@ -74,8 +74,8 @@ use serde::Serialize;
 use tephra_graph::Edge;
 
 use super::{
-    apply_changes_to_content, compute_changes, compute_fix_changes, compute_move_changes, AtomicFs,
-    LinkChange, MoveRewrite, RealFs, RefactorEngine,
+    apply_changes_to_content, compute_changes, compute_fix_changes, compute_fix_changes_qualifying,
+    compute_move_changes, AtomicFs, LinkChange, MoveRewrite, RealFs, RefactorEngine,
 };
 use crate::file_lock;
 
@@ -196,11 +196,41 @@ pub enum RewriteMode {
     /// [`compute_fix_changes`]: wikilinks only, a bare target kept bare
     /// only when `bare_resolves`.
     Fix { bare_resolves: bool },
+    /// [`compute_fix_changes_qualifying`]: [`RewriteMode::Fix`] with the
+    /// Atlas fallback on (G20) for a target whose bare name also exists
+    /// in another source: a link with no `@source:` prefix is written as
+    /// the full stem, a prefixed one by `bare_resolves` as in `Fix`.
+    FixQualifying { bare_resolves: bool },
     /// [`compute_changes`]: every link kind, as the manual refactor does.
     Manual,
     /// [`compute_move_changes`]: the links of a file after the file they
     /// name moved to another source (G6).
     Move(MoveRewrite),
+}
+
+impl RewriteMode {
+    /// The span changes this mode implies for `edges`, found in
+    /// `contents` (the current text of each linking file). Pure. The one
+    /// place that picks the function behind a mode, for the writer here
+    /// and for the rename fix ([`crate::fix::fix_rename_with`]).
+    pub fn changes(
+        &self,
+        edges: &[Edge],
+        contents: &HashMap<String, String>,
+        old_path: &str,
+        new_path: &str,
+    ) -> Vec<LinkChange> {
+        match self {
+            RewriteMode::Fix { bare_resolves } => {
+                compute_fix_changes(edges, contents, old_path, new_path, *bare_resolves)
+            }
+            RewriteMode::FixQualifying { bare_resolves } => {
+                compute_fix_changes_qualifying(edges, contents, old_path, new_path, *bare_resolves)
+            }
+            RewriteMode::Manual => compute_changes(edges, contents, old_path, new_path),
+            RewriteMode::Move(rewrite) => compute_move_changes(edges, contents, rewrite),
+        }
+    }
 }
 
 /// One linking file and the links in it that named the old target.
@@ -571,19 +601,9 @@ impl FixWriter {
 
         // 3. The rewrite, from the text just read.
         let contents = HashMap::from([(req.file.clone(), content.clone())]);
-        let changes: Vec<LinkChange> = match &req.mode {
-            RewriteMode::Fix { bare_resolves } => compute_fix_changes(
-                &req.edges,
-                &contents,
-                &req.old_path,
-                &req.new_path,
-                *bare_resolves,
-            ),
-            RewriteMode::Manual => {
-                compute_changes(&req.edges, &contents, &req.old_path, &req.new_path)
-            }
-            RewriteMode::Move(rewrite) => compute_move_changes(&req.edges, &contents, rewrite),
-        };
+        let changes: Vec<LinkChange> =
+            req.mode
+                .changes(&req.edges, &contents, &req.old_path, &req.new_path);
         if changes.is_empty() {
             return Attempt::NothingToWrite;
         }

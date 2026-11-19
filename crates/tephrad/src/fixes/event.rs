@@ -37,8 +37,9 @@ use super::log::{
 };
 use super::state::{decide, Decision, LogRec};
 use super::{FixAnnouncement, FixEngine, FixError, WrittenFile};
+use crate::fix::FixSpelling;
 use crate::ignore::IgnoreRules;
-use crate::refactor::fix_write::{FileFixRequest, RewriteMode, WriteStatus};
+use crate::refactor::fix_write::{FileFixRequest, WriteStatus};
 use crate::registry::SourceRegistry;
 
 /// What an entry of the log says when the event names a file that
@@ -462,9 +463,7 @@ impl FixEngine {
         if graph.unit(&from_id).is_none() || graph.unit(&to_id).is_none() {
             return Ok(());
         }
-        let bare_resolves = graph
-            .shortest_unique_target(&to_id)
-            .is_some_and(|t| !t.contains('/'));
+        let spelling = FixSpelling::for_target(&graph, &to_id, self.qualify_ambiguous);
         let to_files = graph.get_backlinks_all(&from_id);
 
         let mut outcomes: Vec<(String, String, Result<usize, String>)> = Vec::new();
@@ -501,7 +500,7 @@ impl FixEngine {
                 edges,
                 from_path,
                 to_path,
-                RewriteMode::Fix { bare_resolves },
+                spelling.rewrite_mode(),
             );
             let result = self.writer.write_file(&req);
             let outcome = match result.status {

@@ -171,8 +171,51 @@ pub fn compute_fix_changes(
         file_contents,
         old_path,
         new_path,
-        Some(bare_resolves),
+        Some(FixBare {
+            plain: bare_resolves,
+            prefixed: bare_resolves,
+        }),
     )
+}
+
+/// [`compute_fix_changes`] with the Atlas fallback on (G20,
+/// `qualify_ambiguous_links`): the bare file name of the renamed file
+/// also exists in another source, so a link with no `@source:` prefix
+/// is written as the full source-relative stem even when the bare name
+/// still reaches the file in its own source. A link that carries a
+/// prefix already names its source and keeps the rule of
+/// [`compute_fix_changes`] (`bare_resolves`), so the flag never gives it
+/// extra path. Only the target part of a link changes; the extension,
+/// anchor and alias are kept as in the plain fix.
+///
+/// Which of the two the caller uses is decided in one place,
+/// [`crate::fix::FixSpelling`]; nothing else chooses a spelling.
+pub fn compute_fix_changes_qualifying(
+    edges: &[Edge],
+    file_contents: &HashMap<String, String>,
+    old_path: &str,
+    new_path: &str,
+    bare_resolves: bool,
+) -> Vec<LinkChange> {
+    compute_changes_impl(
+        edges,
+        file_contents,
+        old_path,
+        new_path,
+        Some(FixBare {
+            plain: false,
+            prefixed: bare_resolves,
+        }),
+    )
+}
+
+/// Whether a bare target (no `/`) may stay bare in the automatic fix,
+/// for a link without an `@source:` prefix (`plain`) and for one with
+/// it (`prefixed`). The two differ only with the Atlas fallback on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FixBare {
+    plain: bool,
+    prefixed: bool,
 }
 
 /// What one link in the moved file itself needs (see
@@ -372,21 +415,24 @@ pub fn compute_move_changes(
     out
 }
 
-/// The one body behind [`compute_changes`] and [`compute_fix_changes`].
-/// `fix` is `None` for the manual refactor (every kind, a bare target
-/// always rewritten to the new basename) and `Some(bare_resolves)` for
-/// the automatic fix.
+/// The one body behind [`compute_changes`], [`compute_fix_changes`] and
+/// [`compute_fix_changes_qualifying`]. `fix` is `None` for the manual
+/// refactor (every kind, a bare target always rewritten to the new
+/// basename) and `Some(..)` for the automatic fix.
 fn compute_changes_impl(
     edges: &[Edge],
     file_contents: &HashMap<String, String>,
     old_path: &str,
     new_path: &str,
-    fix: Option<bool>,
+    fix: Option<FixBare>,
 ) -> Vec<LinkChange> {
     if old_path == new_path {
         return Vec::new();
     }
-    let bare_ok = fix.unwrap_or(true);
+    let bare_ok = fix.unwrap_or(FixBare {
+        plain: true,
+        prefixed: true,
+    });
     let mut seen: HashSet<(String, String, String)> = HashSet::new();
     let mut out = Vec::new();
     for edge in edges {
@@ -658,11 +704,20 @@ fn is_safe_bare_destination(path: &str) -> bool {
 /// to rewrite, and this should not occur for an edge this function is
 /// ever called with (such a link never resolves to a *different*
 /// unit), but is handled rather than panicking.
-fn rewrite_wikilink_raw(to_raw: &str, new_path: &str, bare_ok: bool) -> Option<String> {
+///
+/// `bare_ok` ([`FixBare`]) says whether a bare target may stay bare, for
+/// a link with an `@source:` prefix and for one without; the two differ
+/// only under the Atlas fallback (G20).
+fn rewrite_wikilink_raw(to_raw: &str, new_path: &str, bare_ok: FixBare) -> Option<String> {
     let w = tephra_parser::parse_wikilink_inner(to_raw);
     if w.target.is_empty() {
         return None;
     }
+    let bare_ok = if w.source_prefix.is_some() {
+        bare_ok.prefixed
+    } else {
+        bare_ok.plain
+    };
     let new_target = rewrite_target_component(&w.target, new_path, bare_ok);
     let mut out = String::new();
     if let Some(prefix) = &w.source_prefix {
@@ -691,8 +746,10 @@ fn rewrite_wikilink_raw(to_raw: &str, new_path: &str, bare_ok: bool) -> Option<S
 /// adds or removes the extension convention the user originally
 /// typed).
 ///
-/// `bare_ok` is whether the basename still resolves to the renamed
-/// file. When it does not (the automatic fix asked the graph), a bare
+/// `bare_ok` is whether a bare target may stay bare: the basename still
+/// resolves to the renamed file (the automatic fix asked the graph), and
+/// the Atlas fallback does not ask for a fuller path (G20, see
+/// [`compute_fix_changes_qualifying`]). When it is `false`, a bare
 /// target also becomes the full stem, the shortest form that resolves.
 /// A target typed in Unicode NFC stays NFC even when the new path is
 /// spelled NFD on disk (macOS), so the fix does not change how the

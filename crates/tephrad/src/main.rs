@@ -190,7 +190,16 @@ fn main() -> ExitCode {
         Err(e) => tracing::warn!(error = %e, "failed to write access.json"),
     }
 
-    run_server(&cfg.listen_addr, &cache_path, &cfg.data_dir.join("token"))
+    if cfg.qualify_ambiguous_links {
+        tracing::info!("qualify_ambiguous_links is on: link fixes write the fuller same-source path for a name that also exists in another source");
+    }
+
+    run_server(
+        &cfg.listen_addr,
+        &cache_path,
+        &cfg.data_dir.join("token"),
+        cfg.qualify_ambiguous_links,
+    )
 }
 
 /// Stage 5 (listener bind), stage 5b (registry + initial graph build,
@@ -278,6 +287,7 @@ fn run_server(
     listen_addr: &str,
     cache_path: &std::path::Path,
     token_path: &std::path::Path,
+    qualify_ambiguous_links: bool,
 ) -> ExitCode {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -451,7 +461,9 @@ fn run_server(
             Arc::new(tephrad::refactor::fix_write::FixWriter::new(
                 &refactor_engine,
             )),
-        ));
+        )
+        // G20: the Atlas fallback, from the config as read at this start.
+        .with_qualify_ambiguous_links(qualify_ambiguous_links));
         // G1: a rename a watcher sees is fixed by this engine, with no
         // client involved.
         registry.set_rename_fixer(fix_engine.clone());

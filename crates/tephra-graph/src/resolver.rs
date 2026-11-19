@@ -219,6 +219,13 @@ pub(crate) fn normalize_key(s: &str) -> String {
     s.nfc().collect()
 }
 
+/// The key under which the unit at `rel_path` is filed in
+/// [`crate::UnitGraph::basename_index`]: its file name, without a
+/// Markdown extension, in NFC.
+pub(crate) fn bare_name_key(rel_path: &str) -> String {
+    normalize_key(basename_of(strip_markdown_extension(rel_path)))
+}
+
 /// `target`'s normalized full-stem match key (NFC, extension
 /// stripped) — used for both a wikilink's `target` field and, after
 /// percent-decoding and relative-path resolution, a markdown link's

@@ -43,6 +43,7 @@ use tephra_cache::{
 };
 use tephra_graph::{Edge, UnitGraph};
 
+use crate::fix::FixSpelling;
 use crate::refactor::fix_write::{
     FileFixRequest, FileWriteResult, FixWriter, RewriteMode, WriteStatus,
 };
@@ -424,6 +425,7 @@ fn unpromote_rows(cache: &Cache, spec: &UnpromoteSpec) -> Result<Vec<PlanRow>, F
             &spec.folder,
             &units,
             &new_id,
+            false,
         );
         if !own.0.is_empty() {
             rows.insert(PlanRow {
@@ -472,6 +474,7 @@ fn promote_rows(
             &spec.name,
             &new,
             Some(&spec.folder),
+            false,
         );
         if !own.1.is_empty() {
             rows.insert(PlanRow {
@@ -569,6 +572,9 @@ pub struct FixEngine {
     clock: Arc<dyn Clock>,
     stop_after_writes: Option<usize>,
     stop_after_promote_commit: bool,
+    /// The `qualify_ambiguous_links` setting (G20), read from the config
+    /// once at start and the same for every fix this engine makes.
+    qualify_ambiguous: bool,
     run_lock: Mutex<()>,
     /// Held from the question "is this rename in the log already?" to
     /// the entry that answers it (G4): the exact event and the watcher's
@@ -593,6 +599,7 @@ impl FixEngine {
             clock: Arc::new(SystemClock),
             stop_after_writes: None,
             stop_after_promote_commit: false,
+            qualify_ambiguous: false,
             run_lock: Mutex::new(()),
             decision_lock: Mutex::new(()),
             sink: RwLock::new(None),
@@ -637,6 +644,16 @@ impl FixEngine {
 
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
+        self
+    }
+
+    /// Sets the Atlas fallback (G20): with `true`, a plain link whose
+    /// bare name also exists in another source is written as the full
+    /// same-source path. `tephrad` passes the config's
+    /// `qualify_ambiguous_links` once at start. Off by default, which
+    /// leaves every fix as it was before the setting existed.
+    pub fn with_qualify_ambiguous_links(mut self, on: bool) -> Self {
+        self.qualify_ambiguous = on;
         self
     }
 
@@ -881,7 +898,9 @@ impl FixEngine {
                 })
                 .collect();
             // The moved file's own links, when it has any that change.
-            let own = own_links(&graph, old_source, old_path, new_source, new_path, None);
+            let own = own_links(
+                &graph, old_source, old_path, new_source, new_path, None, false,
+            );
             if !own.1.is_empty() {
                 rows.insert(PlanRow {
                     file: (new_source.to_string(), new_path.to_string()),
@@ -1516,15 +1535,15 @@ impl FixEngine {
         let old_id = format!("@{old_source}:{old_path}");
         let new_id = format!("@{target_source}:{target_path}");
         let file_id = format!("@{}:{}", row.source, row.file_path);
-        let bare_resolves = graph
-            .shortest_unique_target(&new_id)
-            .is_some_and(|t| !t.contains('/'));
+        // How a plain link to the target is spelled: decided in one place
+        // for a rename, a move, a promote and an unpromote (G20).
+        let spelling = FixSpelling::for_target(graph, &new_id, self.qualify_ambiguous);
         // A file that went to another source is fixed by one of the three
         // rewrites of a move, by where the linking file is (G6).
         let (edges, mode) = if old_source == target_source {
             (
                 file_edges(graph, &old_id, &new_id, &file_id),
-                RewriteMode::Fix { bare_resolves },
+                spelling.rewrite_mode(),
             )
         } else if file_id == new_id {
             let promoted = promoted_folder(cache, &row)?;
@@ -1536,6 +1555,7 @@ impl FixEngine {
                     &folder,
                     &folder_units(cache, &target_source, &folder)?,
                     &new_id,
+                    self.qualify_ambiguous,
                 ),
                 None => own_links(
                     graph,
@@ -1544,13 +1564,14 @@ impl FixEngine {
                     &target_source,
                     &target_path,
                     promoted.as_deref(),
+                    self.qualify_ambiguous,
                 ),
             };
             (
                 edges,
                 RewriteMode::Move(MoveRewrite::Own {
                     new_path: target_path.clone(),
-                    bare_resolves,
+                    bare_resolves: spelling.plain_bare(),
                     links,
                 }),
             )
@@ -1559,7 +1580,7 @@ impl FixEngine {
                 file_edges(graph, &old_id, &new_id, &file_id),
                 RewriteMode::Move(MoveRewrite::NewSource {
                     new_path: target_path.clone(),
-                    bare_resolves,
+                    bare_resolves: spelling.plain_bare(),
                 }),
             )
         } else {
@@ -1884,6 +1905,11 @@ fn linking_files(
 /// when this is a promote (FR22), else `None`: a link of the file that
 /// names another file of that folder by its path from `old_source`'s
 /// root is then respelled relative to the new root (FR23).
+///
+/// `qualify_ambiguous` is the Atlas fallback (G20), used for the text of
+/// a respelled link ([`FixSpelling::target_text`]). A caller that only
+/// asks whether any link changes, not to what, passes `false`: the
+/// answer is the same either way.
 fn own_links(
     graph: &UnitGraph,
     old_source: &str,
@@ -1891,6 +1917,7 @@ fn own_links(
     new_source: &str,
     new_path: &str,
     promoted: Option<&str>,
+    qualify_ambiguous: bool,
 ) -> (Vec<Edge>, HashMap<String, OwnLink>) {
     let new_id = format!("@{new_source}:{new_path}");
     let (old_stem, _) = crate::refactor::strip_md_ext_pub(old_path);
@@ -1921,7 +1948,7 @@ fn own_links(
                 .ok()?
                 .unit
                 .id;
-            graph.shortest_unique_target(&unit)
+            FixSpelling::target_text(graph, &unit, qualify_ambiguous)
         });
         let action = match w.source_prefix.as_deref() {
             _ if respelled.is_some() => respelled.map(OwnLink::Retarget),
@@ -1981,6 +2008,8 @@ fn strip_folder<'a>(target: &'a str, folder: &str) -> Option<&'a str> {
 ///   is still unique); any other becomes the shortest unique target in
 ///   the parent, with no prefix (FR23).
 /// - A link to any other source, or to nothing, is left alone.
+///
+/// `qualify_ambiguous` is the Atlas fallback (G20), as in [`own_links`].
 fn own_links_folded(
     graph: &UnitGraph,
     child: &str,
@@ -1988,6 +2017,7 @@ fn own_links_folded(
     folder: &str,
     units: &[String],
     new_id: &str,
+    qualify_ambiguous: bool,
 ) -> (Vec<Edge>, HashMap<String, OwnLink>) {
     let mut edges = Vec::new();
     let mut links: HashMap<String, OwnLink> = HashMap::new();
@@ -2021,8 +2051,7 @@ fn own_links_folded(
                     if still_reaches {
                         None
                     } else {
-                        graph
-                            .shortest_unique_target(&target_id)
+                        FixSpelling::target_text(graph, &target_id, qualify_ambiguous)
                             .map(OwnLink::Retarget)
                     }
                 })
