@@ -1,15 +1,18 @@
 //! SQL DDL and the single drop-and-recreate rebuild path (F2).
 //!
 //! Two groups of tables:
-//! - Bootstrap tables (`sources`, `schema_version`, `scan_state`) and
-//!   the durable history tables (`fix_log`, `pending_fixes`,
-//!   `promoted_roots`) are created once with `CREATE TABLE IF NOT
-//!   EXISTS` and are never dropped, not even by a schema-version
-//!   rebuild. The history tables are not derived from the files, so a
-//!   rebuild must not lose them; they name sources and paths as text and
-//!   hold no foreign key into `sources` or `units` (which is dropped and
-//!   recreated), so a rebuild never trips a foreign-key check on them
-//!   and unregistering a source leaves its history.
+//! - Bootstrap tables (`sources`, `schema_version`, `scan_state`), the
+//!   durable history tables (`fix_log`, `pending_fixes`,
+//!   `promoted_roots`) and the durable remote tables (`remote_sources`,
+//!   `remote_items`, `upload_queue`, `remote_pins`, `remote_cursors`)
+//!   are created once with `CREATE TABLE IF NOT EXISTS` and are never
+//!   dropped, not even by a schema-version rebuild. The history and
+//!   remote tables are not derived from the files, so a rebuild must
+//!   not lose them; they name sources and paths as text and hold no
+//!   foreign key into `sources` or `units` (which is dropped and
+//!   recreated) or into each other, so a rebuild never trips a
+//!   foreign-key check on them and unregistering, renaming or promoting
+//!   a local source leaves them alone.
 //! - Core tables (`units`, `links`, `tags`, `blocks`, `headings`,
 //!   `symbols`, the `block_fts` FTS5 index and its `block_names`
 //!   exact-name table) hold derived,
@@ -171,6 +174,107 @@ const CREATE_PROMOTED_ROOTS: &str = "\
         source TEXT NOT NULL, \
         created_at INTEGER NOT NULL, \
         UNIQUE(parent, rel_path) \
+    )";
+
+/// The remote sources (a GitHub repo or a Drive folder) Tephra syncs.
+/// Durable like [`CREATE_FIX_LOG`]: created `IF NOT EXISTS`, never
+/// dropped by a rebuild, and free of any foreign key (the remote tables
+/// name each other and their source by `name` text, never by number).
+/// A remote source is not a row of `sources`, which is the registry of
+/// local roots.
+///
+/// `kind` is the closed `github` | `drive` set. `target` is what the
+/// adapter reads (`owner/repo`, or a Drive folder id), `branch` is the
+/// tracked branch of a GitHub source. `cache` is the per-source cache
+/// on/off flag (on by default). `status` is free text (the sync engine
+/// that writes it owns the vocabulary, like `fix_log.status`), with the
+/// reason a source needs attention in `status_reason`.
+///
+/// There is no ALTER path for a table a rebuild never recreates, so a
+/// column a later PR is sure to need is here from the start.
+const CREATE_REMOTE_SOURCES: &str = "\
+    CREATE TABLE IF NOT EXISTS remote_sources (\
+        name TEXT PRIMARY KEY, \
+        kind TEXT NOT NULL CHECK (kind IN ('github', 'drive')), \
+        target TEXT NOT NULL, \
+        branch TEXT, \
+        cache INTEGER NOT NULL DEFAULT 1 CHECK (cache IN (0, 1)), \
+        status TEXT NOT NULL DEFAULT 'indexing', \
+        status_reason TEXT, \
+        created_at INTEGER NOT NULL, \
+        last_sync_at INTEGER \
+    )";
+
+/// One row per remote file: what is known of it without downloading it.
+/// Durable and foreign-key free, keyed by the source's name and the
+/// item's path as text. `etag`, `sha` (a git blob sha), `revision` (a
+/// Drive head revision id) and `size` are the remote's own values;
+/// `file_id` is the remote's stable id (a Drive file id, which is what
+/// recognises a rename); `last_used` is the Unix time of the last fetch
+/// or saved write, which the LRU eviction orders by. `state` is the
+/// closed set of the eight item states; `reason` says why an item
+/// needs attention.
+const CREATE_REMOTE_ITEMS: &str = "\
+    CREATE TABLE IF NOT EXISTS remote_items (\
+        source TEXT NOT NULL, \
+        path TEXT NOT NULL, \
+        kind TEXT, \
+        file_id TEXT, \
+        etag TEXT, \
+        sha TEXT, \
+        revision TEXT, \
+        size INTEGER, \
+        state TEXT NOT NULL DEFAULT 'remote' CHECK (state IN (\
+            'remote', 'downloading', 'cached', 'pinned', 'pending_upload', \
+            'not_pushed', 'needs_attention', 'missing')), \
+        reason TEXT, \
+        last_used INTEGER, \
+        PRIMARY KEY (source, path) \
+    )";
+
+/// The upload buffer: one row per file with edits not yet sent to the
+/// remote (the latest bytes are read from the content cache when it is
+/// sent). Durable and foreign-key free. `base_revision` is the revision
+/// the edit was based on, which the refuse-if-changed check compares
+/// with the remote's head. `attempts` and `next_retry_at` drive the
+/// doubling backoff; `last_error` is the reason of the last refusal.
+const CREATE_UPLOAD_QUEUE: &str = "\
+    CREATE TABLE IF NOT EXISTS upload_queue (\
+        id INTEGER PRIMARY KEY AUTOINCREMENT, \
+        source TEXT NOT NULL, \
+        path TEXT NOT NULL, \
+        base_revision TEXT, \
+        attempts INTEGER NOT NULL DEFAULT 0, \
+        next_retry_at INTEGER, \
+        last_error TEXT, \
+        created_at INTEGER NOT NULL, \
+        UNIQUE(source, path) \
+    )";
+
+/// The pins: a file or a folder (current and future files) kept
+/// downloaded. Durable and foreign-key free; one row per source and
+/// path.
+const CREATE_REMOTE_PINS: &str = "\
+    CREATE TABLE IF NOT EXISTS remote_pins (\
+        id INTEGER PRIMARY KEY AUTOINCREMENT, \
+        source TEXT NOT NULL, \
+        path TEXT NOT NULL, \
+        is_folder INTEGER NOT NULL DEFAULT 0 CHECK (is_folder IN (0, 1)), \
+        created_at INTEGER NOT NULL, \
+        UNIQUE(source, path) \
+    )";
+
+/// The sync cursor of each remote source (a GitHub etag or tip sha, a
+/// Drive changes-feed page token): exactly one row per source.
+/// `index_complete` is 1 once the first index ran to the end, so a
+/// restart resumes from the cursor instead of indexing from scratch.
+/// Durable and foreign-key free.
+const CREATE_REMOTE_CURSORS: &str = "\
+    CREATE TABLE IF NOT EXISTS remote_cursors (\
+        source TEXT PRIMARY KEY, \
+        cursor TEXT, \
+        index_complete INTEGER NOT NULL DEFAULT 0 CHECK (index_complete IN (0, 1)), \
+        updated_at INTEGER \
     )";
 
 /// One row per link occurrence. `line` is the link's 1-based line in
@@ -357,10 +461,14 @@ pub(crate) fn create_core_indexes(conn: &Connection) -> Result<(), CacheError> {
     Ok(())
 }
 
-/// Creates `sources`, `schema_version`, `scan_state` and the durable
-/// history tables (`fix_log`, `pending_fixes`, `promoted_roots`) if
-/// absent. Idempotent and safe to call on every open: never drops or
-/// truncates any of them, so none of them is touched by a rebuild.
+/// Creates `sources`, `schema_version`, `scan_state`, the durable
+/// history tables (`fix_log`, `pending_fixes`, `promoted_roots`) and the
+/// durable remote tables (`remote_sources`, `remote_items`,
+/// `upload_queue`, `remote_pins`, `remote_cursors`) if absent.
+/// Idempotent and safe to call on every open: never drops or truncates
+/// any of them, so none of them is touched by a rebuild, and a cache
+/// written before the remote tables existed gets them on its next open
+/// with no schema-version bump.
 pub(crate) fn create_bootstrap_tables(conn: &Connection) -> Result<(), CacheError> {
     conn.execute(CREATE_SOURCES, [])?;
     conn.execute(CREATE_SCHEMA_VERSION, [])?;
@@ -368,6 +476,11 @@ pub(crate) fn create_bootstrap_tables(conn: &Connection) -> Result<(), CacheErro
     conn.execute(CREATE_FIX_LOG, [])?;
     conn.execute(CREATE_PENDING_FIXES, [])?;
     conn.execute(CREATE_PROMOTED_ROOTS, [])?;
+    conn.execute(CREATE_REMOTE_SOURCES, [])?;
+    conn.execute(CREATE_REMOTE_ITEMS, [])?;
+    conn.execute(CREATE_UPLOAD_QUEUE, [])?;
+    conn.execute(CREATE_REMOTE_PINS, [])?;
+    conn.execute(CREATE_REMOTE_CURSORS, [])?;
     Ok(())
 }
 
@@ -402,7 +515,7 @@ fn core_table_ddls_if_not_exists() -> [String; 8] {
 /// Drops every core table (children first, parents last, though
 /// `DROP TABLE` in SQLite does not itself enforce foreign keys).
 /// Never touches `sources`, `schema_version`, `scan_state`, `fix_log`,
-/// `pending_fixes` or `promoted_roots`.
+/// `pending_fixes`, `promoted_roots` or any of the five remote tables.
 pub(crate) fn drop_core_tables(conn: &Connection) -> Result<(), CacheError> {
     conn.execute("DROP TABLE IF EXISTS block_fts", [])?;
     conn.execute("DROP TABLE IF EXISTS block_names", [])?;

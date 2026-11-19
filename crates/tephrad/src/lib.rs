@@ -9,8 +9,11 @@
 //! startup-sequence concerns with no API surface a later crate or
 //! test needs to call directly.
 pub mod access;
+pub mod api_url;
 pub mod block_id;
+pub mod cache_limit;
 pub mod catch_up;
+pub mod credentials;
 pub mod dup_ids;
 pub mod file_kind;
 pub mod file_lock;

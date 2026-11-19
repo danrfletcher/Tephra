@@ -29,6 +29,7 @@ mod stage {
     pub const CONFIG: &str = "config";
     pub const DIRECTORY: &str = "directory";
     pub const TOKEN: &str = "token";
+    pub const CREDENTIALS: &str = "credentials";
     pub const CACHE: &str = "cache";
     pub const LISTENER: &str = "listener";
 }
@@ -143,6 +144,26 @@ fn main() -> ExitCode {
         tracing::info!("reusing existing auth token");
     }
     // The token value itself is never logged, at any level, above.
+
+    // Stage 3b: the credential store and the remote cache limit. Choosing
+    // a store reads nothing from it (no Keychain prompt at startup); a
+    // build without a store logs that, and every credential call later
+    // reports it. `cache_limit` was validated by the config stage, so the
+    // conversion cannot fail here; it is logged in bytes. No secret is
+    // read, held or logged at this stage.
+    match tephrad::credentials::open_store(cfg.test_credential_file.as_deref(), &cfg.data_dir) {
+        Ok((_store, kind)) => {
+            tracing::info!(store = kind.as_str(), "credential store selected");
+            if kind == tephrad::credentials::StoreKind::Unavailable {
+                tracing::warn!("this build has no credential store; remote sources cannot sign in");
+            }
+        }
+        Err(e) => return fail(stage::CREDENTIALS, e),
+    }
+    match cfg.cache_limit_bytes() {
+        Ok(bytes) => tracing::info!(cache_limit_bytes = bytes, "remote cache limit"),
+        Err(e) => return fail(stage::CONFIG, format!("cache_limit {e}")),
+    }
 
     // Stage 4: cache open. Creates `<data_dir>/cache.db` if absent
     // (parent directory included), applies the WAL pragmas, and runs

@@ -487,6 +487,12 @@ fn first_run_creates_cache_db_with_six_tables() {
         "tags",
         "blocks",
         "schema_version",
+        // The durable remote tables are made by the same open.
+        "remote_sources",
+        "remote_items",
+        "upload_queue",
+        "remote_pins",
+        "remote_cursors",
     ] {
         assert!(
             tables.iter().any(|t| t == expected),
@@ -1135,6 +1141,300 @@ fn invalid_log_level_fails_startup_with_clear_error_not_silence() {
         !stderr.is_empty(),
         "stderr must not be silently empty on an invalid log_level"
     );
+}
+
+/// `text` without ANSI colour escapes (the daemon colours its log).
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            for n in chars.by_ref() {
+                if n.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The three original keys plus `extra` lines, as a config file.
+fn write_config_with_extra(config_path: &Path, data_dir: &Path, extra: &str) {
+    fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+    fs::write(
+        config_path,
+        format!(
+            "listen_addr = \"{EPHEMERAL_ADDR}\"\n\
+             data_dir = \"{}\"\n\
+             log_level = \"info\"\n\
+             {extra}\n",
+            data_dir.display()
+        ),
+    )
+    .unwrap();
+}
+
+/// Runs the daemon to the end against `extra` config lines and returns
+/// (exit success, stderr, whether the data dir was created).
+fn run_to_exit_with_extra_config(extra: &str) -> (bool, String, bool) {
+    let home = tempfile::tempdir().expect("tempdir");
+    let config_path = home.path().join(".config/tephra/config.toml");
+    let data_dir = home.path().join(".local/share/tephra");
+    write_config_with_extra(&config_path, &data_dir, extra);
+    let output = Command::new(tephrad_bin())
+        .arg("--config")
+        .arg(&config_path)
+        .env("HOME", home.path())
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .output()
+        .expect("run tephrad");
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+        data_dir.exists(),
+    )
+}
+
+/// A bad `cache_limit` or API URL is a startup error at the config stage
+/// that names its key, before anything is created on disk.
+#[test]
+fn bad_cache_limit_and_bad_api_urls_fail_startup_naming_the_key() {
+    for (extra, key) in [
+        ("cache_limit = \"5 KB\"", "cache_limit"),
+        ("cache_limit = \"0 GB\"", "cache_limit"),
+        ("cache_limit = \"5000\"", "cache_limit"),
+        ("cache_limit = \"-1 GB\"", "cache_limit"),
+        ("cache_limit = \"\"", "cache_limit"),
+        (
+            "drive_api_url = \"http://drive.example.com\"",
+            "drive_api_url",
+        ),
+        ("github_api_url = \"ftp://127.0.0.1\"", "github_api_url"),
+    ] {
+        let (ok, stderr, created) = run_to_exit_with_extra_config(extra);
+        assert!(!ok, "{extra}: startup must exit non-zero");
+        assert!(
+            stderr.contains("tephrad: config failed:") && stderr.contains(key),
+            "{extra}: expected a config error naming {key}, got: {stderr:?}"
+        );
+        assert!(!created, "{extra}: nothing is created before config passes");
+    }
+}
+
+/// A `token = ...` key is still an unknown field, and the startup error
+/// names the key without echoing the config line that holds the secret.
+#[test]
+fn a_token_key_in_the_config_still_fails_startup_without_echoing_it() {
+    let (ok, stderr, _) = run_to_exit_with_extra_config("token = \"ghp_SENTINEL_do_not_leak\"");
+    assert!(!ok);
+    assert!(stderr.contains("unknown field `token`"), "{stderr:?}");
+    assert!(
+        !stderr.contains("ghp_SENTINEL_do_not_leak"),
+        "the token value must not reach stderr: {stderr:?}"
+    );
+}
+
+/// A value of the wrong type for a known key is a parse error too; its
+/// source line must not be echoed either.
+#[test]
+fn a_mistyped_value_fails_startup_without_echoing_it() {
+    let (ok, stderr, _) =
+        run_to_exit_with_extra_config("cache_limit = [\"ghp_SENTINEL_do_not_leak\"]");
+    assert!(!ok);
+    assert!(
+        stderr.contains("tephrad: config failed:") && stderr.contains("line "),
+        "{stderr:?}"
+    );
+    assert!(
+        !stderr.contains("ghp_SENTINEL_do_not_leak"),
+        "the value must not reach stderr: {stderr:?}"
+    );
+}
+
+/// A refused API URL that carries a token (in user info, query or
+/// fragment) is named by key and reason; the URL is not echoed.
+#[test]
+fn a_refused_api_url_with_a_token_in_it_is_not_echoed() {
+    for (extra, key) in [
+        (
+            "github_api_url = \"https://x-access-token:ghp_SENTINEL_do_not_leak@api.github.com\"",
+            "github_api_url",
+        ),
+        (
+            "drive_api_url = \"http://example.com/drive?key=ghp_SENTINEL_do_not_leak\"",
+            "drive_api_url",
+        ),
+        (
+            "github_api_url = \"ftp://ghp_SENTINEL_do_not_leak@127.0.0.1\"",
+            "github_api_url",
+        ),
+    ] {
+        let (ok, stderr, _) = run_to_exit_with_extra_config(extra);
+        assert!(!ok, "{extra}: startup must exit non-zero");
+        assert!(
+            stderr.contains("tephrad: config failed:") && stderr.contains(key),
+            "{extra}: expected a config error naming {key}, got: {stderr:?}"
+        );
+        assert!(
+            !stderr.contains("ghp_SENTINEL_do_not_leak"),
+            "{extra}: the URL must not reach stderr: {stderr:?}"
+        );
+    }
+}
+
+/// A secret typed into a size, a hostname or a log level is named by key
+/// and reason only; the value does not reach stderr (and so not the log).
+#[test]
+fn a_secret_typed_into_a_size_host_or_log_level_is_not_echoed() {
+    const S: &str = "ghp_SENTINEL_do_not_leak";
+    for (extra, key) in [
+        (format!("cache_limit = \"{S}\""), "cache_limit"),
+        (format!("cache_limit = \"5 {S}\""), "cache_limit"),
+        (
+            format!("github_api_url = \"http://{S}.evil.com/\""),
+            "github_api_url",
+        ),
+        (
+            format!("drive_api_url = \"http://{S}.evil.com:8080/x\""),
+            "drive_api_url",
+        ),
+    ] {
+        let (ok, stderr, _) = run_to_exit_with_extra_config(&extra);
+        assert!(!ok, "{extra}: startup must exit non-zero");
+        assert!(
+            stderr.contains("tephrad: config failed:") && stderr.contains(key),
+            "{extra}: expected a config error naming {key}, got: {stderr:?}"
+        );
+        assert!(
+            !stderr.contains(S),
+            "{extra}: the value must not reach stderr: {stderr:?}"
+        );
+    }
+
+    for (level, addr) in [(S, EPHEMERAL_ADDR), ("info", S)] {
+        let home = tempfile::tempdir().expect("tempdir");
+        let config_path = home.path().join(".config/tephra/config.toml");
+        let data_dir = home.path().join(".local/share/tephra");
+        write_config_with_level(&config_path, &data_dir, addr, level);
+        let output = Command::new(tephrad_bin())
+            .arg("--config")
+            .arg(&config_path)
+            .env("HOME", home.path())
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_DATA_HOME")
+            .output()
+            .expect("run tephrad");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "level {level} addr {addr}");
+        assert!(stderr.contains("tephrad: config failed:"), "{stderr:?}");
+        assert!(
+            !stderr.contains(S),
+            "level {level} addr {addr}: the value must not reach stderr: {stderr:?}"
+        );
+    }
+}
+
+/// A config written before the new keys existed still starts, and the
+/// log carries the default limit in bytes.
+#[test]
+fn an_old_config_starts_with_the_default_cache_limit_in_bytes() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let config_path = home.path().join(".config/tephra/config.toml");
+    let data_dir = home.path().join(".local/share/tephra");
+    write_config(&config_path, &data_dir, EPHEMERAL_ADDR);
+
+    let mut process = TephradProcess::spawn(home.path(), &config_path);
+    assert!(
+        process.wait_for_line("listening on 127.0.0.1:", Duration::from_secs(10)),
+        "{:?}",
+        process.captured_stderr_lines()
+    );
+    assert_eq!(process.terminate_and_wait(Duration::from_secs(5)), Some(0));
+    let log = strip_ansi(&process.captured_stderr_lines().join("\n"));
+    assert!(log.contains("cache_limit_bytes=10000000000"), "{log}");
+    assert!(log.contains("credential store selected"), "{log}");
+    // The config file was not rewritten.
+    let raw = fs::read_to_string(&config_path).unwrap();
+    assert!(!raw.contains("cache_limit"));
+}
+
+/// Without the feature, `test_credential_file` is a startup error naming
+/// the key.
+#[cfg(not(feature = "test-credential-store"))]
+#[test]
+fn test_credential_file_fails_startup_without_the_feature() {
+    let (ok, stderr, created) =
+        run_to_exit_with_extra_config("test_credential_file = \"/tmp/tephra-creds.json\"");
+    assert!(!ok);
+    assert!(
+        stderr.contains("tephrad: config failed:") && stderr.contains("test_credential_file"),
+        "{stderr:?}"
+    );
+    assert!(!created);
+}
+
+/// With the feature the daemon starts on the file store, logs which
+/// store and the loaded `cache_limit` in bytes, and never the secret.
+#[cfg(feature = "test-credential-store")]
+#[test]
+fn test_credential_file_selects_the_file_store_and_the_log_has_no_secret() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let config_path = home.path().join(".config/tephra/config.toml");
+    let data_dir = home.path().join(".local/share/tephra");
+    let cred_file = data_dir.join("credentials.json");
+    write_config_with_extra(
+        &config_path,
+        &data_dir,
+        &format!(
+            "cache_limit = \"1.5 GiB\"\n\
+             github_api_url = \"http://127.0.0.1:9\"\n\
+             drive_api_url = \"https://drive.example.com\"\n\
+             test_credential_file = \"{}\"",
+            cred_file.display()
+        ),
+    );
+    // Put a secret where the daemon will look; it must never be logged.
+    let sentinel = "ghp_SENTINEL_do_not_leak";
+    fs::create_dir_all(&data_dir).unwrap();
+    fs::write(&cred_file, format!("{{\"github\":\"{sentinel}\"}}")).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&cred_file, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let mut process = TephradProcess::spawn(home.path(), &config_path);
+    assert!(
+        process.wait_for_line("listening on 127.0.0.1:", Duration::from_secs(10)),
+        "{:?}",
+        process.captured_stderr_lines()
+    );
+    assert_eq!(process.terminate_and_wait(Duration::from_secs(5)), Some(0));
+    let log = strip_ansi(&process.captured_stderr_lines().join("\n"));
+    assert!(log.contains("store=\"test-file\""), "{log}");
+    assert!(log.contains("cache_limit_bytes=1610612736"), "{log}");
+    assert!(!log.contains(sentinel), "{log}");
+    assert!(!log.contains("SENTINEL"), "{log}");
+}
+
+/// With the feature, a credential file outside the data dir is a startup
+/// error naming the stage, and nothing is written there.
+#[cfg(feature = "test-credential-store")]
+#[test]
+fn a_credential_file_outside_the_data_dir_fails_startup() {
+    let outside = tempfile::tempdir().unwrap();
+    let file = outside.path().join("c.json");
+    let (ok, stderr, _) =
+        run_to_exit_with_extra_config(&format!("test_credential_file = \"{}\"", file.display()));
+    assert!(!ok);
+    assert!(
+        stderr.contains("tephrad: credentials failed:"),
+        "{stderr:?}"
+    );
+    assert!(!file.exists());
 }
 
 /// E11, end to end with real processes: a daemon that is `kill -9`ed

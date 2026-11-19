@@ -20,6 +20,15 @@ path = "src/bin/register_sources.rs"
 name = "fix_helper"
 path = "src/bin/fix_helper.rs"
 
+[features]
+# Test-only: compiles the file credential store and lets the
+# `test_credential_file` config key select it. Off by default; a build
+# without it has no file-store code and rejects that key at startup.
+test-credential-store = []
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }

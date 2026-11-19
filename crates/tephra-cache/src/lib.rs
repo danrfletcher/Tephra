@@ -2,8 +2,10 @@
 //!
 //! Owns `cache.db` (WAL mode), its schema (`sources`, `units`, `links`,
 //! `tags`, `blocks`, `headings`, `symbols`, the `block_fts` FTS5 index,
-//! `scan_state`, `schema_version`, and the durable `fix_log`,
-//! `pending_fixes` and `promoted_roots`), the single drop-and-rebuild
+//! `scan_state`, `schema_version`, the durable `fix_log`,
+//! `pending_fixes` and `promoted_roots`, and the durable remote tables
+//! `remote_sources`, `remote_items`, `upload_queue`, `remote_pins` and
+//! `remote_cursors`), the single drop-and-rebuild
 //! path triggered by a schema-version mismatch (F2 — no migration
 //! scripts), and per-source status bookkeeping
 //! (`active`/`stale`/`offline`) so an unmounted or offline source's
@@ -20,6 +22,7 @@ mod in_file;
 mod listing;
 mod pending_fixes;
 mod promote;
+mod remote;
 mod schema;
 mod search;
 mod source_rename;
@@ -43,6 +46,7 @@ pub use pending_fixes::{
     NewPendingFix, PendingFixRow, PendingOp, STATE_NEEDS_MANUAL_FIX, STATE_PENDING,
 };
 pub use promote::{NewPromote, NewUnpromote, Promoted, PromotedRootRow, Unpromoted};
+pub use remote::{REMOTE_ITEM_STATES, REMOTE_SOURCE_KINDS, REMOTE_TABLES};
 pub use schema::KindInferrer;
 pub use search::{compare_hits, file_stem, resolve_title, NameCandidate, NameHit, NAME_SEARCH_SQL};
 pub use source_rename::{NewSourceRename, SourceRenamed};
@@ -57,7 +61,8 @@ pub use units::{
 /// on next open, [`Cache::open`] compares the stored `schema_version`
 /// row against this value and, on mismatch, drops and recreates
 /// every core table (never `sources`, `schema_version`,
-/// `scan_state`, `fix_log`, `pending_fixes` or `promoted_roots`) — see [`Cache::rebuild`]. There is no
+/// `scan_state`, `fix_log`, `pending_fixes`, `promoted_roots` or any of
+/// the five remote tables) — see [`Cache::rebuild`]. There is no
 /// migration-file mechanism or version-ladder anywhere in this crate
 /// (F2).
 ///
@@ -75,6 +80,10 @@ pub use units::{
 /// which a rebuild never drops. The first start after the upgrade
 /// rebuilds the core tables and rescans every source, filling the hashes
 /// and identities.
+///
+/// The remote tables did not bump the version: they are created `IF NOT
+/// EXISTS` on every open, so a v3 cache that lacks them gets them on its
+/// next open and a rebuild never drops them.
 pub const CURRENT_SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug)]

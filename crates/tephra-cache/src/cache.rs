@@ -368,7 +368,9 @@ impl Cache {
     /// Row count for one of the fixed internal table names (`sources`,
     /// `units`, `links`, `tags`, `blocks`, `schema_version`,
     /// `headings`, `symbols`, `block_fts`, `scan_state`, and the durable
-    /// `fix_log`, `pending_fixes`, `promoted_roots`). `table`
+    /// `fix_log`, `pending_fixes`, `promoted_roots`, and the remote
+    /// `remote_sources`, `remote_items`, `upload_queue`, `remote_pins`,
+    /// `remote_cursors`). `table`
     /// is checked against that closed allow-list and rejected with
     /// [`CacheError::InvalidTableName`] for anything else — this
     /// method is `pub` (tests and a future RPC layer call it), so the
