@@ -76,6 +76,27 @@ fn is_loopback_host(host: &str) -> bool {
 
 /// Checks `url` against the rule in the module docs.
 pub fn validate_api_url(url: &str) -> Result<(), ApiUrlError> {
+    let (https, host) = parse_api_url(url)?;
+    if https || is_loopback_host(host) {
+        Ok(())
+    } else {
+        Err(ApiUrlError::CleartextToRemoteHost)
+    }
+}
+
+/// Whether `url` is well formed (the rules above, minus the scheme/host
+/// pairing) and its host is a loopback one, whatever the scheme. The
+/// adapters use this to accept a non-default base URL only when it points
+/// at this machine.
+pub fn is_loopback_url(url: &str) -> bool {
+    match parse_api_url(url) {
+        Ok((_, host)) => is_loopback_host(host),
+        Err(_) => false,
+    }
+}
+
+/// The shared parse: `(is_https, host without brackets)`.
+fn parse_api_url(url: &str) -> Result<(bool, &str), ApiUrlError> {
     if url.is_empty() {
         return Err(ApiUrlError::Empty);
     }
@@ -129,11 +150,7 @@ pub fn validate_api_url(url: &str) -> Result<(), ApiUrlError> {
         return Err(ApiUrlError::BadHost);
     }
 
-    if https || is_loopback_host(host) {
-        Ok(())
-    } else {
-        Err(ApiUrlError::CleartextToRemoteHost)
-    }
+    Ok((https, host))
 }
 
 #[cfg(test)]
@@ -217,6 +234,27 @@ mod tests {
         ];
         for (url, want) in cases {
             assert_eq!(validate_api_url(url).as_ref(), Err(want), "{url:?}");
+        }
+    }
+
+    #[test]
+    fn is_loopback_url_follows_the_host_not_the_scheme() {
+        for url in [
+            "http://127.0.0.1:1",
+            "https://127.0.0.1",
+            "http://localhost:80/x",
+            "http://[::1]:8080",
+        ] {
+            assert!(is_loopback_url(url), "{url}");
+        }
+        for url in [
+            "https://api.github.com",
+            "http://127.0.0.1.example.com",
+            "http://user@127.0.0.1",
+            "http://",
+            "",
+        ] {
+            assert!(!is_loopback_url(url), "{url}");
         }
     }
 

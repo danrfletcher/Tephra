@@ -4,6 +4,7 @@ members = [
     "crates/tephrad",
     "crates/tephra-cache",
     "crates/tephra-parser",
+    "crates/tephra-remote",
     "crates/tephra-graph",
     "crates/tephractl",
 ]

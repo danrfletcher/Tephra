@@ -9,7 +9,7 @@
 //!   itself is the one place it is allowed to be.
 //! - Captured `tracing` output of the store calls themselves, including
 //!   failing ones, and the `Display` and `Debug` of every error.
-//! - A source-tree scan of `src/credentials/`: no `println!`,
+//! - A source-tree scan of `tephra-remote/src/credentials/`: no `println!`,
 //!   `eprintln!` or `tracing` call takes a secret value, and nothing
 //!   there reads the environment.
 
@@ -297,9 +297,9 @@ mod sweep {
 // ---- source-tree scan --------------------------------------------------------------
 
 fn credentials_sources() -> Vec<(PathBuf, String)> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/credentials");
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tephra-remote/src/credentials");
     let mut out = Vec::new();
-    for entry in fs::read_dir(&dir).expect("src/credentials") {
+    for entry in fs::read_dir(&dir).expect("tephra-remote/src/credentials") {
         let path = entry.unwrap().path();
         if path.extension().and_then(|e| e.to_str()) == Some("rs") {
             let text = fs::read_to_string(&path).unwrap();

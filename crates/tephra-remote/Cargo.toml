@@ -1,0 +1,40 @@
+[package]
+name = "tephra-remote"
+version = "0.1.0"
+edition = "2021"
+description = "Typed read-side adapters for GitHub and Google Drive, the credential-store trait, and in-process fake servers for tests"
+
+[features]
+# Test-only: compiles the file credential store (see `credentials`).
+test-credential-store = []
+# Test support: the in-process fake GitHub and Drive servers in
+# `testing`. Off by default; a build without it has no axum and no
+# listener code at all.
+test-support = ["dep:axum", "dep:futures-util"]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+
+[dependencies]
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
+tokio = { version = "1", features = ["rt", "net", "sync", "time", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0.154"
+tracing = "0.1"
+httpdate = "1.0.3"
+percent-encoding = "2.3.2"
+libc = "0.2"
+axum = { version = "0.8.9", optional = true }
+futures-util = { version = "0.3.34", optional = true }
+
+[[example]]
+name = "fakes"
+required-features = ["test-support"]
+
+[dev-dependencies]
+# The tests use the fakes through the crate's own feature. They do not
+# turn on `test-credential-store`: features unify across the workspace, so
+# that would switch the file store on inside `tephrad`'s test builds.
+tephra-remote = { path = ".", features = ["test-support"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
+tracing-subscriber = { version = "0.3", features = ["fmt"] }

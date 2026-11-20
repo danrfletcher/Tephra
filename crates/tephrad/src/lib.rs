@@ -9,11 +9,9 @@
 //! startup-sequence concerns with no API surface a later crate or
 //! test needs to call directly.
 pub mod access;
-pub mod api_url;
 pub mod block_id;
 pub mod cache_limit;
 pub mod catch_up;
-pub mod credentials;
 pub mod dup_ids;
 pub mod file_kind;
 pub mod file_lock;
@@ -30,3 +28,9 @@ pub mod search;
 pub mod unit_list;
 pub mod watcher;
 mod writer_gate;
+
+// The credential-store trait and the API-URL rule live in `tephra-remote`
+// (the adapters need them and that crate must not depend on this one, which
+// pulls in `tephra-cache`). Re-exported so the paths stay
+// `tephrad::credentials` and `tephrad::api_url`.
+pub use tephra_remote::{api_url, credentials};
