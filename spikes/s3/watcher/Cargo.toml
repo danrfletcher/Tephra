@@ -1,0 +1,14 @@
+[package]
+name = "spike-watcher"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Throwaway S3 spike: log the raw notify events under a directory"
+
+# Not a member of the Tephra workspace: an empty [workspace] table makes
+# this its own root so cargo does not look for the parent workspace.
+[workspace]
+
+[dependencies]
+# Same crate and version tephrad resolves (Cargo.lock at the repo root).
+notify = "=6.1.1"

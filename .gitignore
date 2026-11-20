@@ -1,3 +1,10 @@
 target/
 .DS_Store
 /verify/
+
+# Spike scratch: release binaries, run output and the spike watcher's build
+# (spikes/ is throwaway, not a workspace member).
+/spikes/.bin/
+/spikes/out/
+/spikes/s3/watcher/target/
+__pycache__/

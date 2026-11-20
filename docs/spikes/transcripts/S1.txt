@@ -1,0 +1,47 @@
+fixture: 50 files at c1, bare repo at 5bdf2fe
+  s1.fixture.files                               50
+== S1 git half: s1.fixture (file:///tmp/tephra-spike.mu1Pmm/fixture.git)
+  git: git version 2.39.5
+  s1.fixture.git_version                         2.39.5
+  s1.fixture.before_clone.git_kb                 0
+  s1.fixture.clone_ms                            10
+  s1.fixture.after_blobless_clone.git_kb         112
+  s1.fixture.after_blobless_clone.git_bytes      27995
+  s1.fixture.after_blobless_clone.git_packs      1
+  s1.fixture.after_blobless_clone.git_blob_objects 0
+  s1.fixture.fetch_ms                            11
+  s1.fixture.after_fetch.git_kb                  136
+  s1.fixture.after_fetch.git_bytes               31456
+  s1.fixture.after_fetch.git_packs               2
+  s1.fixture.after_fetch.git_blob_objects        0
+  s1.fixture.base                                5bdf2fe37e60
+  s1.fixture.head                                5733ad3b19e9
+  s1.fixture.ls_tree_ms                          3
+  s1.fixture.ls_tree_entries                     50
+  s1.fixture.ls_tree_output_bytes                3401
+  s1.fixture.after_ls_tree.git_kb                136
+  s1.fixture.after_ls_tree.git_bytes             31456
+  s1.fixture.after_ls_tree.git_packs             2
+  s1.fixture.after_ls_tree.git_blob_objects      0
+  s1.fixture.diff_m_ms                           9
+  s1.fixture.diff_m_lines                        2
+  s1.fixture.after_diff_m.git_kb                 144
+  s1.fixture.after_diff_m.git_bytes              32806
+  s1.fixture.after_diff_m.git_packs              3
+  s1.fixture.after_diff_m.git_blob_objects       2
+  s1.fixture.rename_count                        2
+  s1.fixture.rename_pure_found                   1
+  s1.fixture.rename_edited_found                 1
+  s1.fixture.text_files                          50
+Auto packing the repository in background for optimum performance.
+See "git help gc" for manual housekeeping.
+Auto packing the repository in background for optimum performance.
+See "git help gc" for manual housekeeping.
+  s1.fixture.index_read_ms                       344
+  s1.fixture.index_read_content_bytes            48131
+  s1.fixture.after_index_read.git_kb             544
+  s1.fixture.after_index_read.git_bytes          108633
+  s1.fixture.after_index_read.git_packs          53
+  s1.fixture.after_index_read.git_blob_objects   51
+  s1.fixture.blobs_landed_by_index_read          49
+  done: s1.fixture
