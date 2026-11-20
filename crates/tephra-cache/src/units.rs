@@ -829,7 +829,7 @@ pub(crate) fn links_from_unit(
 /// [`crate::Cache::table_row_count`] is `pub` and reachable from a
 /// future RPC layer, so an unexpected value must be rejected rather
 /// than merely asserted against in debug builds.
-const ALLOWED_TABLE_NAMES: [&str; 14] = [
+const ALLOWED_TABLE_NAMES: [&str; 19] = [
     "sources",
     "units",
     "links",
@@ -844,6 +844,11 @@ const ALLOWED_TABLE_NAMES: [&str; 14] = [
     "fix_log",
     "pending_fixes",
     "promoted_roots",
+    "remote_sources",
+    "remote_items",
+    "upload_queue",
+    "remote_pins",
+    "remote_cursors",
 ];
 
 pub(crate) fn count_rows(conn: &Connection, table: &str) -> Result<i64, CacheError> {

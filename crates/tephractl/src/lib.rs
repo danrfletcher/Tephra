@@ -11,11 +11,15 @@
 //! - [`cli`]: pure argv parsing into a [`cli::Command`] (no network).
 //! - [`transport`]: the JSON-RPC 2.0 client ([`transport::RpcClient`]).
 //! - [`render`]: formats RPC results/errors as human-readable text.
+//! - [`auth`]: `auth github|google|status|logout`, the sign-in commands.
+//!   They talk to GitHub or Google and the credential store, never to the
+//!   daemon, and add no RPC method.
 //! - [`daemon`]: `daemon install|uninstall|status`, the launchd agent
 //!   (macOS only; needs no token and no running daemon).
 //! - [`commands`]: wires a parsed command to the right RPC call and
 //!   renderer.
 
+pub mod auth;
 pub mod cli;
 pub mod commands;
 pub mod daemon;

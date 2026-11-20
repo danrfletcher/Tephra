@@ -268,13 +268,23 @@ pub fn dump_table(conn: &rusqlite::Connection, table: &str) -> Vec<Vec<rusqlite:
     rows.map(|r| r.expect("row")).collect()
 }
 
-/// The three durable tables, in the order [`seed_durable_rows`] fills them.
-pub const DURABLE_TABLES: [&str; 3] = ["fix_log", "pending_fixes", "promoted_roots"];
+/// The eight durable tables, in the order [`seed_durable_rows`] fills
+/// them: the three history tables, then the five remote tables.
+pub const DURABLE_TABLES: [&str; 8] = [
+    "fix_log",
+    "pending_fixes",
+    "promoted_roots",
+    "remote_sources",
+    "remote_items",
+    "upload_queue",
+    "remote_pins",
+    "remote_cursors",
+];
 
 /// Puts two rows in each durable table (`fix_log`, `pending_fixes`,
-/// `promoted_roots`), naming sources (`notes`, `repo`) that may or may
-/// not be registered. Non-ASCII and empty-string values are included on
-/// purpose.
+/// `promoted_roots` and the five remote tables), naming sources
+/// (`notes`, `repo`, `gh`, `gdrive`) that may or may not be registered.
+/// Non-ASCII and empty-string values are included on purpose.
 pub fn seed_durable_rows(conn: &rusqlite::Connection) {
     conn.execute_batch(
         "INSERT INTO fix_log (created_at, kind, status, old_source, old_path, new_source,
@@ -291,7 +301,29 @@ pub fn seed_durable_rows(conn: &rusqlite::Connection) {
                     1700000300, 1700000300);
          INSERT INTO promoted_roots (parent, rel_path, source, created_at)
             VALUES ('repo', 'crates/tephrad', 'tephrad', 1700000400),
-                   ('notes', 'Ideas', 'ideas', 1700000500);",
+                   ('notes', 'Ideas', 'ideas', 1700000500);
+         INSERT INTO remote_sources (name, kind, target, branch, cache, status, status_reason,
+                                     created_at, last_sync_at)
+            VALUES ('gh', 'github', 'danrfletcher/atlas', 'main', 1, 'active', NULL,
+                    1700000600, 1700000700),
+                   ('gdrive', 'drive', 'Notes Café', NULL, 0, 'offline', 'no network',
+                    1700000650, NULL);
+         INSERT INTO remote_items (source, path, kind, file_id, etag, sha, revision, size, state,
+                                   reason, last_used)
+            VALUES ('gh', 'docs/Café.md', 'prose', NULL, 'W/\"abc\"', 'e69de29b', NULL, 120,
+                    'cached', NULL, 1700000800),
+                   ('gdrive', 'Plan.md', 'prose', '1AbC', NULL, NULL, 'rev-9', 0,
+                    'needs_attention', 'changed on Drive', NULL);
+         INSERT INTO upload_queue (source, path, base_revision, attempts, next_retry_at,
+                                   last_error, created_at)
+            VALUES ('gdrive', 'Plan.md', 'rev-9', 3, 1700000900, 'changed on Drive', 1700000850),
+                   ('gdrive', 'Trip Plans/Ideas.md', NULL, 0, NULL, NULL, 1700000860);
+         INSERT INTO remote_pins (source, path, is_folder, created_at)
+            VALUES ('gdrive', 'Trip Plans', 1, 1700000870),
+                   ('gh', 'README.md', 0, 1700000880);
+         INSERT INTO remote_cursors (source, cursor, index_complete, updated_at)
+            VALUES ('gh', 'W/\"tip\"', 1, 1700000890),
+                   ('gdrive', NULL, 0, NULL);",
     )
     .expect("seed durable rows");
 }

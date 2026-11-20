@@ -12,14 +12,37 @@ path = "src/lib.rs"
 name = "tephractl"
 path = "src/main.rs"
 
+[features]
+# Test-only: compiles the file credential store (in `tephra-remote`) so a
+# `test_credential_file` in config.toml selects it. Off by default: a
+# default build has no file-store code, and `cargo test --workspace` does
+# not turn it on (features unify across the workspace, and `tephrad`'s
+# tests need a build without it).
+test-credential-store = ["tephra-remote/test-credential-store"]
+
 [dependencies]
 # `localtime_r`, for `ls`'s local modified-time column (no date crate).
 libc = "0.2"
 reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "json", "rustls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.154"
+# `auth`: the credential store trait and the GitHub adapter (the token is
+# checked with `GET /user` before it is stored), the base-URL rule and the
+# URL parser for the Google client JSON.
+tephra-remote = { path = "../tephra-remote" }
+# `auth`: read the few config.toml keys it needs (no daemon involved).
+toml = "0.8"
+# `auth google`: the PKCE S256 challenge and the random verifier and state.
+sha2 = "0.10"
+rand = "0.8"
+# `auth github` drives the async GitHub adapter from this blocking binary.
+tokio = { version = "1", features = ["rt", "time", "net"] }
+# `auth google`: the consent URL and the callback query.
+percent-encoding = "2.3.2"
 
 [dev-dependencies]
+# The fake GitHub and Google sign-in servers.
+tephra-remote = { path = "../tephra-remote", features = ["test-support"] }
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }
 axum = { version = "0.8.9", features = ["ws"] }

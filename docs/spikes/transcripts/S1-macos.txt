@@ -1,0 +1,43 @@
+fixture: 50 files at c1, bare repo at ed156e5
+  s1.fixture.files                               50
+== S1 git half: s1.fixture (file:///var/folders/lz/4lt5vlt56xl8bdv7x6k1jqz00000gn/T//tephra-spike.3sRa3C/fixture.git)
+  git: git version 2.50.1 (Apple Git-155)
+  s1.fixture.git_version                         2.50.1 (Apple Git-155)
+  s1.fixture.before_clone.git_kb                 0
+  s1.fixture.clone_ms                            114
+  s1.fixture.after_blobless_clone.git_kb         120
+  s1.fixture.after_blobless_clone.git_bytes      30634
+  s1.fixture.after_blobless_clone.git_packs      1
+  s1.fixture.after_blobless_clone.git_blob_objects 0
+  s1.fixture.fetch_ms                            105
+  s1.fixture.after_fetch.git_kb                  148
+  s1.fixture.after_fetch.git_bytes               34277
+  s1.fixture.after_fetch.git_packs               2
+  s1.fixture.after_fetch.git_blob_objects        0
+  s1.fixture.base                                ed156e5b2838
+  s1.fixture.head                                5c84163023dd
+  s1.fixture.ls_tree_ms                          65
+  s1.fixture.ls_tree_entries                     50
+  s1.fixture.ls_tree_output_bytes                3401
+  s1.fixture.after_ls_tree.git_kb                148
+  s1.fixture.after_ls_tree.git_bytes             34277
+  s1.fixture.after_ls_tree.git_packs             2
+  s1.fixture.after_ls_tree.git_blob_objects      0
+  s1.fixture.diff_m_ms                           145
+  s1.fixture.diff_m_lines                        2
+  s1.fixture.after_diff_m.git_kb                 160
+  s1.fixture.after_diff_m.git_bytes              35726
+  s1.fixture.after_diff_m.git_packs              3
+  s1.fixture.after_diff_m.git_blob_objects       2
+  s1.fixture.rename_count                        2
+  s1.fixture.rename_pure_found                   1
+  s1.fixture.rename_edited_found                 1
+  s1.fixture.text_files                          50
+  s1.fixture.index_read_ms                       4033
+  s1.fixture.index_read_content_bytes            48131
+  s1.fixture.after_index_read.git_kb             752
+  s1.fixture.after_index_read.git_bytes          117154
+  s1.fixture.after_index_read.git_packs          43
+  s1.fixture.after_index_read.git_blob_objects   51
+  s1.fixture.blobs_landed_by_index_read          49
+  done: s1.fixture

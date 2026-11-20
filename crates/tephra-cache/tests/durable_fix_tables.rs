@@ -1,7 +1,8 @@
-//! `fix_log`, `pending_fixes` and `promoted_roots` are durable: created
-//! like `sources`, never dropped by a schema rebuild, and free of any
-//! foreign key into `sources` or `units` (which a rebuild drops and
-//! recreates). Real SQLite in a tempdir.
+//! `fix_log`, `pending_fixes` and `promoted_roots` (and, since the remote
+//! sources work, the five remote tables, which `remote_tables.rs` covers
+//! in depth) are durable: created like `sources`, never dropped by a
+//! schema rebuild, and free of any foreign key into `sources` or `units`
+//! (which a rebuild drops and recreates). Real SQLite in a tempdir.
 
 mod common;
 
@@ -25,7 +26,7 @@ fn seeded(dir: &tempfile::TempDir) -> Cache {
 }
 
 #[test]
-fn rows_in_all_three_tables_survive_cache_rebuild_byte_for_byte() {
+fn rows_in_every_durable_table_survive_cache_rebuild_byte_for_byte() {
     let dir = tempfile::tempdir().unwrap();
     let mut cache = seeded(&dir);
     common::seed_source_with_units(&cache, "notes", "/vault/notes", SourceStatus::Active);

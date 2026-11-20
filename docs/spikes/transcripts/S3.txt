@@ -1,0 +1,180 @@
+== S3 blobless clone + sparse-checkout under a notify watcher
+  git: git version 2.39.5
+  s3.git_version                                 2.39.5
+  s3.watcher                                     notify 6.1.1 recursive on the clone root, no ignore filter
+  s3.initial.working_tree_files                  4
+  s3.initial.git_blob_objects                    4
+  s3.initial.sparse_patterns                     
+-- phase A: git sparse-checkout set docs
+  s3.A.events_total                              91
+  s3.A.events_in_dot_git                         31
+  s3.A.events_in_working_tree                    60
+  s3.A.working_tree_files                        24
+  s3.A.git_kb                                    144
+  s3.A.git_blob_objects                          24
+  s3.A.git_packs                                 3
+  working-tree events (kind, path, count; first 12):
+          1 Modify(Data(Any))	docs/doc-20.md
+          1 Modify(Data(Any))	docs/doc-19.md
+          1 Modify(Data(Any))	docs/doc-18.md
+          1 Modify(Data(Any))	docs/doc-17.md
+          1 Modify(Data(Any))	docs/doc-16.md
+          1 Modify(Data(Any))	docs/doc-15.md
+          1 Modify(Data(Any))	docs/doc-14.md
+          1 Modify(Data(Any))	docs/doc-13.md
+          1 Modify(Data(Any))	docs/doc-12.md
+          1 Modify(Data(Any))	docs/doc-11.md
+          1 Modify(Data(Any))	docs/doc-10.md
+          1 Modify(Data(Any))	docs/doc-09.md
+  .git events (collapsed paths, top 8):
+          5 .git/objects/pack/tmp_pack_<rand>
+          5 .git/info/sparse-checkout.lock
+          5 .git/index.lock
+          4 .git/objects/pack/tmp_idx_<rand>
+          3 .git/objects/maintenance.lock
+          2 .git/objects/pack/pack-<id>.promisor
+          2 .git/objects/pack/pack-<id>.pack
+          2 .git/info/sparse-checkout
+-- phase B: fixture moves to its second commit, then git fetch
+  s3.B.events_total                              41
+  s3.B.events_in_dot_git                         41
+  s3.B.events_in_working_tree                    0
+  s3.B.working_tree_files                        24
+  s3.B.git_kb                                    168
+  s3.B.git_blob_objects                          24
+  s3.B.git_packs                                 4
+  working-tree events (kind, path, count; first 12):
+  .git events (collapsed paths, top 8):
+          7 .git/objects/pack/tmp_pack_<rand>
+          6 .git/refs/remotes/origin/main.lock
+          5 .git/refs/tags/fixture-c2.lock
+          5 .git/objects/pack/tmp_idx_<rand>
+          4 .git/FETCH_HEAD
+          3 .git/objects/maintenance.lock
+          3 .git/logs/refs/remotes/origin/main
+          2 .git/refs/tags/fixture-c2
+-- phase C: git sparse-checkout add src
+  s3.C.events_total                              93
+  s3.C.events_in_dot_git                         32
+  s3.C.events_in_working_tree                    61
+  s3.C.working_tree_files                        44
+  s3.C.git_kb                                    176
+  s3.C.git_blob_objects                          44
+  s3.C.git_packs                                 5
+  working-tree events (kind, path, count; first 12):
+          1 Modify(Data(Any))	src/mod-20.txt
+          1 Modify(Data(Any))	src/mod-19.txt
+          1 Modify(Data(Any))	src/mod-18.txt
+          1 Modify(Data(Any))	src/mod-17.txt
+          1 Modify(Data(Any))	src/mod-16.txt
+          1 Modify(Data(Any))	src/mod-15.txt
+          1 Modify(Data(Any))	src/mod-14.txt
+          1 Modify(Data(Any))	src/mod-13.txt
+          1 Modify(Data(Any))	src/mod-12.txt
+          1 Modify(Data(Any))	src/mod-11.txt
+          1 Modify(Data(Any))	src/mod-10.txt
+          1 Modify(Data(Any))	src/mod-09.txt
+  .git events (collapsed paths, top 8):
+          5 .git/objects/pack/tmp_pack_<rand>
+          5 .git/objects/pack/tmp_idx_<rand>
+          5 .git/info/sparse-checkout.lock
+          5 .git/index.lock
+          3 .git/objects/maintenance.lock
+          2 .git/objects/pack/pack-<id>.promisor
+          2 .git/objects/pack/pack-<id>.pack
+          2 .git/info/sparse-checkout
+  s3.outside_file_on_disk_before_read            no
+-- phase D: read notes/note-01.md (outside the set) through git
+  s3.D.events_total                              16
+  s3.D.events_in_dot_git                         16
+  s3.D.events_in_working_tree                    0
+  s3.D.working_tree_files                        44
+  s3.D.git_kb                                    184
+  s3.D.git_blob_objects                          45
+  s3.D.git_packs                                 6
+  working-tree events (kind, path, count; first 12):
+  .git events (collapsed paths, top 8):
+          5 .git/objects/pack/tmp_pack_<rand>
+          4 .git/objects/pack/tmp_idx_<rand>
+          3 .git/objects/maintenance.lock
+          2 .git/objects/pack/pack-<id>.promisor
+          1 .git/objects/pack/pack-<id>.pack
+          1 .git/objects/pack/pack-<id>.idx
+  s3.read_outside.exit_code                      0
+  s3.read_outside.promisor_blobs_added           1
+  s3.read_outside.promisor_packs_added           1
+  s3.read_outside.git_kb_growth                  8
+  s3.outside_file_on_disk_after_read             no
+-- phase E1: working-tree edit to docs/doc-02.md and a local commit on docs/doc-03.md
+  s3.E1.events_total                             60
+  s3.E1.events_in_dot_git                        56
+  s3.E1.events_in_working_tree                   4
+  s3.E1.working_tree_files                       44
+  s3.E1.git_kb                                   204
+  s3.E1.git_blob_objects                         46
+  s3.E1.git_packs                                6
+  working-tree events (kind, path, count; first 12):
+          1 Modify(Data(Any))	docs/doc-03.md
+          1 Modify(Data(Any))	docs/doc-02.md
+          1 Access(Close(Write))	docs/doc-03.md
+          1 Access(Close(Write))	docs/doc-02.md
+  .git events (collapsed paths, top 8):
+          7 .git/objects/<xx>/<oid>
+          6 .git/refs/heads/main.lock
+          6 .git/index.lock
+          4 .git/next-index-1628.lock
+          3 .git/objects/maintenance.lock
+          3 .git/objects/a5/tmp_obj_<rand>
+          3 .git/objects/4b/tmp_obj_<rand>
+          3 .git/objects/29/tmp_obj_<rand>
+  s3.E.status_changes_before_narrowing           1
+  s3.E.local_commits_ahead_of_origin             1
+-- phase E2: git sparse-checkout set src (docs/ leaves the set)
+  s3.E2.events_total                             41
+  s3.E2.events_in_dot_git                        22
+  s3.E2.events_in_working_tree                   19
+  s3.E2.working_tree_files                       25
+  s3.E2.git_kb                                   204
+  s3.E2.git_blob_objects                         46
+  s3.E2.git_packs                                6
+  working-tree events (kind, path, count; first 12):
+          1 Remove(File)	docs/doc-20.md
+          1 Remove(File)	docs/doc-19.md
+          1 Remove(File)	docs/doc-18.md
+          1 Remove(File)	docs/doc-17.md
+          1 Remove(File)	docs/doc-16.md
+          1 Remove(File)	docs/doc-15.md
+          1 Remove(File)	docs/doc-14.md
+          1 Remove(File)	docs/doc-13.md
+          1 Remove(File)	docs/doc-12.md
+          1 Remove(File)	docs/doc-11.md
+          1 Remove(File)	docs/doc-10.md
+          1 Remove(File)	docs/doc-09.md
+  .git events (collapsed paths, top 8):
+          6 .git/objects/<xx>/<oid>
+          6 .git/index.lock
+          5 .git/info/sparse-checkout.lock
+          2 .git/info/sparse-checkout
+          2 .git/index
+          1 .git/objects/pack/pack-<id>.pack
+  git said: warning: The following paths are not up to date and were left despite sparse patterns: 	docs/doc-02.md  After fixing the above paths, you may want to run `git sparse-checkout reapply`. 
+  s3.E.after_narrowing.docs_doc_02_dirty_file    present
+  s3.E.after_narrowing.docs_doc_03_unpushed_commit_file absent
+  s3.E.after_narrowing.docs_doc_04_clean_file    absent
+  s3.E.after_narrowing.status_changes            1
+  s3.E.after_narrowing.local_commits_ahead_of_origin 1
+-- phase E3: remove src/mod-05.txt by hand (for comparison)
+  s3.E3.events_total                             1
+  s3.E3.events_in_dot_git                        0
+  s3.E3.events_in_working_tree                   1
+  s3.E3.working_tree_files                       24
+  s3.E3.git_kb                                   204
+  s3.E3.git_blob_objects                         46
+  s3.E3.git_packs                                6
+  working-tree events (kind, path, count; first 12):
+          1 Remove(File)	src/mod-05.txt
+  .git events (collapsed paths, top 8):
+  s3.E.after_hand_removal.status_changes         2
+  s3.E.after_hand_removal.status_line            _D_src/mod-05.txt
+  raw event log: 359 events, saved to spikes/out/s3-events.tsv
+  done: S3

@@ -7,6 +7,7 @@
 use std::io::{self, BufReader, Write};
 use std::process::ExitCode;
 
+use tephractl::auth;
 use tephractl::cli::{self, Action};
 use tephractl::commands;
 use tephractl::daemon;
@@ -36,6 +37,24 @@ fn main() -> ExitCode {
     // the first start, when no token exists yet).
     if daemon::is_daemon_command(&parsed.command) {
         let code = daemon::run(
+            &parsed.command,
+            parsed.json,
+            &mut io::stdout(),
+            &mut io::stderr(),
+        );
+        let _ = io::stdout().flush();
+        let _ = io::stderr().flush();
+        return if code == 0 {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
+
+    // `auth` commands sign in to GitHub and Google and use the credential
+    // store: no bearer token file, no daemon.
+    if auth::is_auth_command(&parsed.command) {
+        let code = auth::run_from_environment(
             &parsed.command,
             parsed.json,
             &mut io::stdout(),
