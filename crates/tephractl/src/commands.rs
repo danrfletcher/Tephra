@@ -148,6 +148,20 @@ pub fn execute_with_prompt_writer<R: BufRead, W: Write>(
                 stderr: String::from_utf8_lossy(&err).into_owned(),
             }
         }
+        // Same: `main.rs` runs the `auth` commands before any token or
+        // client exists.
+        Command::AuthGithub { .. }
+        | Command::AuthGoogle
+        | Command::AuthStatus
+        | Command::AuthLogout { .. } => {
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let exit_code = crate::auth::run_from_environment(command, json, &mut out, &mut err);
+            CommandOutcome {
+                exit_code,
+                stdout: String::from_utf8_lossy(&out).into_owned(),
+                stderr: String::from_utf8_lossy(&err).into_owned(),
+            }
+        }
     }
 }
 

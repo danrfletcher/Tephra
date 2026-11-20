@@ -24,6 +24,19 @@ pub fn data_dir() -> PathBuf {
     resolve_data_dir(|k| env::var(k).ok())
 }
 
+/// Returns the directory tephra's config file lives in, honoring
+/// `XDG_CONFIG_HOME` and falling back to `~/.config/tephra`. The same
+/// rule as `tephrad`'s `paths::config_dir` (the daemon's module is
+/// binary-only, so this is an independent copy, like [`data_dir`]).
+pub fn config_dir() -> PathBuf {
+    resolve_config_dir(|k| env::var(k).ok())
+}
+
+/// The default config file path: `<config_dir>/config.toml`.
+pub fn default_config_path() -> PathBuf {
+    config_dir().join("config.toml")
+}
+
 /// The default token path: `<data_dir>/token`.
 pub fn default_token_path() -> PathBuf {
     data_dir().join("token")
@@ -40,6 +53,19 @@ where
     }
     let home = get("HOME").unwrap_or_else(|| ".".to_string());
     PathBuf::from(home).join(".local/share").join("tephra")
+}
+
+fn resolve_config_dir<F>(get: F) -> PathBuf
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if let Some(v) = get("XDG_CONFIG_HOME") {
+        if !v.is_empty() {
+            return PathBuf::from(v).join("tephra");
+        }
+    }
+    let home = get("HOME").unwrap_or_else(|| ".".to_string());
+    PathBuf::from(home).join(".config").join("tephra")
 }
 
 #[cfg(test)]
@@ -86,6 +112,20 @@ mod tests {
         assert_eq!(
             dir.join("token"),
             PathBuf::from("/custom/data/tephra/token")
+        );
+    }
+
+    #[test]
+    fn config_dir_honors_xdg_config_home_and_falls_back_to_home() {
+        let get = env_map(&[
+            ("XDG_CONFIG_HOME", "/custom/cfg"),
+            ("HOME", "/home/someone"),
+        ]);
+        assert_eq!(resolve_config_dir(get), PathBuf::from("/custom/cfg/tephra"));
+        let get = env_map(&[("XDG_CONFIG_HOME", ""), ("HOME", "/home/someone")]);
+        assert_eq!(
+            resolve_config_dir(get),
+            PathBuf::from("/home/someone/.config/tephra")
         );
     }
 }

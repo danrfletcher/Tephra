@@ -6,6 +6,9 @@
 #[path = "cli/support/mock_server.rs"]
 mod support;
 
+#[path = "cli/support/auth_support.rs"]
+mod auth_support;
+
 #[path = "cli/args.rs"]
 mod args;
 
@@ -38,3 +41,12 @@ mod transport;
 
 #[path = "cli/search_in_file.rs"]
 mod search_in_file;
+
+#[path = "cli/remote_auth.rs"]
+mod remote_auth;
+
+#[path = "cli/google_loopback.rs"]
+mod google_loopback;
+
+#[path = "cli/auth_secrets.rs"]
+mod auth_secrets;

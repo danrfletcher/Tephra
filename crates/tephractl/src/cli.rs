@@ -11,6 +11,8 @@
 
 use std::fmt;
 
+use tephra_remote::credentials::Provider;
+
 use crate::since::Since;
 
 pub const USAGE: &str = "\
@@ -36,6 +38,10 @@ USAGE:
     tephractl daemon install [--from <path>] [--json]
     tephractl daemon uninstall
     tephractl daemon status [--json]
+    tephractl auth github [-]
+    tephractl auth google
+    tephractl auth status [--json]
+    tephractl auth logout github|google
     tephractl -h | --help
 
 LS:
@@ -115,6 +121,20 @@ DAEMON (macOS only; need no token and no running daemon):
                       (--from <path> installs that tephrad instead of the one next to tephractl)
     daemon uninstall  Unload the agent and remove the plist and the installed copy
     daemon status     Show whether the agent is installed and running
+
+AUTH (need no token and no running daemon; credentials go to the macOS Keychain only):
+    auth github [-]       Sign in to GitHub. Reads the token with echo off, or one line from
+                          stdin with `-` (so it can be piped in). A token is never taken as an
+                          argument. Checks it with GET /user and stores it only if GitHub
+                          accepts it. Needs a fine-grained read-only token.
+    auth google           Sign in to Google Drive in your browser (loopback redirect, PKCE).
+                          Needs google_client_json in config.toml: your own Desktop-app OAuth
+                          client, published In production (in Testing mode Google expires
+                          refresh tokens after 7 days). Waits up to 5 minutes.
+    auth status [--json]  One line per provider: signed in or auth_required. Reads the
+                          credential store only; makes no network call and shows no token.
+    auth logout <provider>  Delete that provider's stored credential (github or google). It
+                          is local only: nothing is revoked at GitHub or Google.
 
 GLOBAL OPTIONS:
     --json          Print raw structured JSON instead of human-readable text
@@ -250,6 +270,19 @@ pub enum Command {
     },
     DaemonUninstall,
     DaemonStatus,
+    /// `auth github [-]`. `stdin` is the `-`: read the token from one
+    /// line of stdin instead of the hidden prompt.
+    AuthGithub {
+        stdin: bool,
+    },
+    /// `auth google`.
+    AuthGoogle,
+    /// `auth status`.
+    AuthStatus,
+    /// `auth logout <provider>`.
+    AuthLogout {
+        provider: Provider,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -371,6 +404,17 @@ where
         "backlinks" => parse_backlinks(&mut iter)?,
         "fixes" => parse_fixes(&mut iter)?,
         "daemon" => parse_daemon(&mut iter)?,
+        "auth" => {
+            let (command, json) = parse_auth(&mut iter)?;
+            // `--json` and `--addr` before the word: only `auth status`
+            // has JSON output, and no `auth` command talks to the daemon.
+            if (leading_json && !matches!(command, Command::AuthStatus)) || leading_addr.is_some() {
+                return Err(ArgsError(
+                    "auth commands take no --addr, and --json only on auth status".to_string(),
+                ));
+            }
+            (command, json, None)
+        }
         other => return Err(ArgsError(format!("unrecognized command: {other}"))),
     };
 
@@ -716,6 +760,58 @@ fn parse_daemon_trailing<'a>(
         }
     }
     Ok((json, ()))
+}
+
+/// `auth ...`. The messages here never repeat an argument: a token
+/// typed after `auth github` by mistake must not be echoed back into the
+/// terminal scrollback, a log or a CI transcript.
+fn parse_auth<'a>(iter: &mut impl Iterator<Item = &'a str>) -> Result<(Command, bool), ArgsError> {
+    let sub = iter.next().ok_or_else(|| {
+        ArgsError("expected an auth subcommand: github, google, status, or logout".to_string())
+    })?;
+    match sub {
+        "github" => match (iter.next(), iter.next()) {
+            (None, _) => Ok((Command::AuthGithub { stdin: false }, false)),
+            (Some("-"), None) => Ok((Command::AuthGithub { stdin: true }, false)),
+            _ => Err(ArgsError(
+                "auth github takes no token argument (a token on the command line would \
+                 reach your shell history and the process list); run `auth github` and \
+                 type it at the prompt, or pipe it in with `auth github -`"
+                    .to_string(),
+            )),
+        },
+        "google" => match iter.next() {
+            None => Ok((Command::AuthGoogle, false)),
+            Some(_) => Err(ArgsError("auth google takes no arguments".to_string())),
+        },
+        "status" => match (iter.next(), iter.next()) {
+            (None, _) => Ok((Command::AuthStatus, false)),
+            (Some("--json"), None) => Ok((Command::AuthStatus, true)),
+            _ => Err(ArgsError(
+                "auth status takes no arguments except --json".to_string(),
+            )),
+        },
+        "logout" => {
+            let provider = match iter.next() {
+                Some("github") => Provider::Github,
+                Some("google") => Provider::Google,
+                _ => {
+                    return Err(ArgsError(
+                        "auth logout needs one provider: github or google".to_string(),
+                    ))
+                }
+            };
+            match iter.next() {
+                None => Ok((Command::AuthLogout { provider }, false)),
+                Some(_) => Err(ArgsError(
+                    "auth logout takes exactly one provider: github or google".to_string(),
+                )),
+            }
+        }
+        _ => Err(ArgsError(
+            "unrecognized auth subcommand (expected github, google, status, or logout)".to_string(),
+        )),
+    }
 }
 
 fn parse_block_id<'a>(

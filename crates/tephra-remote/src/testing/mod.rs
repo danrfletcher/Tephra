@@ -2,6 +2,9 @@
 //! for every later PR that needs a remote to talk to. Compiled only with
 //! the cargo feature `test-support`.
 //!
+//! - [`FakeGoogleOAuth`] is the Google sign-in pair (consent redirect and
+//!   token endpoint) that `tephractl auth google` talks to; it needs no
+//!   bearer token and checks the PKCE verifier.
 //! - [`FakeGithub`] and [`FakeDrive`] are `axum` servers on `127.0.0.1:0`
 //!   (loopback only; never another address). `base_url()` is what to pass
 //!   to the real adapter; a Drive fake's base URL ends in `/drive/v3`.
@@ -40,9 +43,11 @@ use crate::clock::Clock;
 
 mod drive;
 mod github;
+mod google_oauth;
 
 pub use drive::{DriveLimit, FakeDrive};
 pub use github::{FakeGithub, GithubLimit};
+pub use google_oauth::{AuthorizeRequest, FakeGoogleOAuth, TokenRequest};
 
 /// One request the fake saw.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,6 +123,9 @@ impl RequestLog {
 /// Which tokens the fake accepts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AuthMode {
+    /// No token needed: the OAuth endpoints, which are called before
+    /// anyone holds a token.
+    Open,
     /// Any non-empty bearer token.
     Any,
     /// Only these. An empty set is a revoked token: everything is a 401.
@@ -193,6 +201,7 @@ impl<S> Common<S> {
             .map(str::trim)
             .filter(|t| !t.is_empty());
         match (&*self.auth(), token) {
+            (AuthMode::Open, _) => true,
             (_, None) => false,
             (AuthMode::Any, Some(_)) => true,
             (AuthMode::Only(set), Some(t)) => set.contains(t),

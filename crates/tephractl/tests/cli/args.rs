@@ -233,3 +233,71 @@ fn daemon_commands_run_when_no_token_file_exists() {
         .to_lowercase()
         .contains("token"));
 }
+
+/// Every `auth` line of `cli::USAGE` parses to its command (PR-4).
+#[test]
+fn every_auth_usage_line_parses() {
+    use tephra_remote::credentials::Provider;
+
+    let auth_lines: Vec<&str> = cli::USAGE
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("tephractl auth "))
+        .collect();
+    assert_eq!(auth_lines.len(), 4, "{auth_lines:?}");
+
+    let cases: [(&[&str], Command, bool); 7] = [
+        (
+            &["auth", "github"],
+            Command::AuthGithub { stdin: false },
+            false,
+        ),
+        (
+            &["auth", "github", "-"],
+            Command::AuthGithub { stdin: true },
+            false,
+        ),
+        (&["auth", "google"], Command::AuthGoogle, false),
+        (&["auth", "status"], Command::AuthStatus, false),
+        (&["auth", "status", "--json"], Command::AuthStatus, true),
+        (
+            &["auth", "logout", "github"],
+            Command::AuthLogout {
+                provider: Provider::Github,
+            },
+            false,
+        ),
+        (
+            &["auth", "logout", "google"],
+            Command::AuthLogout {
+                provider: Provider::Google,
+            },
+            false,
+        ),
+    ];
+    for (args, command, json) in cases {
+        let parsed = run(args).unwrap();
+        assert_eq!(parsed.command, command, "{args:?}");
+        assert_eq!(parsed.json, json, "{args:?}");
+    }
+}
+
+/// A token or another provider name is a usage error, and the message
+/// never repeats what was typed.
+#[test]
+fn auth_usage_errors_do_not_echo_the_argument() {
+    for args in [
+        vec!["auth"],
+        vec!["auth", "github", "ghp_SENTINELTOKEN"],
+        vec!["auth", "github", "-", "ghp_SENTINELTOKEN"],
+        vec!["auth", "google", "ya29.SENTINELTOKEN"],
+        vec!["auth", "status", "ghp_SENTINELTOKEN"],
+        vec!["auth", "logout"],
+        vec!["auth", "logout", "ghp_SENTINELTOKEN"],
+        vec!["auth", "logout", "github", "google"],
+        vec!["auth", "ghp_SENTINELTOKEN"],
+    ] {
+        let err = cli::parse_args(args.iter().copied()).unwrap_err();
+        assert!(!err.0.contains("SENTINEL"), "{args:?}: {err}");
+    }
+}

@@ -2163,6 +2163,7 @@ dependencies = [
  "security-framework",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tephra-remote",
  "tokio",
  "tracing",
@@ -2176,14 +2177,19 @@ dependencies = [
  "axum",
  "filetime",
  "libc",
+ "percent-encoding",
+ "rand 0.8.8",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tephra-cache",
  "tephra-graph",
+ "tephra-remote",
  "tephrad",
  "tokio",
+ "toml",
 ]
 
 [[package]]

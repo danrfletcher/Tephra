@@ -79,6 +79,12 @@ Every command takes `--json` (raw structured output) and `--addr <addr>` (daemon
 | `backlinks <id>` | The links to one file (`@s:path`) or one block (`@s:path#^id`), one row per link with its line. |
 | `fixes [--since <30m\|2h\|7d\|date>] [--json]` | The log of automatic link fixes (`fix.list`), newest first: `time kind old -> new (n files) status`; an `uncertain` line ends with ` - why`. It only reads. |
 | `daemon install`, `daemon uninstall`, `daemon status` | Run `tephrad` as a launchd agent (macOS only). |
+| `auth github [-]` | Sign in to GitHub. It reads a token with echo off (or one line from stdin with `-`; a token is never an argument, so it cannot reach shell history or `ps`), checks it with `GET /user`, and only on a 200 stores it in the macOS Keychain and prints `signed in as <login>`. A rejected, empty or whitespace-containing token, a rate limit or a network error exits 1 and stores nothing. Use a fine-grained read-only token. |
+| `auth google` | Sign in to Google Drive in your browser (loopback redirect on `127.0.0.1`, PKCE). It prints the consent URL, opens it, waits up to 5 minutes, and stores the token set, refresh token included, in the Keychain. It needs `google_client_json` in `config.toml`: the path to the JSON of your own Google Cloud OAuth client of type Desktop app, with the consent screen published In production (a client left in Testing mode gets refresh tokens that expire after 7 days). |
+| `auth status` | One line per provider, `signed in` or `auth_required`, read from the Keychain only (nothing is sent; a credential the provider has since revoked still reads `signed in`). `--json` gives `{"github":{"state":...},"google":{"state":...}}`. It never prints a token. |
+| `auth logout github` or `auth logout google` | Delete that provider's Keychain item and leave the other alone. Local only: the token is not revoked at the provider. Not signed in is not an error. |
+
+The `auth` commands need neither the daemon nor the bearer-token file, and add no RPC method. Credentials live only in the macOS Keychain, one item per provider; if the Keychain cannot be used the command exits 1 with `Keychain unavailable` and nothing is written anywhere else. `config.toml` keys read by `tephractl`: `google_client_json`, and, for tests only, `github_api_url` (a loopback URL) and `test_credential_file` (honoured only by a build with the `test-credential-store` feature).
 
 Searches never change how a link resolves: an unprefixed `[[Name]]` resolves only inside its own source.
 
