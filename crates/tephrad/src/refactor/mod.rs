@@ -850,7 +850,7 @@ fn split_federated_id(id: &str) -> Option<(&str, &str)> {
 /// from its end. When that offset falls inside a multi-byte character
 /// (`Todo…ab`, `Résumé—v2.docx`) the name cannot end in the extension
 /// and comes back as `(p, None)`.
-fn strip_md_ext(p: &str) -> (&str, Option<&str>) {
+pub(crate) fn strip_md_ext(p: &str) -> (&str, Option<&str>) {
     for ext in [".md", ".markdown"] {
         if p.len() > ext.len() {
             let idx = p.len() - ext.len();
@@ -863,12 +863,6 @@ fn strip_md_ext(p: &str) -> (&str, Option<&str>) {
         }
     }
     (p, None)
-}
-
-/// [`strip_md_ext`] for the fix engine: the path without a `.md` or
-/// `.markdown` extension, and the extension.
-pub(crate) fn strip_md_ext_pub(p: &str) -> (&str, Option<&str>) {
-    strip_md_ext(p)
 }
 
 fn basename(p: &str) -> &str {
@@ -1088,11 +1082,36 @@ impl AtomicFs for RealFs {
         fs::set_permissions(path, perms)
     }
     fn sync(&self, path: &Path) -> io::Result<()> {
-        fs::File::open(path)?.sync_all()
+        sync_before_rename(&fs::File::open(path)?)
     }
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         fs::rename(from, to)
     }
+}
+
+/// Makes a temp file's bytes reach the disk before the rename that
+/// publishes them (the ordering that keeps a crash from leaving an empty
+/// or torn file under the real name).
+///
+/// On Linux and elsewhere that is `sync_all` (`fsync`). On macOS
+/// `sync_all` is `F_FULLFSYNC`, which also empties the drive's own write
+/// cache: about 10 ms a file here, and for a fix that rewrites 500 files
+/// more than half of the 5 s the client waits for its reply. What a
+/// temp-file-then-rename needs is only the ORDER (this file's data before
+/// the rename that follows), and macOS has a call for exactly that,
+/// `F_BARRIERFSYNC`: `fsync` plus a barrier to the drive, about a third
+/// of the cost. A file system that refuses it gets the full flush.
+fn sync_before_rename(file: &fs::File) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: `fd` is open for the whole call; F_BARRIERFSYNC takes
+        // no argument.
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_BARRIERFSYNC) } == 0 {
+            return Ok(());
+        }
+    }
+    file.sync_all()
 }
 
 /// Rewrites `target`'s content to `new_content` via the real
@@ -1157,6 +1176,9 @@ pub fn rewrite_links_atomic_with(
         .unwrap_or("file");
     let tmp_name = format!(".{file_name}.tephra-tmp-{}", rand::random::<u32>());
     let tmp_path = dir.join(tmp_name);
+    // Named as in flight until the rename (or the cleanup after a
+    // failure) is done, so no source walk sweeps it away meanwhile.
+    let _in_flight = LiveTemp::claim(&tmp_path);
 
     let write_and_prepare = (|| -> io::Result<()> {
         fs_ops.write_new(&tmp_path, new_content)?;
@@ -1250,6 +1272,50 @@ pub fn is_stale_temp_file_name(file_name: &str) -> bool {
         Some((_, suffix)) => !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()),
         None => false,
     }
+}
+
+/// Temp files of atomic rewrites that are being written right now in
+/// this process, by absolute path.
+static LIVE_TEMPS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Holds `path`, the temp file of an atomic rewrite, as in flight for as
+/// long as the guard lives. A temp file is named like a stale one the
+/// moment it is created, so a source walk running in the same process
+/// (the rescan after a rewrite, a register, a catch-up) would otherwise
+/// remove it from under the writer, whose rename then fails with "No such
+/// file or directory". The walks ask [`is_live_temp`] before sweeping.
+/// Claim the path BEFORE creating the file and drop the guard only after
+/// the rename or the cleanup. Only a file left by a killed process, which
+/// no guard names, is ever swept.
+pub(crate) struct LiveTemp(PathBuf);
+
+impl LiveTemp {
+    pub(crate) fn claim(path: &Path) -> Self {
+        LIVE_TEMPS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(path.to_path_buf());
+        LiveTemp(path.to_path_buf())
+    }
+}
+
+impl Drop for LiveTemp {
+    fn drop(&mut self) {
+        let mut live = LIVE_TEMPS.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(i) = live.iter().position(|p| *p == self.0) {
+            live.swap_remove(i);
+        }
+    }
+}
+
+/// Whether `path` is the temp file of a rewrite in flight in this
+/// process (see [`LiveTemp`]).
+pub fn is_live_temp(path: &Path) -> bool {
+    LIVE_TEMPS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .any(|p| p == path)
 }
 
 // ---------------------------------------------------------------

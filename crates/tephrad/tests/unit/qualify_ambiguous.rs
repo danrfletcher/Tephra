@@ -428,6 +428,34 @@ fn the_other_sources_names_are_a_fact_about_the_index_not_a_search() {
     assert!(!graph.name_in_other_source("@docs:Nothing.md"));
 }
 
+/// A file that moved to another source is, until the graph is rebuilt,
+/// still a unit of its old source. Asked about its new id, that unit is
+/// the file itself: it must not make the name "also in another source"
+/// and so qualify every plain link to it.
+#[test]
+fn a_moved_file_still_held_at_its_old_id_is_not_another_sources_file_of_the_same_name() {
+    let mut graph = UnitGraph::new();
+    graph.register_source("old");
+    graph.register_source("new");
+    graph.upsert_unit("old", "docs/Plan.md", UnitFacts::default());
+    graph.upsert_unit("new", "docs/Plan.md", UnitFacts::default());
+    assert!(
+        FixSpelling::for_target(&graph, "@new:docs/Plan.md", true).qualify,
+        "asked as a stranger: the old unit counts"
+    );
+    let spelling =
+        FixSpelling::for_target_ignoring(&graph, "@new:docs/Plan.md", true, &["@old:docs/Plan.md"]);
+    assert!(!spelling.qualify, "the old unit is the moved file");
+
+    // A third source's file of the same name still counts.
+    graph.register_source("third");
+    graph.upsert_unit("third", "x/Plan.md", UnitFacts::default());
+    assert!(
+        FixSpelling::for_target_ignoring(&graph, "@new:docs/Plan.md", true, &["@old:docs/Plan.md"])
+            .qualify
+    );
+}
+
 #[test]
 fn a_move_and_a_respelled_link_use_the_same_decision() {
     // Later fix kinds (move, promote, unpromote) take their spelling from

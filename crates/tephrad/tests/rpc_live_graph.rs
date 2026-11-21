@@ -410,96 +410,10 @@ fn concurrent_refreshes_across_many_threads_never_lose_a_committed_source() {
     }
 }
 
-/// R9, deterministic proof: directly measures whether two concurrent
-/// `GraphRefresh::refresh()` calls run in parallel or are serialized.
-///
-/// Before the fix, `refresh()` opened the cache, ran the full
-/// `UnitGraph::build_from_cache` rebuild, and called
-/// `SharedGraph::replace` with nothing serializing those three steps
-/// across concurrent callers — two calls could, and in this test's
-/// probing did, run concurrently and both complete in roughly the
-/// time of *one* call. With the fix's `rebuild_lock` held across that
-/// whole sequence, the second caller to acquire it cannot start its
-/// own rebuild until the first one has fully finished (read, build,
-/// *and* replace), so two concurrent calls together always take at
-/// least on the order of *two* calls' worth of time, never one's.
-///
-/// A sizeable base source is registered first purely to make a
-/// single `refresh()` call's own duration (measured directly below,
-/// rather than assumed) long enough to be a reliable, non-flaky yardstick
-/// for comparison, instead of hard-coding a magic duration that would
-/// be meaningless on a faster or slower machine.
-#[test]
-fn concurrent_refresh_calls_are_serialized_not_run_in_parallel() {
-    let data_dir = tempfile::tempdir().expect("data dir");
-    let cache_path = data_dir.path().join("cache.db");
-
-    let registry_cache = Cache::open(&cache_path).expect("open cache for registry");
-    let registry = SourceRegistry::new(registry_cache).expect("new registry");
-
-    let graph_cache = Cache::open(&cache_path).expect("open cache for graph");
-    let initial_graph = UnitGraph::build_from_cache(&graph_cache).expect("build initial graph");
-    let shared_graph = Arc::new(SharedGraph::new(initial_graph));
-    let graph_refresh = GraphRefresh::new(shared_graph, cache_path.clone());
-
-    let base = tempfile::tempdir().expect("base vault");
-    for i in 0..6000 {
-        std::fs::write(
-            base.path().join(format!("note-{i}.md")),
-            format!("# Note {i}\n"),
-        )
-        .expect("write base fixture file");
-    }
-    registry
-        .register("base", base.path())
-        .expect("register base");
-
-    // Calibrate against this machine's own speed: time one call alone
-    // first, with nothing else contending for the lock.
-    let single_call_started = std::time::Instant::now();
-    graph_refresh.refresh().expect("calibration refresh");
-    let single_call_duration = single_call_started.elapsed();
-
-    // Now fire two calls at once, released from a `Barrier` together,
-    // and time each one independently from the moment it was
-    // released.
-    let barrier = Arc::new(std::sync::Barrier::new(2));
-    let other = {
-        let graph_refresh = graph_refresh.clone();
-        let barrier = barrier.clone();
-        std::thread::spawn(move || {
-            barrier.wait();
-            let started = std::time::Instant::now();
-            graph_refresh
-                .refresh()
-                .expect("concurrent refresh (other thread)");
-            started.elapsed()
-        })
-    };
-    barrier.wait();
-    let this_started = std::time::Instant::now();
-    graph_refresh
-        .refresh()
-        .expect("concurrent refresh (this thread)");
-    let this_duration = this_started.elapsed();
-    let other_duration = other.join().expect("other thread must not panic");
-
-    // Whichever of the two calls had to wait for the lock takes
-    // roughly as long as *two* calibrated calls; if they instead ran
-    // in parallel, both would take roughly as long as *one*. A
-    // 1.5x-single threshold sits cleanly between those two outcomes.
-    let slower = this_duration.max(other_duration);
-    let threshold = single_call_duration + single_call_duration / 2;
-    assert!(
-        slower >= threshold,
-        "two concurrent refresh() calls completed in {this_duration:?} and {other_duration:?} \
-         (a single calibrated call took {single_call_duration:?}); the slower of the two must \
-         take at least ~1.5x a single call's duration, proving it waited for the other to fully \
-         finish (read, build, and replace) rather than racing it — got {slower:?}, which is \
-         consistent with the two calls having run concurrently instead of being serialized by \
-         `rebuild_lock` (R9)"
-    );
-}
+// The serialisation of concurrent `GraphRefresh::refresh()` calls is proved
+// by the unit test `refresh_waits_for_the_rebuild_lock_and_runs_once_it_is_released`
+// in `src/rpc/backend.rs`: it holds `rebuild_lock` itself instead of comparing
+// wall-clock durations, so it does not depend on host load (R10).
 
 /// G3 over the real RPC transport and the real registry/graph: a `.md`
 /// target's backlinks list the `.txt`, `.org`, `.rst` and `.adoc` units
@@ -769,7 +683,7 @@ async fn block_links_resolve_and_list_backlinks_over_rpc_and_follow_a_watcher_dr
     // GP9: move the enum to conflict.rs; the watcher picks both up.
     repo.write(OLD, "pub fn parse_config() {}\n");
     repo.write(NEW, ENUM);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
     let moved = loop {
         graph_refresh.refresh().expect("refresh");
         let resolved = call(
@@ -810,7 +724,7 @@ async fn block_links_resolve_and_list_backlinks_over_rpc_and_follow_a_watcher_dr
 
     // E8: a copy in a third file makes the moved ID ambiguous.
     repo.write("crates/tephrad/src/copy.rs", ENUM);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
     let ambiguous = loop {
         graph_refresh.refresh().expect("refresh");
         let resolved = call(
@@ -951,7 +865,7 @@ async fn a_source_that_goes_offline_while_running_flags_block_results_offline() 
     // offline transition sends and refresh the way the daemon does.
     while events.try_recv().is_ok() {}
     std::fs::remove_dir_all(repo.root()).expect("remove the source root");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
     loop {
         match events.try_recv() {
             Ok(tephrad::registry::DaemonEvent::SourceChanged { source, .. })

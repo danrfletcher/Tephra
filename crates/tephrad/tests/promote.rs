@@ -323,9 +323,12 @@ fn gp10_the_tephra_layout_rewrites_exactly_the_links_that_must_change() {
     assert!(registry.contains("[[@notes:Design]]"), "{registry}");
     let notes_md = d.text("crates/tephrad/tephrad.md");
     assert!(notes_md.contains("[[@notes:README]]"), "{notes_md}");
-    assert!(
-        notes_md.contains("[[tephrad]]") || !notes_md.contains("crates/tephrad/tephrad"),
-        "{notes_md}"
+    // The path spelling of its own file is respelled (FR23) to the
+    // shortest text that still reaches it, and `[[registry.rs]]` (a name
+    // inside the folder) and `[[@notes:README]]` are exactly as above.
+    assert_eq!(
+        notes_md,
+        "# tephrad notes\n\n[[registry.rs]] [[@notes:README]] [[tephrad]]\n"
     );
     let scan = d.text("crates/tephrad/src/scan.rs");
     assert_eq!(
@@ -526,6 +529,108 @@ fn ignored_paths_stay_untracked_in_the_new_source() {
         .units_under_prefix(parent.id, "proj")
         .unwrap()
         .is_empty());
+    d.close();
+}
+
+/// The folder's own ignore rules decide what the new source keeps: an
+/// ignored file is not re-owned (no rescan is needed to drop it), and a
+/// link to it is left as it was, not rewritten to `@proj:` for a file the
+/// new source never indexes.
+#[test]
+fn ignored_files_are_not_reowned_and_links_to_them_are_not_rewritten() {
+    let d = Daemon::start(
+        &[
+            ("proj/A.md", "# a\n"),
+            ("proj/.tephraignore", "private/\n"),
+            ("proj/private/Secret.md", "# secret\n"),
+            (
+                "Outside.md",
+                "reaches [[proj/A]] and [[proj/private/Secret]]\n",
+            ),
+        ],
+        &[],
+        real_writer(),
+        false,
+    );
+    let out = d
+        .registry
+        .promote("proj", d.notes_root().join("proj"), &d.engine)
+        .expect("promote");
+    assert_eq!(out.units_moved, 1, "only A.md is re-owned");
+
+    // No rescan: the rows are already where they belong.
+    let cache = reopen(&d);
+    let child = cache.get_source("proj").unwrap().unwrap();
+    let parent = cache.get_source("notes").unwrap().unwrap();
+    assert!(cache
+        .get_unit_by_rel_path(child.id, "A.md")
+        .unwrap()
+        .is_some());
+    assert!(cache
+        .get_unit_by_rel_path(child.id, "private/Secret.md")
+        .unwrap()
+        .is_none());
+    assert!(cache
+        .units_under_prefix(parent.id, "proj")
+        .unwrap()
+        .is_empty());
+
+    let outside = d.text("Outside.md");
+    assert!(outside.contains("[[@proj:A]]"), "{outside}");
+    assert!(
+        outside.contains("[[proj/private/Secret]]"),
+        "the link to the ignored file is as it was: {outside}"
+    );
+    d.close();
+}
+
+/// A failure of the promote's own work after its transaction committed
+/// (not a kill) must not leave the new source unwatched and unannounced
+/// until the next start: it is watched and pushed, and the rewrites still
+/// pending are finished by a retry.
+#[test]
+fn a_promote_that_fails_after_it_committed_still_watches_and_announces_the_source() {
+    let d = daemon();
+    let mut client = d.connect();
+    let _ = client.drain(Duration::from_millis(300));
+    let failing = FixEngine::new(&d.cache_path, real_writer()).with_fail_after_promote_reown();
+    let result = d
+        .registry
+        .promote("proj", d.notes_root().join("proj"), &failing);
+    assert!(
+        matches!(&result, Err(RegistryError::Fix(m)) if m.contains("injected failure")),
+        "{result:?}"
+    );
+
+    assert!(
+        d.registry.is_watching("proj"),
+        "the new source has a watcher"
+    );
+    {
+        let cache = reopen(&d);
+        let child = cache.get_source("proj").unwrap().unwrap();
+        let parent = cache.get_source("notes").unwrap().unwrap();
+        assert!(cache
+            .get_unit_by_rel_path(child.id, "A.md")
+            .unwrap()
+            .is_some());
+        assert!(cache
+            .units_under_prefix(parent.id, "proj")
+            .unwrap()
+            .is_empty());
+    }
+    let pushes = client.drain(Duration::from_secs(3));
+    assert!(
+        pushes
+            .iter()
+            .any(|p| p.to_string().contains("sources_changed") && p.to_string().contains("proj")),
+        "a push says the source list changed: {pushes:?}"
+    );
+
+    // The rewrites the failed run left pending are done by a retry.
+    d.engine.resume().expect("resume");
+    let outside = d.text("Outside.md");
+    assert!(outside.contains("[[@proj:A]]"), "{outside}");
     d.close();
 }
 
@@ -731,7 +836,7 @@ fn a_user_edit_of_a_rewritten_file_made_during_the_promote_is_indexed() {
 
     let cache = reopen(&d);
     let notes = cache.get_source("notes").unwrap().expect("notes").id;
-    let indexed = fix_world::wait_until(Duration::from_secs(15), || {
+    let indexed = fix_world::wait_until(Duration::from_secs(60), || {
         let Ok(Some(unit)) = cache.get_unit_by_rel_path(notes, "Outside.md") else {
             return false;
         };

@@ -506,11 +506,11 @@ impl FixEngine {
             let outcome = match result.status {
                 WriteStatus::Written => {
                     announcement.merge(FixAnnouncement {
-                        notices: Vec::new(),
                         written: vec![WrittenFile {
                             source: f.source.clone(),
                             path: abs,
                         }],
+                        ..FixAnnouncement::default()
                     });
                     Ok(result.links_changed)
                 }
@@ -558,14 +558,12 @@ impl FixEngine {
                 }
             }
         }
-        cache.update_fix_log(
-            entry_id,
-            &FixLogChange {
-                status: overall_status(&detail.files).to_string(),
-                files_changed: detail.files_written(),
-                detail_json: Some(detail.to_json()),
-            },
-        )?;
+        let change = FixLogChange {
+            status: overall_status(&detail.files).to_string(),
+            files_changed: detail.files_written(),
+            detail_json: Some(detail.to_json()),
+        };
+        self.write_cache(|| cache.update_fix_log(entry_id, &change))?;
         // The notice of this entry as it stands now.
         if let Some(row) = cache.get_fix_log(entry_id)? {
             let now = FixNotice::from_row(&row);
@@ -746,11 +744,11 @@ impl RenameEvents {
         for (source, paths) in [(old_source, &index_old), (new_source, &index_new)] {
             for path in paths {
                 announcement.merge(FixAnnouncement {
-                    notices: Vec::new(),
-                    written: vec![WrittenFile {
+                    indexed: vec![WrittenFile {
                         source: source.to_string(),
                         path: path.clone(),
                     }],
+                    ..FixAnnouncement::default()
                 });
             }
         }
@@ -800,11 +798,11 @@ impl RenameEvents {
             .map_err(|e| RenameEventError::Failed(e.to_string()))?;
         if known {
             self.engine.announce(FixAnnouncement {
-                notices: Vec::new(),
-                written: vec![WrittenFile {
+                indexed: vec![WrittenFile {
                     source: source.clone(),
                     path: old.abs.clone(),
                 }],
+                ..FixAnnouncement::default()
             });
         }
         Ok(RenameEventWire::NothingToFix)
@@ -852,6 +850,10 @@ impl RenameEvents {
         if target_abs != new.abs {
             index.push(target_abs.clone());
         }
+        // The paths the push names. The old spelling of a case-only
+        // rename is one of them although it is never indexed: a client
+        // that reads the push's paths learns that the old unit is gone.
+        let mut named = Vec::new();
         if old.abs.symlink_metadata().is_ok() {
             // The old spelling still stats (case-insensitive disk): it
             // is the new file under another name, so its rows are
@@ -859,12 +861,14 @@ impl RenameEvents {
             self.registry
                 .forget_spellings(source, std::slice::from_ref(&old.at.rel))
                 .map_err(|e| RenameEventError::Failed(e.to_string()))?;
+            named.push(old.abs.clone());
         } else {
             index.push(old.abs.clone());
         }
         self.registry
             .reindex_paths(source, &index)
             .map_err(|e| RenameEventError::Failed(e.to_string()))?;
+        named.extend(index.iter().cloned());
 
         let started = if is_dir {
             self.fix_folder(&cache, source, root, &log, &old.at.rel, &target, &exists)?
@@ -880,7 +884,7 @@ impl RenameEvents {
             // or one that vanished again): there is nothing to link to.
             Err(FixError::Refused(why)) => {
                 tracing::debug!(source, old = %old.at.rel, new = %new.at.rel, %why, "rename event refused by the engine");
-                self.announce_paths(source, &index);
+                self.announce_paths(source, &named);
                 return Ok(RenameEventWire::NothingToFix);
             }
             Err(e) => return Err(e.into()),
@@ -899,15 +903,17 @@ impl RenameEvents {
             }
         }
 
-        // The rename itself is news too, and the written files have to be
-        // indexed again: one push, after the log entry is complete.
-        for path in &index {
+        // The rename itself is news too: one push, after the log entry
+        // is complete. The paths were indexed above, so the announcement
+        // names them without indexing them again (the old spelling of a
+        // case-only rename must not be indexed at all).
+        for path in &named {
             announcement.merge(FixAnnouncement {
-                notices: Vec::new(),
-                written: vec![WrittenFile {
+                indexed: vec![WrittenFile {
                     source: source.to_string(),
                     path: path.clone(),
                 }],
+                ..FixAnnouncement::default()
             });
         }
         self.engine.announce(announcement);
@@ -917,14 +923,14 @@ impl RenameEvents {
 
     fn announce_paths(&self, source: &str, paths: &[PathBuf]) {
         self.engine.announce(FixAnnouncement {
-            notices: Vec::new(),
-            written: paths
+            indexed: paths
                 .iter()
                 .map(|p| WrittenFile {
                     source: source.to_string(),
                     path: p.clone(),
                 })
                 .collect(),
+            ..FixAnnouncement::default()
         });
     }
 

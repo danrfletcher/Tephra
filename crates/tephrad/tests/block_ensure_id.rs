@@ -644,8 +644,12 @@ async fn a_unit_in_an_offline_source_is_refused() {
 #[tokio::test]
 async fn a_unit_in_a_permission_denied_source_is_refused() {
     use std::os::unix::fs::PermissionsExt;
-    // File modes are ignored for root.
-    if std::fs::metadata("/proc/self").is_err() && std::env::var("USER").as_deref() == Ok("root") {
+    // File modes are ignored for root (the rust container's default user).
+    extern "C" {
+        fn geteuid() -> u32;
+    }
+    if unsafe { geteuid() } == 0 {
+        eprintln!("skipped: running as root, directory modes are ignored");
         return;
     }
     let daemon = Daemon::start().await;
@@ -1002,6 +1006,64 @@ fn concurrent_calls_on_one_paragraph_return_one_id_and_make_one_write() {
         format!("the paragraph\nspans two lines ^{id}\n\nother\n")
     );
     assert_eq!(rig.fs.count_prefix("rename"), 1, "{:?}", rig.fs.calls());
+}
+
+/// An `AtomicFs` that runs a full rescan of the source between the temp
+/// file's creation and the rename, as a concurrent `link.apply_refactor`
+/// (whose last step is a rescan) does in the race below.
+struct RescanBetweenWriteAndRename {
+    registry: Arc<SourceRegistry>,
+}
+
+impl AtomicFs for RescanBetweenWriteAndRename {
+    fn write_new(&self, path: &Path, content: &[u8]) -> std::io::Result<()> {
+        RealFs.write_new(path, content)
+    }
+    fn set_permissions(&self, path: &Path, perms: std::fs::Permissions) -> std::io::Result<()> {
+        RealFs.set_permissions(path, perms)
+    }
+    fn sync(&self, path: &Path) -> std::io::Result<()> {
+        assert!(path.exists(), "the temp file exists before the rescan");
+        self.registry.rescan("notes").expect("rescan");
+        RealFs.sync(path)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        RealFs.rename(from, to)
+    }
+}
+
+/// A source walk (the rescan another writer ends with, a register, a
+/// catch-up) sweeps away files named like a killed writer's temp file.
+/// It must leave the temp file of a write running in this process
+/// alone, or the write's rename fails with "No such file or directory"
+/// (this was the failure of the race test below, about 1 run in 10).
+#[test]
+fn a_rescan_during_the_write_does_not_sweep_the_writers_live_temp_file() {
+    let data = tempfile::tempdir().unwrap();
+    let registry =
+        Arc::new(SourceRegistry::new(Cache::open(data.path().join("cache.db")).unwrap()).unwrap());
+    let src = fixtures::empty_source();
+    src.write_bytes("n.md", b"first\nsecond\n");
+    registry.register("notes", src.root()).unwrap();
+    let engine = BlockIdEngine::with_parts(
+        registry.clone(),
+        Arc::new(RescanBetweenWriteAndRename {
+            registry: registry.clone(),
+        }),
+        Arc::new(RecordingWatcher::default()),
+    )
+    .with_settle(Duration::ZERO);
+
+    let wire = engine
+        .ensure_id("@notes:n.md", 1)
+        .expect("the write succeeds");
+    assert!(wire.created);
+    let id = wire.id.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(src.root().join("n.md")).unwrap(),
+        format!("first\nsecond ^{id}\n")
+    );
+    assert!(temp_files_in(src.root()).is_empty());
 }
 
 /// `block.ensure_id` racing `link.apply_refactor` on the same file:

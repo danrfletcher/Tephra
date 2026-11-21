@@ -583,20 +583,25 @@ impl UnitGraph {
     /// (E2) — [`crate::UnitMetadata::offline`]/[`Edge::offline`]
     /// reflect that rather than the source being dropped.
     pub fn build_from_cache(cache: &Cache) -> Result<Self, GraphError> {
-        let mut graph = UnitGraph::new();
+        // Every read comes from one snapshot: a unit another connection
+        // is re-indexing right now is read whole (its old rows or its new
+        // ones), never as a row whose links are not there yet.
+        let mut graph = cache.read_snapshot(|| {
+            let mut graph = UnitGraph::new();
+            for source in cache.list_sources()? {
+                graph.register_source(&source.name);
+                if source.status == SourceStatus::Offline {
+                    graph.offline_sources.insert(source.name.clone());
+                }
 
-        for source in cache.list_sources()? {
-            graph.register_source(&source.name);
-            if source.status == SourceStatus::Offline {
-                graph.offline_sources.insert(source.name.clone());
+                for with_status in cache.units_with_status_for_source(&source.name)? {
+                    let unit = with_status.unit;
+                    let facts = load_unit_facts(cache, unit.id, unit.frontmatter_json)?;
+                    graph.insert_node(&source.name, &unit.rel_path, facts);
+                }
             }
-
-            for with_status in cache.units_with_status_for_source(&source.name)? {
-                let unit = with_status.unit;
-                let facts = load_unit_facts(cache, unit.id, unit.frontmatter_json)?;
-                graph.insert_node(&source.name, &unit.rel_path, facts);
-            }
-        }
+            Ok::<_, GraphError>(graph)
+        })?;
 
         graph.rebuild_edges();
         Ok(graph)

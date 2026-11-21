@@ -797,6 +797,8 @@ fn now_unix() -> i64 {
 /// crate's own transaction helpers.
 const MAX_CACHE_BUSY_RETRIES: u32 = 8;
 const CACHE_BUSY_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(150);
+/// How often a fix's announcement tries again to index a file it rewrote.
+const ANNOUNCE_REINDEX_RETRIES: u32 = 3;
 
 /// Whether `err` is SQLite's `SQLITE_BUSY`, the same classification
 /// `scan::is_database_busy` applies to a `ScanError`.
@@ -983,8 +985,12 @@ pub enum BootOutcome {
     Offline,
     /// Skipped: the OS will not list its root. Rows kept.
     PermissionDenied,
-    /// Skipped: its watcher could not be started (or its root could
-    /// not be read). Nothing was written for it.
+    /// Its watcher could not be started (nothing was written for it,
+    /// and it is not watched), or its root's ignore rules could not be
+    /// read; or its comparison or catch-up failed (the cache is as it
+    /// was, and the source IS watched from now on, without a rename
+    /// pairing); or it was unregistered while it was starting (no
+    /// watcher is left).
     Failed(String),
     /// A shutdown arrived first: nothing was written for it.
     Stopped,
@@ -1320,9 +1326,21 @@ impl SourceRegistry {
                     .unwrap_or_else(|p| p.into_inner()) = rules;
             }
         };
-        let done = engine
-            .promote(spec, &skip_folder)
-            .map_err(|e| RegistryError::Fix(e.to_string()))?;
+        let done = match engine.promote(spec, &skip_folder) {
+            Ok(done) => done,
+            Err(e) => {
+                // A kill stand-in ([`crate::fixes::FixError::Stopped`]) is
+                // left exactly as a kill leaves it. Any other failure
+                // after the transaction committed must not leave the new
+                // source without a watcher and without a push until the
+                // next start: it is finished here, and the rewrites still
+                // pending are retried like any other.
+                if e != crate::fixes::FixError::Stopped {
+                    self.finish_committed_promote(spec, &skip_folder);
+                }
+                return Err(RegistryError::Fix(e.to_string()));
+            }
+        };
         for file in &done.announcement.written {
             if let Err(e) = self.reindex_quietly(&file.source, &file.path) {
                 tracing::warn!(source = %file.source, path = %file.path.display(), error = %e, "could not index a file the promote rewrote");
@@ -1332,6 +1350,52 @@ impl SourceRegistry {
             .scan_and_watch(&spec.name, done.source_id, &spec.root)
             .map(|_| ());
         Ok((done, scanned))
+    }
+
+    /// After [`FixEngine::promote`] failed: when its transaction had
+    /// committed (the new source's row exists), finishes what the rest of
+    /// the promote would have done, so the source is not left unwatched
+    /// and unannounced until the next start: the rows still in the parent
+    /// are re-owned, the parent skips the folder, the new source is
+    /// scanned and watched, and ONE push says the source list changed
+    /// (with no fix entry: the pending rewrites are retried later). A
+    /// failure before the commit changed nothing and is left alone.
+    ///
+    /// "Committed" means the row named `spec.name` is THIS promote's: its
+    /// path is `spec.root` and a live `promoted_roots` row ties it to
+    /// `spec.parent` and `spec.folder`. A source of the same name that
+    /// `register` added meanwhile (it does not take `promote_lock`) makes
+    /// `begin_promote` fail with a duplicate; that source is not ours, and
+    /// is left exactly as it is.
+    fn finish_committed_promote(&self, spec: &crate::fixes::PromoteSpec, skip_folder: &dyn Fn()) {
+        let source_id = {
+            let cache = self.cache.lock().unwrap();
+            let row = match cache.get_source(&spec.name) {
+                Ok(Some(row)) => row,
+                _ => return,
+            };
+            if Path::new(&row.path) != spec.root.as_path() {
+                return;
+            }
+            let ours = cache.live_promoted_roots().is_ok_and(|roots| {
+                roots.iter().any(|r| {
+                    r.source == spec.name && r.parent == spec.parent && r.rel_path == spec.folder
+                })
+            });
+            if !ours {
+                return;
+            }
+            row.id
+        };
+        self.complete_promotes();
+        skip_folder();
+        if let Err(e) = self.scan_and_watch(&spec.name, source_id, &spec.root) {
+            tracing::warn!(source = %spec.name, error = %e, "could not scan and watch a promoted source after its fix failed");
+        }
+        let _ = self.events_tx.send(DaemonEvent::SourceListChanged {
+            changes: vec![SourceChange::new(SourceChangeKind::Promoted, &spec.name)],
+            fixes: Vec::new(),
+        });
     }
 
     /// `true` when `name` is a source made by a promote and still tied to
@@ -1546,9 +1610,13 @@ impl SourceRegistry {
             // the source the logged rename made of it. Same answer as
             // the first time, so it is a no-op success. A name that was
             // simply unregistered has no such log entry and stays
-            // `unknown_source`.
+            // `unknown_source`. Names are compared without regard to case,
+            // as `name_taken` does: a retry that spells the new name
+            // differently is still the same rename.
             let retry = !existing.iter().any(|s| s.name == name)
-                && existing.iter().any(|s| s.name == new_name)
+                && existing
+                    .iter()
+                    .any(|s| s.name.eq_ignore_ascii_case(new_name))
                 && cache.source_rename_logged(name, new_name)?;
             if retry {
                 RenameCheck::Unchanged
@@ -1648,6 +1716,13 @@ impl SourceRegistry {
             }
             None => false,
         };
+        // Known limit: the old name's pending-delete pool goes with its
+        // detector. A file that vanished from this source just before the
+        // rename and was still waiting out the hold for a twin is no
+        // longer paired by the live watcher, and nothing is logged for
+        // it. The watchers are paused for the whole rename, so the window
+        // is the hold itself; a file really gone is found by the next
+        // start's catch-up against the cache.
         self.renames.remove_source(old);
         if self.is_permission_denied(old) {
             self.set_permission_denied(old, false);
@@ -2258,7 +2333,10 @@ impl SourceRegistry {
     /// cache and the new files that could be a vanished file's twin are
     /// hashed; then, one source at a time, the changed files are indexed
     /// in one transaction (through the writer gate, so an RPC that
-    /// arrives meanwhile waits its turn), one `source_changed` is sent
+    /// arrives meanwhile waits its turn), the source is compared a second
+    /// time and a file whose row no longer matches (edited while the
+    /// catch-up ran) is indexed too, so that edit does not rest on the
+    /// OS delivering its event, one `source_changed` is sent
     /// if anything changed, the watcher is started, and what vanished
     /// and appeared is handed to the source's rename detector, which
     /// applies a unique hash pair after the hold
@@ -2271,7 +2349,10 @@ impl SourceRegistry {
     /// list. A source whose scan never finished has no baseline to
     /// compare with, so it is only watched. A source stored as `offline`
     /// whose root is back is compared like any other and goes
-    /// `offline` -> `stale` -> `active` around the catch-up. A source whose watcher
+    /// `offline` -> `stale` -> `active` around the catch-up, and all of
+    /// it is announced as ONE `source_changed` once the status is final.
+    /// A source whose comparison or catch-up fails is logged and watched
+    /// all the same (see [`BootOutcome::Failed`]); one whose watcher
     /// cannot start is logged and skipped; the others carry on.
     /// `should_stop` is checked before each source; one already being
     /// indexed finishes, since its batch is a single transaction.
@@ -2296,6 +2377,9 @@ impl SourceRegistry {
             diff: Option<catch_up::Diff>,
             vanished: Vec<crate::rename_detect::Vanished>,
             appeared: Vec<crate::rename_detect::Appeared>,
+            /// Why the comparison or the catch-up did not happen; the
+            /// source is watched all the same.
+            catch_up_failed: Option<String>,
         }
 
         self.complete_promotes();
@@ -2308,6 +2392,7 @@ impl SourceRegistry {
         };
         let mut outcomes: Vec<(String, BootOutcome)> = Vec::new();
         let mut boots: Vec<Boot> = Vec::new();
+        let registered: HashSet<String> = rows.iter().map(|r| r.name.clone()).collect();
 
         // 1. Which sources are online, and their OS watch.
         for row in rows {
@@ -2358,40 +2443,28 @@ impl SourceRegistry {
                 diff: None,
                 vanished: Vec::new(),
                 appeared: Vec::new(),
+                catch_up_failed: None,
             });
         }
 
         // 2. Compare each source with its cache (reads only).
         let mut stopped = false;
-        let mut failed: Vec<usize> = Vec::new();
-        for (i, boot) in boots.iter_mut().enumerate() {
+        for boot in boots.iter_mut() {
             if should_stop() {
                 stopped = true;
                 break;
             }
-            let compared = (|| -> Result<Option<catch_up::Diff>, String> {
-                let cache = Cache::open_read_only(&self.cache_path).map_err(|e| e.to_string())?;
-                if !cache
-                    .scan_finished(boot.row.id)
-                    .map_err(|e| e.to_string())?
-                {
-                    tracing::info!(source = %boot.row.name, "no finished scan to compare with; watching only");
-                    return Ok(None);
-                }
-                let cached =
-                    catch_up::cached_files(&cache, &boot.row.name).map_err(|e| e.to_string())?;
-                let rules = boot.ignore_rules.read().unwrap().clone();
-                let disk = catch_up::list_disk(&boot.root, &rules).map_err(|e| e.to_string())?;
-                Ok(Some(catch_up::diff(cached, disk, |rel| {
-                    catch_up::is_gone(&boot.root, rel)
-                })))
-            })();
+            let compared = self.compare_with_cache(&boot.row, &boot.root, &boot.ignore_rules);
             match compared {
                 Ok(diff) => boot.diff = diff,
                 Err(e) => {
-                    tracing::warn!(source = %boot.row.name, error = %e, "catch-up could not compare the source with its cache; skipping the source");
-                    outcomes.push((boot.row.name.clone(), BootOutcome::Failed(e)));
-                    failed.push(i);
+                    // The root is readable and its watch is subscribed:
+                    // only the comparison failed, so the source is still
+                    // watched (a source with no watcher until the next
+                    // restart would miss every edit and rename), with
+                    // the outcome saying the catch-up did not happen.
+                    tracing::warn!(source = %boot.row.name, error = %e, "catch-up could not compare the source with its cache; watching it without a catch-up");
+                    boot.catch_up_failed = Some(e);
                 }
             }
         }
@@ -2410,12 +2483,51 @@ impl SourceRegistry {
             }
         }
 
-        // 4. One source at a time: index what changed, start the watcher,
-        // hand the rename detector what vanished and appeared.
-        for (i, boot) in boots.into_iter().enumerate() {
-            if failed.contains(&i) {
-                continue;
-            }
+        // What a run that stopped was holding when it stopped (a hash pair
+        // waiting out its hold): handed to the detector again below, so
+        // the rename is fixed or logged this time (PR-9 R3, R8). A file
+        // of a source that is gone is settled here.
+        let fixer = self
+            .rename_fixer
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let (mut recalled_v, mut recalled_a) = match &fixer {
+            Some(f) => f.recall(),
+            None => (Vec::new(), Vec::new()),
+        };
+        if let Some(f) = &fixer {
+            let gone_v: Vec<(String, String)> = recalled_v
+                .iter()
+                .filter(|v| !registered.contains(&v.source))
+                .map(|v| (v.source.clone(), v.path.clone()))
+                .collect();
+            let gone_a: Vec<(String, String)> = recalled_a
+                .iter()
+                .filter(|a| !registered.contains(&a.source))
+                .map(|a| (a.source.clone(), a.path.clone()))
+                .collect();
+            recalled_v.retain(|v| registered.contains(&v.source));
+            recalled_a.retain(|a| registered.contains(&a.source));
+            f.release(&gone_v, &gone_a);
+        }
+
+        // 4. One source at a time: index what changed and start the watcher.
+        // What vanished and appeared is kept and handed to the rename
+        // detector once every source has been brought up to date (below),
+        // not one source at a time: a hash pair waits a hold for a twin to
+        // turn up, and the twin may be a new file of a source that is
+        // still being indexed. Handing the facts over as each source
+        // finishes would start the first source's hold before the last
+        // source's facts exist, and a slow catch-up in a later source
+        // (a large source, a busy host) could outlast the hold, so a
+        // rename would be paired, or a move missed, on a partial view.
+        let mut to_detect: Vec<(
+            Arc<SourceRenames>,
+            Vec<crate::rename_detect::Vanished>,
+            Vec<crate::rename_detect::Appeared>,
+        )> = Vec::new();
+        for boot in boots {
             if stopped || should_stop() {
                 stopped = true;
                 outcomes.push((boot.row.name, BootOutcome::Stopped));
@@ -2426,33 +2538,89 @@ impl SourceRegistry {
                 root,
                 ignore_rules,
                 tap,
-                diff,
+                mut diff,
                 vanished,
                 appeared,
+                mut catch_up_failed,
             } = boot;
             let mut paths = 0;
-            if let Some(diff) = &diff {
+            let mut announce: Vec<PathBuf> = Vec::new();
+            let mut status_changed = false;
+            if let Some(d) = &diff {
                 if row.status == SourceStatus::Offline {
                     // The root is back and its cached rows are the
                     // baseline just compared: stale while they are
                     // brought up to date (offline cannot go straight
                     // to active).
-                    self.set_status(&row, SourceStatus::Stale);
+                    status_changed |= self.set_status(&row, SourceStatus::Stale);
                 }
-                let changed = diff.changed_paths(&root);
-                if !changed.is_empty() {
-                    match self.index_catch_up(&row, &root, &ignore_rules, changed) {
-                        Ok(n) => paths = n,
+                let changed = d.changed_paths(&root);
+                // Before the vanished rows are deleted below: what is
+                // about to wait out a hold is kept durably, so a stop
+                // during the hold does not lose the rename (PR-9 R8).
+                if let (Some(f), false) = (&fixer, vanished.is_empty()) {
+                    let named = |source: &str| source.to_string();
+                    let mut v = vanished.clone();
+                    let mut a = appeared.clone();
+                    v.iter_mut().for_each(|x| x.source = named(&row.name));
+                    a.iter_mut().for_each(|x| x.source = named(&row.name));
+                    f.hold(&v, &a);
+                }
+                if !changed.is_empty() || !d.unlisted.is_empty() {
+                    match self.index_catch_up(&row, &root, &ignore_rules, changed, &d.unlisted) {
+                        Ok(done) => {
+                            paths = done.len();
+                            announce = done;
+                        }
                         Err(e) => {
-                            tracing::warn!(source = %row.name, error = %e, "catch-up could not bring the cache up to date; skipping the source");
-                            outcomes.push((row.name, BootOutcome::Failed(e)));
-                            continue;
+                            // Nothing was written; the source is
+                            // watched all the same, and not paired.
+                            tracing::warn!(source = %row.name, error = %e, "catch-up could not bring the cache up to date; watching the source without it");
+                            catch_up_failed = Some(e);
+                        }
+                    }
+                }
+                // A file edited between the comparison above and now (the
+                // catch-up hashes files and takes its turn at the writer
+                // gate in between) is in none of `changed`, and its OS
+                // event is the only thing that would bring it back: the
+                // watch is subscribed, but an OS can drop or merge an
+                // event, and this window is where a save is most likely to
+                // land. Compare again and index the files whose rows no
+                // longer match. Only edited files: a new or vanished file
+                // is the rename detector's business and is left to the
+                // watcher, so a rename made in this window is still seen
+                // as one.
+                if catch_up_failed.is_none() {
+                    if let Ok(Some(again)) = self.compare_with_cache(&row, &root, &ignore_rules) {
+                        let late: HashSet<PathBuf> =
+                            again.edited.iter().map(|rel| root.join(rel)).collect();
+                        if !late.is_empty() {
+                            match self.index_catch_up(&row, &root, &ignore_rules, late, &[]) {
+                                Ok(done) => {
+                                    paths += done.len();
+                                    announce.extend(done);
+                                }
+                                Err(e) => {
+                                    tracing::warn!(source = %row.name, error = %e, "catch-up could not index a file edited while it ran; the watcher will see it");
+                                }
+                            }
                         }
                     }
                 }
             }
+            if catch_up_failed.is_some() {
+                diff = None;
+            }
             if diff.is_some() && row.status != SourceStatus::Active {
-                self.set_status(&row, SourceStatus::Active);
+                status_changed |= self.set_status(&row, SourceStatus::Active);
+            }
+            // ONE push for the whole catch-up, after the status is final
+            // (a client that rebuilds from the push sees `active`, not
+            // `stale`): the files that changed and, if it moved, the
+            // status.
+            if !announce.is_empty() || status_changed {
+                self.send_source_changed(&row.name, announce, Vec::new());
             }
             let renames = match self.start_watcher(
                 row.name.clone(),
@@ -2468,14 +2636,58 @@ impl SourceRegistry {
                     continue;
                 }
             };
-            if diff.is_some() {
-                let fixer = self
-                    .rename_fixer
-                    .read()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .clone();
-                if let Some(fixer) = fixer {
-                    renames.on_batch(&*fixer, &HashMap::new(), vanished, appeared);
+            // `source.unregister` can land between the list at the top
+            // and the watcher going into the running map: it would find
+            // nothing to stop and leave this one running on a source
+            // that is gone. Look again, and take the watcher back out
+            // if the row is not this one any more.
+            if !self.is_still_registered(&row) {
+                self.stop_watcher_of(&row.name);
+                outcomes.push((
+                    row.name,
+                    BootOutcome::Failed("unregistered while starting".to_string()),
+                ));
+                continue;
+            }
+            if let Some(e) = catch_up_failed {
+                outcomes.push((row.name, BootOutcome::Failed(e)));
+            } else if diff.is_some() {
+                if let Some(fixer) = &fixer {
+                    let (mut vanished, mut appeared) = (vanished, appeared);
+                    // The held files of this source that are still true:
+                    // a vanished file that is back on disk, or a new one
+                    // that is gone, is not a rename any more.
+                    let mut stale_v = Vec::new();
+                    let mut stale_a = Vec::new();
+                    let mut keep =
+                        |held_v: &mut Vec<crate::rename_detect::Vanished>,
+                         held_a: &mut Vec<crate::rename_detect::Appeared>| {
+                            let (mine_v, rest_v): (Vec<_>, Vec<_>) = std::mem::take(held_v)
+                                .into_iter()
+                                .partition(|v| v.source == row.name);
+                            let (mine_a, rest_a): (Vec<_>, Vec<_>) = std::mem::take(held_a)
+                                .into_iter()
+                                .partition(|a| a.source == row.name);
+                            *held_v = rest_v;
+                            *held_a = rest_a;
+                            for v in mine_v {
+                                if root_exists(&row.path, &v.path) {
+                                    stale_v.push((v.source, v.path));
+                                } else if !vanished.iter().any(|x| x.path == v.path) {
+                                    vanished.push(v);
+                                }
+                            }
+                            for a in mine_a {
+                                if !root_exists(&row.path, &a.path) {
+                                    stale_a.push((a.source, a.path));
+                                } else if !appeared.iter().any(|x| x.path == a.path) {
+                                    appeared.push(a);
+                                }
+                            }
+                        };
+                    keep(&mut recalled_v, &mut recalled_a);
+                    fixer.release(&stale_v, &stale_a);
+                    to_detect.push((renames, vanished, appeared));
                 }
                 tracing::info!(source = %row.name, paths, "catch_up_complete");
                 outcomes.push((row.name, BootOutcome::CaughtUp { paths }));
@@ -2483,22 +2695,71 @@ impl SourceRegistry {
                 outcomes.push((row.name, BootOutcome::Watching));
             }
         }
+        // 5. Every source's facts are in: now the holds start, together,
+        // under one hold of the detector's lock (no hold can end between
+        // one source's facts and the next's).
+        if let Some(fixer) = &fixer {
+            SourceRenames::on_boot_batches(&**fixer, to_detect);
+        }
         outcomes
     }
 
+    /// The source's cached rows against its disk, for the startup
+    /// catch-up (reads only). `Ok(None)` when no scan of it ever
+    /// finished: there is no baseline to compare with.
+    fn compare_with_cache(
+        &self,
+        row: &SourceRow,
+        root: &Path,
+        ignore_rules: &Arc<RwLock<IgnoreRules>>,
+    ) -> Result<Option<catch_up::Diff>, String> {
+        let cache = Cache::open_read_only(&self.cache_path).map_err(|e| e.to_string())?;
+        if !cache.scan_finished(row.id).map_err(|e| e.to_string())? {
+            tracing::info!(source = %row.name, "no finished scan to compare with; watching only");
+            return Ok(None);
+        }
+        let cached = catch_up::cached_files(&cache, &row.name).map_err(|e| e.to_string())?;
+        let rules = ignore_rules.read().unwrap().clone();
+        let disk = catch_up::list_disk(root, &rules).map_err(|e| e.to_string())?;
+        Ok(Some(catch_up::diff(cached, disk, |rel| {
+            catch_up::is_gone(root, rel)
+        })))
+    }
+
+    /// Whether the registry still holds the source `row` (same name, same
+    /// id): a `source.unregister` or an unregister and register of the
+    /// name does not leave this boot a watcher.
+    fn is_still_registered(&self, row: &SourceRow) -> bool {
+        let cache = self.cache.lock().unwrap();
+        matches!(cache.get_source(&row.name), Ok(Some(now)) if now.id == row.id)
+    }
+
+    /// Stops and forgets the watcher of `name`, as `unregister` does.
+    fn stop_watcher_of(&self, name: &str) {
+        if let Some(running) = self.running.lock().unwrap().remove(name) {
+            running.handle.stop();
+            *running.live.lock().unwrap_or_else(|p| p.into_inner()) = false;
+        }
+        self.renames.remove_source(name);
+    }
+
     /// Brings the cache up to date with `changed` in one transaction, as
-    /// a watcher batch does, and announces it as one `source_changed`.
-    /// Returns how many paths changed.
+    /// a watcher batch does, and drops the rows of `unlisted` paths.
+    /// Returns the paths that changed; the caller announces them (once,
+    /// with the source's final status).
     fn index_catch_up(
         &self,
         row: &SourceRow,
         root: &Path,
         ignore_rules: &Arc<RwLock<IgnoreRules>>,
         changed: HashSet<PathBuf>,
-    ) -> Result<usize, String> {
+        unlisted: &[String],
+    ) -> Result<Vec<PathBuf>, String> {
         let cache = Cache::open(&self.cache_path).map_err(|e| e.to_string())?;
         let rules = ignore_rules.read().unwrap().clone();
-        let total = scan::settle_deferred(
+        let dropped =
+            catch_up::drop_unlisted(&cache, row.id, root, unlisted).map_err(|e| e.to_string())?;
+        let mut total = scan::settle_deferred(
             changed,
             scan::DEFER_RETRY_DELAY,
             |paths, can_defer| {
@@ -2515,15 +2776,43 @@ impl SourceRegistry {
             |_| {},
         )
         .map_err(|e| e.to_string())?;
-        let n = total.changed_paths.len();
-        if n > 0 {
-            let _ = self.events_tx.send(DaemonEvent::SourceChanged {
-                source: row.name.clone(),
-                paths: total.changed_paths,
-                fixes: Vec::new(),
-            });
+        total.changed_paths.extend(dropped);
+        Ok(total.changed_paths)
+    }
+
+    /// Whether `name` is still a source a client should be told about:
+    /// its watcher's live flag when it has one (cleared by `unregister`
+    /// before it returns, so no push follows `removed`), else whether the
+    /// registry still holds the row. The cache lock is taken here, so a
+    /// caller must not hold it.
+    fn is_live_source(&self, name: &str) -> bool {
+        if let Some(running) = self.running.lock().unwrap().get(name) {
+            return *running.live.lock().unwrap_or_else(|p| p.into_inner());
         }
-        Ok(n)
+        let cache = self.cache.lock().unwrap();
+        matches!(cache.get_source(name), Ok(Some(_)))
+    }
+
+    /// Sends one `SourceChanged` for `source`, unless the source has been
+    /// unregistered: the same gate the watcher's own batch goes through
+    /// (`send_if_live`), for the senders that do not run on the watcher
+    /// (catch-up, rescan, the fix sink, a re-index), so none of them can
+    /// follow `source_removed` with a change for a source that is gone.
+    fn send_source_changed(
+        &self,
+        source: &str,
+        paths: Vec<PathBuf>,
+        fixes: Vec<crate::fixes::FixNotice>,
+    ) {
+        if !self.is_live_source(source) {
+            tracing::debug!(%source, "source_changed not sent: the source is gone");
+            return;
+        }
+        let _ = self.events_tx.send(DaemonEvent::SourceChanged {
+            source: source.to_string(),
+            paths,
+            fixes,
+        });
     }
 
     /// A source whose root is missing: stored as `offline` (its rows
@@ -2532,17 +2821,20 @@ impl SourceRegistry {
         if row.status == SourceStatus::Offline {
             return;
         }
-        let cache = self.cache.lock().unwrap();
-        match retry_cache_on_busy(&self.gate, || {
-            cache.transition_source_status(&row.name, SourceStatus::Offline)
-        }) {
+        let marked = {
+            let cache = self.cache.lock().unwrap();
+            retry_cache_on_busy(&self.gate, || {
+                cache.transition_source_status(&row.name, SourceStatus::Offline)
+            })
+        };
+        match marked {
             Ok(()) => {
                 tracing::warn!(source = %row.name, "source root is missing; marked offline");
-                let _ = self.events_tx.send(DaemonEvent::SourceChanged {
-                    source: row.name.clone(),
-                    paths: Vec::new(),
-                    fixes: Vec::new(),
-                });
+                // The cache lock is released first: `send_source_changed`
+                // takes it (through `is_live_source`) and drops the push if
+                // a `source.unregister` removed the source since `start_all`
+                // listed it.
+                self.send_source_changed(&row.name, Vec::new(), Vec::new());
             }
             Err(e) => {
                 tracing::warn!(source = %row.name, error = %e, "failed to mark source offline");
@@ -2550,20 +2842,16 @@ impl SourceRegistry {
         }
     }
 
-    /// Moves a source's stored status along one valid edge and tells the
-    /// graph, logging (not failing) when the edge is refused.
-    fn set_status(&self, row: &SourceRow, to: SourceStatus) {
+    /// Moves a source's stored status along one valid edge, logging (not
+    /// failing) when the edge is refused. Sends nothing: the boot sends
+    /// one push when it is done. Returns whether the status moved.
+    fn set_status(&self, row: &SourceRow, to: SourceStatus) -> bool {
         let cache = self.cache.lock().unwrap();
         match retry_cache_on_busy(&self.gate, || cache.transition_source_status(&row.name, to)) {
-            Ok(()) => {
-                let _ = self.events_tx.send(DaemonEvent::SourceChanged {
-                    source: row.name.clone(),
-                    paths: Vec::new(),
-                    fixes: Vec::new(),
-                });
-            }
+            Ok(()) => true,
             Err(e) => {
                 tracing::warn!(source = %row.name, error = %e, status = ?to, "failed to change the source's status");
+                false
             }
         }
     }
@@ -2622,11 +2910,7 @@ impl SourceRegistry {
                         units_written = stats.units_written,
                         "interrupted scan redone"
                     );
-                    let _ = self.events_tx.send(DaemonEvent::SourceChanged {
-                        source: row.name.clone(),
-                        paths: Vec::new(),
-                        fixes: Vec::new(),
-                    });
+                    self.send_source_changed(&row.name, Vec::new(), Vec::new());
                 }
                 Err(e) => {
                     tracing::warn!(source = %row.name, error = %e, "failed to redo an interrupted scan");
@@ -2806,11 +3090,7 @@ impl SourceRegistry {
     pub fn reindex_file(&self, source: &str, abs_path: &Path) -> Result<(), RegistryError> {
         let changed_paths = self.reindex_quietly(source, abs_path)?;
         if !changed_paths.is_empty() {
-            let _ = self.events_tx.send(DaemonEvent::SourceChanged {
-                source: source.to_string(),
-                paths: changed_paths,
-                fixes: Vec::new(),
-            });
+            self.send_source_changed(source, changed_paths, Vec::new());
         }
         Ok(())
     }
@@ -2824,6 +3104,48 @@ impl SourceRegistry {
         abs_path: &Path,
     ) -> Result<Vec<PathBuf>, RegistryError> {
         self.reindex_paths(source, &[abs_path.to_path_buf()])
+    }
+
+    /// [`SourceRegistry::reindex_quietly`], tried again a few times when
+    /// it fails (a database held busy beyond SQLite's own timeout), so a
+    /// file the fix rewrote is not left stale for one passing error.
+    fn reindex_with_retries(
+        &self,
+        source: &str,
+        abs_path: &Path,
+    ) -> Result<Vec<PathBuf>, RegistryError> {
+        let mut tries = 0;
+        loop {
+            match self.reindex_quietly(source, abs_path) {
+                // The source is gone: no retry brings it back.
+                Err(e @ RegistryError::NotFound(_)) => return Err(e),
+                Err(_) if tries < ANNOUNCE_REINDEX_RETRIES => {
+                    tries += 1;
+                    std::thread::sleep(CACHE_BUSY_RETRY_BACKOFF);
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// [`SourceRegistry::reindex_with_retries`] for many files of one
+    /// source in one batch.
+    fn reindex_batch_with_retries(
+        &self,
+        source: &str,
+        paths: &[PathBuf],
+    ) -> Result<Vec<PathBuf>, RegistryError> {
+        let mut tries = 0;
+        loop {
+            match self.reindex_paths(source, paths) {
+                Err(e @ RegistryError::NotFound(_)) => return Err(e),
+                Err(_) if tries < ANNOUNCE_REINDEX_RETRIES => {
+                    tries += 1;
+                    std::thread::sleep(CACHE_BUSY_RETRY_BACKOFF);
+                }
+                other => return other,
+            }
+        }
     }
 
     /// Brings the cache up to date with `paths` of `source` (files or
@@ -2869,34 +3191,78 @@ impl SourceRegistry {
 
 /// The fix engine's announcements (G17): every file it rewrote is indexed
 /// again here (its watcher event is dropped as Tephra's own, so nothing
-/// else would), then ONE event per source goes out, carrying the files
-/// and the entries. A batch whose files and entries are all in one
-/// source, which is every rename within one source, makes one event.
+/// else would), then ONE event goes out for a batch with entries,
+/// carrying every file and every entry whatever source it is in. A batch
+/// with files and no entries makes one event per source.
 impl crate::fixes::FixSink for SourceRegistry {
     fn announce(&self, announcement: crate::fixes::FixAnnouncement) {
         use std::collections::BTreeMap;
         let mut by_source: BTreeMap<String, (Vec<PathBuf>, Vec<crate::fixes::FixNotice>)> =
             BTreeMap::new();
+        // One batch per source, as a watcher batch does: opening the
+        // database, reading the ignore rules and the transaction are paid
+        // once, not once per file (500 linking files made that most of a
+        // second). A batch that fails (after its retries) is tried file by
+        // file, so one file's failure is not every file's.
+        let mut written: BTreeMap<&str, Vec<&Path>> = BTreeMap::new();
         for file in &announcement.written {
-            match self.reindex_quietly(&file.source, &file.path) {
+            written
+                .entry(file.source.as_str())
+                .or_default()
+                .push(file.path.as_path());
+        }
+        for (source, files) in written {
+            let owned: Vec<PathBuf> = files.iter().map(|p| p.to_path_buf()).collect();
+            let slot = by_source.entry(source.to_string()).or_default();
+            match self.reindex_batch_with_retries(source, &owned) {
                 Ok(paths) => {
-                    let slot = by_source.entry(file.source.clone()).or_default();
                     for p in paths {
                         if !slot.0.contains(&p) {
                             slot.0.push(p);
                         }
                     }
+                    continue;
                 }
                 Err(e) => {
-                    tracing::warn!(source = %file.source, path = %file.path.display(), error = %e, "could not index a file the fix rewrote");
-                    // Still named: the file did change on disk.
-                    let slot = by_source.entry(file.source.clone()).or_default();
-                    if !slot.0.contains(&file.path) {
-                        slot.0.push(file.path.clone());
+                    tracing::debug!(%source, error = %e, files = owned.len(), "the batch index of a fix's files failed; indexing them one by one");
+                }
+            }
+            for file in files {
+                match self.reindex_with_retries(source, file) {
+                    Ok(paths) => {
+                        for p in paths {
+                            if !slot.0.contains(&p) {
+                                slot.0.push(p);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(%source, path = %file.display(), error = %e, "could not index a file the fix rewrote");
+                        // The watcher would drop this file's event as Tephra's own
+                        // and the row would stay stale until the file
+                        // changed again: take the record back, so the event
+                        // is handled like any other change.
+                        crate::dup_ids::forget_self_write(file);
+                        // Still named: the file did change on disk.
+                        if !slot.0.iter().any(|p| p == file) {
+                            slot.0.push(file.to_path_buf());
+                        }
                     }
                 }
             }
         }
+        // Files the caller indexed itself: named in the push, and not
+        // indexed a second time. One the fix also wrote was handled above.
+        for file in &announcement.indexed {
+            if announcement.written.contains(file) {
+                continue;
+            }
+            let slot = by_source.entry(file.source.clone()).or_default();
+            if !slot.0.contains(&file.path) {
+                slot.0.push(file.path.clone());
+            }
+        }
+        let primary = announcement.notices.first().map(|n| n.source.clone());
         for notice in announcement.notices {
             by_source
                 .entry(notice.source.clone())
@@ -2904,12 +3270,30 @@ impl crate::fixes::FixSink for SourceRegistry {
                 .1
                 .push(notice);
         }
+        // A fix with entries is ONE push, even when it wrote files in two
+        // sources (a move across sources, G17 "one notification per fix
+        // batch"): `source` is the first entry's source (the entry's own),
+        // `paths` are every file written, in any source, as absolute
+        // paths, and `fixes` every entry. A second event for the other
+        // source would carry no `fixes`, so the forwarder would take it
+        // for a watcher batch, run the pending-fix retry for it, and the
+        // client would be told twice about one fix.
+        if let Some(first) = primary {
+            let mut paths: Vec<PathBuf> = Vec::new();
+            let mut fixes: Vec<crate::fixes::FixNotice> = Vec::new();
+            for (_, (p, f)) in by_source {
+                for path in p {
+                    if !paths.contains(&path) {
+                        paths.push(path);
+                    }
+                }
+                fixes.extend(f);
+            }
+            self.send_source_changed(&first, paths, fixes);
+            return;
+        }
         for (source, (paths, fixes)) in by_source {
-            let _ = self.events_tx.send(DaemonEvent::SourceChanged {
-                source,
-                paths,
-                fixes,
-            });
+            self.send_source_changed(&source, paths, fixes);
         }
     }
 }
@@ -2927,6 +3311,12 @@ pub struct CachedUnit {
     /// The cached row for the file; `None` for a path that is no file of
     /// this source (or was never indexed).
     pub unit: Option<tephra_cache::UnitRow>,
+}
+
+/// Whether `rel` exists under the source root `root` (a held rename's
+/// file, looked at again at the next start).
+fn root_exists(root: &str, rel: &str) -> bool {
+    Path::new(root).join(rel).exists()
 }
 
 #[cfg(test)]
@@ -3824,6 +4214,73 @@ mod tests {
         out
     }
 
+    /// A `register` of the promote's name can land between the promote's
+    /// validation and its transaction (`register` does not take the
+    /// promote lock). The transaction then fails with a duplicate, and
+    /// the failure path must not "finish" the promote against that other
+    /// source: no scan of the folder into it, no new watcher, no push.
+    #[test]
+    fn a_failed_promote_leaves_an_unrelated_source_of_the_same_name_alone() {
+        use crate::fixes::{FixEngine, PromoteSpec};
+        use crate::refactor::fix_write::{FixWriter, ThreadSleeper};
+        use crate::refactor::RealFs;
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let parent_dir = source_dir(&[("top.md", "# Top\n")]);
+        std::fs::create_dir(parent_dir.path().join("proj")).unwrap();
+        std::fs::write(parent_dir.path().join("proj/A.md"), "# A\n").unwrap();
+        let other_dir = source_dir(&[("own.md", "# Own\n")]);
+
+        let registry = registry_in(cache_dir.path());
+        registry.register("notes", parent_dir.path()).unwrap();
+        // The unrelated source that took the name first.
+        registry.register("proj", other_dir.path()).unwrap();
+        let mut rx = registry.subscribe();
+
+        let writer = Arc::new(FixWriter::with_parts(
+            Arc::new(Mutex::new(())),
+            Arc::new(RealFs),
+            Arc::new(ThreadSleeper),
+        ));
+        let engine = FixEngine::new(cache_dir.path().join("cache.db"), writer);
+        let spec = PromoteSpec {
+            parent: "notes".to_string(),
+            name: "proj".to_string(),
+            root: parent_dir.path().join("proj").canonicalize().unwrap(),
+            folder: "proj".to_string(),
+        };
+        let parent = registry
+            .cache
+            .lock()
+            .unwrap()
+            .get_source("notes")
+            .unwrap()
+            .unwrap();
+        let result = registry.promote_paused(&spec, &parent, &engine);
+        assert!(result.is_err(), "the promote did not commit");
+
+        let cache = registry.cache.lock().unwrap();
+        let other = cache.get_source("proj").unwrap().unwrap();
+        assert_eq!(
+            Path::new(&other.path),
+            other_dir.path().canonicalize().unwrap(),
+            "the other source keeps its own root"
+        );
+        assert!(
+            cache
+                .get_unit_by_rel_path(other.id, "A.md")
+                .unwrap()
+                .is_none(),
+            "the parent's folder was not indexed into the other source"
+        );
+        assert!(cache.promoted_roots().unwrap().is_empty());
+        drop(cache);
+        assert!(
+            list_events(&mut rx).is_empty(),
+            "no 'promoted' push for a promote that did not happen"
+        );
+    }
+
     #[test]
     fn register_and_unregister_each_send_exactly_one_event_naming_the_source() {
         let cache_dir = tempfile::tempdir().unwrap();
@@ -4031,6 +4488,90 @@ mod tests {
                 changes: vec![SourceChange::new(SourceChangeKind::Removed, "notes")],
                 fixes: Vec::new(),
             }]
+        );
+    }
+
+    /// The senders that do not run on a watcher (catch-up, rescan, a
+    /// re-index, the fix sink) go through the same gate as the watcher's
+    /// batch: nothing follows `removed` for the name.
+    #[test]
+    fn the_fix_sink_sends_nothing_for_a_source_that_was_unregistered() {
+        use crate::fixes::{FixAnnouncement, FixNotice, FixSink};
+        let cache_dir = tempfile::tempdir().unwrap();
+        let src = source_dir(&[("a.md", "# A\n")]);
+        let registry = registry_in(cache_dir.path());
+        registry.register("notes", src.path()).unwrap();
+        let notice = || FixNotice {
+            kind: "rename".into(),
+            source: "notes".into(),
+            old: "a.md".into(),
+            new: "b.md".into(),
+            new_source: None,
+            files_changed: 0,
+            status: "applied".into(),
+            deferred: 0,
+        };
+        let mut rx = registry.subscribe();
+
+        registry.announce(FixAnnouncement {
+            notices: vec![notice()],
+            ..Default::default()
+        });
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(DaemonEvent::SourceChanged { .. })
+        ));
+
+        registry.unregister("notes").unwrap();
+        while rx.try_recv().is_ok() {}
+        registry.announce(FixAnnouncement {
+            notices: vec![notice()],
+            ..Default::default()
+        });
+        assert!(rx.try_recv().is_err(), "a push for a source that is gone");
+    }
+
+    /// T68: `mark_offline` (called by `start_all` for a missing root) goes
+    /// through the live gate too. A source whose live flag is already
+    /// cleared by `unregister` (its row not yet deleted) gets no push; a
+    /// live one gets exactly one.
+    #[test]
+    fn mark_offline_sends_nothing_for_a_source_being_unregistered() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let src = source_dir(&[("a.md", "# A\n")]);
+        let registry = registry_in(cache_dir.path());
+        registry.register("notes", src.path()).unwrap();
+        let row = || {
+            registry
+                .cache
+                .lock()
+                .unwrap()
+                .get_source("notes")
+                .unwrap()
+                .unwrap()
+        };
+        let mut rx = registry.subscribe();
+        while rx.try_recv().is_ok() {}
+
+        // Live: the status moves and one SourceChanged goes out.
+        registry.mark_offline(&row());
+        assert_eq!(row().status, SourceStatus::Offline);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(DaemonEvent::SourceChanged { .. })
+        ));
+        assert!(rx.try_recv().is_err());
+
+        // Back to active, then `unregister` has cleared the live flag
+        // but not yet deleted the row: the status still moves, no push.
+        registry.set_status(&row(), SourceStatus::Active);
+        let live = Arc::clone(&registry.running.lock().unwrap().get("notes").unwrap().live);
+        *live.lock().unwrap() = false;
+        registry.mark_offline(&row());
+        assert_eq!(row().status, SourceStatus::Offline);
+        assert!(
+            rx.try_recv().is_err(),
+            "a push for a source being unregistered"
         );
     }
 }

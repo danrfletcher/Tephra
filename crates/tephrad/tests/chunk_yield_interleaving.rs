@@ -234,7 +234,18 @@ fn a_concurrent_in_process_writer_lands_mid_scan_every_time() {
 /// consistently measured a ratio above 3.5 — confirmed by rerunning
 /// this exact test against that scratch copy. [`TAX_RATIO_BOUND`]
 /// sits well clear of both.
+///
+/// Not in the default run (T69). What it looks for is a *sleep*, and a
+/// sleeping thread uses no CPU, so a CPU-time stopwatch (as
+/// `tephra-parser`'s `large_file.rs` uses) cannot see it; a wall-clock
+/// ratio can, but on a loaded host the 20,000-file run stretches by
+/// several times (83.76 s against a 9.98 s projection at load ~29) with
+/// no change to the code. Run it on a quiet machine:
+/// `cargo test -p tephrad --test chunk_yield_interleaving -- --ignored`.
+/// The hand-off itself stays covered in the default run by
+/// `a_concurrent_in_process_writer_lands_mid_scan_every_time`.
 #[test]
+#[ignore = "wall-clock ratio (a sleep uses no CPU, so CPU time cannot show it): run on a quiet machine with --ignored"]
 fn an_uncontended_multi_chunk_scan_pays_no_fixed_per_chunk_tax() {
     /// Below `scan::SCAN_COMMIT_CHUNK_SIZE` (500): `walk_and_write`
     /// commits exactly once (the final commit after the walk loop
@@ -258,7 +269,15 @@ fn an_uncontended_multi_chunk_scan_pays_no_fixed_per_chunk_tax() {
     /// ratios above 3.5 — see the function doc comment).
     const TAX_RATIO_BOUND: f64 = 2.2;
 
+    /// Scans a fixture of `file_count` files into a fresh cache
+    /// `TRIES` times and returns the fastest run. A ratio of two
+    /// wall-clock times is only as steady as the machine: on a loaded
+    /// host one run can be stretched by time spent waiting for a core,
+    /// which says nothing about the scan. The fastest of a few runs is
+    /// the one least disturbed, and a per-chunk sleep is in every run,
+    /// so the minimum still shows it.
     fn timed_scan(file_count: usize) -> Duration {
+        const TRIES: usize = 3;
         let fixture = fixtures::empty_source();
         for i in 0..file_count {
             fixture.write(
@@ -266,25 +285,31 @@ fn an_uncontended_multi_chunk_scan_pays_no_fixed_per_chunk_tax() {
                 &format!("# Note {i}\n\nSome content for note {i}.\n"),
             );
         }
-        let cache_dir = tempfile::tempdir().expect("cache tempdir");
-        let cache_path = cache_dir.path().join("cache.db");
-        let cache = Cache::open(&cache_path).expect("open cache");
-        let source_id = cache
-            .register_source(
-                "notes",
-                &fixture.root().to_string_lossy(),
-                SourceStatus::Active,
-            )
-            .expect("register_source");
         let ignore_rules = tephrad::ignore::IgnoreRules::load(fixture.root()).expect("load ignore");
+        (0..TRIES)
+            .map(|_| {
+                let cache_dir = tempfile::tempdir().expect("cache tempdir");
+                let cache_path = cache_dir.path().join("cache.db");
+                let cache = Cache::open(&cache_path).expect("open cache");
+                let source_id = cache
+                    .register_source(
+                        "notes",
+                        &fixture.root().to_string_lossy(),
+                        SourceStatus::Active,
+                    )
+                    .expect("register_source");
 
-        let started = Instant::now();
-        let stats = tephrad::scan::scan_source(&cache, source_id, fixture.root(), &ignore_rules)
-            .expect("scan_source");
-        let elapsed = started.elapsed();
+                let started = Instant::now();
+                let stats =
+                    tephrad::scan::scan_source(&cache, source_id, fixture.root(), &ignore_rules)
+                        .expect("scan_source");
+                let elapsed = started.elapsed();
 
-        assert_eq!(stats.units_written, file_count);
-        elapsed
+                assert_eq!(stats.units_written, file_count);
+                elapsed
+            })
+            .min()
+            .expect("at least one try")
     }
 
     let low = timed_scan(CALIBRATION_LOW).as_secs_f64();

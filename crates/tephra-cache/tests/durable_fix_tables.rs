@@ -167,11 +167,24 @@ fn unregistering_a_source_leaves_its_history_behind() {
 
     assert!(cache.get_source("notes").unwrap().is_none());
     assert_eq!(cache.table_row_count("units").unwrap(), 0);
-    assert_eq!(
-        dump_all(cache.connection()),
-        before,
-        "rows naming `notes` are still there"
-    );
+    // The log of what was done (`fix_log`, `pending_fixes`) is history and
+    // stays. The `promoted_roots` row that names `notes` as the parent does
+    // not: it says what is promoted NOW, keyed by name, and a source
+    // registered under the name later would be taken for the parent.
+    let after = dump_all(cache.connection());
+    let tables = common::DURABLE_TABLES;
+    for (i, table) in tables.iter().enumerate() {
+        if *table != "promoted_roots" {
+            assert_eq!(after[i], before[i], "{table}: rows naming `notes` stay");
+        }
+    }
+    let roots: Vec<String> = cache
+        .promoted_roots()
+        .unwrap()
+        .into_iter()
+        .map(|r| r.source)
+        .collect();
+    assert_eq!(roots, vec!["tephrad".to_string()], "only `notes`' row went");
     // A source of the same name registered again meets its history.
     cache
         .register_source("notes", "/elsewhere", SourceStatus::Active)

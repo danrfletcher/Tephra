@@ -156,6 +156,36 @@ impl Cache {
         &self.path
     }
 
+    /// Runs `read` against one snapshot of the database: every read it
+    /// makes sees the cache as it was when the first one ran, whatever
+    /// another connection commits meanwhile (the file is in WAL mode, so
+    /// a read transaction is never blocked by a writer and never sees
+    /// half of its work).
+    ///
+    /// For a reader that takes several queries to build one picture (the
+    /// graph reads the unit list and then each unit's links). Without it
+    /// a unit another connection has just re-indexed can be read as a
+    /// row with none of its links. If this connection is already inside
+    /// a transaction, that transaction is the snapshot and `read` simply
+    /// runs. `read` must only read: nothing it does is written.
+    pub fn read_snapshot<T, E: From<CacheError>>(
+        &self,
+        read: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        if !self.conn.is_autocommit() {
+            return read();
+        }
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(CacheError::from)?;
+        let out = read();
+        // A read-only transaction: nothing to keep, so ending it never
+        // fails in a way that matters. Drop rolls it back.
+        drop(tx);
+        out
+    }
+
     /// Current `PRAGMA journal_mode` value (expected `"wal"`).
     pub fn journal_mode(&self) -> Result<String, CacheError> {
         let mode: String = self
@@ -509,8 +539,9 @@ impl Cache {
         units::delete_units_under_prefix(&self.conn, source_id, rel_prefix)
     }
 
-    /// Deletes the named source's row, its scan record, and every
-    /// core-table row that belonged to it. Idempotent: a no-op
+    /// Deletes the named source's row, its scan record, its
+    /// `promoted_roots` rows (as the promoted child or as the parent),
+    /// and every core-table row that belonged to it. Idempotent: a no-op
     /// (not an error) if no source with this name exists, so
     /// `source.unregister` can be called twice on an already-removed
     /// source without erroring.
@@ -519,6 +550,17 @@ impl Cache {
             units::delete_units_for_source(&self.conn, row.id)?;
             self.conn
                 .execute("DELETE FROM scan_state WHERE source_id = ?1", [row.id])?;
+            // The promoted-root rows that name it, as the promoted child
+            // or as the parent: they are keyed by source NAME, so one left
+            // behind would be taken for a promote of whatever source is
+            // registered under that name later, and its `(parent,
+            // rel_path)` would block promoting that folder again. A
+            // promoted child of the deleted source is a top-level source
+            // from now on.
+            self.conn.execute(
+                "DELETE FROM promoted_roots WHERE source = ?1 OR parent = ?1",
+                [name],
+            )?;
             self.conn
                 .execute("DELETE FROM sources WHERE id = ?1", [row.id])?;
         }

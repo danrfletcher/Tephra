@@ -261,11 +261,18 @@ async fn a_multibyte_source_does_not_take_another_source_down() {
 }
 
 /// E26: invalid UTF-8 on disk is not newly broken. The scan skips a file
-/// whose own name is not UTF-8 (`scan::to_rel_string` pins this at unit
+/// whose own name is not UTF-8 (`scan::to_rel_string` covers this at unit
 /// level) and indexes the rest; the crash-class names around it are
 /// indexed as well. APFS refuses to create such a name, so on macOS this
-/// test returns early; it runs on Linux.
+/// test is reported as ignored rather than passing without checking
+/// anything; it runs on Linux. The unit tests in `scan.rs`
+/// (`to_rel_string_rejects_a_path_with_a_non_utf8_component`) cover the
+/// same rule on every platform.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "this filesystem refuses a non-UTF-8 file name; runs on Linux"
+)]
 fn a_non_utf8_file_name_is_skipped_as_before_and_the_rest_is_indexed() {
     use std::os::unix::ffi::OsStrExt;
 

@@ -722,7 +722,9 @@ pub fn render_backlinks(result: &Value) -> String {
 /// ` - message` when the entry carries one (why it has no fix). An entry that
 /// touched files of two sources names them as `@source:path`. An empty
 /// log prints `no fixes`. A `source_rename` entry already names both
-/// sources in full (`@old:` and `@new:`), so it is printed as it is.
+/// sources in full (`@old:` and `@new:`), so it is printed as it is; a
+/// `promote` entry's new name and an `unpromote` entry's old name are
+/// `@name:` already and are printed as they are too.
 ///
 /// Paths come from file names, so control characters in them are shown
 /// as `?`.
@@ -743,26 +745,27 @@ pub fn render_fixes(result: &Value) -> String {
             .and_then(Value::as_array)
             .map(|a| a.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
-        // The two names of a source rename are already `@source:` forms.
-        let whole = str_field(entry, "kind") == "source_rename";
-        let name = |field: &str| {
-            entry.get(field).and_then(Value::as_str).map(|path| {
-                if sources.len() > 1 && !whole {
-                    printable(&format!("@{}:{path}", sources[0]))
-                } else {
-                    printable(path)
-                }
-            })
+        // A name that is already an `@source:` form is printed as it is:
+        // both names of a source rename, the new name of a promote
+        // (`@name:`) and the old name of an unpromote (`@name:`). Adding
+        // the source again would print `@name:@name:`.
+        let kind = str_field(entry, "kind");
+        let old_whole = matches!(kind, "source_rename" | "unpromote");
+        let new_whole = matches!(kind, "source_rename" | "promote");
+        let name = |field: &str, whole: bool, source: Option<&&str>| {
+            entry
+                .get(field)
+                .and_then(Value::as_str)
+                .map(|path| match source {
+                    Some(source) if sources.len() > 1 && !whole => {
+                        printable(&format!("@{source}:{path}"))
+                    }
+                    _ => printable(path),
+                })
         };
-        let old = name("old").unwrap_or_else(|| "?".to_string());
-        let pair = match entry.get("new").and_then(Value::as_str) {
-            Some(new) if sources.len() > 1 && !whole => {
-                format!(
-                    "{old} -> {}",
-                    printable(&format!("@{}:{new}", sources[sources.len() - 1]))
-                )
-            }
-            Some(new) => format!("{old} -> {}", printable(new)),
+        let old = name("old", old_whole, sources.first()).unwrap_or_else(|| "?".to_string());
+        let pair = match name("new", new_whole, sources.last()) {
+            Some(new) => format!("{old} -> {new}"),
             None => format!("{old} (no pair)"),
         };
         let files = entry

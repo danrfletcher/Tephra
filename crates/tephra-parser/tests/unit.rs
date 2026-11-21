@@ -13,6 +13,8 @@ mod code_comments;
 mod code_languages;
 #[path = "unit/code_robustness.rs"]
 mod code_robustness;
+#[path = "unit/cpu_timer.rs"]
+mod cpu_timer;
 #[path = "unit/determinism.rs"]
 mod determinism;
 #[path = "unit/documents_docx.rs"]

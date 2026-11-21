@@ -573,7 +573,7 @@ fn callers(krate: &str, needle: &str) -> Vec<(String, usize)> {
 fn the_qualify_branch_exists_once_and_only_the_spelling_step_reaches_it() {
     // The cross-source fact is asked in one place.
     assert_eq!(
-        callers("tephrad", ".name_in_other_source("),
+        callers("tephrad", ".name_in_other_source_ignoring("),
         vec![("fix/mod.rs".to_string(), 1)]
     );
     // The full-path spelling is asked in one place too.

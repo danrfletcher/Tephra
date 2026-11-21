@@ -535,6 +535,13 @@ fn an_unreadable_file_is_skipped_with_a_warning_and_the_scan_carries_on() {
     assert_eq!(stats.units_written, 2);
 }
 
+/// One process-wide log sink. A per-test `with_default` subscriber is
+/// not reliable here: `tracing` caches, per callsite, whether anyone is
+/// listening, and a test running in parallel on another thread with no
+/// subscriber can leave the callsite switched off for the test that set
+/// one a moment later (the capture then comes back empty). So the
+/// subscriber is installed once for the whole binary and each test reads
+/// only the lines that name its own temp directory.
 #[derive(Clone, Default)]
 struct LogBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
@@ -555,6 +562,32 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
     }
 }
 
+fn global_log() -> &'static LogBuf {
+    static LOG: std::sync::OnceLock<LogBuf> = std::sync::OnceLock::new();
+    LOG.get_or_init(|| {
+        let buf = LogBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("one global subscriber in this test binary");
+        buf
+    })
+}
+
+/// The log lines that mention `root` (one test's own source).
+fn log_lines_for(root: &std::path::Path) -> Vec<String> {
+    let needle = root.display().to_string();
+    String::from_utf8(global_log().0.lock().unwrap().clone())
+        .unwrap()
+        .lines()
+        .filter(|l| l.contains(&needle))
+        .map(str::to_string)
+        .collect()
+}
+
 #[test]
 fn a_too_large_file_logs_one_info_line_and_a_nul_file_logs_nothing() {
     // E3: exactly one `info` line naming the path and the size; E2: a
@@ -571,26 +604,18 @@ fn a_too_large_file_logs_one_info_line_and_a_nul_file_logs_nothing() {
     fixture.write("fine.md", "# ok\n");
     let env = env_for(&fixture);
 
-    let buf = LogBuf::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(buf.clone())
-        .with_ansi(false)
-        .with_max_level(tracing::Level::TRACE)
-        .finish();
-    let stats = tracing::subscriber::with_default(subscriber, || {
-        scan::scan_source(
-            &env.cache,
-            env.source_id,
-            &env.root,
-            &IgnoreRules::default(),
-        )
-    })
+    global_log();
+    let stats = scan::scan_source(
+        &env.cache,
+        env.source_id,
+        &env.root,
+        &IgnoreRules::default(),
+    )
     .expect("scan carries on");
     assert_eq!(stats.units_written, 4);
 
-    let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
-    let lines: Vec<&str> = log.lines().collect();
-    let big: Vec<&&str> = lines.iter().filter(|l| l.contains("big.md")).collect();
+    let lines = log_lines_for(&env.root);
+    let big: Vec<&String> = lines.iter().filter(|l| l.contains("big.md")).collect();
     assert_eq!(big.len(), 1, "{lines:?}");
     assert!(big[0].contains("INFO"), "{}", big[0]);
     assert!(
@@ -608,6 +633,48 @@ fn a_too_large_file_logs_one_info_line_and_a_nul_file_logs_nothing() {
     assert_eq!(unit(&env, "nul.py").unwrap().kind, "binary");
     let big = unit(&env, "big.md").unwrap();
     assert_eq!((big.kind.as_str(), big.too_large), ("prose", true));
+}
+
+#[test]
+fn a_batch_never_indexes_or_reports_a_temp_file_of_the_writer() {
+    // A slow atomic rewrite leaves its temp file on disk past the
+    // debounce window, so a batch can fire while it is there. It is not
+    // content: no unit, no changed path, whether it arrives as a path or
+    // inside a directory event.
+    let fixture = fixtures::empty_source();
+    fixture.write("Note.md", "# Note\n");
+    fixture.write(".Note.md.tephra-tmp-2752873005", "# Note\n\n[[x]]\n");
+    fixture.write("sub/.Other.md.tephra-tmp-1", "# Other\n");
+    fixture.write("sub/Other.md", "# Other\n");
+    let env = env_for(&fixture);
+    let rules = IgnoreRules::default();
+
+    let mut paths = HashSet::new();
+    paths.insert(env.root.join("Note.md"));
+    paths.insert(env.root.join(".Note.md.tephra-tmp-2752873005"));
+    paths.insert(env.root.join("sub"));
+    let outcome =
+        scan::apply_change_batch(&env.cache, env.source_id, &env.root, &paths, &rules).unwrap();
+
+    assert!(unit(&env, "Note.md").is_some());
+    assert!(unit(&env, "sub/Other.md").is_some());
+    assert!(unit(&env, ".Note.md.tephra-tmp-2752873005").is_none());
+    assert!(unit(&env, "sub/.Other.md.tephra-tmp-1").is_none());
+    let mut reported: Vec<String> = outcome
+        .changed_paths
+        .iter()
+        .map(|p| p.strip_prefix(&env.root).unwrap().display().to_string())
+        .collect();
+    reported.sort();
+    assert_eq!(reported, ["Note.md", "sub/Other.md"]);
+    assert!(
+        outcome
+            .appeared
+            .iter()
+            .all(|a| !a.path.contains("tephra-tmp")),
+        "no temp file to pair with a vanished one: {:?}",
+        outcome.appeared
+    );
 }
 
 fn headings_of(env: &Env, rel: &str) -> Vec<(i64, String, i64)> {

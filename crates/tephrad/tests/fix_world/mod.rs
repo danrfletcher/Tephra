@@ -67,6 +67,126 @@ impl Sleeper for NoSleep {
     fn sleep(&self, _d: Duration) {}
 }
 
+/// The real write loop over `fs`, on a writer gate the test holds: while
+/// the test has `gate` locked, no file is written, as while a fix, a
+/// refactor or a promote holds the gate (E15).
+pub fn writer_over_gate(gate: Arc<Mutex<()>>, fs: Arc<dyn AtomicFs>) -> Arc<dyn FileWriter> {
+    Arc::new(FixWriter::with_parts(gate, fs, Arc::new(NoSleep)))
+}
+
+/// Where [`EditingFs`] disturbs a file.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum EditAt {
+    /// Between the writer's first look at the file and its read (E8): the
+    /// bytes read are not the ones fingerprinted.
+    BetweenLookAndRead,
+    /// While the replacement is being synced, so before the rename (E25,
+    /// a user's save in the last moment).
+    BeforeRename,
+}
+
+/// The real file system, except that the first `budget` times it is
+/// asked to, it appends to `victim` (and moves its mtime on), as a user's
+/// editor would. After that the file is left alone, so the next attempt
+/// finds it unchanged. `edits` counts what was done.
+pub struct EditingFs {
+    pub at: EditAt,
+    pub victim: &'static str,
+    budget: std::sync::atomic::AtomicUsize,
+    pub edits: std::sync::atomic::AtomicUsize,
+    just_edited: std::sync::atomic::AtomicBool,
+}
+
+impl EditingFs {
+    pub fn new(at: EditAt, victim: &'static str, budget: usize) -> EditingFs {
+        EditingFs {
+            at,
+            victim,
+            budget: std::sync::atomic::AtomicUsize::new(budget),
+            edits: std::sync::atomic::AtomicUsize::new(0),
+            just_edited: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Disturbs the victim in the next `n` attempts: armed after a test's
+    /// set-up, which writes through the same loop.
+    pub fn arm(&self, n: usize) {
+        self.budget.store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn is_victim(&self, path: &std::path::Path) -> bool {
+        path.file_name().and_then(|n| n.to_str()) == Some(self.victim)
+    }
+
+    /// Takes one from the budget and edits `target`; false when none is left.
+    fn edit(&self, target: &std::path::Path) -> std::io::Result<bool> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let left = self.budget.load(SeqCst);
+        if left == 0 {
+            return Ok(false);
+        }
+        self.budget.store(left - 1, SeqCst);
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(target)?;
+        f.write_all(b"edited meanwhile\n")?;
+        drop(f);
+        let now = std::fs::metadata(target)?.modified()?;
+        filetime::set_file_mtime(
+            target,
+            filetime::FileTime::from_system_time(now + Duration::from_secs(7)),
+        )?;
+        self.edits.fetch_add(1, SeqCst);
+        Ok(true)
+    }
+}
+
+impl AtomicFs for EditingFs {
+    fn write_new(&self, path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
+        RealFs.write_new(path, content)
+    }
+    fn set_permissions(
+        &self,
+        path: &std::path::Path,
+        perms: std::fs::Permissions,
+    ) -> std::io::Result<()> {
+        RealFs.set_permissions(path, perms)
+    }
+    fn sync(&self, path: &std::path::Path) -> std::io::Result<()> {
+        RealFs.sync(path)?;
+        if self.at == EditAt::BeforeRename {
+            // `.<name>.tephra-tmp-<digits>` is the temp file; its target is
+            // the name between the dot and `.tephra-tmp-`.
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let original = name
+                .strip_prefix('.')
+                .and_then(|n| n.rsplit_once(".tephra-tmp-"))
+                .map(|(o, _)| o);
+            if original == Some(self.victim) {
+                self.edit(&path.with_file_name(self.victim))?;
+            }
+        }
+        Ok(())
+    }
+    fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+        RealFs.rename(from, to)
+    }
+    fn fingerprint(
+        &self,
+        path: &std::path::Path,
+    ) -> std::io::Result<(u64, Option<std::time::SystemTime>)> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let real = RealFs.fingerprint(path)?;
+        if self.at == EditAt::BetweenLookAndRead && self.is_victim(path) {
+            // The first look of an attempt is followed by the edit; the
+            // look after the read (the next call) is not.
+            if !self.just_edited.swap(false, SeqCst) && self.edit(path)? {
+                self.just_edited.store(true, SeqCst);
+            }
+        }
+        Ok(real)
+    }
+}
+
 pub fn real_writer() -> Arc<dyn FileWriter> {
     writer_over(Arc::new(RealFs))
 }

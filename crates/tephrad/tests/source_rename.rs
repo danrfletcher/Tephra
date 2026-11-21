@@ -14,12 +14,13 @@ mod fixtures;
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use fix_world::{fixes_of, real_writer, Daemon};
+use fix_world::{fixes_of, real_writer, writer_over, writer_over_gate, Daemon, EditAt, EditingFs};
 use tephra_cache::Cache;
 use tephra_graph::{EdgeTarget, UnitGraph};
-use tephrad::fixes::{FixEngine, FixError};
+use tephrad::fixes::{FileWriter, FixEngine, FixError};
 use tephrad::registry::{RegistryError, RenameError, RenameOutcome};
 
 const FOLDER: &str = "crates/tephrad";
@@ -628,6 +629,11 @@ fn a_repeat_of_a_committed_rename_is_a_silent_no_op_but_an_unregistered_name_is_
 
     let again = rename(&d, "tephrad", "daemon").expect("the retry is a no-op success");
     assert!(again.unchanged);
+    // Names are compared without regard to case, as the name check is: a
+    // retry that spells the new name differently is the same rename.
+    let cased = rename(&d, "tephrad", "DAEMON").expect("a retry in other case is a no-op");
+    assert!(cased.unchanged);
+    assert_eq!(names(&d), vec!["daemon", "notes", "other"]);
     assert_eq!(tree(&d), (notes, other), "nothing on disk changed");
     assert_eq!(d.entries().len(), entries_before, "no second log entry");
     assert!(
@@ -681,5 +687,229 @@ fn a_four_thousand_link_file_is_rewritten_whole_in_one_call() {
     assert!(!text.contains("[[@other:"));
     assert_eq!(text.matches("[[@vault:Vault#^id").count(), 4000);
     assert_eq!(text, body.replace("[[@other:", "[[@vault:"));
+    d.close();
+}
+
+/// A promoted `tephrad` over a write loop that disturbs `Design.md`
+/// (`docs/Design.md`, linked to by `@tephrad:` once promoted). The
+/// disturbance is armed only after the promote, which writes through the
+/// same loop.
+fn promoted_over_editing(at: EditAt) -> (Daemon, Arc<EditingFs>) {
+    let fs = Arc::new(EditingFs::new(at, "Design.md", 0));
+    let d = Daemon::start(&repo(), &vault(), writer_over(fs.clone()), false);
+    d.registry
+        .promote("tephrad", d.notes_root().join(FOLDER), &d.engine)
+        .expect("promote");
+    (d, fs)
+}
+
+/// E8: a linking file that changes between the writer's look and its
+/// read is read again, and the rename completes with the person's edit
+/// kept and the link respelled.
+#[test]
+fn e8_a_file_changed_between_look_and_read_is_retried_and_the_rename_completes() {
+    let (d, fs) = promoted_over_editing(EditAt::BetweenLookAndRead);
+    fs.arm(1);
+    let out = rename(&d, "tephrad", "daemon").expect("rename");
+    assert_eq!(out.status, "applied", "{out:?}");
+    assert_eq!(out.deferred, 0, "{out:?}");
+    assert_eq!(fs.edits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let design = d.text("docs/Design.md");
+    assert!(design.contains("[[@daemon:src/scan.rs]]"), "{design}");
+    assert!(design.ends_with("edited meanwhile\n"), "{design}");
+    assert!(
+        !design.contains("@tephrad:"),
+        "the retry read the new bytes: {design}"
+    );
+    let cache = reopen(&d);
+    assert!(
+        cache.pending_fixes(None, None).unwrap().is_empty(),
+        "nothing is left to retry"
+    );
+    d.close();
+}
+
+/// E25: a save in the last moment before the rename (the temp file is
+/// synced) is never overwritten: the attempt is dropped and made again
+/// from the new text.
+#[test]
+fn e25_a_user_save_before_the_rename_is_kept_and_the_write_is_made_again() {
+    let (d, fs) = promoted_over_editing(EditAt::BeforeRename);
+    fs.arm(1);
+    let out = rename(&d, "tephrad", "daemon").expect("rename");
+    assert_eq!(out.status, "applied", "{out:?}");
+    assert_eq!(fs.edits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let design = d.text("docs/Design.md");
+    assert!(design.ends_with("edited meanwhile\n"), "the save is kept");
+    assert!(design.contains("[[@daemon:src/scan.rs]]"), "{design}");
+    d.close();
+}
+
+/// E25 again, when the file changes under every attempt: it is deferred
+/// (`partial`), the person's text is left exactly as they saved it, and
+/// the leftover is stored for a later retry.
+#[test]
+fn e25_a_file_saved_under_every_attempt_is_deferred_with_the_save_kept() {
+    let (d, fs) = promoted_over_editing(EditAt::BeforeRename);
+    fs.arm(usize::MAX);
+    let out = rename(&d, "tephrad", "daemon").expect("rename");
+    assert_eq!(out.status, "partial", "{out:?}");
+    assert_eq!(out.deferred, 1, "{out:?}");
+    let design = d.text("docs/Design.md");
+    assert!(design.ends_with("edited meanwhile\n"), "{design}");
+    assert!(design.contains("@tephrad:"), "not rewritten: {design}");
+    let pending = reopen(&d).pending_fixes(None, None).unwrap();
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    assert_eq!(pending[0].file_path, "docs/Design.md");
+    // The others were written.
+    assert!(d
+        .other_text("Vault.md")
+        .contains("[[@daemon:src/registry.rs#^k3f9a2]]"));
+    d.close();
+}
+
+/// E15: a rename waits behind whatever holds the writer gate (a fix, a
+/// refactor, a promote), writes nothing while it is held, and completes
+/// when it is let go. The gate is the very mutex the write loop locks for
+/// each file, held here by the test.
+#[test]
+fn e15_a_rename_waits_behind_the_writer_gate_and_completes_when_it_is_released() {
+    let gate = Arc::new(Mutex::new(()));
+    let d = Daemon::start(
+        &repo(),
+        &vault(),
+        writer_over_gate(gate.clone(), Arc::new(tephrad::refactor::RealFs)),
+        false,
+    );
+    d.registry
+        .promote("tephrad", d.notes_root().join(FOLDER), &d.engine)
+        .expect("promote");
+    let before = tree(&d);
+
+    let held = gate.lock().unwrap();
+    let (registry, engine) = (d.registry.clone(), d.engine.clone());
+    let worker = std::thread::spawn(move || registry.rename("tephrad", "daemon", &engine));
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(
+        !worker.is_finished(),
+        "the rename did not wait for the gate"
+    );
+    let during: BTreeMap<_, _> = fixtures::tree_snapshot(d.other.root())
+        .into_iter()
+        .map(|(k, (b, _))| (k, b))
+        .collect();
+    let before_other: BTreeMap<_, _> = before
+        .1
+        .iter()
+        .map(|(k, (b, _))| (k.clone(), b.clone()))
+        .collect();
+    assert_eq!(
+        during, before_other,
+        "a file was written while the gate was held"
+    );
+    drop(held);
+
+    let out = worker.join().expect("thread").expect("rename");
+    assert_eq!(out.status, "applied", "{out:?}");
+    assert!(d
+        .other_text("Vault.md")
+        .contains("[[@daemon:src/registry.rs#^k3f9a2]]"));
+    assert_eq!(rename_entries(&d).len(), 1);
+    d.close();
+}
+
+/// A write loop that is killed just after a file's rename: the file is
+/// written, and nothing after it (the row is not finished, the entry not
+/// updated) ever runs. Armed after the set-up, which writes too.
+struct DiesAfterRename {
+    inner: Arc<dyn FileWriter>,
+    armed: std::sync::atomic::AtomicBool,
+    /// The file that was in flight when the writer was killed.
+    victim: Mutex<Option<String>>,
+}
+
+impl FileWriter for DiesAfterRename {
+    fn write_file(
+        &self,
+        req: &tephrad::refactor::fix_write::FileFixRequest,
+    ) -> tephrad::refactor::fix_write::FileWriteResult {
+        self.inner.write_file(req)
+    }
+
+    fn write_file_noting(
+        &self,
+        req: &tephrad::refactor::fix_write::FileFixRequest,
+        intent: Option<tephrad::refactor::fix_write::IntentSink<'_>>,
+    ) -> tephrad::refactor::fix_write::FileWriteResult {
+        let result = self.inner.write_file_noting(req, intent);
+        if result.status == tephrad::refactor::fix_write::WriteStatus::Written
+            && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            *self.victim.lock().unwrap() = Some(req.file.to_string());
+            panic!("killed after the rename of {}", req.file);
+        }
+        result
+    }
+}
+
+/// PR-5 R7: a run killed after a file's rename and before its row was
+/// finished. On the next run that file has no link left to rewrite, but
+/// it is not "nothing to fix": the durable mark of what was about to be
+/// written matches the file, so it is counted as written, and the entry
+/// ends with the same `files_changed` as a run that was never killed.
+#[test]
+fn r7_a_file_written_just_before_a_kill_is_counted_as_written_on_resume() {
+    let whole = promoted();
+    let want = rename(&whole, "tephrad", "daemon")
+        .expect("rename")
+        .files_changed;
+    whole.close();
+
+    let killer = Arc::new(DiesAfterRename {
+        inner: real_writer(),
+        armed: std::sync::atomic::AtomicBool::new(false),
+        victim: Mutex::new(None),
+    });
+    let d = Daemon::start(&repo(), &vault(), killer.clone(), false);
+    d.registry
+        .promote("tephrad", d.notes_root().join(FOLDER), &d.engine)
+        .expect("promote");
+    killer
+        .armed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rename(&d, "tephrad", "daemon")
+    }));
+    assert!(died.is_err(), "the writer was killed");
+
+    // The kill left the file in flight written. (The daemon's own
+    // forwarder retries pending rows on its own thread, so how many rows
+    // are still pending here is not fixed; the end state below is.)
+    let cache = reopen(&d);
+    let victim = killer
+        .victim
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("a file was in flight");
+    let rel = victim
+        .split_once(':')
+        .map_or(victim.as_str(), |(_, rel)| rel);
+    let written = std::fs::read_to_string(d.notes_root().join(FOLDER).join(rel))
+        .or_else(|_| std::fs::read_to_string(d.notes_root().join(rel)))
+        .unwrap_or_else(|e| panic!("{victim}: {e}"));
+    assert!(
+        written.contains("[[@daemon:") && !written.contains("[[@tephrad:"),
+        "its rename landed: {written}"
+    );
+
+    // The next run: nothing is written twice and none is lost from the count.
+    d.engine.resume().expect("resume");
+    assert!(cache.pending_fixes(None, None).unwrap().is_empty());
+    assert_eq!(cache.table_row_count("pending_writes").unwrap(), 0);
+    let entries = rename_entries(&d);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].status, "applied", "{:?}", entries[0]);
+    assert_eq!(entries[0].files_changed, want, "{:?}", entries[0]);
     d.close();
 }

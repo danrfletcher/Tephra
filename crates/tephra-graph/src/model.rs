@@ -506,6 +506,24 @@ impl UnitGraph {
         out
     }
 
+    /// Whether the bare link text `target`, written in `source`, named
+    /// the file that was at `old_rel_path` before that file moved to
+    /// `new_id`: the old file had the one shortest stem among the files
+    /// the text matched. A tie, or a shorter stem elsewhere, means the
+    /// link named some other file or none, whatever it resolves to now.
+    /// Judged from the graph as it is after the move (the old file may
+    /// or may not still be in it).
+    pub fn link_named_file_before_move(
+        &self,
+        source: &str,
+        old_rel_path: &str,
+        new_id: &str,
+        target: &str,
+    ) -> bool {
+        let key = normalize_key(strip_markdown_extension(target));
+        crate::resolver::old_path_won_before_rename(self, source, old_rel_path, new_id, &key)
+    }
+
     /// Every wikilink a rename of `old_id` to `new_id` (both in this
     /// graph's *after* state: `old_id` is no longer a unit, `new_id` is)
     /// has to look at: [`UnitGraph::get_backlinks_all`] for `old_id`
@@ -522,17 +540,29 @@ impl UnitGraph {
     /// stem and basename, and kept only when the old file would have won
     /// the resolver's choice before the rename (see
     /// `resolver::old_path_won_before_rename`): a link that already
-    /// pointed at the other file is not a link to the renamed one. Only
+    /// pointed at the other file is not a link to the renamed one. The
+    /// same test applies to a link that now dangles: one that was a tie
+    /// before the rename (three same-length `x/Training Plan.md`) never
+    /// reached the old file and is left out. Only
     /// wikilinks; a Markdown link is matched by exact path and never
     /// falls back to a basename. A link that now resolves to `new_id`
     /// is already right and is left out.
     pub fn get_rename_backlinks(&self, old_id: &str, new_id: &str) -> Vec<Edge> {
-        let mut out = self.get_backlinks_all(old_id);
+        // Links still recorded against the old id (the cache has not
+        // caught up): they named it, whatever else was in the graph.
+        let mut idxs: Vec<usize> = self.backward_index.get(old_id).cloned().unwrap_or_default();
+        let finish = |mut idxs: Vec<usize>| {
+            idxs.sort_unstable();
+            idxs.dedup();
+            let mut out: Vec<Edge> = idxs.iter().filter_map(|&i| self.edges[i].clone()).collect();
+            out.sort_by(edge_sort_key);
+            out
+        };
         if self.nodes.contains_key(old_id) {
-            return out;
+            return finish(idxs);
         }
         let Some((source, rel_path)) = parse_federated_id(old_id) else {
-            return out;
+            return finish(idxs);
         };
         let stem = normalize_key(strip_markdown_extension(rel_path));
         let basename = basename_of(&stem).to_string();
@@ -540,7 +570,6 @@ impl UnitGraph {
         if basename != stem {
             keys.push(basename);
         }
-        let mut idxs: Vec<usize> = Vec::new();
         for key in &keys {
             let Some(slots) = self.match_index.get(&(source.to_string(), key.clone())) else {
                 continue;
@@ -549,26 +578,28 @@ impl UnitGraph {
                 let Some(edge) = self.edges[i].as_ref() else {
                     continue;
                 };
-                let EdgeTarget::Resolved(target) = &edge.to else {
-                    continue;
-                };
-                if edge.kind != tephra_parser::LINK_KIND_WIKILINK
-                    || target == old_id
-                    || target == new_id
-                {
+                if edge.kind != tephra_parser::LINK_KIND_WIKILINK {
                     continue;
                 }
-                if crate::resolver::old_path_won_before_rename(self, source, rel_path, new_id, key)
+                // A link that now dangles, or now resolves to another
+                // file, named the old file only if the old file won the
+                // resolver's choice before the rename. A tie (it was
+                // ambiguous then and is still) never reached the old
+                // file, so it is not one of its links.
+                let candidate = match &edge.to {
+                    EdgeTarget::Dangling => true,
+                    EdgeTarget::Resolved(target) => target != old_id && target != new_id,
+                };
+                if candidate
+                    && crate::resolver::old_path_won_before_rename(
+                        self, source, rel_path, new_id, key,
+                    )
                 {
                     idxs.push(i);
                 }
             }
         }
-        idxs.sort_unstable();
-        idxs.dedup();
-        out.extend(idxs.iter().filter_map(|&i| self.edges[i].clone()));
-        out.sort_by(edge_sort_key);
-        out
+        finish(idxs)
     }
 
     /// The shortest wikilink target text that resolves to unit `id`
@@ -603,12 +634,24 @@ impl UnitGraph {
     /// (F11). Units of an offline source count (their rows stay cached);
     /// files in an ignored directory are not units, so never count.
     pub fn name_in_other_source(&self, id: &str) -> bool {
+        self.name_in_other_source_ignoring(id, &[])
+    }
+
+    /// [`UnitGraph::name_in_other_source`], not counting the units in
+    /// `ignoring`. A file that has moved from one source to another is,
+    /// until the graph is rebuilt, still a unit of its old source: asked
+    /// about its new id, that old unit is the same file, not "another
+    /// source's file of the same name".
+    pub fn name_in_other_source_ignoring(&self, id: &str, ignoring: &[&str]) -> bool {
         let Some(facts) = self.nodes.get(id) else {
             return false;
         };
         let key = crate::resolver::bare_name_key(&facts.rel_path);
         self.basename_index.iter().any(|(source, names)| {
-            *source != facts.source && names.get(&key).is_some_and(|ids| !ids.is_empty())
+            *source != facts.source
+                && names
+                    .get(&key)
+                    .is_some_and(|ids| ids.iter().any(|i| !ignoring.contains(&i.as_str())))
         })
     }
 

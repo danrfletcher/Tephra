@@ -76,6 +76,18 @@ pub enum PendingOp {
     },
 }
 
+/// What a fix was about to write into a row's file (see
+/// [`crate::Cache::mark_pending_write`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingWrite {
+    /// Byte length of the new text.
+    pub len: i64,
+    /// `content_hash_bytes` of the new text.
+    pub hash: String,
+    /// How many links the write changes.
+    pub links: i64,
+}
+
 const COLUMNS: &str = "id, fix_id, source, file_path, old_source, old_path, new_source, \
                        new_path, state, reason, attempts, created_at, updated_at";
 
@@ -122,6 +134,40 @@ pub(crate) fn insert(
     Ok(conn.last_insert_rowid())
 }
 
+/// Records (or replaces) what row `pending_id` is about to write.
+pub(crate) fn mark_write(
+    conn: &Connection,
+    pending_id: i64,
+    write: &PendingWrite,
+    now: i64,
+) -> Result<(), CacheError> {
+    conn.execute(
+        "INSERT OR REPLACE INTO pending_writes (pending_id, len, hash, links, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![pending_id, write.len, write.hash, write.links, now],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn marked_write(
+    conn: &Connection,
+    pending_id: i64,
+) -> Result<Option<PendingWrite>, CacheError> {
+    Ok(conn
+        .query_row(
+            "SELECT len, hash, links FROM pending_writes WHERE pending_id = ?1",
+            [pending_id],
+            |r| {
+                Ok(PendingWrite {
+                    len: r.get(0)?,
+                    hash: r.get(1)?,
+                    links: r.get(2)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
 pub(crate) fn get(conn: &Connection, id: i64) -> Result<Option<PendingFixRow>, CacheError> {
     Ok(conn
         .query_row(
@@ -156,6 +202,9 @@ pub(crate) fn apply(
     op: &PendingOp,
     now: i64,
 ) -> Result<bool, CacheError> {
+    // Whatever the row becomes, what it was about to write is settled: it
+    // was written (the entry says so), or it was not and is derived again.
+    conn.execute("DELETE FROM pending_writes WHERE pending_id = ?1", [id])?;
     let n = match op {
         PendingOp::Delete => conn.execute("DELETE FROM pending_fixes WHERE id = ?1", [id])?,
         PendingOp::Update {

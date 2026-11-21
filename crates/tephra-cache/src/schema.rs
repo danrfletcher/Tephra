@@ -158,6 +158,40 @@ const CREATE_PENDING_FIXES: &str = "\
         updated_at INTEGER NOT NULL \
     )";
 
+/// The files the rename detector is holding: a file that vanished or
+/// appeared whose pairing waits out a hold (PR-9 R3, R8). Written before
+/// the cache rows of a vanished file are deleted and removed when the
+/// detector settles the file (paired and fixed, or given up and logged),
+/// so a run that stops during the hold finds them at the next start and
+/// the rename is not lost. Durable and foreign-key free, like
+/// [`CREATE_FIX_LOG`]. `hash` is NULL for a file that was never hashed.
+const CREATE_HELD_RENAMES: &str = "\
+    CREATE TABLE IF NOT EXISTS held_renames (\
+        kind TEXT NOT NULL, \
+        source TEXT NOT NULL, \
+        path TEXT NOT NULL, \
+        hash TEXT, \
+        created_at INTEGER NOT NULL, \
+        PRIMARY KEY (kind, source, path)\
+    )";
+
+/// What a fix is about to write into a file, recorded before the rename
+/// that puts it there: the length and content hash of the new text and
+/// how many links it changes. One row per `pending_fixes` row, kept until
+/// that row is finished or changes state. If the process stops between
+/// the rename and the row being finished, the next run finds the file
+/// already holding this text and counts it as written, rather than as a
+/// file with nothing left to fix. Durable and foreign-key free, like
+/// [`CREATE_FIX_LOG`] (a new table, so no `ALTER TABLE` path is needed).
+const CREATE_PENDING_WRITES: &str = "\
+    CREATE TABLE IF NOT EXISTS pending_writes (\
+        pending_id INTEGER PRIMARY KEY, \
+        len INTEGER NOT NULL, \
+        hash TEXT NOT NULL, \
+        links INTEGER NOT NULL, \
+        created_at INTEGER NOT NULL \
+    )";
+
 /// The folders that were made their own source: `parent` (a source
 /// name) skips `rel_path` (relative to its root) when it scans, because
 /// `source` owns it. Durable and foreign-key free, like
@@ -358,7 +392,8 @@ pub(crate) fn create_core_indexes(conn: &Connection) -> Result<(), CacheError> {
 }
 
 /// Creates `sources`, `schema_version`, `scan_state` and the durable
-/// history tables (`fix_log`, `pending_fixes`, `promoted_roots`) if
+/// history tables (`fix_log`, `pending_fixes`, `pending_writes`,
+/// `held_renames`, `promoted_roots`) if
 /// absent. Idempotent and safe to call on every open: never drops or
 /// truncates any of them, so none of them is touched by a rebuild.
 pub(crate) fn create_bootstrap_tables(conn: &Connection) -> Result<(), CacheError> {
@@ -367,6 +402,8 @@ pub(crate) fn create_bootstrap_tables(conn: &Connection) -> Result<(), CacheErro
     conn.execute(CREATE_SCAN_STATE, [])?;
     conn.execute(CREATE_FIX_LOG, [])?;
     conn.execute(CREATE_PENDING_FIXES, [])?;
+    conn.execute(CREATE_PENDING_WRITES, [])?;
+    conn.execute(CREATE_HELD_RENAMES, [])?;
     conn.execute(CREATE_PROMOTED_ROOTS, [])?;
     Ok(())
 }

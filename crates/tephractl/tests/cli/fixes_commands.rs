@@ -319,3 +319,44 @@ fn a_source_rename_line_names_the_old_and_new_source_once() {
         )
     );
 }
+
+/// A promote entry stores its new name as `@name:` already, and an
+/// unpromote entry its old name: each is printed once, with no second
+/// `@source:` prefix (`@vsub:@vsub:`).
+#[test]
+fn promote_and_unpromote_lines_do_not_double_the_source_prefix() {
+    let body = json!({"jsonrpc": "2.0", "id": 1, "result": [
+        {
+            "id": 9,
+            "time": 1_794_790_100,
+            "kind": "unpromote",
+            "sources": ["vsub", "vault"],
+            "old": "@vsub:",
+            "new": "Projects/Sub",
+            "files_changed": 1,
+            "status": "applied"
+        },
+        {
+            "id": 8,
+            "time": 1_794_790_000,
+            "kind": "promote",
+            "sources": ["vault", "vsub"],
+            "old": "Projects/Sub",
+            "new": "@vsub:",
+            "files_changed": 2,
+            "status": "applied"
+        }
+    ]});
+    let server = MockServer::start(vec![Behavior::Respond { status: 200, body }]);
+    let outcome = run(&server, None, false);
+    assert_eq!(outcome.exit_code, 0, "{}", outcome.stderr);
+    assert_eq!(
+        outcome.stdout,
+        format!(
+            "{} unpromote @vsub: -> @vault:Projects/Sub (1 file) applied\n\
+             {} promote @vault:Projects/Sub -> @vsub: (2 files) applied\n",
+            local_time(1_794_790_100),
+            local_time(1_794_790_000)
+        )
+    );
+}

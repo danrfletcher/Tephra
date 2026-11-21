@@ -29,8 +29,8 @@
 //! 3. work out the rewrite from the text just read, by link text and
 //!    never by byte offsets saved earlier: a link the file no longer
 //!    contains gives nothing to write for it;
-//! 4. refuse a file whose owner-write bit is off (G24, F14), before any
-//!    temp file exists;
+//! 4. refuse a file whose owner-write bit is off or that this process may
+//!    not write (an ACL deny; G24, F14), before any temp file exists;
 //! 5. write a temp file beside it, give it the file's permissions,
 //!    fsync it;
 //! 6. look at the original's fingerprint once more, size AND mtime, just
@@ -48,7 +48,9 @@
 //!
 //! - Permanent (immutable flag, `EPERM`, `EACCES` including an ACL deny,
 //!   an unwritable directory, a symlink, a read-only mode, a read-only
-//!   file system): the first attempt ends it. Status
+//!   file system, or an internal failure applying the computed link
+//!   changes to the text just read, which no retry can change): the
+//!   first attempt ends it. Status
 //!   [`WriteStatus::NeedsManualFix`], no backoff, no second attempt, and
 //!   the result says it is retried only at startup, on `source.rescan`
 //!   or when that file changes ([`RetryPlan::OnlyAtStartupRescanOrFileChange`]).
@@ -232,6 +234,26 @@ impl RewriteMode {
         }
     }
 }
+
+/// What the writer is about to put in a file, told to the caller just
+/// before the rename that puts it there (PR-5 R7): the caller records it
+/// durably, so a run that stops after the rename can tell, from the file
+/// itself, that the write landed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteIntent {
+    /// Byte length of the new text.
+    pub len: u64,
+    /// `tephra_parser::content_hash_bytes` of the new text.
+    pub hash: String,
+    /// How many links the new text changes.
+    pub links: usize,
+}
+
+/// Called with the [`WriteIntent`] before each rename. An error means the
+/// intent could not be recorded: the rename is not made and the attempt
+/// counts as a transient failure, so a write is never made that a restart
+/// could not recognise.
+pub type IntentSink<'a> = &'a dyn Fn(&WriteIntent) -> io::Result<()>;
 
 /// One linking file and the links in it that named the old target.
 #[derive(Debug, Clone)]
@@ -458,12 +480,22 @@ impl FixWriter {
     /// Rewrites the links in one file: up to [`MAX_WRITE_ATTEMPTS`]
     /// attempts (see the module doc).
     pub fn write_file(&self, req: &FileFixRequest) -> FileWriteResult {
+        self.write_file_noting(req, None)
+    }
+
+    /// [`FixWriter::write_file`], telling `intent` what each attempt is
+    /// about to write, just before its rename.
+    pub fn write_file_noting(
+        &self,
+        req: &FileFixRequest,
+        intent: Option<IntentSink<'_>>,
+    ) -> FileWriteResult {
         let mut changed_attempts = 0u32;
         let mut last_transient: Option<String> = None;
         let mut attempts = 0u32;
         for n in 1..=MAX_WRITE_ATTEMPTS {
             attempts = n;
-            match self.attempt(req) {
+            match self.attempt(req, intent) {
                 Attempt::Written { links } => {
                     if self.own_writes.load(Ordering::SeqCst) {
                         crate::dup_ids::note_self_write(&req.abs_path);
@@ -551,7 +583,7 @@ impl FixWriter {
     }
 
     /// One attempt, under the gate and the file's lock.
-    fn attempt(&self, req: &FileFixRequest) -> Attempt {
+    fn attempt(&self, req: &FileFixRequest, intent: Option<IntentSink<'_>>) -> Attempt {
         let _gate = self.gate.lock().unwrap_or_else(|p| p.into_inner());
         let _file_lock = file_lock::lock(&req.abs_path);
         let abs = req.abs_path.as_path();
@@ -615,14 +647,38 @@ impl FixWriter {
                 "the file is read-only, so its links are not rewritten".to_string(),
             );
         }
+        // The mode bit says nothing of an ACL: one that denies write (and
+        // not delete) leaves the owner-write bit on, and a temp file
+        // renamed over the file would replace it all the same. The
+        // kernel's own answer for this process, which counts ACLs, is
+        // asked before any temp file exists.
+        if !may_write(abs) {
+            return Attempt::Permanent(
+                "the file is not writable by this process (a permission or an ACL denies it), so its links are not rewritten"
+                    .to_string(),
+            );
+        }
         let refs: Vec<&LinkChange> = changes.iter().collect();
         let new_content = match apply_changes_to_content(&content, &refs) {
             Ok(c) => c,
-            Err(e) => return Attempt::Transient(e),
+            // Deterministic: the same text and the same changes fail the
+            // same way on every attempt (overlapping or out-of-range
+            // spans), so retrying and deferring would only waste rounds.
+            Err(e) => {
+                return Attempt::Permanent(format!(
+                    "internal error: the link changes could not be applied: {e}"
+                ))
+            }
         };
 
         // 5-7. Temp file, fsync, re-check, rename.
-        match self.replace(abs, &meta, new_content.as_bytes(), before) {
+        match self.replace(
+            abs,
+            &meta,
+            new_content.as_bytes(),
+            before,
+            intent.map(|sink| (sink, changes.len())),
+        ) {
             Ok(Replaced::Done) => Attempt::Written {
                 links: changes.len(),
             },
@@ -639,6 +695,7 @@ impl FixWriter {
         meta: &fs::Metadata,
         content: &[u8],
         before: (u64, Option<std::time::SystemTime>),
+        intent: Option<(IntentSink<'_>, usize)>,
     ) -> io::Result<Replaced> {
         let dir = target.parent().unwrap_or_else(|| Path::new("."));
         let file_name = target
@@ -647,6 +704,9 @@ impl FixWriter {
             .unwrap_or("file");
         // `.<name>.tephra-tmp-<digits>`: the form the source scan sweeps.
         let tmp = dir.join(format!(".{file_name}.tephra-tmp-{}", rand::random::<u32>()));
+        // In flight until the rename or cleanup below: no source walk in
+        // this process may sweep it meanwhile (see `LiveTemp`).
+        let _in_flight = super::LiveTemp::claim(&tmp);
 
         let prepared = (|| -> io::Result<()> {
             self.fs.write_new(&tmp, content)?;
@@ -671,6 +731,26 @@ impl FixWriter {
             }
         }
 
+        // Told last, after every check that can still send the attempt
+        // round again, so the record is of the write about to be made.
+        if let Some((sink, links)) = intent {
+            let told = sink(&WriteIntent {
+                len: content.len() as u64,
+                hash: tephra_parser::content_hash_bytes(content),
+                links,
+            });
+            if let Err(e) = told {
+                let _ = fs::remove_file(&tmp);
+                return Err(e);
+            }
+        }
+
+        // Known residual window of temp + rename (plan "Known risks",
+        // FR25): if the target is deleted after the fingerprint above
+        // and before this rename, the rename recreates it with the
+        // rewritten content. The re-check narrows the window but cannot
+        // close it; no portable atomic "replace only if it still
+        // exists" call is available.
         match self.fs.rename(&tmp, target) {
             Ok(()) => Ok(Replaced::Done),
             Err(e) => {
@@ -732,6 +812,28 @@ fn log_recovered(req: &FileFixRequest, recovered: u32, attempts: u32) {
     }
 }
 
+/// Whether this process may write the file: `access(W_OK)` on Unix,
+/// which the kernel answers from the mode bits AND any ACL. Elsewhere
+/// (and when the path cannot be turned into a C string) it says yes: the
+/// read-only attribute is already checked, and the rename's own error is
+/// still classified.
+fn may_write(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+            return true;
+        };
+        // SAFETY: `c` is a valid NUL-terminated string for the call.
+        unsafe { libc::access(c.as_ptr(), libc::W_OK) == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        true
+    }
+}
+
 /// Whether the file's owner-write bit is off. On Unix that is
 /// `mode & 0o200 == 0` (`Permissions::readonly` tests only that no write
 /// bit at all is set); elsewhere the platform's read-only attribute.
@@ -768,7 +870,7 @@ fn is_immutable(meta: &fs::Metadata) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
     use std::sync::Mutex as StdMutex;
     use std::time::SystemTime;
 
@@ -923,6 +1025,72 @@ mod tests {
         r
     }
 
+    /// PR-5 R7: the writer says what it is about to write, once, before
+    /// the rename: the new text's length and hash, and the links changed.
+    #[test]
+    fn the_intent_names_the_text_about_to_be_written_before_the_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Weekly Review.md");
+        fs::write(&path, "See [[Training Plan]].\n").unwrap();
+        let writer = FixWriter::with_parts(
+            Arc::new(Mutex::new(())),
+            Arc::new(RealFs),
+            Arc::new(CountingSleeper::default()),
+        );
+        let told = Mutex::new(Vec::new());
+        let on_disk_when_told = Mutex::new(Vec::new());
+        let sink = |i: &WriteIntent| -> io::Result<()> {
+            told.lock().unwrap().push(i.clone());
+            on_disk_when_told
+                .lock()
+                .unwrap()
+                .push(fs::read_to_string(&path).unwrap());
+            Ok(())
+        };
+        let r = writer.write_file_noting(&request(dir.path(), 0), Some(&sink));
+        assert_eq!(r.status, WriteStatus::Written);
+        let now = fs::read(&path).unwrap();
+        assert_eq!(
+            told.into_inner().unwrap(),
+            vec![WriteIntent {
+                len: now.len() as u64,
+                hash: tephra_parser::content_hash_bytes(&now),
+                links: 1,
+            }]
+        );
+        assert_eq!(
+            on_disk_when_told.into_inner().unwrap(),
+            ["See [[Training Plan]].\n"],
+            "told before the rename, while the file still has the old text"
+        );
+    }
+
+    /// An intent that cannot be recorded stops the write: a file is never
+    /// replaced by a text a restart could not recognise. The attempt is
+    /// transient, so the file is left as it was and no temp file stays.
+    #[test]
+    fn an_intent_that_cannot_be_recorded_stops_the_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Weekly Review.md");
+        let original = "See [[Training Plan]].\n";
+        fs::write(&path, original).unwrap();
+        let writer = FixWriter::with_parts(
+            Arc::new(Mutex::new(())),
+            Arc::new(RealFs),
+            Arc::new(CountingSleeper::default()),
+        );
+        let sink = |_: &WriteIntent| -> io::Result<()> { Err(io::Error::other("disk full")) };
+        let r = writer.write_file_noting(&request(dir.path(), 0), Some(&sink));
+        assert_eq!(r.status, WriteStatus::Deferred);
+        assert_eq!(r.failure_class, Some(FailureClass::Transient));
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        let left: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left.len(), 1, "no temp file stays: {left:?}");
+    }
+
     #[test]
     fn a_file_that_moves_every_attempt_is_deferred_then_needs_a_manual_fix_at_the_round_cap() {
         let dir = tempfile::tempdir().unwrap();
@@ -990,6 +1158,71 @@ mod tests {
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
         assert_eq!(names, vec!["Weekly Review.md".to_string()]);
+    }
+
+    /// A sleeper that moves a fake clock instead of waiting: what the
+    /// loop waits for is then a sum on the clock, not a count of calls.
+    struct ClockSleeper(Arc<AtomicU64>);
+
+    impl Sleeper for ClockSleeper {
+        fn sleep(&self, d: Duration) {
+            self.0.fetch_add(d.as_millis() as u64, Ordering::SeqCst);
+        }
+    }
+
+    /// The retry state on a fake clock (G9, G22): the writer's own waits
+    /// advance the clock, the caller takes each round's `after_ms` as the
+    /// earliest time of the next round and moves the clock there, and the
+    /// time to the give-up is exactly the named backoffs, with no round
+    /// due before its backoff has run out.
+    #[test]
+    fn the_retry_state_runs_on_a_fake_clock_and_no_round_is_due_early() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Weekly Review.md");
+        fs::write(&path, "See [[Training Plan]].\n").unwrap();
+        let clock = Arc::new(AtomicU64::new(0));
+        let writer = FixWriter::with_parts(
+            Arc::new(Mutex::new(())),
+            Arc::new(AlwaysMoves {
+                syncs: AtomicU32::new(0),
+            }),
+            Arc::new(ClockSleeper(clock.clone())),
+        );
+
+        let mut rounds = 0;
+        let mut due_at = 0u64;
+        let mut expected_total = 0u64;
+        for round in 1..=MAX_ITEM_ROUNDS {
+            // The caller does not run a round before it is due.
+            let now = clock.load(Ordering::SeqCst);
+            assert!(
+                now >= due_at,
+                "round {round} would run {} ms early",
+                due_at - now
+            );
+            let started = clock.load(Ordering::SeqCst);
+            let r = writer.write_file(&request(dir.path(), rounds));
+            // One round's own waits: two backoffs between three attempts.
+            let waited = clock.load(Ordering::SeqCst) - started;
+            let per_round = (write_backoff(1) + write_backoff(2)).as_millis() as u64;
+            assert_eq!(waited, per_round, "round {round}");
+            expected_total += per_round;
+            rounds = r.rounds;
+            match r.retry {
+                RetryPlan::AfterBackoff { after_ms } => {
+                    assert_eq!(after_ms, item_backoff(round).as_millis() as u64);
+                    due_at = clock.load(Ordering::SeqCst) + after_ms;
+                    // The clock moves to when it is due; nothing runs before.
+                    clock.store(due_at, Ordering::SeqCst);
+                    expected_total += after_ms;
+                }
+                _ => {
+                    assert_eq!(round, MAX_ITEM_ROUNDS);
+                    assert_eq!(r.status, WriteStatus::NeedsManualFix);
+                }
+            }
+        }
+        assert_eq!(clock.load(Ordering::SeqCst), expected_total);
     }
 
     #[test]

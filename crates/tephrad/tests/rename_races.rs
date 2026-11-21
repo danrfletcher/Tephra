@@ -118,8 +118,7 @@ fn assert_not_a_host_share(path: &Path) {
         };
         let mountpoint = before.split(' ').nth(4).unwrap_or("");
         let fstype = after.split(' ').next().unwrap_or("").to_string();
-        if path.starts_with(mountpoint)
-            && best.as_ref().map_or(true, |(n, _)| mountpoint.len() >= *n)
+        if path.starts_with(mountpoint) && best.as_ref().is_none_or(|(n, _)| mountpoint.len() >= *n)
         {
             best = Some((mountpoint.len(), fstype));
         }
@@ -972,11 +971,31 @@ fn race_6_the_exact_event_beats_a_hash_guess_in_both_orders() {
                 "order 1: the guess and its correction: {:?}",
                 d.entries()
             );
+            // The log shows the correction: the guess's entry
+            // (OLD -> Guess.md, applied, N files) stays, and the exact
+            // event's own entry (OLD -> Plan.md) is applied and counts
+            // the same N files, the ones it pointed at Plan.md instead.
+            let guess = renames
+                .iter()
+                .find(|e| e["old"] == json!(OLD) && e["new"] == json!(GUESS))
+                .unwrap_or_else(|| panic!("order 1, the guess entry: {renames:?}"));
+            let correction = renames
+                .iter()
+                .find(|e| e["old"] == json!(OLD) && e["new"] == json!(NEW))
+                .unwrap_or_else(|| panic!("order 1, the correction entry: {renames:?}"));
+            assert_eq!(guess["status"], json!("applied"), "order 1: {guess}");
+            assert_eq!(
+                correction["status"],
+                json!("applied"),
+                "order 1: {correction}"
+            );
             assert!(
-                renames
-                    .iter()
-                    .any(|e| e["new"] == json!(NEW) && e["status"] == json!("applied")),
-                "order 1: {renames:?}"
+                guess["files_changed"].as_u64().unwrap_or(0) > 0,
+                "order 1: the guess wrote files: {guess}"
+            );
+            assert_eq!(
+                correction["files_changed"], guess["files_changed"],
+                "order 1: the correction repoints every file the guess wrote"
             );
             let again = d.event(OLD, NEW);
             assert_eq!(

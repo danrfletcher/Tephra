@@ -162,7 +162,10 @@ stop_own_daemon() {
 refuse_host_share() {
   local path=$1 fstype
   # The nearest existing ancestor decides: the path may not be made yet.
-  fstype=$(dsh "p='$path'; while [ ! -e \"\$p\" ]; do p=\$(dirname \"\$p\"); done; df -PT \"\$p\" 2>/dev/null | awk 'NR==2 {print \$2}'") || fstype=""
+  # The path is passed to the container's shell as an argument ($1), never
+  # written into the script text: a path with a quote in it (or `$(...)`)
+  # is then only a path.
+  fstype=$(docker exec "$CONTAINER" sh -c 'p=$1; while [ ! -e "$p" ]; do p=$(dirname "$p"); done; df -PT "$p" 2>/dev/null | awk '"'"'NR==2 {print $2}'"'"'' sh "$path") || fstype=""
   case "$fstype" in
     virtiofs | 9p | grpcfuse | osxfs | vboxsf | nfs | nfs4 | cifs | fuse*)
       die "$path is on a $fstype mount (a bind mount of the host); tests need the container's own filesystem, for example /tmp; nothing was changed"
@@ -340,7 +343,17 @@ cmd_start() {
       source="$RUN/vault"
       seed_vault || die "cannot seed the test vault in $RUN/vault"
     fi
-    if ! ctl source list 2>/dev/null | grep -q 'notes'; then
+    # A source called `notes` from an earlier start may still be
+    # registered (the data dir outlives a restart), pointing at another
+    # folder: the table row is `NAME STATUS PATH`, and only a row whose
+    # name is exactly `notes` counts. One at another path is replaced, so
+    # what is printed below is what is registered.
+    local current
+    current=$(ctl source list 2>/dev/null | awk '$1 == "notes" { $1 = ""; $2 = ""; sub(/^ +/, ""); sub(/ \(offline\)$/, ""); print; exit }')
+    if [ "$current" != "$source" ]; then
+      if [ -n "$current" ]; then
+        ctl source remove notes >/dev/null 2>&1 || die "tephrad is up on $ADDR but 'source remove notes' (it points at $current) failed"
+      fi
       ctl source add notes "$source" >/dev/null 2>&1 || die "tephrad is up on $ADDR but 'source add notes $source' failed"
     fi
     source_note="source notes = $source"

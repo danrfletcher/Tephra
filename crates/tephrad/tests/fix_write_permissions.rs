@@ -118,6 +118,57 @@ fn g24_a_0444_file_is_never_rewritten_and_its_bytes_mtime_and_inode_stay() {
     assert!(tmp_files(w.notes.root()).is_empty());
 }
 
+/// An ACL that denies write but not delete leaves the owner-write bit on,
+/// and a temp file renamed over the file would replace it. The writer asks
+/// the kernel (`access`), so it is refused like a read-only file. macOS
+/// only: it sets a real ACL with `chmod +a`.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_acl_that_denies_write_is_refused_before_a_temp_file_exists() {
+    require_non_root();
+    let w = gp1_renamed();
+    let reqs = w.requests("Training Plan.md", "Plan.md");
+    let path = w.notes.root().join("Weekly Review.md");
+    let user = String::from_utf8(
+        std::process::Command::new("id")
+            .arg("-un")
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let user = user.trim();
+    let set = std::process::Command::new("chmod")
+        .arg("+a")
+        .arg(format!("user:{user} deny write,writeattr,writeextattr"))
+        .arg(&path)
+        .status()
+        .unwrap();
+    assert!(set.success(), "could not set the ACL");
+    struct ClearAcl<'a>(&'a Path);
+    impl Drop for ClearAcl<'_> {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("chmod")
+                .arg("-N")
+                .arg(self.0)
+                .status();
+        }
+    }
+    let _clear = ClearAcl(&path);
+    let before = identity(&path);
+    assert_ne!(fs::metadata(&path).unwrap().permissions().mode() & 0o200, 0);
+
+    let (writer, sleeper) = real_writer();
+    let r = writer.write_file(request_for(&reqs, "Weekly Review.md"));
+
+    assert_eq!(r.status, WriteStatus::NeedsManualFix, "{r:?}");
+    assert_eq!(r.attempts, 1);
+    assert_eq!(r.failure_class, Some(FailureClass::Permanent));
+    assert_eq!(sleeper.slept.lock().unwrap().len(), 0);
+    assert_eq!(identity(&path), before, "the file was replaced");
+    assert!(tmp_files(w.notes.root()).is_empty());
+}
+
 #[test]
 fn f14_a_0444_file_is_not_overwritten_by_a_second_attempt_or_a_repeat_call_or_a_give_up() {
     require_non_root();

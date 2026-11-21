@@ -282,6 +282,36 @@ grep -c 'exec -d' "$LOG" | grep -qx 1 && ok "still one daemon started" || bad "s
 not_in_log "only its own pid is signalled" 'kill [^4]'
 unset STUB_UP
 
+# A --source path with a quote in it is an argument, never script text.
+export STUB_UP=no
+run start s --source "/tmp/it's here"
+expect "a source path with a quote is accepted" 0 "127.0.0.1:43111"
+in_log "the path reaches the container shell as an argument" "sh /tmp/it's here"
+not_in_log "the path is not written into the shell text" "p='/tmp"
+unset STUB_UP
+
+# A `notes` source of an earlier start that points elsewhere is replaced;
+# one that already points at the folder is kept; a source that only has
+# `notes` in its name does not count.
+export STUB_UP=no STUB_SOURCES="NAME STATUS PATH
+notes-old active /tmp/vault2
+notes active /tmp/old-vault"
+run start s --source /tmp/vault2
+expect "start with another folder" 0 "source notes = /tmp/vault2"
+in_log "the old notes is removed" "source remove notes"
+in_log "notes is added at the new folder" "source add notes /tmp/vault2"
+export STUB_SOURCES="NAME STATUS PATH
+notes active /tmp/vault2"
+run start s --source /tmp/vault2
+not_in_log "notes already at the folder is left alone" "source remove notes"
+not_in_log "and not added twice" "source add notes"
+export STUB_SOURCES="NAME STATUS PATH
+notes-old active /tmp/vault2"
+run start s --source /tmp/vault2
+in_log "a source with notes only in its name does not count" "source add notes /tmp/vault2"
+not_in_log "and nothing is removed" "source remove notes"
+unset STUB_UP STUB_SOURCES
+
 # A port in use: the daemon exits at start with the bind error.
 export STUB_UP=no STUB_NOLISTEN=1 STUB_START_ERROR="tephrad: listener failed: Address already in use (os error 98)"
 run start s --port 4812 --no-source

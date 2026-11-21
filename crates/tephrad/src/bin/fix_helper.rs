@@ -8,6 +8,11 @@
 //! write loop, once, and exits. It needs no running daemon, but it may
 //! run beside one (they share only the cache file).
 //!
+//! Built only with the `test-harness` feature (`cargo build --bin
+//! fix_helper --features test-harness`), so `cargo install tephrad` does
+//! not put a tool that rewrites files directly on a machine; `cargo test`
+//! turns the feature on itself.
+//!
 //! USAGE:
 //!     fix_helper <cache-db> rename <source> <old-path> <new-path> [--stop-after <n>]
 //!     fix_helper <cache-db> resume [--stop-after <n>]
