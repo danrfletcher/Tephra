@@ -378,12 +378,17 @@ fn cached_ids_of_file(
 /// Relative path, normalized to forward slashes regardless of
 /// platform, for storage in `units.rel_path` and for matching against
 /// [`IgnoreRules`].
+///
+/// `None` when `abs` is not below `root`, is `root` itself, or has any
+/// component that is not valid UTF-8. A path is never stored with such a
+/// component dropped: that would let two different files share one
+/// `rel_path`, or map `dir/bad\xff.md` onto the directory's own path.
 pub(crate) fn to_rel_string(root: &Path, abs: &Path) -> Option<String> {
     let rel = abs.strip_prefix(root).ok()?;
-    let joined: Vec<&str> = rel
+    let joined = rel
         .components()
-        .filter_map(|c| c.as_os_str().to_str())
-        .collect();
+        .map(|c| c.as_os_str().to_str())
+        .collect::<Option<Vec<&str>>>()?;
     if joined.is_empty() {
         None
     } else {
@@ -414,22 +419,54 @@ struct ContentStamp {
     device: Option<u64>,
 }
 
+/// A file's identity from a `stat`: its inode and volume.
+#[cfg(unix)]
+fn stat_identity(metadata: &fs::Metadata) -> (Option<u64>, Option<u64>) {
+    use std::os::unix::fs::MetadataExt;
+    (Some(metadata.ino()), Some(metadata.dev()))
+}
+
+/// No inode or device number to read: identity stays `None`. This is
+/// the only part of the stamp that differs by platform, so it is the
+/// only `cfg` split.
+#[cfg(not(unix))]
+fn stat_identity(_metadata: &fs::Metadata) -> (Option<u64>, Option<u64>) {
+    (None, None)
+}
+
 impl ContentStamp {
     /// The identity half, from a `stat` of the file.
-    #[cfg(unix)]
     fn of(metadata: &fs::Metadata) -> Self {
-        use std::os::unix::fs::MetadataExt;
+        let (inode, device) = stat_identity(metadata);
         ContentStamp {
             hash: None,
-            inode: Some(metadata.ino()),
-            device: Some(metadata.dev()),
+            inode,
+            device,
         }
     }
 
-    /// No inode or device number to read: identity stays `None`.
-    #[cfg(not(unix))]
-    fn of(_metadata: &fs::Metadata) -> Self {
-        ContentStamp::default()
+    /// Makes the identity and the hash one snapshot. The identity comes
+    /// from a `stat` taken before the bytes were read; an editor that
+    /// saves by temp file and rename in between leaves the old inode
+    /// next to the new file's hash. `after` is a second `stat` taken
+    /// once the last read is done. If it names another file (or the
+    /// file is gone), the identity is the one `after` reports and the
+    /// hash is dropped: the bytes may be from either file, and a row
+    /// with no hash is never taken for a rename match. Where there is
+    /// no identity (non-Unix) nothing can disagree and this does
+    /// nothing. Returns whether the two stats agreed.
+    fn settle(&mut self, after: Option<&fs::Metadata>) -> bool {
+        let (inode, device) = after.map_or((None, None), stat_identity);
+        if self.inode.is_none() && self.device.is_none() {
+            return true;
+        }
+        if after.is_some() && inode == self.inode && device == self.device {
+            return true;
+        }
+        self.inode = inode;
+        self.device = device;
+        self.hash = None;
+        false
     }
 
     /// The hash half: SHA-256 of the file's raw bytes, with no text
@@ -753,6 +790,14 @@ fn write_unit(
             }
         }
     }
+    // Re-stat after the last read: identity and hash must describe the
+    // same file (see `ContentStamp::settle`).
+    if !stamp.settle(fs::metadata(abs_path).ok().as_ref()) {
+        tracing::warn!(
+            path = %abs_path.display(),
+            "file was replaced while it was being read; indexed without a content hash"
+        );
+    }
     if too_large {
         tracing::info!(
             path = %abs_path.display(),
@@ -1020,6 +1065,34 @@ fn parse_file(
     }
 }
 
+/// Whether the file at `abs` is called `rel` on disk, as far as a disk
+/// that ignores case can tell: a path whose spelling differs from the
+/// real one only in ASCII case (`plan.md` for `Plan.md`) is not. The
+/// real spelling comes from `canonicalize`, which gives the case the
+/// directory holds on macOS and Windows, and the path itself on a disk
+/// that keeps case (where every stat that succeeds is exact). Anything
+/// else (a failed lookup, a different normalisation of the same name, a
+/// path that is not under `rel`'s shape) says the path is fine: this
+/// only ever rules out the one case it names.
+fn is_spelled_as_on_disk(_root: &Path, abs: &Path, rel: &str) -> bool {
+    let Ok(real) = fs::canonicalize(abs) else {
+        return true;
+    };
+    let wanted: Vec<&str> = rel.split('/').collect();
+    let real_parts: Vec<std::borrow::Cow<'_, str>> = real
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect();
+    if real_parts.len() < wanted.len() {
+        return true;
+    }
+    let tail = &real_parts[real_parts.len() - wanted.len()..];
+    wanted
+        .iter()
+        .zip(tail)
+        .all(|(w, r)| *w == r.as_ref() || !w.eq_ignore_ascii_case(r))
+}
+
 /// Deletes the one unit row at `source_id`/`rel_path` (if any) and
 /// its cascading links/tags/blocks, via `cache`'s typed helpers.
 /// Returns whether a row actually existed to delete.
@@ -1117,6 +1190,12 @@ fn walk_and_write(
 
         if let Some(file_name) = entry.path().file_name().and_then(|n| n.to_str()) {
             if refactor::is_stale_temp_file_name(file_name) {
+                // The temp file of a rewrite running right now in this
+                // process is not stale: leave it for its writer, who
+                // renames it into place.
+                if refactor::is_live_temp(entry.path()) {
+                    continue;
+                }
                 // R3 review finding: a process killed between
                 // `rewrite_links_atomic`'s `write_new` and `rename`
                 // can leave one of these behind in the user's own
@@ -1259,7 +1338,7 @@ pub fn sweep_stale_temp_files(root: &Path) -> io::Result<usize> {
         let Some(file_name) = entry.path().file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if !refactor::is_stale_temp_file_name(file_name) {
+        if !refactor::is_stale_temp_file_name(file_name) || refactor::is_live_temp(entry.path()) {
             continue;
         }
         match fs::remove_file(entry.path()) {
@@ -1507,6 +1586,9 @@ fn upsert_directory(
             stats.files_ignored += 1;
             continue;
         }
+        if is_writer_temp_path(entry.path()) {
+            continue;
+        }
         let rel_path = match to_rel_string(root, entry.path()) {
             Some(r) => r,
             None => continue,
@@ -1585,6 +1667,14 @@ fn identity_of(row: &tephra_cache::UnitRow) -> Option<crate::rename_detect::Iden
         (Some(device), Some(inode)) => Some(crate::rename_detect::Identity { device, inode }),
         _ => None,
     }
+}
+
+/// Whether `path` is named like the temp file of one of Tephra's own
+/// atomic rewrites (`.<name>.tephra-tmp-<digits>`).
+fn is_writer_temp_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(refactor::is_stale_temp_file_name)
 }
 
 /// Applies one debounce-coalesced batch of changed absolute paths
@@ -1739,6 +1829,14 @@ fn apply_change_batch_once(
             stats.files_ignored += 1;
             continue;
         }
+        // A temp file of one of Tephra's own atomic writes. It is on its
+        // way to being renamed over the real file, which has its own
+        // event, so it is never a unit: indexing it would report it as a
+        // change (and a new file to pair with a vanished one) for as long
+        // as a slow write keeps it on disk.
+        if is_writer_temp_path(abs_path) {
+            continue;
+        }
 
         // T2: never read through a symlink. A changed path that is a
         // symlink, or lies below one, is not content of this source: a
@@ -1769,6 +1867,17 @@ fn apply_change_batch_once(
                         appeared: &mut appeared,
                     },
                 )?;
+            }
+            Ok(meta) if meta.is_file() && !is_spelled_as_on_disk(root, abs_path, &rel_path) => {
+                // The old spelling after a case-only rename, on a disk
+                // that ignores case: it stats as the file, but no file is
+                // called that. Indexing it would bring back a unit for a
+                // name that is gone, beside the real one (which has its
+                // own event). Treated as gone: its row, if any, goes.
+                note_vanished(cache, source_id, &rel_path, &mut vanished)?;
+                if delete_existing_unit(cache, source_id, &rel_path)? {
+                    touched_paths.push(abs_path.clone());
+                }
             }
             Ok(meta) if meta.is_file() => {
                 // G19: what the cache held for the file, before its
@@ -1857,14 +1966,13 @@ mod tests {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
-    /// E26 (pinned, unchanged by the char-boundary fix): a path component
-    /// that is not valid UTF-8 is dropped by `to_rel_string`, not
-    /// repaired, so a file whose own name is invalid has no relative path
-    /// (it is skipped) and one under an invalid directory is stored
-    /// without that directory. Valid multi-byte names pass through as
-    /// they are.
+    /// E26: a path with any component that is not valid UTF-8 has no
+    /// relative path, so the file is skipped (never stored under a path
+    /// with that component dropped, which could collide with another
+    /// file or with the directory's own path). Valid multi-byte names
+    /// pass through as they are.
     #[test]
-    fn to_rel_string_pins_todays_handling_of_a_non_utf8_name() {
+    fn to_rel_string_rejects_a_path_with_a_non_utf8_component() {
         let root = Path::new("/vault");
         let join = |parts: &[&[u8]]| {
             let mut p = root.to_path_buf();
@@ -1884,15 +1992,96 @@ mod tests {
         );
         assert_eq!(
             to_rel_string(root, &join(&[b"d\xff", b"inner.md"])),
-            Some("inner.md".to_string()),
-            "an invalid directory component is dropped from the stored path"
+            None,
+            "a file under a directory whose name is not UTF-8 is skipped"
+        );
+        assert_eq!(
+            to_rel_string(root, &join(&[b"dir", b"bad\xff.md"])),
+            None,
+            "an invalid name inside a valid directory must not map to the directory's path"
         );
         assert_eq!(
             to_rel_string(
                 root,
                 &join(&["日本".as_bytes(), b"d\xff", "Todo…ab".as_bytes()])
             ),
+            None
+        );
+        assert_eq!(
+            to_rel_string(root, &join(&["日本".as_bytes(), "Todo…ab".as_bytes()])),
             Some("日本/Todo…ab".to_string())
         );
+    }
+
+    /// An editor that saves by temp file and rename between the stat and
+    /// the read leaves the old inode beside the new bytes' hash. The
+    /// second stat catches it: the identity follows the file now at the
+    /// path and the hash is dropped. A file left alone keeps both.
+    #[test]
+    fn settle_drops_the_hash_when_the_file_was_replaced_during_the_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note.md");
+        fs::write(&path, "old text").unwrap();
+
+        let mut untouched = ContentStamp::of(&fs::metadata(&path).unwrap());
+        untouched.set_hash(b"old text");
+        let before = (untouched.inode, untouched.device);
+        assert!(untouched.settle(fs::metadata(&path).ok().as_ref()));
+        assert_eq!((untouched.inode, untouched.device), before);
+        assert!(untouched.hash.is_some(), "an unchanged file keeps its hash");
+
+        let mut replaced = ContentStamp::of(&fs::metadata(&path).unwrap());
+        replaced.set_hash(b"old text");
+        let temp = dir.path().join("note.md.tmp");
+        fs::write(&temp, "new text").unwrap();
+        fs::rename(&temp, &path).unwrap();
+        let after = fs::metadata(&path).unwrap();
+        assert!(!replaced.settle(Some(&after)));
+        let (inode, device) = stat_identity(&after);
+        assert_eq!((replaced.inode, replaced.device), (inode, device));
+        assert_ne!(replaced.inode, before.0, "the replacement is another inode");
+        assert!(replaced.hash.is_none(), "the hash may be of either file");
+
+        let mut vanished = ContentStamp::of(&fs::metadata(&path).unwrap());
+        vanished.set_hash(b"new text");
+        fs::remove_file(&path).unwrap();
+        assert!(!vanished.settle(fs::metadata(&path).ok().as_ref()));
+        assert!(vanished.hash.is_none() && vanished.inode.is_none());
+    }
+
+    /// On a disk that ignores case, the old spelling of a case-only
+    /// rename still stats as the file. A batch that names it must not
+    /// bring that spelling back as a unit (a ghost beside the real one).
+    #[test]
+    fn a_batch_naming_the_old_spelling_of_a_case_only_rename_indexes_only_the_real_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fs::write(root.join("Plan.md"), "# Plan\n").unwrap();
+        let cache = Cache::open(root.join("cache.db")).unwrap();
+        let id = cache
+            .register_source(
+                "notes",
+                &root.to_string_lossy(),
+                tephra_cache::SourceStatus::Active,
+            )
+            .unwrap();
+        scan_source(&cache, id, &root, &IgnoreRules::default()).unwrap();
+        assert!(cache.get_unit_by_rel_path(id, "Plan.md").unwrap().is_some());
+
+        fs::rename(root.join("Plan.md"), root.join("Plan.tmp")).unwrap();
+        fs::rename(root.join("Plan.tmp"), root.join("plan.md")).unwrap();
+        if fs::metadata(root.join("Plan.md")).is_err() {
+            // A disk that keeps case: the old spelling is simply gone, and
+            // there is no ghost to guard against.
+            return;
+        }
+        let changed: HashSet<PathBuf> = [root.join("Plan.md"), root.join("plan.md")].into();
+        apply_change_batch(&cache, id, &root, &changed, &IgnoreRules::default()).unwrap();
+
+        assert!(
+            cache.get_unit_by_rel_path(id, "Plan.md").unwrap().is_none(),
+            "no unit for the spelling that is gone"
+        );
+        assert!(cache.get_unit_by_rel_path(id, "plan.md").unwrap().is_some());
     }
 }

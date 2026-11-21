@@ -959,3 +959,75 @@ impl FixBackend for UnsupportedFixes {
         Err("fix log backend not configured for this test fixture".to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::registry::SourceRegistry;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// R9/R10, deterministic: `refresh()` must not start (or finish) its
+    /// read-build-replace while another caller holds `rebuild_lock`. The
+    /// test takes the lock itself, so no wall-clock measurement of a
+    /// "single call" is involved and the result does not depend on host
+    /// load. While the lock is held, the cache already contains a source
+    /// the shared graph does not; a refresh that ignored the lock would
+    /// replace the graph with one containing it.
+    #[test]
+    fn refresh_waits_for_the_rebuild_lock_and_runs_once_it_is_released() {
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let cache_path = data_dir.path().join("cache.db");
+
+        let registry =
+            SourceRegistry::new(Cache::open(&cache_path).expect("open cache")).expect("registry");
+        let initial = UnitGraph::build_from_cache(&Cache::open(&cache_path).expect("open cache"))
+            .expect("initial graph");
+        let shared = Arc::new(SharedGraph::new(initial));
+        let graph_refresh = GraphRefresh::new(shared.clone(), cache_path);
+
+        let vault = tempfile::tempdir().expect("vault");
+        std::fs::write(vault.path().join("note.md"), "# Note\n").expect("write note");
+        registry.register("base", vault.path()).expect("register");
+        assert!(
+            shared.resolve_link("[[note]]", Some("base")).is_err(),
+            "precondition: the shared graph predates the registration"
+        );
+
+        let guard = graph_refresh
+            .rebuild_lock
+            .lock()
+            .expect("take rebuild_lock");
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = {
+            let graph_refresh = graph_refresh.clone();
+            std::thread::spawn(move || {
+                let result = graph_refresh.refresh();
+                done_tx.send(result).expect("report refresh result");
+            })
+        };
+
+        // The refresh must stay blocked for as long as the lock is held.
+        // Waiting longer only makes a wrongly-passing refresh more likely
+        // to be caught; a slow host can never make this part fail.
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(500)).is_err(),
+            "refresh() returned while the test held rebuild_lock"
+        );
+        assert!(
+            shared.resolve_link("[[note]]", Some("base")).is_err(),
+            "refresh() replaced the graph while the test held rebuild_lock"
+        );
+
+        drop(guard);
+        done_rx
+            .recv_timeout(Duration::from_secs(300))
+            .expect("refresh() must finish once the lock is released")
+            .expect("refresh succeeds");
+        worker.join().expect("worker must not panic");
+        assert!(
+            shared.resolve_link("[[note]]", Some("base")).is_ok(),
+            "the released refresh must install the graph built from the cache"
+        );
+    }
+}

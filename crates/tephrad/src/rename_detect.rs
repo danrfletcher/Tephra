@@ -763,6 +763,23 @@ pub trait RenameFixer: Send + Sync {
     fn start_batch(&self) {}
     /// See [`RenameFixer::start_batch`].
     fn finish_batch(&self) {}
+    /// The detector is about to hold these files while it waits to see
+    /// whether they pair. A fixer that keeps them durably (the engine
+    /// does) lets a run that stops during the hold pick the pairing up
+    /// again at the next start ([`RenameFixer::recall`]). Called BEFORE
+    /// the cache rows of the vanished files are deleted, where the caller
+    /// can order it so (the start-up catch-up does).
+    fn hold(&self, _vanished: &[Vanished], _appeared: &[Appeared]) {}
+    /// The files [`RenameFixer::hold`] kept and
+    /// [`RenameFixer::release`] has not removed, from a run that stopped.
+    fn recall(&self) -> (Vec<Vanished>, Vec<Appeared>) {
+        (Vec::new(), Vec::new())
+    }
+    /// These files, `(source, path)`, are settled: paired and fixed,
+    /// given up and logged, or no longer true. [`dispatch`] calls it for
+    /// every file it handled whose fix or log did not fail; one that did
+    /// fail stays held and is tried again at the next start.
+    fn release(&self, _vanished: &[(String, String)], _appeared: &[(String, String)]) {}
 }
 
 /// Ends the batch [`dispatch`] opened, however it returns.
@@ -793,6 +810,9 @@ pub type RootOf<'a> = &'a dyn Fn(&str) -> Option<PathBuf>;
 pub fn dispatch(fixer: &dyn RenameFixer, root_of: RootOf<'_>, decisions: Decisions) {
     fixer.start_batch();
     let _batch = BatchGuard(fixer);
+    // What this call settled, to be released from the durable hold.
+    let mut done_v: Vec<(String, String)> = Vec::new();
+    let mut done_a: Vec<(String, String)> = Vec::new();
     let (selfs, rest): (Vec<Rename>, Vec<Rename>) = decisions
         .renames
         .into_iter()
@@ -802,8 +822,11 @@ pub fn dispatch(fixer: &dyn RenameFixer, root_of: RootOf<'_>, decisions: Decisio
         if gone {
             if let Err(e) = fixer.record_uncertain(&r.source, &r.from) {
                 tracing::warn!(source = %r.source, path = %r.from, error = %e, "could not log an uncertain vanish");
+                continue;
             }
         }
+        done_v.push((r.source.clone(), r.from.clone()));
+        done_a.push((r.to_source.clone(), r.to.clone()));
     }
     let (moves, renames): (Vec<Rename>, Vec<Rename>) = rest.into_iter().partition(Rename::is_move);
 
@@ -819,8 +842,11 @@ pub fn dispatch(fixer: &dyn RenameFixer, root_of: RootOf<'_>, decisions: Decisio
         let root = root_of(&source);
         let gone = |dir: &str| root.as_ref().is_none_or(|root| !root.join(dir).exists());
         for change in group_folders(list, gone) {
-            let result = match change {
-                Change::File(r) => fixer.fix_rename(&source, &r.from, &r.to),
+            let (result, handled): (Result<(), String>, Vec<(String, String)>) = match change {
+                Change::File(r) => (
+                    fixer.fix_rename(&source, &r.from, &r.to),
+                    vec![(r.from, r.to)],
+                ),
                 Change::Folder {
                     old_dir,
                     new_dir,
@@ -830,27 +856,49 @@ pub fn dispatch(fixer: &dyn RenameFixer, root_of: RootOf<'_>, decisions: Decisio
                         .iter()
                         .map(|r| (r.from.clone(), r.to.clone()))
                         .collect();
-                    fixer.fix_folder_rename(&source, &old_dir, &new_dir, &moves)
+                    (
+                        fixer.fix_folder_rename(&source, &old_dir, &new_dir, &moves),
+                        moves,
+                    )
                 }
             };
-            if let Err(e) = result {
-                tracing::warn!(source = %source, error = %e, "automatic link fix of a rename failed");
+            match result {
+                Ok(()) => {
+                    for (from, to) in handled {
+                        done_v.push((source.clone(), from));
+                        done_a.push((source.clone(), to));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(source = %source, error = %e, "automatic link fix of a rename failed");
+                }
             }
         }
     }
     for m in moves {
-        if let Err(e) = fixer.fix_move(&m.source, &m.from, &m.to_source, &m.to) {
-            tracing::warn!(from = %m.source, to = %m.to_source, error = %e, "automatic link fix of a move failed");
+        match fixer.fix_move(&m.source, &m.from, &m.to_source, &m.to) {
+            Ok(()) => {
+                done_v.push((m.source.clone(), m.from.clone()));
+                done_a.push((m.to_source.clone(), m.to.clone()));
+            }
+            Err(e) => {
+                tracing::warn!(from = %m.source, to = %m.to_source, error = %e, "automatic link fix of a move failed");
+            }
         }
     }
     for v in decisions.gave_up_vanished {
-        if let Err(e) = fixer.record_uncertain(&v.source, &v.path) {
-            tracing::warn!(source = %v.source, path = %v.path, error = %e, "could not log an uncertain vanish");
+        match fixer.record_uncertain(&v.source, &v.path) {
+            Ok(()) => done_v.push((v.source, v.path)),
+            Err(e) => {
+                tracing::warn!(source = %v.source, path = %v.path, error = %e, "could not log an uncertain vanish");
+            }
         }
     }
     for a in decisions.gave_up_appeared {
         tracing::debug!(source = %a.source, path = %a.path, "new file had no vanished twin: a plain create");
+        done_a.push((a.source, a.path));
     }
+    fixer.release(&done_v, &done_a);
 }
 
 // ---------------------------------------------------------------
@@ -949,6 +997,24 @@ impl SourceRenames {
         SourceRenames { source, root, pool }
     }
 
+    /// This source's name and the OS's word set on what a batch found.
+    fn stamp(
+        &self,
+        marks: &HashMap<PathBuf, OsMark>,
+        vanished: &mut [Vanished],
+        appeared: &mut [Appeared],
+    ) {
+        let mark = |rel: &str| crate::watcher::mark_of(marks, &self.root, &self.root.join(rel));
+        for v in vanished {
+            v.source = self.source.clone();
+            v.os = mark(&v.path);
+        }
+        for a in appeared {
+            a.source = self.source.clone();
+            a.os = mark(&a.path);
+        }
+    }
+
     /// Takes in what one applied batch found. `marks` are what the OS
     /// said about the paths of that batch ([`crate::watcher::OsHints`]);
     /// each file takes its own, else its folder's. What is certain
@@ -963,14 +1029,19 @@ impl SourceRenames {
         if vanished.is_empty() && appeared.is_empty() {
             return;
         }
-        let mark = |rel: &str| crate::watcher::mark_of(marks, &self.root, &self.root.join(rel));
-        for v in &mut vanished {
-            v.source = self.source.clone();
-            v.os = mark(&v.path);
-        }
-        for a in &mut appeared {
-            a.source = self.source.clone();
-            a.os = mark(&a.path);
+        self.stamp(marks, &mut vanished, &mut appeared);
+        // What may have to wait out a hold is kept durably first (a new
+        // file only matters if something has vanished that it could pair
+        // with). `dispatch` releases it once it is settled.
+        let holds_something = !vanished.is_empty()
+            || self
+                .pool
+                .detector
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .has_vanished();
+        if holds_something {
+            fixer.hold(&vanished, &appeared);
         }
         let decisions = {
             let mut d = self.pool.detector.lock().unwrap_or_else(|p| p.into_inner());
@@ -979,6 +1050,61 @@ impl SourceRenames {
         self.pool.wake.notify_one();
         if !decisions.is_empty() {
             self.pool.dispatch(fixer, decisions);
+        }
+    }
+
+    /// What the catch-up at start found, for every source at once: the
+    /// batches of all the sources are taken in under ONE hold of the
+    /// detector, so no hold ends between the first source's files and the
+    /// last's. A hash pair waits a hold for a twin, and the twin may be a
+    /// file of a source that was brought up to date after this one;
+    /// taking the sources in one at a time starts the first one's hold
+    /// before the last one's files are known, and a slow catch-up in
+    /// between (a big source, a busy host) can outlast it. The batches
+    /// must all be of sources that share one pool (the registry's).
+    pub fn on_boot_batches(
+        fixer: &dyn RenameFixer,
+        batches: Vec<(Arc<SourceRenames>, Vec<Vanished>, Vec<Appeared>)>,
+    ) {
+        let no_marks = HashMap::new();
+        let mut prepared: Vec<(Arc<RenamePool>, Vec<Vanished>, Vec<Appeared>)> = Vec::new();
+        for (source, mut vanished, mut appeared) in batches {
+            if vanished.is_empty() && appeared.is_empty() {
+                continue;
+            }
+            source.stamp(&no_marks, &mut vanished, &mut appeared);
+            prepared.push((source.pool.clone(), vanished, appeared));
+        }
+        let Some(pool) = prepared.first().map(|(p, _, _)| p.clone()) else {
+            return;
+        };
+        debug_assert!(prepared.iter().all(|(p, _, _)| Arc::ptr_eq(p, &pool)));
+        // As `on_batch`: kept durably first, if something is waiting on a
+        // twin (anything vanished, in this batch or an earlier one).
+        let holds_something = prepared.iter().any(|(_, v, _)| !v.is_empty())
+            || pool
+                .detector
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .has_vanished();
+        if holds_something {
+            for (_, vanished, appeared) in &prepared {
+                fixer.hold(vanished, appeared);
+            }
+        }
+        let all_decisions: Vec<Decisions> = {
+            let mut d = pool.detector.lock().unwrap_or_else(|p| p.into_inner());
+            let now = Instant::now();
+            prepared
+                .into_iter()
+                .map(|(_, vanished, appeared)| d.ingest(now, vanished, appeared))
+                .collect()
+        };
+        pool.wake.notify_one();
+        for decisions in all_decisions {
+            if !decisions.is_empty() {
+                pool.dispatch(fixer, decisions);
+            }
         }
     }
 }

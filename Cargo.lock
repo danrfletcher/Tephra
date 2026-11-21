@@ -2103,6 +2103,7 @@ dependencies = [
 name = "tephra-cache"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "rusqlite",
  "tempfile",
  "tephrad",
@@ -2112,6 +2113,7 @@ dependencies = [
 name = "tephra-graph"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "percent-encoding",
  "serde",
  "serde_json",
@@ -2125,6 +2127,7 @@ dependencies = [
 name = "tephra-parser"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "lopdf",
  "pulldown-cmark",
  "quick-xml",
@@ -2186,6 +2189,7 @@ dependencies = [
  "tephra-cache",
  "tephra-graph",
  "tephra-parser",
+ "tephrad",
  "tokio",
  "tokio-tungstenite 0.30.0",
  "toml",

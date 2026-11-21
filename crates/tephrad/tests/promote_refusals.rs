@@ -92,9 +92,15 @@ fn refused(d: &Daemon, name: &str, root: &Path, reason: &str, text: &str) {
         other => panic!("wanted {reason}, got {other:?}"),
     }
     assert_eq!(world(d), before, "{reason}: nothing may change");
+    // No source-list marker and no fix is pushed. An ordinary watcher push
+    // is not what is checked: the OS can still hand the watcher the files
+    // the world was set up with after the client above went quiet.
+    let late = client.drain(Duration::from_millis(600));
     assert!(
-        client.next_push(Duration::from_millis(600)).is_none(),
-        "{reason}: nothing may be pushed"
+        late.iter()
+            .all(|p| p["params"].get("sources_changed").is_none()
+                && p["params"].get("fixes").is_none()),
+        "{reason}: nothing may be pushed: {late:?}"
     );
 }
 

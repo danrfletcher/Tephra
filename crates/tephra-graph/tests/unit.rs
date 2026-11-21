@@ -7,6 +7,8 @@ mod fixtures;
 
 #[path = "unit/block_links.rs"]
 mod block_links;
+#[path = "../../tephra-parser/tests/unit/cpu_timer.rs"]
+mod cpu_timer;
 #[path = "unit/large_fan_in.rs"]
 mod large_fan_in;
 #[path = "unit/markdown_links.rs"]

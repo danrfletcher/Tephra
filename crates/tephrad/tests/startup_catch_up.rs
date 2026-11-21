@@ -32,9 +32,25 @@ use tephrad::refactor::{AtomicFs, RealFs};
 use tephrad::registry::{BootOutcome, DaemonEvent, SourceRegistry};
 use tephrad::rpc::backend::{FixBackend, FixService, SourceBackend};
 
-const WAIT: Duration = Duration::from_secs(20);
+/// A wait returns the moment its condition holds; the bound is for a
+/// loaded machine whose OS hands the watcher its events late.
+const WAIT: Duration = Duration::from_secs(90);
 /// What a test shortens the two-second hold to.
 const HOLD: Duration = Duration::from_millis(100);
+/// How long a *negative* check gives the daemon to do the thing it must
+/// not do (write again, push, index) before looking. The spec asks for
+/// polling with `wait_until` and never a fixed sleep, and every check
+/// that waits for something to happen does that. A check that nothing
+/// happens has no state to poll for, so it waits this long and then
+/// looks once. That is a stated deviation from the spec, and it can only
+/// fail to see a late wrong action (a false pass); it never makes a
+/// correct run fail, so it cannot flake on a loaded host. The wait is
+/// several times the `HOLD` and watcher debounce, the longest any such
+/// action takes to start.
+const NEGATIVE_WAIT: Duration = Duration::from_millis(400);
+/// The same for the paused-watchers check, which has to outlast one full
+/// watcher debounce window plus the poll the watcher runs on.
+const NEGATIVE_WAIT_PAUSED: Duration = Duration::from_millis(600);
 
 fn wait_until(timeout: Duration, mut check: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + timeout;
@@ -162,6 +178,20 @@ impl World {
             .get_unit_by_rel_path(s.id, rel)
             .unwrap()
             .and_then(|u| u.hash)
+    }
+
+    /// Whether the cache's hash of `rel` is the hash of the file as it is
+    /// on disk now: the file has been indexed since it was last written.
+    fn cache_is_current(&self, source: &str, rel: &str) -> bool {
+        let root = if source == "notes" {
+            self.notes.root()
+        } else {
+            self.tephra.root()
+        };
+        match (self.unit_hash(source, rel), fs::read(root.join(rel))) {
+            (Some(cached), Ok(bytes)) => cached == tephra_parser::content_hash_bytes(&bytes),
+            _ => false,
+        }
     }
 
     fn indexed(&self, source: &str, rel: &str) -> bool {
@@ -357,6 +387,48 @@ fn a_file_moved_to_another_source_while_down_is_fixed_as_one_move() {
     assert!(w.indexed("tephra", "Training Plan.md"));
 }
 
+/// The hold a hash pair waits for a twin starts once EVERY source has been
+/// brought up to date, not as each one finishes. Here the later source
+/// (`tephra`, where the moved file is) has a long catch-up of its own: a
+/// few thousand new files to index, far longer than the test's `HOLD`.
+/// Were the first source's facts handed over as soon as it was done, its
+/// hold would be over before the move's other half is known and the move
+/// would be logged `uncertain` instead of fixed as one `move`. This is the
+/// slow-host case that made the two cross-source tests above flaky under
+/// load, made deterministic.
+#[test]
+fn a_slow_catch_up_in_a_later_source_does_not_end_an_earlier_sources_hold() {
+    let w = World::new(&GP1_FILES);
+    let text = w.text("Training Plan.md");
+    fs::remove_file(w.root().join("Training Plan.md")).unwrap();
+    w.tephra.write("Training Plan.md", &text);
+    for i in 0..3000 {
+        w.tephra.write(
+            &format!("bulk-{i}.md"),
+            &format!("# Bulk {i}\n\nA file that is new in the later source, number {i}.\n"),
+        );
+    }
+
+    // A short hold, so the later source's catch-up is certain to outlast
+    // it on any host (3000 files take longer than this to index).
+    let (registry, engine) = w.registry();
+    registry.set_rename_hold(Duration::from_millis(5));
+    let b = Boot {
+        outcomes: registry.start_all(|| false),
+        registry,
+        engine,
+    };
+
+    assert!(
+        wait_until(WAIT, || b.kinds("move").len() == 1
+            && w.text("Weekly Review.md").contains("@tephra:")),
+        "{:?}",
+        b.entries()
+    );
+    assert!(b.uncertain().is_empty(), "{:?}", b.entries());
+    assert!(b.kinds("rename").is_empty());
+}
+
 #[test]
 fn a_hash_in_two_sources_is_not_used_to_pair_a_rename_inside_one() {
     let w = World::new(&GP1_FILES);
@@ -401,6 +473,27 @@ fn an_edit_made_while_down_is_indexed_at_start() {
     assert_ne!(w.unit_hash("notes", "Unrelated.md"), before);
     assert!(w.indexed("notes", "Fresh.md"));
     assert!(b.kinds("rename").is_empty());
+}
+
+/// A path an edited `.tephraignore` matches while the daemon is down is
+/// no longer listed, but it is still on disk: it is not "vanished" (no
+/// rename pairing, no log entry), and its cached row goes at start.
+#[test]
+fn a_file_the_ignore_file_now_matches_loses_its_row_at_start_and_is_not_a_vanished_file() {
+    let w = World::new(&GP1_FILES);
+    assert!(w.indexed("notes", "Unrelated.md"));
+    w.notes.write(".tephraignore", "Unrelated.md\n");
+
+    let b = w.boot();
+
+    assert!(!w.indexed("notes", "Unrelated.md"), "the stale row is gone");
+    assert!(
+        w.root().join("Unrelated.md").exists(),
+        "the file is not touched"
+    );
+    assert!(b.kinds("uncertain").is_empty(), "{:?}", b.entries());
+    assert!(b.kinds("rename").is_empty());
+    assert!(matches!(b.outcome("notes"), BootOutcome::CaughtUp { paths } if *paths >= 1));
 }
 
 #[test]
@@ -502,6 +595,41 @@ fn an_offline_source_whose_root_is_back_is_caught_up_and_active() {
     assert!(w.indexed("tephra", "new-while-away.md"));
 }
 
+/// The offline -> stale -> active round trip and the catch-up are ONE
+/// push, sent once the status is final, so a client that rebuilds from
+/// it sees `active` and the new file together.
+#[test]
+fn an_offline_source_coming_back_is_announced_once_with_its_final_status() {
+    let w = World::new(&GP1_FILES);
+    let moved = w.tephra.root().with_extension("away");
+    fs::rename(w.tephra.root(), &moved).unwrap();
+    drop(w.boot());
+    fs::rename(&moved, w.tephra.root()).unwrap();
+    w.tephra.write("new-while-away.md", "# new\n");
+
+    let (registry, _engine) = w.registry();
+    let mut events = registry.subscribe();
+    registry.start_all(|| false);
+
+    let pushes: Vec<DaemonEvent> = drain(&mut events)
+        .into_iter()
+        .filter(|e| matches!(e, DaemonEvent::SourceChanged { source, .. } if source == "tephra"))
+        .collect();
+    assert_eq!(pushes.len(), 1, "{pushes:?}");
+    match &pushes[0] {
+        DaemonEvent::SourceChanged { paths, .. } => assert!(
+            paths.iter().any(|p| p.ends_with("new-while-away.md")),
+            "{paths:?}"
+        ),
+        other => panic!("{other:?}"),
+    }
+    let cache = Cache::open(&w.cache_path).unwrap();
+    assert_eq!(
+        cache.get_source("tephra").unwrap().unwrap().status,
+        SourceStatus::Active
+    );
+}
+
 #[test]
 fn a_shutdown_before_start_all_writes_nothing_and_starts_no_watcher() {
     let w = World::new(&GP1_FILES);
@@ -545,6 +673,13 @@ fn after_start_a_live_rename_is_fixed_by_the_watcher() {
     let w = World::new(&GP1_FILES);
     let b = w.boot();
     assert!(matches!(b.outcome("notes"), BootOutcome::CaughtUp { .. }));
+    // The production hold, not `HOLD`: the OS can hand the watcher the
+    // files written while the world was set up as a batch of its own after
+    // the start, so the rename below can arrive as two batches a debounce
+    // window (250 ms) or more apart. A hold shorter than that gives up on
+    // the vanished file ("uncertain") before its twin turns up, which is
+    // what a 100 ms hold did here about 1 run in 10.
+    b.registry.set_rename_hold(tephrad::watcher::RENAME_HOLD);
 
     w.rename("Training Plan.md", "Plan.md");
 
@@ -620,6 +755,23 @@ fn gp8() -> World {
 fn gp8_a_pull_that_renamed_a_doc_while_down_fixes_both_link_spellings_once() {
     let w = gp8();
     let design_before = read(w.notes.root(), "Design.md");
+    // The two files that link the doc before the rename, from the graph.
+    let backlinks_of = |id: &str| -> Vec<String> {
+        let graph = tephra_graph::UnitGraph::build_from_cache(&Cache::open(&w.cache_path).unwrap())
+            .expect("graph");
+        let mut from: Vec<String> = graph
+            .get_backlinks(id)
+            .into_iter()
+            .map(|e| e.from)
+            .collect();
+        from.sort();
+        from
+    };
+    let backlinks_before = backlinks_of("@tephra:docs/ARCHITECTURE.md");
+    assert_eq!(
+        backlinks_before,
+        vec!["@notes:Design.md", "@tephra:docs/Guide.md"]
+    );
     // `git pull`: a new inode, no rename flag.
     fs::create_dir_all(w.tephra.root().join("docs/architecture")).unwrap();
     fs::rename(
@@ -668,20 +820,22 @@ fn gp8_a_pull_that_renamed_a_doc_while_down_fixes_both_link_spellings_once() {
         "the renamed file is not written"
     );
     assert_eq!(of(&after, "README.md"), of(&tephra_before, "README.md"));
-    // Both linking files now resolve to the new file: the same two
-    // backlinks the old one had.
-    let linking: Vec<&str> = ["Design.md", "docs/Guide.md"]
-        .into_iter()
-        .filter(|rel| {
-            let root = if *rel == "Design.md" {
-                w.notes.root()
-            } else {
-                w.tephra.root()
-            };
-            read(root, rel).contains("overview")
-        })
-        .collect();
-    assert_eq!(linking.len(), 2);
+    // Both linking files now resolve to the new file: the graph, built
+    // from the cache the way the daemon builds it, gives the new unit the
+    // same two backlinks the old one had (checked before the rename).
+    assert!(
+        wait_until(WAIT, || {
+            w.cache_is_current("tephra", "docs/Guide.md")
+                && w.cache_is_current("notes", "Design.md")
+        }),
+        "the fix's writes are indexed"
+    );
+    assert_eq!(
+        backlinks_of("@tephra:docs/architecture/overview.md"),
+        backlinks_before,
+        "the new file has the backlinks the old one had"
+    );
+    assert!(backlinks_of("@tephra:docs/ARCHITECTURE.md").is_empty());
     assert!(w.indexed("tephra", "docs/architecture/overview.md"));
     assert!(!w.indexed("tephra", "docs/ARCHITECTURE.md"));
 }
@@ -704,8 +858,25 @@ fn e18_a_second_start_with_nothing_changed_writes_nothing_and_announces_nothing(
         );
         assert!(wait_until(WAIT, || read(w.notes.root(), "Design.md")
             .contains("overview")));
-        // The fix's own writes settle in the cache before the next start.
-        assert!(wait_until(WAIT, || w.indexed("tephra", "docs/Guide.md")));
+        // The fix's own writes settle before the next start: both linking
+        // files carry their new text, the cache holds that text (a row
+        // that merely exists is the one from before the fix), and no
+        // temp file of the write is left.
+        assert!(
+            wait_until(WAIT, || {
+                w.cache_is_current("tephra", "docs/Guide.md")
+                    && w.cache_is_current("notes", "Design.md")
+                    && read(w.tephra.root(), "docs/Guide.md").contains("overview")
+                    && [w.notes.root(), w.tephra.root()]
+                        .iter()
+                        .all(|root| tree(root).iter().all(|f| !f.0.contains(".tephra-tmp")))
+            }),
+            "{:?}",
+            tree(w.tephra.root())
+                .iter()
+                .map(|f| &f.0)
+                .collect::<Vec<_>>()
+        );
     }
     let notes_before = tree(w.notes.root());
     let tephra_before = tree(w.tephra.root());
@@ -713,8 +884,8 @@ fn e18_a_second_start_with_nothing_changed_writes_nothing_and_announces_nothing(
     let (registry, engine) = w.registry();
     let mut events = registry.subscribe();
     let outcomes = registry.start_all(|| false);
-    // A bounded wait for anything the start would push late.
-    std::thread::sleep(Duration::from_millis(400));
+    // Nothing is to be pushed late: a negative check (see `NEGATIVE_WAIT`).
+    std::thread::sleep(NEGATIVE_WAIT);
 
     assert!(
         outcomes
@@ -990,7 +1161,7 @@ fn fr4_after_a_schema_rebuild_nothing_is_paired_and_a_vanished_file_is_logged_on
     // A second start adds nothing: logged once.
     let (registry, engine) = w.registry();
     registry.start_all(|| false);
-    std::thread::sleep(Duration::from_millis(400));
+    std::thread::sleep(NEGATIVE_WAIT);
     assert_eq!(engine.list(None, 100).unwrap().len(), 1);
 }
 
@@ -1017,7 +1188,7 @@ fn an_unfinished_source_is_rescanned_first_and_never_paired() {
             .all(|(_, o)| *o == BootOutcome::CaughtUp { paths: 0 }),
         "{outcomes:?}"
     );
-    std::thread::sleep(Duration::from_millis(400));
+    std::thread::sleep(NEGATIVE_WAIT);
     assert_eq!(
         w.text("Weekly Review.md"),
         weekly,
@@ -1134,7 +1305,7 @@ fn e9_a_kill_after_the_first_of_several_files_is_finished_by_the_next_boot_none_
             linkers.map(|f| w.text(f))
         );
         // Nothing more is written however long the hold task is given.
-        std::thread::sleep(Duration::from_millis(400));
+        std::thread::sleep(NEGATIVE_WAIT);
         assert_eq!(linkers.iter().filter(|f| fixed(f)).count(), 1);
     }
     let done: Vec<&str> = linkers.iter().copied().filter(|f| fixed(f)).collect();
@@ -1159,6 +1330,130 @@ fn e9_a_kill_after_the_first_of_several_files_is_finished_by_the_next_boot_none_
     let renames = b.kinds("rename");
     assert_eq!(renames.len(), 1, "{:?}", b.entries());
     assert_eq!(renames[0].status, "applied");
+}
+
+// ---------------------------------------------------------------
+// A stop during the hold does not lose the rename (PR-9 R3, R8)
+// ---------------------------------------------------------------
+
+impl World {
+    fn held(&self) -> usize {
+        Cache::open(&self.cache_path)
+            .unwrap()
+            .held_renames()
+            .unwrap()
+            .len()
+    }
+
+    /// A boot whose hold is far longer than any test: nothing it holds is
+    /// decided before it is dropped, as a stop during the hold.
+    fn boot_then_stop_during_the_hold(&self) {
+        let (registry, engine) = self.registry();
+        registry.set_rename_hold(Duration::from_secs(600));
+        let outcomes = registry.start_all(|| false);
+        assert!(
+            matches!(
+                outcomes.iter().find(|(n, _)| n == "notes").map(|o| &o.1),
+                Some(BootOutcome::CaughtUp { .. })
+            ),
+            "{outcomes:?}"
+        );
+        // The catch-up has indexed the new path and dropped the old row:
+        // the next start has nothing to compare, only what was held.
+        assert!(self.indexed("notes", "Plan.md"));
+        assert!(!self.indexed("notes", "Training Plan.md"));
+        drop((registry, engine));
+    }
+}
+
+/// R8: the catch-up deletes the vanished rows and indexes the new ones at
+/// once, but a hash pair is only applied after its hold. If the daemon
+/// stops during the hold, the next start finds the cache already current,
+/// so without a durable record nothing would pair the two files and the
+/// links to the old name stay dangling. The held files are kept before
+/// the rows go, and the next start hands them back to the detector.
+#[test]
+fn r8_a_stop_during_the_hold_of_a_hash_pair_does_not_lose_the_rename() {
+    let w = World::new(&GP1_FILES);
+    w.rename("Training Plan.md", "Plan.md");
+
+    w.boot_then_stop_during_the_hold();
+    assert_eq!(w.held(), 2, "the vanished file and the new one are kept");
+    assert!(
+        w.text("Weekly Review.md").contains("[[Training Plan]]"),
+        "nothing was decided before the stop"
+    );
+
+    let b = w.boot();
+    assert_eq!(b.outcome("notes"), &BootOutcome::CaughtUp { paths: 0 });
+    assert!(
+        wait_until(WAIT, || {
+            w.text("Weekly Review.md").contains("[[Plan]]")
+                && w.text("Goals.md").contains("[[Plan|plan]]")
+        }),
+        "the rename was not fixed: {:?}",
+        w.text("Weekly Review.md")
+    );
+    assert!(
+        wait_until(WAIT, || b.kinds("rename").len() == 1 && w.held() == 0),
+        "{:?} held {}",
+        b.entries(),
+        w.held()
+    );
+    let renames = b.kinds("rename");
+    assert_eq!(renames[0].old.as_deref(), Some("Training Plan.md"));
+    assert_eq!(renames[0].new.as_deref(), Some("Plan.md"));
+    assert_eq!(renames[0].files_changed, 3);
+    assert!(b.uncertain().is_empty(), "{:?}", b.entries());
+}
+
+/// R8: a vanished file with no twin, held when the daemon stopped, is
+/// still logged `uncertain` at the next start rather than forgotten.
+#[test]
+fn r8_a_stop_during_the_hold_of_a_vanished_file_still_logs_it_uncertain() {
+    let w = World::new(&GP1_FILES);
+    fs::remove_file(w.root().join("Training Plan.md")).unwrap();
+
+    let (registry, engine) = w.registry();
+    registry.set_rename_hold(Duration::from_secs(600));
+    registry.start_all(|| false);
+    drop((registry, engine));
+    assert_eq!(w.held(), 1);
+
+    let b = w.boot();
+    assert!(
+        wait_until(WAIT, || b.uncertain() == ["Training Plan.md"]
+            && w.held() == 0),
+        "{:?} held {}",
+        b.entries(),
+        w.held()
+    );
+}
+
+/// A held file that is no longer true at the next start (the vanished
+/// file is back) is dropped, not paired.
+#[test]
+fn r8_a_held_vanished_file_that_is_back_at_the_next_start_is_dropped_not_paired() {
+    let w = World::new(&GP1_FILES);
+    fs::remove_file(w.root().join("Training Plan.md")).unwrap();
+    let (registry, engine) = w.registry();
+    registry.set_rename_hold(Duration::from_secs(600));
+    registry.start_all(|| false);
+    drop((registry, engine));
+    assert_eq!(w.held(), 1);
+    // Put it back byte for byte (a restore).
+    let original = GP1_FILES
+        .iter()
+        .find(|(p, _)| *p == "Training Plan.md")
+        .expect("fixture file")
+        .1;
+    w.notes.write("Training Plan.md", original);
+
+    let b = w.boot();
+    assert!(wait_until(WAIT, || w.held() == 0), "held {}", w.held());
+    std::thread::sleep(NEGATIVE_WAIT);
+    assert!(b.kinds("rename").is_empty(), "{:?}", b.entries());
+    assert!(b.uncertain().is_empty(), "{:?}", b.entries());
 }
 
 // ---------------------------------------------------------------
@@ -1217,7 +1512,7 @@ fn a_boot_started_watcher_reindexes_edit_create_and_delete_and_is_paused_and_sto
     b.registry.pause_all_watchers();
     assert!(b.registry.watchers_paused());
     w.notes.write("Held.md", "# Held\n");
-    std::thread::sleep(Duration::from_millis(600));
+    std::thread::sleep(NEGATIVE_WAIT_PAUSED);
     assert!(!w.indexed("notes", "Held.md"), "indexed while paused");
     b.registry.resume_all_watchers();
     assert!(wait_until(WAIT, || w.indexed("notes", "Held.md")));

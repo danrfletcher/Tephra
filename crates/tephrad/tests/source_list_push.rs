@@ -269,6 +269,27 @@ impl Client {
     fn push(&mut self) -> Value {
         self.next_push(WAIT).expect("a push within the timeout")
     }
+
+    /// The next push that carries `sources_changed`, which the caller
+    /// expects to be there. Ordinary pushes (no marker) are skipped: a
+    /// watcher batch for the files a test wrote before it registered the
+    /// source (FSEvents reports them late under load) can arrive before
+    /// or between the marker pushes, and is not what these tests are
+    /// about. Pushes arrive in the order they were sent, so skipping them
+    /// still lets "a refused call sends no marker push" be checked by
+    /// reading up to the next real change's marker.
+    fn sources_push(&mut self) -> Value {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let push = self
+                .next_push(left)
+                .expect("a sources_changed push within the timeout");
+            if sources_changed(&push).is_some() {
+                return push;
+            }
+        }
+    }
 }
 
 /// The `sources_changed` list of a push, or `None` for an ordinary one.
@@ -304,7 +325,7 @@ fn register_then_unregister_over_rpc_send_one_push_each_and_a_requery_agrees_at_
 
     let reply = d.register("notes", &src);
     assert!(reply.get("error").is_none(), "{reply}");
-    let push = client.push();
+    let push = client.sources_push();
     assert_eq!(push["params"]["sources_changed"], added("notes"), "{push}");
     // `source` and `paths` stay, `paths` empty (the whole-source form).
     assert_eq!(push["params"]["source"], json!("notes"));
@@ -326,7 +347,7 @@ fn register_then_unregister_over_rpc_send_one_push_each_and_a_requery_agrees_at_
 
     let reply = d.unregister("notes");
     assert!(reply.get("error").is_none(), "{reply}");
-    let push = client.push();
+    let push = client.sources_push();
     assert_eq!(
         push["params"]["sources_changed"],
         removed("notes"),
@@ -338,7 +359,10 @@ fn register_then_unregister_over_rpc_send_one_push_each_and_a_requery_agrees_at_
     // Exactly one push each: the next one is the next call's.
     let reply = d.register("again", &src);
     assert!(reply.get("error").is_none(), "{reply}");
-    assert_eq!(client.push()["params"]["sources_changed"], added("again"));
+    assert_eq!(
+        client.sources_push()["params"]["sources_changed"],
+        added("again")
+    );
     d.close();
 }
 
@@ -352,7 +376,7 @@ fn a_client_that_ignores_sources_changed_still_reads_source_and_paths() {
     let d = Daemon::start();
     let mut client = d.connect();
     d.register("notes", &notes());
-    let push = client.push();
+    let push = client.sources_push();
     let old: Old = serde_json::from_value(push["params"].clone()).unwrap();
     assert_eq!(old.source, "notes");
     assert!(old.paths.is_empty());
@@ -370,7 +394,7 @@ fn the_forwarder_refreshes_the_graph_before_it_broadcasts_a_direct_register() {
     let registry = d.registry.clone();
     let root = src.root().to_path_buf();
     let worker = std::thread::spawn(move || registry.register("notes", root).map(|_| ()));
-    let push = client.push();
+    let push = client.sources_push();
     worker.join().unwrap().expect("register");
     assert_eq!(push["params"]["sources_changed"], added("notes"));
     assert!(
@@ -381,7 +405,7 @@ fn the_forwarder_refreshes_the_graph_before_it_broadcasts_a_direct_register() {
 
     let registry = d.registry.clone();
     let worker = std::thread::spawn(move || registry.unregister("notes"));
-    let push = client.push();
+    let push = client.sources_push();
     worker.join().unwrap().expect("unregister");
     assert_eq!(push["params"]["sources_changed"], removed("notes"));
     assert!(
@@ -403,7 +427,7 @@ fn the_emitter_carries_renamed_promoted_and_unpromoted_to_a_client() {
         SourceChangeKind::Unpromoted,
         "docs",
     )]);
-    let renamed = client.push();
+    let renamed = client.sources_push();
     assert_eq!(
         renamed["params"]["sources_changed"],
         json!([{ "kind": "renamed", "name": "journal", "old_name": "notes" }])
@@ -411,11 +435,11 @@ fn the_emitter_carries_renamed_promoted_and_unpromoted_to_a_client() {
     assert_eq!(renamed["params"]["source"], json!("journal"));
     assert!(renamed.get("id").is_none());
     assert_eq!(
-        client.push()["params"]["sources_changed"],
+        client.sources_push()["params"]["sources_changed"],
         json!([{ "kind": "promoted", "name": "docs" }])
     );
     assert_eq!(
-        client.push()["params"]["sources_changed"],
+        client.sources_push()["params"]["sources_changed"],
         json!([{ "kind": "unpromoted", "name": "docs" }])
     );
     d.close();
@@ -431,7 +455,10 @@ fn a_failed_register_and_an_unknown_unregister_send_no_push() {
     let mut client = d.connect();
     let src = notes();
     assert!(d.register("notes", &src).get("error").is_none());
-    assert_eq!(client.push()["params"]["sources_changed"], added("notes"));
+    assert_eq!(
+        client.sources_push()["params"]["sources_changed"],
+        added("notes")
+    );
 
     // Missing path, not a folder, duplicate name, duplicate root, nested
     // and ancestor roots: all refused.
@@ -458,7 +485,7 @@ fn a_failed_register_and_an_unknown_unregister_send_no_push() {
 
     // The first push after all that is the next real change's.
     assert!(d.register("sentinel", &other).get("error").is_none());
-    let push = client.push();
+    let push = client.sources_push();
     assert_eq!(
         push["params"]["sources_changed"],
         added("sentinel"),
@@ -481,7 +508,7 @@ fn a_register_that_rolls_back_sends_no_added_push() {
 
     assert!(d.register("sentinel", &notes()).get("error").is_none());
     assert_eq!(
-        client.push()["params"]["sources_changed"],
+        client.sources_push()["params"]["sources_changed"],
         added("sentinel")
     );
     d.close();
@@ -495,8 +522,8 @@ fn add_then_remove_with_no_read_between_sends_two_pushes_in_that_order() {
     assert!(d.register("notes", &src).get("error").is_none());
     assert!(d.unregister("notes").get("error").is_none());
 
-    let first = client.push();
-    let second = client.push();
+    let first = client.sources_push();
+    let second = client.sources_push();
     assert_eq!(
         first["params"]["sources_changed"],
         added("notes"),
@@ -518,15 +545,24 @@ fn a_client_that_missed_the_first_push_still_converges_on_source_list() {
     let src = notes();
 
     assert!(d.register("notes", &src).get("error").is_none());
-    assert_eq!(first.push()["params"]["sources_changed"], added("notes"));
+    assert_eq!(
+        first.sources_push()["params"]["sources_changed"],
+        added("notes")
+    );
     // A second client joins between the two changes, once the first push
     // has gone out: it misses it. (Joining earlier would be a race with
     // the forwarder, which sends one push at a time.)
     let mut second = d.connect();
     assert!(d.unregister("notes").get("error").is_none());
 
-    assert_eq!(first.push()["params"]["sources_changed"], removed("notes"));
-    assert_eq!(second.push()["params"]["sources_changed"], removed("notes"));
+    assert_eq!(
+        first.sources_push()["params"]["sources_changed"],
+        removed("notes")
+    );
+    assert_eq!(
+        second.sources_push()["params"]["sources_changed"],
+        removed("notes")
+    );
     // Neither missed nor late: `source.list` says what is true now.
     assert!(d.listed().is_empty());
     let mut late = d.connect();
@@ -561,18 +597,27 @@ fn two_concurrent_registers_send_two_pushes_and_both_sources_resolve() {
         "{ra} {rb}"
     );
 
-    let mut names: Vec<String> = (0..2)
-        .map(|_| {
-            let push = client.push();
-            let list = push["params"]["sources_changed"]
-                .as_array()
-                .unwrap()
-                .clone();
-            assert_eq!(list.len(), 1, "{push}");
-            assert_eq!(list[0]["kind"], json!("added"));
-            list[0]["name"].as_str().unwrap().to_string()
-        })
-        .collect();
+    // Read pushes until both `added` markers are in, by kind and not by
+    // position: an ordinary push (no `sources_changed`, e.g. a watcher
+    // batch for a file written while the source was set up) can be sent
+    // between them under load, and is not what this test is about. A
+    // second marker for the same name, or any other kind, fails it.
+    let deadline = Instant::now() + WAIT;
+    let mut names: Vec<String> = Vec::new();
+    while names.len() < 2 {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let push = client
+            .next_push(left)
+            .unwrap_or_else(|| panic!("two added pushes expected; saw {names:?}"));
+        let Some(list) = sources_changed(&push).and_then(Value::as_array) else {
+            continue;
+        };
+        assert_eq!(list.len(), 1, "{push}");
+        assert_eq!(list[0]["kind"], json!("added"), "{push}");
+        let name = list[0]["name"].as_str().unwrap().to_string();
+        assert!(!names.contains(&name), "{name} announced twice: {push}");
+        names.push(name);
+    }
     names.sort();
     assert_eq!(names, ["alpha", "beta"]);
     assert_eq!(d.listed(), ["alpha", "beta"]);
@@ -626,7 +671,10 @@ fn a_rescan_finding_a_new_file_is_an_ordinary_push_with_no_sources_changed() {
     let mut client = d.connect();
     let src = notes();
     assert!(d.register("notes", &src).get("error").is_none());
-    assert_eq!(client.push()["params"]["sources_changed"], added("notes"));
+    assert_eq!(
+        client.sources_push()["params"]["sources_changed"],
+        added("notes")
+    );
 
     // E17: a rescan that finds a new file is an ordinary push with paths.
     src.write("four.md", "# Four\n");

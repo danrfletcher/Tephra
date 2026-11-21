@@ -599,7 +599,9 @@ pub(crate) fn shortest_unique_target(graph: &crate::UnitGraph, id: &str) -> Opti
 /// file under its new name), plus the old file when its stem (or
 /// basename) is `key`. The old file won when it has the one shortest
 /// stem; a tie with another file means the link was ambiguous and never
-/// resolved to it.
+/// resolved to it. The old file's own id is left out of the candidates
+/// as well as `new_id`, so a graph that still holds it gives the same
+/// answer as one that does not.
 pub(crate) fn old_path_won_before_rename(
     graph: &crate::UnitGraph,
     source: &str,
@@ -628,9 +630,10 @@ pub(crate) fn old_path_won_before_rename(
         .and_then(|m| m.get(key))
         .map(|v| v.as_slice())
         .unwrap_or(&[]);
+    let old_id = format!("@{source}:{old_rel_path}");
     others
         .iter()
-        .filter(|id| id.as_str() != new_id)
+        .filter(|id| id.as_str() != new_id && id.as_str() != old_id)
         .filter_map(|id| graph.nodes.get(id))
         .all(|facts| {
             normalize_key(strip_markdown_extension(&facts.rel_path))

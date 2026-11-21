@@ -1308,12 +1308,16 @@ fn a_cross_source_moves_three_rewrites_start_no_new_batch_and_no_second_log_entr
     std::fs::rename(d.notes.root().join("Ideas/Target.md"), to).unwrap();
 
     let (push, _) = client.next_fix_push(fix_world::WAIT);
-    let Some(push) = push else {
-        assert!(!d.watcher_live, "no fix was pushed: {:?}", d.entries());
-        eprintln!("the OS watcher was deaf; nothing to check");
-        d.close();
-        return;
-    };
+    // A deaf OS watcher is a failure here, not a skip: this test is the
+    // check that the watchers read the fix's own writes as nothing, and a
+    // test that returns early would pass without checking it.
+    let push = push.unwrap_or_else(|| {
+        panic!(
+            "no fix was pushed (OS watcher live: {}): {:?}",
+            d.watcher_live,
+            d.entries()
+        )
+    });
     assert_eq!(fix_world::fixes_of(&push)[0]["kind"], "move");
     assert_eq!(fix_world::fixes_of(&push)[0]["files_changed"], 3);
     // The writes of the three rewrites are all on disk once the push is out.
@@ -1331,6 +1335,22 @@ fn a_cross_source_moves_three_rewrites_start_no_new_batch_and_no_second_log_entr
     let mut seen = Vec::new();
     while let Ok(event) = events.try_recv() {
         seen.push(event);
+    }
+    // The fix announces its own writes once, one SourceChanged per source
+    // it wrote in. A watcher batch for those writes would name a file a
+    // second time: each file only the fix wrote is in exactly one.
+    for name in ["Index.md", "Reader.md"] {
+        let naming = seen
+            .iter()
+            .filter(|e| {
+                matches!(e, tephrad::registry::DaemonEvent::SourceChanged { paths, .. }
+                    if paths.iter().any(|p| p.ends_with(name)))
+            })
+            .count();
+        assert_eq!(
+            naming, 1,
+            "{name} is announced by the fix alone, not again by a watcher batch: {seen:?}"
+        );
     }
     for event in &seen {
         let tephrad::registry::DaemonEvent::SourceChanged { paths, .. } = event else {

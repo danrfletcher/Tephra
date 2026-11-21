@@ -8,9 +8,14 @@
 //! though a same-sized fence-free file stays comfortably within it).
 
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tephra_parser::{parse_unit, ParsedUnit, RECOMMENDED_MAX_FILE_BYTES};
+
+use crate::cpu_timer::CpuTimer;
+
+// The budgets below are CPU time of the parsing thread (see
+// `cpu_timer.rs`): a loaded host stretches wall-clock time, not CPU time.
 
 /// Best-effort current resident set size, in bytes, of this process.
 /// `None` if it couldn't be determined (e.g. no `/proc` and no `ps`
@@ -70,7 +75,7 @@ fn a_fence_free_multi_megabyte_file_parses_within_a_bounded_time_budget() {
     // runs over real matches the whole way through.
     let large_content = repeat_to_cap(FENCE_FREE_UNIT_BLOCK);
 
-    let start = Instant::now();
+    let start = CpuTimer::start();
     let unit = parse_unit(Path::new("large.md"), &large_content);
     let elapsed = start.elapsed();
 
@@ -92,7 +97,7 @@ fn a_fence_heavy_multi_megabyte_file_parses_within_a_bounded_time_budget() {
     // the fix (vs. 0.41s for an equivalent fence-free file).
     let large_content = repeat_to_cap(FENCE_HEAVY_UNIT_BLOCK);
 
-    let start = Instant::now();
+    let start = CpuTimer::start();
     let unit = parse_unit(Path::new("large-fenced.md"), &large_content);
     let elapsed = start.elapsed();
 
@@ -121,13 +126,13 @@ fn a_fence_heavy_file_costs_no_more_time_or_memory_than_a_same_sized_fence_free_
     let fence_heavy_content = repeat_to_cap(FENCE_HEAVY_UNIT_BLOCK);
 
     let rss_before_free = current_rss_bytes();
-    let free_start = Instant::now();
+    let free_start = CpuTimer::start();
     let free_unit = parse_unit(Path::new("large.md"), &fence_free_content);
     let free_elapsed = free_start.elapsed();
     let rss_after_free = current_rss_bytes();
 
     let rss_before_heavy = current_rss_bytes();
-    let heavy_start = Instant::now();
+    let heavy_start = CpuTimer::start();
     let heavy_unit = parse_unit(Path::new("large-fenced.md"), &fence_heavy_content);
     let heavy_elapsed = heavy_start.elapsed();
     let rss_after_heavy = current_rss_bytes();
@@ -188,7 +193,7 @@ fn assert_extracted_prose(unit: &ParsedUnit, expect_headings: bool) {
 fn a_multi_megabyte_txt_parses_within_a_bounded_time_budget() {
     let content = repeat_to_cap(TXT_UNIT_BLOCK);
 
-    let start = Instant::now();
+    let start = CpuTimer::start();
     let unit = parse_unit(Path::new("large.txt"), &content);
     let elapsed = start.elapsed();
 
@@ -204,7 +209,7 @@ fn a_multi_megabyte_txt_parses_within_a_bounded_time_budget() {
 fn a_multi_megabyte_org_parses_within_a_bounded_time_budget() {
     let content = repeat_to_cap(ORG_UNIT_BLOCK);
 
-    let start = Instant::now();
+    let start = CpuTimer::start();
     let unit = parse_unit(Path::new("large.org"), &content);
     let elapsed = start.elapsed();
 
@@ -221,7 +226,7 @@ fn a_multi_megabyte_single_paragraph_txt_is_still_bounded() {
     // No blank line at all: one paragraph, one Markdown-link chunk.
     let content = repeat_to_cap("a [[Note]] and [t](p.md) link on one line\n");
 
-    let start = Instant::now();
+    let start = CpuTimer::start();
     let unit = parse_unit(Path::new("one-paragraph.txt"), &content);
     let elapsed = start.elapsed();
 

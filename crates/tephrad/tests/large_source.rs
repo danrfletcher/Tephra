@@ -14,11 +14,13 @@
 //!   `ps` (macOS/Linux) rather than an extra memory-profiling
 //!   dependency.
 
+#[path = "../../tephra-parser/tests/unit/cpu_timer.rs"]
+mod cpu_timer;
 mod fixtures;
 
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tephra_cache::Cache;
 use tephrad::registry::SourceRegistry;
@@ -150,7 +152,10 @@ fn a_100k_plus_ignored_subtree_is_pruned_before_the_walk_descends_into_it() {
     });
 
     let baseline_kb = current_rss_kb();
-    let started = Instant::now();
+    // CPU time of this thread, not wall-clock: the scan runs on it from
+    // start to finish, and the budget below is about work done, so it
+    // must hold on a busy host (it failed at load 20-30 on wall-clock).
+    let started = cpu_timer::CpuTimer::start();
     let stats = registry
         .register("big-vault", fixture.root())
         .expect("register");
@@ -243,11 +248,11 @@ fn a_100k_plus_ignored_subtree_is_pruned_before_the_walk_descends_into_it() {
         }
     }
 
-    // A generous time bound: this would not hold if the scan touched
+    // A generous CPU-time bound: this would not hold if the scan touched
     // (even just `stat`ed) all 120k ignored files one by one.
     assert!(
         elapsed < Duration::from_secs(10),
-        "scanning {VALID_FILE_COUNT} real files took {elapsed:?}; \
+        "scanning {VALID_FILE_COUNT} real files took {elapsed:?} of CPU time; \
          the 120k ignored files under node_modules must have been pruned \
          at the directory level, not visited one by one"
     );

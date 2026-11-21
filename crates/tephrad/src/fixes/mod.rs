@@ -45,7 +45,7 @@ use tephra_graph::{Edge, UnitGraph};
 
 use crate::fix::FixSpelling;
 use crate::refactor::fix_write::{
-    FileFixRequest, FileWriteResult, FixWriter, RewriteMode, WriteStatus,
+    FileFixRequest, FileWriteResult, FixWriter, IntentSink, RewriteMode, WriteIntent, WriteStatus,
 };
 use crate::refactor::{MoveRewrite, OwnLink, DOCUMENT_READ_ONLY};
 
@@ -134,6 +134,17 @@ impl From<tephra_graph::GraphError> for FixError {
 pub trait FileWriter: Send + Sync {
     fn write_file(&self, req: &FileFixRequest) -> FileWriteResult;
 
+    /// [`FileWriter::write_file`], telling `intent` what each attempt is
+    /// about to write, just before its rename (see [`WriteIntent`]). A
+    /// writer that cannot say ignores `intent`.
+    fn write_file_noting(
+        &self,
+        req: &FileFixRequest,
+        _intent: Option<IntentSink<'_>>,
+    ) -> FileWriteResult {
+        self.write_file(req)
+    }
+
     /// Asks the writer to record each file it writes as Tephra's own
     /// write ([`crate::dup_ids::note_self_write`]), so the watcher drops
     /// the file's event. Called by [`FixEngine::set_sink`]: the sink is
@@ -145,6 +156,14 @@ pub trait FileWriter: Send + Sync {
 impl FileWriter for FixWriter {
     fn write_file(&self, req: &FileFixRequest) -> FileWriteResult {
         FixWriter::write_file(self, req)
+    }
+
+    fn write_file_noting(
+        &self,
+        req: &FileFixRequest,
+        intent: Option<IntentSink<'_>>,
+    ) -> FileWriteResult {
+        FixWriter::write_file_noting(self, req, intent)
     }
 
     fn record_own_writes(&self, on: bool) {
@@ -172,11 +191,16 @@ pub struct WrittenFile {
 pub struct FixAnnouncement {
     pub notices: Vec<FixNotice>,
     pub written: Vec<WrittenFile>,
+    /// Files the caller has already indexed itself (the rename event
+    /// reads the graph after the rename, so it indexes the paths first).
+    /// They are named in the push but not indexed a second time, unless
+    /// the fix also wrote them (then they are in `written`).
+    pub indexed: Vec<WrittenFile>,
 }
 
 impl FixAnnouncement {
     pub fn is_empty(&self) -> bool {
-        self.notices.is_empty() && self.written.is_empty()
+        self.notices.is_empty() && self.written.is_empty() && self.indexed.is_empty()
     }
 
     /// Adds `other`: its entries after this one's, its files the ones
@@ -186,6 +210,11 @@ impl FixAnnouncement {
         for file in other.written {
             if !self.written.contains(&file) {
                 self.written.push(file);
+            }
+        }
+        for file in other.indexed {
+            if !self.indexed.contains(&file) {
+                self.indexed.push(file);
             }
         }
     }
@@ -408,14 +437,24 @@ fn unpromote_rows(cache: &Cache, spec: &UnpromoteSpec) -> Result<Vec<PlanRow>, F
     let mut rows: BTreeSet<PlanRow> = BTreeSet::new();
     for old in &units {
         let new = format!("{}/{old}", spec.folder);
-        if let Ok(files) = linking_files(&graph, &spec.name, old, &spec.parent, &new) {
-            for file in files {
-                rows.insert(PlanRow {
-                    file,
-                    old: old.clone(),
-                    new: new.clone(),
-                });
+        match linking_files(&graph, &spec.name, old, &spec.parent, &new) {
+            Ok(files) => {
+                for file in files {
+                    rows.insert(PlanRow {
+                        file,
+                        old: old.clone(),
+                        new: new.clone(),
+                    });
+                }
             }
+            // The file is not in the graph as it will be: its crossing
+            // links cannot be listed. Left out, but never silently.
+            Err(e) => tracing::warn!(
+                source = %spec.name,
+                path = %old,
+                error = %e,
+                "unpromote: could not list the files that link to a moved file; its links are not queued"
+            ),
         }
         let new_id = format!("@{}:{new}", spec.parent);
         let own = own_links_folded(
@@ -458,14 +497,24 @@ fn promote_rows(
         let Some(new) = old.strip_prefix(&prefix).map(str::to_string) else {
             continue;
         };
-        if let Ok(files) = linking_files(&graph, &spec.parent, &old, &spec.name, &new) {
-            for file in files {
-                rows.insert(PlanRow {
-                    file,
-                    old: old.clone(),
-                    new: new.clone(),
-                });
+        match linking_files(&graph, &spec.parent, &old, &spec.name, &new) {
+            Ok(files) => {
+                for file in files {
+                    rows.insert(PlanRow {
+                        file,
+                        old: old.clone(),
+                        new: new.clone(),
+                    });
+                }
             }
+            // The file is not in the graph as it will be: its crossing
+            // links cannot be listed. Left out, but never silently.
+            Err(e) => tracing::warn!(
+                source = %spec.parent,
+                path = %old,
+                error = %e,
+                "promote: could not list the files that link to a moved file; its links are not queued"
+            ),
         }
         let own = own_links(
             &graph,
@@ -555,6 +604,7 @@ impl Report {
         Ok(FixAnnouncement {
             notices,
             written: self.written.clone(),
+            indexed: Vec::new(),
         })
     }
 }
@@ -572,6 +622,7 @@ pub struct FixEngine {
     clock: Arc<dyn Clock>,
     stop_after_writes: Option<usize>,
     stop_after_promote_commit: bool,
+    fail_after_promote_reown: bool,
     /// The `qualify_ambiguous_links` setting (G20), read from the config
     /// once at start and the same for every fix this engine makes.
     qualify_ambiguous: bool,
@@ -599,6 +650,7 @@ impl FixEngine {
             clock: Arc::new(SystemClock),
             stop_after_writes: None,
             stop_after_promote_commit: false,
+            fail_after_promote_reown: false,
             qualify_ambiguous: false,
             run_lock: Mutex::new(()),
             decision_lock: Mutex::new(()),
@@ -676,8 +728,32 @@ impl FixEngine {
         self
     }
 
+    /// Test hook: [`FixEngine::promote`] fails with an ordinary
+    /// [`FixError::Cache`] right after the rows are re-owned and before
+    /// the rewrites run, as an error from the work itself would. Unlike
+    /// [`FixEngine::with_stop_after_promote_commit`] it is not a kill
+    /// stand-in: the caller is expected to finish the promote.
+    pub fn with_fail_after_promote_reown(mut self) -> Self {
+        self.fail_after_promote_reown = true;
+        self
+    }
+
     fn open(&self) -> Result<Cache, FixError> {
         Ok(Cache::open(&self.cache_path)?)
+    }
+
+    /// Runs one cache write of the fix log or the pending list through
+    /// the registry's writer gate, with the same retry on `SQLITE_BUSY`
+    /// as every other writer ([`crate::registry::retry_cache_on_busy`]).
+    /// Without it a write made while a long scan holds the database
+    /// would depend on SQLite's own 5 s busy timeout alone, and a busy
+    /// error would fail the whole pass.
+    fn write_cache<T>(
+        &self,
+        attempt: impl FnMut() -> Result<T, tephra_cache::CacheError>,
+    ) -> Result<T, FixError> {
+        let gate = crate::writer_gate::for_path(&self.cache_path);
+        Ok(crate::registry::retry_cache_on_busy(&gate, attempt)?)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
@@ -754,7 +830,7 @@ impl FixEngine {
             message: Some(message.to_string()),
             ..FixDetail::default()
         };
-        let id = cache.insert_fix_log(&NewFixLog {
+        let new_log = NewFixLog {
             created_at: now,
             kind: KIND_UNCERTAIN.to_string(),
             status: STATUS_UNCERTAIN.to_string(),
@@ -764,7 +840,8 @@ impl FixEngine {
             new_path: None,
             files_changed: 0,
             detail_json: Some(detail.to_json()),
-        })?;
+        };
+        let id = self.write_cache(|| cache.insert_fix_log(&new_log))?;
         entry(&cache, id)
     }
 
@@ -935,14 +1012,10 @@ impl FixEngine {
         new_path: &str,
     ) -> Result<bool, FixError> {
         let cache = self.open()?;
-        // Both sources' entries, oldest first (id order); a move names
-        // both, so a same-source pair is read twice and deduplicated.
-        let mut log = cache.fix_log_summaries(old_source)?;
-        if new_source != old_source {
-            log.extend(cache.fix_log_summaries(new_source)?);
-        }
-        log.sort_by_key(|e| e.id);
-        log.dedup_by_key(|e| e.id);
+        // Only the entries that can decide it, oldest first (id order),
+        // chosen by the database: the whole log is not read on every move
+        // signal.
+        let log = cache.fix_log_moves_between((old_source, old_path), (new_source, new_path))?;
 
         let at = |source: &Option<String>, path: &Option<String>, want: (&str, &str)| {
             source.as_deref() == Some(want.0) && path.as_deref() == Some(want.1)
@@ -1042,20 +1115,18 @@ impl FixEngine {
                 new_path: Some(r.new.clone()),
             })
             .collect();
-        let (fix_id, _) = cache.start_fix(
-            &NewFixLog {
-                created_at: now,
-                kind: plan.kind.to_string(),
-                status: overall_status(&detail.files).to_string(),
-                old_source: Some(plan.old_source.clone()),
-                old_path: Some(plan.entry_old.clone()),
-                new_source: Some(plan.new_source.clone()),
-                new_path: Some(plan.entry_new.clone()),
-                files_changed: 0,
-                detail_json: Some(detail.to_json()),
-            },
-            &pending,
-        )?;
+        let new_log = NewFixLog {
+            created_at: now,
+            kind: plan.kind.to_string(),
+            status: overall_status(&detail.files).to_string(),
+            old_source: Some(plan.old_source.clone()),
+            old_path: Some(plan.entry_old.clone()),
+            new_source: Some(plan.new_source.clone()),
+            new_path: Some(plan.entry_new.clone()),
+            files_changed: 0,
+            detail_json: Some(detail.to_json()),
+        };
+        let (fix_id, _) = self.write_cache(|| cache.start_fix(&new_log, &pending))?;
         self.run_fix(&cache, fix_id)
     }
 
@@ -1080,10 +1151,11 @@ impl FixEngine {
         let announcement = report.announcement(cache, &[fix_id]);
         if let Err(e) = run {
             // A caller that gets an error has no announcement to merge
-            // into its own: whatever was written is announced now, so
-            // the files are indexed again.
+            // into its own: whatever was written is announced now (or
+            // joins the open watcher batch's one push), so the files are
+            // indexed again.
             if let Ok(a) = announcement {
-                self.announce(a);
+                self.announce_or_collect(a);
             }
             return Err(e);
         }
@@ -1099,7 +1171,9 @@ impl FixEngine {
     ///    (a savepoint that is always rolled back, [`Cache::simulate_promote`]),
     ///    then ONE transaction writes the new source's row, the parent's
     ///    exclusion, the log entry (kind `promote`) and that list;
-    /// 2. the parent's rows under the folder are re-owned, in place;
+    /// 2. the parent's rows under the folder are re-owned, in place (the
+    ///    ones the new source's own ignore rules skip are dropped instead:
+    ///    they are not re-owned);
     /// 3. `after_reown` runs (the caller makes its live watchers skip the
     ///    folder from here on), then
     /// 4. every pending file is rewritten, by the same write loop as any
@@ -1126,7 +1200,26 @@ impl FixEngine {
             FixError::Refused(format!("source {} is not registered", spec.parent))
         })?;
         let root = spec.root.to_string_lossy().into_owned();
-        let moved = cache.units_under_prefix(parent.id, &spec.folder)?;
+        // The rows the new source will not keep: what its own
+        // `.tephraignore` (and the default ignores) skip. They are not
+        // re-owned and no link to them is rewritten to `@name:` (it would
+        // point at a file the new source never indexes); they are dropped
+        // from the parent after the promote commits, below.
+        let rules = crate::ignore::IgnoreRules::load(&spec.root).map_err(|e| {
+            FixError::Cache(format!(
+                "could not read the ignore rules of {}: {e}",
+                spec.root.display()
+            ))
+        })?;
+        let folder_prefix = format!("{}/", spec.folder);
+        let (moved, ignored): (Vec<_>, Vec<_>) = cache
+            .units_under_prefix(parent.id, &spec.folder)?
+            .into_iter()
+            .partition(|u| {
+                u.rel_path
+                    .strip_prefix(&folder_prefix)
+                    .is_none_or(|rel| !rules.is_ignored(Path::new(rel)))
+            });
 
         let rows = retry_cache_on_busy(&gate, || {
             cache.simulate_promote(parent.id, &spec.name, &root, &spec.folder, |after| {
@@ -1178,10 +1271,18 @@ impl FixEngine {
         if self.stop_after_promote_commit {
             return Err(FixError::Stopped);
         }
+        for unit in &ignored {
+            retry_cache_on_busy(&gate, || cache.delete_unit(unit.id))?;
+        }
         let units_moved = retry_cache_on_busy(&gate, || {
             cache.reown_units(parent.id, begun.source_id, &spec.folder)
         })?;
         after_reown();
+        if self.fail_after_promote_reown {
+            return Err(FixError::Cache(
+                "injected failure after the promote re-owned its rows".to_string(),
+            ));
+        }
         let (entry, announcement) = self.run_fix(&cache, begun.fix_id)?;
         Ok(PromoteDone {
             source_id: begun.source_id,
@@ -1401,15 +1502,21 @@ impl FixEngine {
 
     /// One pass for `trigger`.
     pub fn retry(&self, trigger: &Trigger) -> Result<RunSummary, FixError> {
-        let _guard = self.lock();
-        let cache = self.open()?;
-        let rows = cache.pending_fixes(None, None)?;
-        let picks = retry::select(rows, trigger, self.clock.now());
-        let mut report = Report::default();
-        let run = self.run_picks(&cache, picks, &mut report);
+        // The announcement is made after the engine lock is released: the
+        // sink re-indexes the written files and sends the push, which
+        // would otherwise lengthen the time other fixes wait on the lock.
+        let (run, announcement) = {
+            let _guard = self.lock();
+            let cache = self.open()?;
+            let rows = cache.pending_fixes(None, None)?;
+            let picks = retry::select(rows, trigger, self.clock.now());
+            let mut report = Report::default();
+            let run = self.run_picks(&cache, picks, &mut report);
+            (run, report.announcement(&cache, &[]))
+        };
         // A retry has no caller to return the announcement to (G25):
         // what it finished goes out through the sink, as its own entry.
-        if let Ok(a) = report.announcement(&cache, &[]) {
+        if let Ok(a) = announcement {
             self.announce(a);
         }
         run
@@ -1486,6 +1593,28 @@ impl FixEngine {
             return Ok(None);
         }
 
+        // A run that stopped between this file's rename and the row being
+        // finished left the file written and the row pending: the file
+        // holds the text the row's mark says was about to be written. It
+        // is counted as written, not as a file with no link left (PR-5
+        // R7), and indexed again like any file a fix wrote.
+        if let Some(links) = self.written_before_stopping(cache, &source.path, &row)? {
+            let outcome = Outcome {
+                file_status: FILE_WRITTEN,
+                reason: Some("written before the previous run stopped".to_string()),
+                links_changed: links,
+                attempts: 0,
+                recovered_edits: 0,
+                chain: Vec::new(),
+                keep: None,
+            };
+            self.finish(cache, &row, outcome, summary)?;
+            return Ok(Some(WrittenFile {
+                source: row.source.clone(),
+                path: Path::new(&source.path).join(&row.file_path),
+            }));
+        }
+
         if is_source_rename_row(&row) {
             return self.process_source_rename(
                 cache,
@@ -1516,16 +1645,12 @@ impl FixEngine {
 
         // A chain A to B to C: the row now names C.
         if row.new_path.as_deref() != Some(target_path.as_str()) {
-            cache.apply_fix_step(
-                row.id,
-                &PendingOp::Repoint {
-                    new_source: target_source.clone(),
-                    new_path: target_path.clone(),
-                },
-                self.clock.now(),
-                None,
-                |_| None,
-            )?;
+            let repoint = PendingOp::Repoint {
+                new_source: target_source.clone(),
+                new_path: target_path.clone(),
+            };
+            let now = self.clock.now();
+            self.write_cache(|| cache.apply_fix_step(row.id, &repoint, now, None, |_| None))?;
             row.new_source = Some(target_source.clone());
             row.new_path = Some(target_path.clone());
         }
@@ -1537,7 +1662,12 @@ impl FixEngine {
         let file_id = format!("@{}:{}", row.source, row.file_path);
         // How a plain link to the target is spelled: decided in one place
         // for a rename, a move, a promote and an unpromote (G20).
-        let spelling = FixSpelling::for_target(graph, &new_id, self.qualify_ambiguous);
+        let spelling = FixSpelling::for_target_ignoring(
+            graph,
+            &new_id,
+            self.qualify_ambiguous,
+            &[old_id.as_str()],
+        );
         // A file that went to another source is fixed by one of the three
         // rewrites of a move, by where the linking file is (G6).
         let (edges, mode) = if old_source == target_source {
@@ -1614,7 +1744,7 @@ impl FixEngine {
         req.chain = chain.clone();
         req.prior_rounds = prior_rounds;
 
-        let result = self.writer.write_file(&req);
+        let result = self.write_row(cache, &row, &req);
         let wrote = result.status == WriteStatus::Written;
         let outcome = Outcome::from_write(&result, chain);
         self.finish(cache, &row, outcome, summary)?;
@@ -1682,7 +1812,7 @@ impl FixEngine {
             }),
         );
         req.prior_rounds = prior_rounds;
-        let result = self.writer.write_file(&req);
+        let result = self.write_row(cache, &row, &req);
         let wrote = result.status == WriteStatus::Written;
         let outcome = Outcome::from_write(&result, Vec::new());
         self.finish(cache, &row, outcome, summary)?;
@@ -1690,6 +1820,53 @@ impl FixEngine {
             source: row.source.clone(),
             path: abs_path,
         }))
+    }
+
+    /// The write of one row's file. Before each rename the writer says
+    /// what it is about to write, and that is recorded durably under the
+    /// row ([`Cache::mark_pending_write`]), so a restart can tell the
+    /// write landed ([`FixEngine::written_before_stopping`]). A mark that
+    /// cannot be recorded stops the rename: the attempt is transient and
+    /// is made again.
+    fn write_row(
+        &self,
+        cache: &Cache,
+        row: &PendingFixRow,
+        req: &FileFixRequest,
+    ) -> FileWriteResult {
+        let note = |intent: &WriteIntent| -> std::io::Result<()> {
+            let mark = tephra_cache::PendingWrite {
+                len: intent.len as i64,
+                hash: intent.hash.clone(),
+                links: intent.links as i64,
+            };
+            let now = self.clock.now();
+            self.write_cache(|| cache.mark_pending_write(row.id, &mark, now))
+                .map_err(|e| std::io::Error::other(format!("could not record the write: {e}")))
+        };
+        self.writer.write_file_noting(req, Some(&note))
+    }
+
+    /// How many links the previous run wrote into `row`'s file, when it
+    /// stopped after the rename and before the row was finished: the row
+    /// has a mark and the file is, byte for byte, the text the mark names
+    /// (length and hash). `None` for a row that was never marked or whose
+    /// file is anything else, such as one the person has edited since.
+    fn written_before_stopping(
+        &self,
+        cache: &Cache,
+        source_root: &str,
+        row: &PendingFixRow,
+    ) -> Result<Option<usize>, FixError> {
+        let Some(mark) = cache.pending_write(row.id)? else {
+            return Ok(None);
+        };
+        let Ok(bytes) = std::fs::read(Path::new(source_root).join(&row.file_path)) else {
+            return Ok(None);
+        };
+        let same = bytes.len() as i64 == mark.len
+            && tephra_parser::content_hash_bytes(&bytes) == mark.hash;
+        Ok(same.then_some(mark.links.max(0) as usize))
     }
 
     /// Records one row's outcome: the row and the entry in one
@@ -1715,7 +1892,8 @@ impl FixEngine {
                 attempts: i64::from(k.rounds),
             },
         };
-        cache.apply_fix_step(row.id, &op, self.clock.now(), row.fix_id, |log| {
+        let now = self.clock.now();
+        let change = |log: &tephra_cache::FixLogRow| {
             let mut detail = FixDetail::parse(log.detail_json.as_deref());
             let file = detail.file_mut(&row.source, &row.file_path);
             file.status = outcome.file_status.to_string();
@@ -1732,7 +1910,8 @@ impl FixEngine {
                 files_changed: detail.files_written(),
                 detail_json: Some(detail.to_json()),
             })
-        })?;
+        };
+        self.write_cache(|| cache.apply_fix_step(row.id, &op, now, row.fix_id, change))?;
         Ok(())
     }
 }
@@ -1833,6 +2012,41 @@ fn entry(cache: &Cache, id: i64) -> Result<FixEntryWire, FixError> {
         .ok_or_else(|| FixError::Cache(format!("fix log entry {id} is gone")))
 }
 
+/// One [`FileFixRequest`] per file with a wikilink that named `old` of
+/// `source`, after it was renamed to `new` within the source: the work
+/// the engine does for a rename, built the way the engine builds it (the
+/// same listing of the linking files, the same edges per file, the same
+/// spelling decision), so a caller that wants the writer's requests for a
+/// rename, tests included, does not rebuild the rules by hand. `root` is
+/// the source's root on disk.
+pub fn rename_requests(
+    graph: &UnitGraph,
+    source: &str,
+    root: &Path,
+    old: &str,
+    new: &str,
+    qualify_ambiguous: bool,
+) -> Result<Vec<FileFixRequest>, FixError> {
+    let old_id = format!("@{source}:{old}");
+    let new_id = format!("@{source}:{new}");
+    let spelling = FixSpelling::for_target(graph, &new_id, qualify_ambiguous);
+    Ok(linking_files(graph, source, old, source, new)?
+        .into_iter()
+        .map(|(file_source, file_path)| {
+            let file_id = format!("@{file_source}:{file_path}");
+            let edges = file_edges(graph, &old_id, &new_id, &file_id);
+            FileFixRequest::new(
+                file_id,
+                root.join(&file_path),
+                edges,
+                old,
+                new,
+                spelling.rewrite_mode(),
+            )
+        })
+        .collect())
+}
+
 /// The wikilink edges from `file_id` to the old target: those that
 /// dangle and those the rename handed to another file of the same name.
 /// A self-link of the renamed file recorded under the old id belongs to
@@ -1920,10 +2134,10 @@ fn own_links(
     qualify_ambiguous: bool,
 ) -> (Vec<Edge>, HashMap<String, OwnLink>) {
     let new_id = format!("@{new_source}:{new_path}");
-    let (old_stem, _) = crate::refactor::strip_md_ext_pub(old_path);
+    let (old_stem, _) = crate::refactor::strip_md_ext(old_path);
     let old_base = old_stem.rsplit('/').next().unwrap_or(old_stem);
     let names_old_file = |target: &str| {
-        let (t, _) = crate::refactor::strip_md_ext_pub(target);
+        let (t, _) = crate::refactor::strip_md_ext(target);
         t.eq_ignore_ascii_case(old_stem) || t.eq_ignore_ascii_case(old_base)
     };
     let mut edges = Vec::new();
@@ -1954,13 +2168,24 @@ fn own_links(
             _ if respelled.is_some() => respelled.map(OwnLink::Retarget),
             None => match graph.resolve_link(&file_ref(old_source), None) {
                 Ok(_) => Some(OwnLink::AddPrefix(old_source.to_string())),
-                Err(_) if names_old_file(&w.target) => Some(OwnLink::SelfLink),
+                // A bare text that names the old file but resolves to
+                // nothing now: a link to the file itself only if the
+                // file was the one it resolved to before the move. A
+                // tie before it (and still) is not a link to this file.
+                Err(_)
+                    if names_old_file(&w.target)
+                        && graph.link_named_file_before_move(
+                            old_source, old_path, &new_id, &w.target,
+                        ) =>
+                {
+                    Some(OwnLink::SelfLink)
+                }
                 Err(_) => None,
             },
             Some(p) if p == old_source => {
                 // `@old:<own old path>`: the file itself. Anything else
                 // with that prefix still names the other source, right.
-                let full = crate::refactor::strip_md_ext_pub(&w.target).0;
+                let full = crate::refactor::strip_md_ext(&w.target).0;
                 full.eq_ignore_ascii_case(old_stem)
                     .then_some(OwnLink::SelfLink)
             }
@@ -2071,8 +2296,8 @@ fn own_links_folded(
 /// shortest stem wins, a tie being no file at all (the resolver's rule,
 /// without regard to case). The extension of a Markdown file is optional.
 fn child_target<'a>(units: &'a [String], target: &str) -> Option<&'a str> {
-    let key = crate::refactor::strip_md_ext_pub(target).0.to_lowercase();
-    let stem = |u: &'a str| crate::refactor::strip_md_ext_pub(u).0.to_lowercase();
+    let key = crate::refactor::strip_md_ext(target).0.to_lowercase();
+    let stem = |u: &'a str| crate::refactor::strip_md_ext(u).0.to_lowercase();
     let mut found: Vec<(&'a str, usize)> = units
         .iter()
         .map(String::as_str)
@@ -2150,6 +2375,103 @@ fn relative_paths(
 }
 
 impl crate::rename_detect::RenameFixer for FixEngine {
+    fn hold(
+        &self,
+        vanished: &[crate::rename_detect::Vanished],
+        appeared: &[crate::rename_detect::Appeared],
+    ) {
+        use tephra_cache::{HeldFile, HeldKind};
+        let files: Vec<HeldFile> = vanished
+            .iter()
+            .map(|v| HeldFile {
+                kind: HeldKind::Vanished,
+                source: v.source.clone(),
+                path: v.path.clone(),
+                hash: v.hash.clone(),
+            })
+            .chain(appeared.iter().map(|a| HeldFile {
+                kind: HeldKind::Appeared,
+                source: a.source.clone(),
+                path: a.path.clone(),
+                hash: a.hash.clone(),
+            }))
+            .collect();
+        if files.is_empty() {
+            return;
+        }
+        let now = self.clock.now();
+        let kept = self
+            .open()
+            .and_then(|cache| self.write_cache(|| cache.hold_renames(&files, now)));
+        if let Err(e) = kept {
+            // The hold still runs in memory; only a stop during it would
+            // lose the pairing.
+            tracing::warn!(error = %e, "could not keep the held renames durably");
+        }
+    }
+
+    fn recall(
+        &self,
+    ) -> (
+        Vec<crate::rename_detect::Vanished>,
+        Vec<crate::rename_detect::Appeared>,
+    ) {
+        use tephra_cache::HeldKind;
+        let held = match self.open().and_then(|c| Ok(c.held_renames()?)) {
+            Ok(held) => held,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not read the held renames");
+                return (Vec::new(), Vec::new());
+            }
+        };
+        let (mut vanished, mut appeared) = (Vec::new(), Vec::new());
+        for f in held {
+            match f.kind {
+                HeldKind::Vanished => vanished.push(crate::rename_detect::Vanished {
+                    source: f.source,
+                    path: f.path,
+                    identity: None,
+                    hash: f.hash,
+                    os: None,
+                }),
+                HeldKind::Appeared => appeared.push(crate::rename_detect::Appeared {
+                    source: f.source,
+                    path: f.path,
+                    identity: None,
+                    hash: f.hash,
+                    os: None,
+                }),
+            }
+        }
+        (vanished, appeared)
+    }
+
+    fn release(&self, vanished: &[(String, String)], appeared: &[(String, String)]) {
+        use tephra_cache::{HeldFile, HeldKind};
+        let files: Vec<HeldFile> = vanished
+            .iter()
+            .map(|(s, p)| (HeldKind::Vanished, s, p))
+            .chain(appeared.iter().map(|(s, p)| (HeldKind::Appeared, s, p)))
+            .map(|(kind, source, path)| HeldFile {
+                kind,
+                source: source.clone(),
+                path: path.clone(),
+                hash: None,
+            })
+            .collect();
+        if files.is_empty() {
+            return;
+        }
+        let released = self
+            .open()
+            .and_then(|cache| self.write_cache(|| cache.release_held_renames(&files)));
+        if let Err(e) = released {
+            // Left held, they are settled again at the next start, which
+            // finds the fix already in the log.
+            tracing::warn!(error = %e, "could not release the settled held renames");
+        }
+    }
+
     fn start_batch(&self) {
         self.batches
             .lock()

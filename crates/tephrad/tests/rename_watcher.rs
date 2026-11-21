@@ -24,8 +24,11 @@ use tephrad::refactor::{AtomicFs, RealFs};
 use tephrad::registry::SourceRegistry;
 
 /// How long a wait for the daemon to react may take. A hash-only pair
-/// waits `RENAME_HOLD` (2 s) first, so this is well above it.
-const WAIT: Duration = Duration::from_secs(20);
+/// waits `RENAME_HOLD` (2 s) first, so this is well above it. A wait
+/// returns the moment its condition holds, so the bound only matters when
+/// the OS is slow to hand the watcher its events (a loaded machine ran
+/// this suite 25 s late), and it is set for that.
+const WAIT: Duration = Duration::from_secs(90);
 
 fn wait_until(timeout: Duration, mut check: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + timeout;
@@ -405,16 +408,24 @@ fn e2_one_unwritable_file_leaves_the_others_rewritten_and_stays_as_pending_work(
         "Index.md was not rewritten: {:?}",
         w.text("Index.md")
     );
+    // Index.md's row is finished only after its rename lands, so under
+    // load it can still be pending when the file already reads as
+    // rewritten. Wait for the settled state: the only pending row is the
+    // one for Other.md.
+    let settled = |w: &World| {
+        let rows = Cache::open(&w.cache_path)
+            .unwrap()
+            .pending_fixes(None, None)
+            .unwrap();
+        rows.len() == 1 && rows[0].file_path == "Other.md"
+    };
     assert!(
-        wait_until(WAIT, || {
-            Cache::open(&w.cache_path)
-                .unwrap()
-                .pending_fixes(None, None)
-                .unwrap()
-                .iter()
-                .any(|r| r.file_path == "Other.md")
-        }),
-        "no pending row for the file that could not be written"
+        wait_until(WAIT, || settled(&w)),
+        "the pending list never settled to the Other.md row: {:?}",
+        Cache::open(&w.cache_path)
+            .unwrap()
+            .pending_fixes(None, None)
+            .unwrap()
     );
 
     // The unwritable file is untouched: no half-written bytes, no temp

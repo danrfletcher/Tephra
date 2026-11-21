@@ -210,7 +210,7 @@ pub(crate) fn summaries_for_source(
 // On the cache
 // ---------------------------------------------------------------
 
-use crate::pending_fixes::{self, NewPendingFix, PendingFixRow, PendingOp};
+use crate::pending_fixes::{self, NewPendingFix, PendingFixRow, PendingOp, PendingWrite};
 use crate::Cache;
 
 impl Cache {
@@ -263,6 +263,39 @@ impl Cache {
         summaries_for_source(self.connection(), source)
     }
 
+    /// The `move` and `rename` entries that matter to the move of `old`
+    /// to `new` (each a `(source, path)`), oldest first: that exact move,
+    /// and any entry that took a file away from `new` or brought one to
+    /// `old`. What decides whether the move is already logged and still
+    /// stands, read by the database instead of the whole log.
+    pub fn fix_log_moves_between(
+        &self,
+        old: (&str, &str),
+        new: (&str, &str),
+    ) -> Result<Vec<FixLogSummary>, CacheError> {
+        let mut stmt = self.connection().prepare(
+            "SELECT id, created_at, kind, old_source, old_path, new_source, new_path \
+             FROM fix_log WHERE kind IN ('move', 'rename') AND ( \
+               (old_source = ?1 AND old_path = ?2 AND new_source = ?3 AND new_path = ?4) \
+               OR (old_source = ?3 AND old_path = ?4) \
+               OR (new_source = ?1 AND new_path = ?2)) ORDER BY id ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![old.0, old.1, new.0, new.1], |row| {
+                Ok(FixLogSummary {
+                    id: row.get(0)?,
+                    created_at: row.get(1)?,
+                    kind: row.get(2)?,
+                    old_source: row.get(3)?,
+                    old_path: row.get(4)?,
+                    new_source: row.get(5)?,
+                    new_path: row.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Whether the log holds a `source_rename` entry from the source
     /// `old` to the source `new`. The entry is written in the same
     /// transaction as the rename itself, so it is there exactly when the
@@ -271,7 +304,7 @@ impl Cache {
     pub fn source_rename_logged(&self, old: &str, new: &str) -> Result<bool, CacheError> {
         Ok(self.connection().query_row(
             "SELECT EXISTS (SELECT 1 FROM fix_log WHERE kind = 'source_rename' \
-             AND old_source = ?1 AND new_source = ?2)",
+             AND old_source = ?1 COLLATE NOCASE AND new_source = ?2 COLLATE NOCASE)",
             params![old, new],
             |r| r.get(0),
         )?)
@@ -296,6 +329,40 @@ impl Cache {
         fix_id: Option<i64>,
     ) -> Result<Vec<PendingFixRow>, CacheError> {
         pending_fixes::list(self.connection(), source, fix_id)
+    }
+
+    /// Records the files the rename detector holds (see
+    /// [`crate::HeldFile`]), in one transaction.
+    pub fn hold_renames(&self, files: &[crate::HeldFile], now: i64) -> Result<(), CacheError> {
+        crate::held_renames::hold(self.connection(), files, now)
+    }
+
+    /// Removes held files the detector has settled.
+    pub fn release_held_renames(&self, files: &[crate::HeldFile]) -> Result<(), CacheError> {
+        crate::held_renames::release(self.connection(), files)
+    }
+
+    /// Every held file, oldest first.
+    pub fn held_renames(&self) -> Result<Vec<crate::HeldFile>, CacheError> {
+        crate::held_renames::all(self.connection())
+    }
+
+    /// Records, durably, what the fix of row `pending_id` is about to put
+    /// in its file: called just before the rename. The row's next change
+    /// ([`Cache::apply_fix_step`]) removes it.
+    pub fn mark_pending_write(
+        &self,
+        pending_id: i64,
+        write: &PendingWrite,
+        now: i64,
+    ) -> Result<(), CacheError> {
+        pending_fixes::mark_write(self.connection(), pending_id, write, now)
+    }
+
+    /// What row `pending_id` was about to write, if a run stopped before
+    /// the row was finished.
+    pub fn pending_write(&self, pending_id: i64) -> Result<Option<PendingWrite>, CacheError> {
+        pending_fixes::marked_write(self.connection(), pending_id)
     }
 
     pub fn get_pending_fix(&self, id: i64) -> Result<Option<PendingFixRow>, CacheError> {

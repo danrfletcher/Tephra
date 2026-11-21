@@ -20,6 +20,7 @@ use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
 use fix_world::{wait_until, writer_over, Daemon, WAIT};
+use serde_json::Value;
 use tephra_cache::Cache;
 use tephra_graph::{ResolveError, UnitGraph};
 use tephrad::fixes::event::RenameEventWire;
@@ -287,7 +288,13 @@ fn a_kill_between_the_rewrites_resumes_the_rest_and_leaves_one_entry_and_no_half
             );
             written += usize::from(now[i] == after[i]);
         }
-        assert_eq!(written, n, "n={n}: exactly the writes before the kill");
+        // At least the writes before the kill: the daemon's own forwarder
+        // retries pending rows on its own thread, so it may have finished
+        // more by now. The end state is checked after the resume below.
+        assert!(
+            written >= n,
+            "n={n}: the writes before the kill are on disk"
+        );
         assert_eq!(
             moves(&d).len(),
             1,
@@ -295,9 +302,19 @@ fn a_kill_between_the_rewrites_resumes_the_rest_and_leaves_one_entry_and_no_half
         );
 
         // Restart: a new engine over the same cache finishes the work.
-        let summary = fresh_engine(&d).resume().expect("resume");
-        assert_eq!(summary.written, 3 - n, "n={n}");
-        assert_eq!(fixed(&d), [true; 3], "n={n}");
+        // How many rows this resume wrote is not fixed (the forwarder may
+        // have finished some first), so check the end state only.
+        fresh_engine(&d).resume().expect("resume");
+        assert!(
+            wait_until(WAIT, || fixed(&d) == [true; 3]
+                && Cache::open(&d.cache_path)
+                    .unwrap()
+                    .pending_fixes(None, None)
+                    .unwrap()
+                    .is_empty()),
+            "n={n}: not finished: {:?}",
+            fixed(&d)
+        );
         let m = moves(&d);
         assert_eq!(m.len(), 1, "n={n}: still one entry");
         assert_eq!((m[0].status.as_str(), m[0].files_changed), ("applied", 3));
@@ -329,6 +346,72 @@ fn the_push_and_the_log_entry_carry_both_sources_and_the_total_of_all_three_rewr
     assert_eq!(notices[0]["new_source"], "other");
     assert_eq!(notices[0]["files_changed"], 3);
     assert_eq!(moves(&d)[0].files_changed, 3);
+    d.close();
+}
+
+/// PR-7 R1 / G17: the move writes files in BOTH sources, and the clients
+/// still get ONE push for it: not one per source with the second one
+/// empty of fixes (which the forwarder would take for a watcher batch).
+/// The push names the files of both sources.
+#[test]
+fn a_move_that_writes_in_two_sources_is_one_push_naming_the_files_of_both() {
+    let d = daemon();
+    let mut client = d.connect();
+    move_on_disk(&d);
+    assert!(matches!(
+        event(&d).unwrap(),
+        RenameEventWire::Applied { files_changed: 3 }
+    ));
+    let pushes = client.drain(std::time::Duration::from_millis(1200));
+    let notes_root = d.notes_root();
+    let other_root = d.other_root();
+    let named = |p: &Value| -> Vec<PathBuf> {
+        p["params"]["paths"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(PathBuf::from)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    // The user's own `mv` makes the watcher announce the moved file (a
+    // plain push, no fixes). The fix makes ONE push of its own, and no
+    // other push names a file only the fix rewrote (Index.md, Reader.md),
+    // which is what a second per-source push for the fix would do.
+    let with = fix_world::with_fixes(&pushes);
+    assert_eq!(
+        with.len(),
+        1,
+        "one push for the whole move, none for the second source: {pushes:?}"
+    );
+    for p in &pushes {
+        if p["params"].get("fixes").is_some() {
+            continue;
+        }
+        for f in named(p) {
+            assert!(
+                f != notes_root.join("Index.md") && f != other_root.join("Reader.md"),
+                "a push without fixes names a file only the fix wrote: {p}"
+            );
+        }
+    }
+    let push = with[0];
+    assert_eq!(fix_world::fixes_of(push).len(), 1, "{push}");
+    assert_eq!(push["params"]["source"], "notes", "{push}");
+    let paths = named(push);
+    for want in [
+        notes_root.join("Index.md"),
+        other_root.join("Reader.md"),
+        other_root.join("docs/target.md"),
+    ] {
+        assert!(
+            paths.contains(&want),
+            "{} is named in {paths:?}",
+            want.display()
+        );
+    }
     d.close();
 }
 
@@ -1081,5 +1164,54 @@ fn f8_a_block_cut_in_one_source_and_pasted_in_another_is_not_followed() {
         .expect("followed inside its source");
     assert_eq!(found.unit.id, "@notes:New.md");
     assert!(found.block.is_some_and(|b| b.moved));
+    d.close();
+}
+
+/// A bare link in the moved file that never named the moved file (three
+/// `Plan` files tied before the move, so `[[Plan]]` pointed at none of
+/// them) is left as it is. After the move it is still a tie, which the
+/// graph reports the same way as a link to a file that is gone; it must
+/// not be taken for a link to the moved file and respelled.
+#[test]
+fn a_bare_link_in_the_moved_file_that_was_a_tie_before_the_move_is_left_alone() {
+    let own = "# Plan\n\nSee [[Plan]].\n";
+    let d = Daemon::start(
+        &[
+            ("X/Plan.md", own),
+            ("Y/Plan.md", "# Y\n"),
+            ("Z/Plan.md", "# Z\n"),
+            ("Index.md", "the plan: [[X/Plan]]\n"),
+        ],
+        &[],
+        fix_world::real_writer(),
+        false,
+    );
+    let to = d.other.root().join("docs/plan.md");
+    std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+    std::fs::rename(d.notes.root().join("X/Plan.md"), &to).unwrap();
+    {
+        use tephrad::rpc::backend::FixBackend;
+        let reply = d
+            .service
+            .rename_event(
+                &d.notes_root().join("X/Plan.md").display().to_string(),
+                &to.display().to_string(),
+            )
+            .expect("event");
+        assert!(
+            matches!(reply, RenameEventWire::Applied { .. }),
+            "{reply:?}"
+        );
+    }
+    assert_eq!(
+        d.text("Index.md"),
+        "the plan: [[@other:docs/plan]]\n",
+        "a link that did name the file is fixed"
+    );
+    assert_eq!(
+        d.other_text("docs/plan.md"),
+        own,
+        "the tied link in the moved file is not respelled"
+    );
     d.close();
 }

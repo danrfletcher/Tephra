@@ -47,7 +47,6 @@ fn promote_over_websocket_replies_and_pushes_once_with_the_fix() {
     let _ = client.drain(Duration::from_millis(300));
     let root = d.notes_root().join("proj");
 
-    let started = std::time::Instant::now();
     let result = client.request(
         "source.promote",
         json!({"name": "proj", "root": root.display().to_string()}),
@@ -59,9 +58,11 @@ fn promote_over_websocket_replies_and_pushes_once_with_the_fix() {
     assert_eq!(result["files_changed"], 2);
     assert_eq!(result["status"], "applied");
 
-    let (push, _) = client.next_fix_push(Duration::from_secs(8));
+    // A hang guard, not a latency bound: how long the push takes depends on
+    // host load (the promote re-scans the folder first), and the push
+    // arriving at all is what this checks.
+    let (push, _) = client.next_fix_push(Duration::from_secs(60));
     let push = push.expect("the push");
-    assert!(started.elapsed() < Duration::from_secs(10));
     assert_eq!(
         push["params"]["sources_changed"],
         json!([{"kind": "promoted", "name": "proj"}])

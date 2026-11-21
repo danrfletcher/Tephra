@@ -576,6 +576,17 @@ pub fn note_self_write(path: &Path) {
     );
 }
 
+/// Takes back the record [`note_self_write`] made for `path`, so the
+/// watcher no longer drops its next event as Tephra's own. For a write
+/// whose result could not be indexed: the change must then reach the
+/// watcher like any other.
+pub fn forget_self_write(path: &Path) {
+    self_writes()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(path);
+}
+
 /// Removes from `changed` every path that is exactly as Tephra last wrote
 /// it (it is the event of that write), and the temp files of that write
 /// beside them. A path changed again since is kept, and so is every
@@ -941,6 +952,18 @@ mod tests {
         let mut batch: HashSet<PathBuf> = [file.clone()].into();
         assert_eq!(drop_self_writes(&mut batch), 0);
         assert_eq!(batch.len(), 1);
+    }
+
+    #[test]
+    fn a_forgotten_own_write_is_a_real_change_to_the_watcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("forgotten.md");
+        std::fs::write(&file, "one").unwrap();
+        note_self_write(&file);
+        forget_self_write(&file);
+        let mut batch: HashSet<PathBuf> = [file.clone()].into();
+        assert_eq!(drop_self_writes(&mut batch), 0);
+        assert_eq!(batch, HashSet::from([file]));
     }
 
     // --- the fix engine's writes (E17) ---------------------------------

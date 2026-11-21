@@ -411,20 +411,36 @@ struct PrivateDir(PathBuf);
 
 impl PrivateDir {
     fn create() -> io::Result<Self> {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0);
-        let path =
-            std::env::temp_dir().join(format!("tephra-identity-{}-{nanos}", std::process::id()));
-        let mut builder = fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
+        // Process-wide counter: two installs in one process (parallel
+        // tests) can read the same clock tick, and a coarse clock (macOS
+        // ticks in microseconds) makes that likely. The directory is made
+        // with `create`, which fails on an existing path, so a name that
+        // is taken is never reused: take the next one.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let mut last = None;
+        for _ in 0..32 {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0);
+            let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "tephra-identity-{}-{nanos}-{seq}",
+                std::process::id()
+            ));
+            let mut builder = fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            match builder.create(&path) {
+                Ok(()) => return Ok(PrivateDir(path)),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => last = Some(e),
+                Err(e) => return Err(e),
+            }
         }
-        builder.create(&path)?;
-        Ok(PrivateDir(path))
+        Err(last.unwrap_or_else(|| io::Error::from(io::ErrorKind::AlreadyExists)))
     }
 
     fn path(&self) -> &Path {
@@ -1211,6 +1227,29 @@ mod tests {
             fs::read_to_string(&f.layout.installed_binary).unwrap(),
             "other build"
         );
+    }
+
+    #[test]
+    fn private_dirs_made_at_the_same_moment_never_share_a_path() {
+        let made: Vec<PrivateDir> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..16)
+                .map(|_| {
+                    s.spawn(|| {
+                        (0..8)
+                            .map(|_| PrivateDir::create().unwrap())
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect()
+        });
+        let paths: std::collections::HashSet<_> =
+            made.iter().map(|d| d.path().to_path_buf()).collect();
+        assert_eq!(paths.len(), made.len(), "every call got its own directory");
+        assert!(paths.iter().all(|p| p.is_dir()));
     }
 
     #[test]

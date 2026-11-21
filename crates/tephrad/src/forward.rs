@@ -21,6 +21,7 @@ use serde_json::{json, Value};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::broadcast::Receiver;
 use tokio::sync::watch;
+use tokio::task::JoinSet;
 
 use crate::fixes::FixEngine;
 use crate::registry::DaemonEvent;
@@ -86,13 +87,24 @@ pub async fn push(state: &Arc<AppState>, event: &DaemonEvent) {
 /// Forwards events until the stop signal fires or the event stream
 /// closes. The loop must end on the signal: `main.rs` waits for this
 /// task before it hands the registry back to be dropped.
+///
+/// The pending-fix retry of a watcher batch (G9) can write files and
+/// back off, so it runs on its own blocking task and is never awaited
+/// inside the loop: a slow retry would hold back every later event and
+/// let the broadcast channel lag and drop some. The retries serialise
+/// themselves inside [`FixEngine`], and the loop waits for the ones still
+/// running before it returns, so none outlives the registry.
 pub async fn run(
     state: Arc<AppState>,
     fixes: Arc<FixEngine>,
     mut events: Receiver<DaemonEvent>,
     mut stop: watch::Receiver<bool>,
 ) {
+    let mut retries: JoinSet<()> = JoinSet::new();
     loop {
+        // Finished retries are collected as the loop goes, so the set
+        // does not grow over the life of the daemon.
+        while retries.try_join_next().is_some() {}
         tokio::select! {
             _ = stop.changed() => break,
             recv = events.recv() => match recv {
@@ -116,22 +128,25 @@ pub async fn run(
                         continue;
                     }
                     let fixes = fixes.clone();
-                    let retried =
-                        tokio::task::spawn_blocking(move || fixes.after_batch(&source, &paths))
-                            .await;
-                    match retried {
-                        Ok(Ok(_)) => {}
-                        Ok(Err(e)) => {
-                            tracing::warn!(error = %e, "retrying pending fixes after a watcher event failed");
+                    retries.spawn(async move {
+                        let retried =
+                            tokio::task::spawn_blocking(move || fixes.after_batch(&source, &paths))
+                                .await;
+                        match retried {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(e)) => {
+                                tracing::warn!(error = %e, "retrying pending fixes after a watcher event failed");
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "pending-fixes retry task panicked");
+                            }
                         }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "pending-fixes retry task panicked");
-                        }
-                    }
+                    });
                 }
                 Err(RecvError::Lagged(_)) => continue,
                 Err(RecvError::Closed) => break,
             }
         }
     }
+    while retries.join_next().await.is_some() {}
 }

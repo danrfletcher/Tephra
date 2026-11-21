@@ -11,9 +11,10 @@ mod fix_world;
 mod fixtures;
 
 use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use fix_world::{fixes_of, real_writer, Daemon};
+use fix_world::{fixes_of, real_writer, writer_over, writer_over_gate, Daemon, EditAt, EditingFs};
 use tephra_cache::Cache;
 use tephra_graph::{EdgeTarget, UnitGraph};
 use tephrad::registry::{RegistryError, UnpromoteError};
@@ -408,7 +409,18 @@ fn unpromoting_a_source_with_promoted_children_leaves_them_promoted_under_its_pa
         .get_unit_by_rel_path(inner.id, "Fresh.md")
         .unwrap()
         .is_some());
-    let _ = before;
+    // The same links reach the same files as before: the graph's edge
+    // set after the unpromote is the one from before it, with only
+    // `outer`'s files spelled as the parent's again (the set, not a count).
+    let respell = |id: &str| match id.strip_prefix("@outer:") {
+        Some(rest) => format!("@notes:outer/{rest}"),
+        None => id.to_string(),
+    };
+    let expected: BTreeSet<(String, String, String)> = before
+        .into_iter()
+        .map(|(from, to, kind)| (respell(&from), respell(&to), kind))
+        .collect();
+    assert_eq!(edge_set_of(&d), expected);
     d.close();
 }
 
@@ -694,5 +706,70 @@ fn own_writes_start_nothing_and_a_later_user_edit_is_indexed() {
     });
     assert!(indexed, "the user's save was not indexed");
     assert_eq!(d.entries().len(), 2, "the user's edit made no fix");
+    d.close();
+}
+
+/// F14: a linking file (`Vault.md`, which links into the promoted source)
+/// that changes between the writer's look and its read is read again: the
+/// unpromote completes, the person's edit is kept and the link is back in
+/// the parent's form. The disturbance is armed after the promote, which
+/// writes through the same loop.
+#[test]
+fn f14_a_linking_file_changed_between_read_and_write_is_retried() {
+    let fs = Arc::new(EditingFs::new(EditAt::BetweenLookAndRead, "Vault.md", 0));
+    let d = Daemon::start(&repo(), &vault(), writer_over(fs.clone()), false);
+    promote(&d);
+    fs.arm(1);
+    let out = unpromote(&d);
+    assert_eq!(out.status, "applied", "{out:?}");
+    assert_eq!(fs.edits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let vault = d.other_text("Vault.md");
+    assert!(vault.ends_with("edited meanwhile\n"), "{vault}");
+    assert!(
+        vault.contains("[[@notes:crates/tephrad/src/registry.rs#^k3f9a2]]"),
+        "{vault}"
+    );
+    assert!(!vault.contains("@tephrad:"), "{vault}");
+    assert!(reopen(&d).pending_fixes(None, None).unwrap().is_empty());
+    d.close();
+}
+
+/// E15: an unpromote waits behind whatever holds the writer gate (a fix,
+/// a refactor or a promote), writes no file while it is held and
+/// completes when it is let go. The gate is the mutex the write loop
+/// locks for each file; the test holds it.
+#[test]
+fn e15_an_unpromote_waits_behind_the_writer_gate_and_completes_when_it_is_released() {
+    let gate = Arc::new(Mutex::new(()));
+    let d = Daemon::start(
+        &repo(),
+        &vault(),
+        writer_over_gate(gate.clone(), Arc::new(tephrad::refactor::RealFs)),
+        false,
+    );
+    promote(&d);
+    let promoted_vault = d.other_text("Vault.md");
+
+    let held = gate.lock().unwrap();
+    let (registry, engine) = (d.registry.clone(), d.engine.clone());
+    let worker = std::thread::spawn(move || registry.unpromote("tephrad", &engine));
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(
+        !worker.is_finished(),
+        "the unpromote did not wait for the gate"
+    );
+    assert_eq!(
+        d.other_text("Vault.md"),
+        promoted_vault,
+        "written under the gate"
+    );
+    drop(held);
+
+    let out = worker.join().expect("thread").expect("unpromote");
+    assert_eq!(out.status, "applied", "{out:?}");
+    assert!(d
+        .other_text("Vault.md")
+        .contains("[[@notes:crates/tephrad/src/registry.rs#^k3f9a2]]"));
+    assert!(!names(&d).contains(&"tephrad".to_string()));
     d.close();
 }

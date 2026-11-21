@@ -16,9 +16,18 @@ path = "src/main.rs"
 name = "register_sources"
 path = "src/bin/register_sources.rs"
 
+# A test harness that rewrites files directly against any cache it is
+# pointed at: not part of what `cargo install tephrad` puts on a machine.
+# It is built only with the `test-harness` feature, which `cargo test`
+# turns on through the dev-dependency on this crate below (so the
+# workspace's tests still build and run it).
 [[bin]]
 name = "fix_helper"
 path = "src/bin/fix_helper.rs"
+required-features = ["test-harness"]
+
+[features]
+test-harness = []
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
@@ -41,6 +50,7 @@ libc = "0.2"
 unicode-normalization = "0.1"
 
 [dev-dependencies]
+tephrad = { path = ".", features = ["test-harness"] }
 reqwest = { version = "0.13.5", features = ["json"] }
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }

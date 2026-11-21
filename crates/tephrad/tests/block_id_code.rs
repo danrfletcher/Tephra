@@ -103,6 +103,7 @@ struct Rig {
     fs: Arc<RecordingFs>,
     watcher: Arc<RecordingWatcher>,
     engine: BlockIdEngine,
+    registry: Arc<SourceRegistry>,
     src: fixtures::TempSource,
     _data: tempfile::TempDir,
 }
@@ -126,12 +127,13 @@ fn rig_with(fixtures_to_copy: &[&str], files: &[(&str, &[u8])], fail_rename: boo
         ..Default::default()
     });
     let watcher = Arc::new(RecordingWatcher::default());
-    let engine = BlockIdEngine::with_parts(registry, fs.clone(), watcher.clone())
+    let engine = BlockIdEngine::with_parts(registry.clone(), fs.clone(), watcher.clone())
         .with_settle(Duration::ZERO);
     Rig {
         fs,
         watcher,
         engine,
+        registry,
         src,
         _data: data,
     }
@@ -869,6 +871,12 @@ fn a_refused_request_never_touches_the_filesystem_or_the_watcher() {
 #[test]
 fn a_file_changed_since_the_cache_saw_it_is_refused_with_try_again() {
     let rig = rig(&["sample.go"]);
+    // The registry's own watcher would index the change and bring the
+    // cache back in step (it does, given a moment, under load), so the
+    // file would no longer be "changed since the cache saw it". Hold
+    // the watcher paused: the change stays unseen by the cache until
+    // the refusal is checked.
+    rig.registry.pause_all_watchers();
     // Another writer: same size, a later mtime.
     let path = rig.path("sample.go");
     let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
@@ -880,6 +888,7 @@ fn a_file_changed_since_the_cache_saw_it_is_refused_with_try_again() {
 
     // And a changed size.
     let rig = rig_with(&["sample.go"], &[], false);
+    rig.registry.pause_all_watchers();
     let mut content = rig.read("sample.go");
     content.push_str("\nfunc Extra() {}\n");
     std::fs::write(rig.path("sample.go"), content).unwrap();

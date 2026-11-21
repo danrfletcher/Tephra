@@ -16,6 +16,7 @@
 mod cache;
 mod fix_log;
 mod fts;
+mod held_renames;
 mod in_file;
 mod listing;
 mod pending_fixes;
@@ -35,12 +36,13 @@ pub use fix_log::{
 pub use fts::{
     make_snippet, BlockHit, NewFtsRow, FTS_ROWS_PER_UNIT, MAX_RANK_CANDIDATES, MIN_TRIGRAM_CHARS,
 };
+pub use held_renames::{HeldFile, HeldKind};
 pub use in_file::{InFileCandidate, InFileScope};
 pub use listing::{
     compare_entries, compare_names, FolderEntry, FolderListing, FolderState, FOLDER_KIND,
 };
 pub use pending_fixes::{
-    NewPendingFix, PendingFixRow, PendingOp, STATE_NEEDS_MANUAL_FIX, STATE_PENDING,
+    NewPendingFix, PendingFixRow, PendingOp, PendingWrite, STATE_NEEDS_MANUAL_FIX, STATE_PENDING,
 };
 pub use promote::{NewPromote, NewUnpromote, Promoted, PromotedRootRow, Unpromoted};
 pub use schema::KindInferrer;

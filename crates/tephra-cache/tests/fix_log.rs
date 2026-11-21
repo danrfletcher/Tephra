@@ -382,3 +382,33 @@ fn log_and_pending_rows_survive_a_schema_version_rebuild_byte_for_byte() {
         "the work list reads back through the typed API after a rebuild"
     );
 }
+
+/// What decides whether a move is already logged and still stands is read
+/// by the database: the exact move, and the entries that took a file away
+/// from the new place or brought one to the old place; nothing else.
+#[test]
+fn the_moves_between_two_places_are_selected_by_the_database() {
+    let (_dir, cache) = cache();
+    let put = |kind: &str, os: &str, op: &str, ns: &str, np: &str| {
+        let mut e = entry(1, op, np);
+        e.kind = kind.into();
+        e.old_source = Some(os.into());
+        e.new_source = Some(ns.into());
+        cache.insert_fix_log(&e).unwrap()
+    };
+    let exact = put("move", "a", "x.md", "b", "x.md");
+    let back = put("move", "b", "x.md", "a", "x.md");
+    let away = put("rename", "b", "x.md", "b", "y.md");
+    let to_old = put("rename", "a", "w.md", "a", "x.md");
+    put("move", "a", "other.md", "b", "other.md");
+    put("rename", "notes", "p.md", "notes", "q.md");
+    put("uncertain", "a", "x.md", "b", "x.md");
+
+    let ids: Vec<i64> = cache
+        .fix_log_moves_between(("a", "x.md"), ("b", "x.md"))
+        .unwrap()
+        .into_iter()
+        .map(|e| e.id)
+        .collect();
+    assert_eq!(ids, vec![exact, back, away, to_old]);
+}

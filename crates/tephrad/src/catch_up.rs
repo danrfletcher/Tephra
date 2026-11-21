@@ -74,12 +74,23 @@ pub struct Diff {
     pub new: Vec<DiskFile>,
     /// Cached files that are gone from disk.
     pub vanished: Vec<CachedFile>,
+    /// Cached files the listing does not hold but that are not gone
+    /// either (a stat finds them, or cannot say): a path an edited
+    /// `.tephraignore` now matches, or one under a folder that is no
+    /// longer listed. Nothing in the batch indexer would ever touch
+    /// them (an ignored path is skipped, not deleted), so the caller
+    /// drops the ones a stat still finds. A row whose stat fails
+    /// is left alone: that says nothing about the file.
+    pub unlisted: Vec<String>,
 }
 
 impl Diff {
     /// Whether the disk is exactly what the cache describes.
     pub fn is_empty(&self) -> bool {
-        self.edited.is_empty() && self.new.is_empty() && self.vanished.is_empty()
+        self.edited.is_empty()
+            && self.new.is_empty()
+            && self.vanished.is_empty()
+            && self.unlisted.is_empty()
     }
 
     /// Every path the cache has to be brought up to date for, as
@@ -116,6 +127,8 @@ pub fn diff(cached: Vec<CachedFile>, disk: Vec<DiskFile>, is_gone: impl Fn(&str)
             None => {
                 if is_gone(&row.path) {
                     out.vanished.push(row);
+                } else {
+                    out.unlisted.push(row.path);
                 }
             }
         }
@@ -124,6 +137,7 @@ pub fn diff(cached: Vec<CachedFile>, disk: Vec<DiskFile>, is_gone: impl Fn(&str)
     out.edited.sort();
     out.new.sort_by(|a, b| a.path.cmp(&b.path));
     out.vanished.sort_by(|a, b| a.path.cmp(&b.path));
+    out.unlisted.sort();
     out
 }
 
@@ -311,6 +325,29 @@ pub fn is_gone(root: &Path, rel: &str) -> bool {
     )
 }
 
+/// Drops the cached rows of `unlisted` paths that a stat still finds on
+/// disk (see [`Diff::unlisted`]) and returns their absolute paths. A
+/// path whose stat fails is left alone.
+pub fn drop_unlisted(
+    cache: &tephra_cache::Cache,
+    source_id: i64,
+    root: &Path,
+    unlisted: &[String],
+) -> Result<Vec<PathBuf>, tephra_cache::CacheError> {
+    let mut dropped = Vec::new();
+    for rel in unlisted {
+        let abs = root.join(rel);
+        if fs::symlink_metadata(&abs).is_err() {
+            continue;
+        }
+        if let Some(row) = cache.get_unit_by_rel_path(source_id, rel)? {
+            cache.delete_unit(row.id)?;
+            dropped.push(abs);
+        }
+    }
+    Ok(dropped)
+}
+
 /// How a boot starts a source's watcher; a test replaces it.
 pub type StartTap<'a> =
     dyn Fn(&Path, Arc<RwLock<IgnoreRules>>) -> Result<WatcherTap, WatchError> + Sync + 'a;
@@ -371,6 +408,21 @@ mod tests {
     }
 
     // ---- diff ------------------------------------------------------
+
+    #[test]
+    fn a_cached_file_missing_from_the_listing_but_still_there_is_unlisted_not_vanished() {
+        let d = diff(
+            vec![
+                cached("a.md", 1, 1, Some("h")),
+                cached("b.md", 1, 1, Some("g")),
+            ],
+            vec![],
+            |rel| rel == "b.md",
+        );
+        assert_eq!(d.unlisted, vec!["a.md"]);
+        assert_eq!(paths(&d.vanished), vec!["b.md"]);
+        assert!(!d.is_empty());
+    }
 
     #[test]
     fn diff_sorts_each_file_into_one_class() {

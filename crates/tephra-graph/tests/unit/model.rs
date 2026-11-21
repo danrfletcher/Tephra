@@ -344,6 +344,57 @@ fn get_backlinks_on_a_renamed_notes_old_id_still_finds_every_impacted_incoming_l
     assert!(graph.get_backlinks("@notes:NewDoc.md").is_empty());
 }
 
+/// A bare link that was already a tie before the rename (three
+/// same-length `Training Plan.md` in three folders) and is still a tie
+/// after one of them is renamed never reached the renamed file, so the
+/// rename fix must not list it. A link the renamed file did win (it was
+/// the shortest) is listed even though it now dangles.
+#[test]
+fn rename_backlinks_leave_out_a_link_that_was_already_ambiguous() {
+    let mut graph = UnitGraph::new();
+    for dir in ["a", "b", "c"] {
+        graph.upsert_unit(
+            "notes",
+            &format!("{dir}/Training Plan.md"),
+            facts(&[], &[], &[]),
+        );
+    }
+    graph.upsert_unit(
+        "notes",
+        "Linker.md",
+        facts(&[("Training Plan", "wikilink")], &[], &[]),
+    );
+    assert!(
+        graph.get_backlinks("@notes:a/Training Plan.md").is_empty(),
+        "the link is a tie before the rename: it reaches none of them"
+    );
+
+    graph.remove_unit("notes", "a/Training Plan.md");
+    graph.upsert_unit("notes", "a/Plan.md", facts(&[], &[], &[]));
+    let tied = graph.get_rename_backlinks("@notes:a/Training Plan.md", "@notes:a/Plan.md");
+    assert!(tied.is_empty(), "{tied:?}");
+
+    // The shortest stem wins, so the root file owned the bare link.
+    let mut graph = UnitGraph::new();
+    for path in [
+        "Training Plan.md",
+        "a/Training Plan.md",
+        "b/Training Plan.md",
+    ] {
+        graph.upsert_unit("notes", path, facts(&[], &[], &[]));
+    }
+    graph.upsert_unit(
+        "notes",
+        "Linker.md",
+        facts(&[("Training Plan", "wikilink")], &[], &[]),
+    );
+    graph.remove_unit("notes", "Training Plan.md");
+    graph.upsert_unit("notes", "Plan.md", facts(&[], &[], &[]));
+    let owned = graph.get_rename_backlinks("@notes:Training Plan.md", "@notes:Plan.md");
+    assert_eq!(owned.len(), 1, "{owned:?}");
+    assert_eq!(owned[0].from, "@notes:Linker.md");
+}
+
 /// R9: re-upserting the exact same path (a watcher's debounced edit
 /// of a file whose own rel_path didn't change) must not leave a
 /// stale duplicate of this id behind in its own stem/basename index

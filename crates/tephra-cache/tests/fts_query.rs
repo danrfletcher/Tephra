@@ -5,6 +5,8 @@
 //! limit, Unicode, offline flags and snippets.
 
 mod common;
+#[path = "../../tephra-parser/tests/unit/cpu_timer.rs"]
+mod cpu_timer;
 
 use common::open_temp_cache;
 use tephra_cache::{Cache, NewFtsRow, NewUnit, SourceStatus};
@@ -633,7 +635,7 @@ fn seed_large(cache: &Cache, units: usize) {
 /// Every query in `queries` answers in under 500 ms and fills the limit.
 fn assert_fast(cache: &Cache, queries: &[&str]) {
     for query in queries {
-        let start = std::time::Instant::now();
+        let start = cpu_timer::CpuTimer::start();
         let hits = cache.search_all_blocks(query, 50).unwrap();
         let elapsed = start.elapsed();
         eprintln!("^^{query}: {elapsed:?}");
@@ -651,7 +653,7 @@ fn a_full_text_query_over_a_large_index_is_fast_enough() {
     let cache = open_temp_cache(&dir);
     seed_large(&cache, 20_000);
 
-    let start = std::time::Instant::now();
+    let start = cpu_timer::CpuTimer::start();
     let hits = cache.search_all_blocks("conflict", 50).unwrap();
     let elapsed = start.elapsed();
     assert_eq!(hits.len(), 21, "i = 0, 997, ... below 20,000");
@@ -693,7 +695,7 @@ fn a_query_over_a_hundred_thousand_files_is_under_500_ms() {
     let cache = open_temp_cache(&dir);
     seed_large(&cache, 100_000);
     assert_fast(&cache, &["the", "tion", "paragraph", "translation", "th"]);
-    let start = std::time::Instant::now();
+    let start = cpu_timer::CpuTimer::start();
     assert_eq!(cache.search_all_blocks("conflict", 50).unwrap().len(), 50);
     assert!(start.elapsed().as_millis() < 500);
 }

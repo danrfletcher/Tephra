@@ -564,43 +564,16 @@ impl FixWorld {
         fs::read_to_string(self.notes.root().join(rel)).expect("read notes file")
     }
 
-    /// One request per linking file for the rename `old` to `new`, built
-    /// from the graph as `fix_rename` builds it (a self-link recorded
-    /// under the old id belongs to the file at the new one).
+    /// One request per linking file for the rename `old` to `new`, from the
+    /// engine's own builder ([`tephrad::fixes::rename_requests`]), so what
+    /// the write tests send the writer is what production sends it.
     pub fn requests(
         &self,
         old: &str,
         new: &str,
     ) -> Vec<tephrad::refactor::fix_write::FileFixRequest> {
-        use tephrad::refactor::fix_write::{FileFixRequest, RewriteMode};
-        let graph = self.graph();
-        let old_id = format!("@notes:{old}");
-        let new_id = format!("@notes:{new}");
-        let bare_resolves = graph
-            .shortest_unique_target(&new_id)
-            .is_some_and(|t| !t.contains('/'));
-        let mut by_file: std::collections::BTreeMap<String, Vec<tephra_graph::Edge>> =
-            Default::default();
-        for mut edge in graph.get_rename_backlinks(&old_id, &new_id) {
-            if edge.from == old_id {
-                edge.from = new_id.clone();
-            }
-            by_file.entry(edge.from.clone()).or_default().push(edge);
-        }
-        by_file
-            .into_iter()
-            .map(|(file, edges)| {
-                let rel = file.strip_prefix("@notes:").unwrap().to_string();
-                FileFixRequest::new(
-                    file,
-                    self.notes.root().join(rel),
-                    edges,
-                    old,
-                    new,
-                    RewriteMode::Fix { bare_resolves },
-                )
-            })
-            .collect()
+        tephrad::fixes::rename_requests(&self.graph(), "notes", self.notes.root(), old, new, false)
+            .expect("the renamed file is in the graph")
     }
 }
 

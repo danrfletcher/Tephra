@@ -234,14 +234,15 @@ fn a_source_promoted_out_of_the_one_that_folds_back_becomes_a_child_of_its_paren
 
 #[test]
 fn deleting_a_parent_source_leaves_its_promoted_child_a_source_of_its_own() {
-    // The row stays (history, like the fix log; durable_fix_tables.rs), but
-    // the parent is gone, so `begin_unpromote` has nothing to fold into and
+    // The row goes with the parent (it says what is promoted now, and is
+    // keyed by name), and `begin_unpromote` has nothing to fold into and
     // refuses: the child is top-level (FR13, FR22).
     let dir = tempfile::tempdir().unwrap();
     let cache = common::open_temp_cache(&dir);
     promoted(&cache);
     cache.delete_source("tephra").unwrap();
     assert!(cache.get_source("tephrad").unwrap().is_some());
+    assert!(cache.promoted_roots().unwrap().is_empty());
     let (log, rows) = (log("unpromote"), []);
     assert!(matches!(
         cache.begin_unpromote(&unpromote(&log, &rows)),
@@ -254,12 +255,49 @@ fn deleting_a_parent_source_leaves_its_promoted_child_a_source_of_its_own() {
     );
 }
 
-/// R1: the parent is deleted and a DIFFERENT source takes its name. The
-/// row names `tephra` and `tephrad` still, but `tephrad` is not under
-/// the new `tephra`'s root: the row is history, not a promote of it.
+/// Deleting the child removes its row too, so the folder can be promoted
+/// again (the `(parent, rel_path)` key is free) and the row is not taken
+/// for the promote of a source registered under the child's name later.
+#[test]
+fn deleting_the_promoted_child_removes_its_row_and_frees_the_folder() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = common::open_temp_cache(&dir);
+    promoted(&cache);
+    assert_eq!(cache.promoted_roots().unwrap().len(), 1);
+
+    cache.delete_source("tephrad").unwrap();
+
+    assert!(cache.promoted_roots().unwrap().is_empty());
+    let log_row = log("promote");
+    cache
+        .begin_promote(&NewPromote {
+            name: "tephrad",
+            root: "/repo/crates/tephrad",
+            parent: "tephra",
+            rel_path: "crates/tephrad",
+            created_at: 40,
+            log: &log_row,
+            pending: &[],
+        })
+        .expect("the folder can be promoted again");
+}
+
+/// R1: the parent is deleted and a DIFFERENT source takes its name, while
+/// a row naming the old parent is still there (written by an older build,
+/// which kept the rows of a deleted source). The row names `tephra` and
+/// `tephrad` still, but `tephrad` is not under the new `tephra`'s root:
+/// the row is history, not a promote of it.
 fn parent_replaced_by_another_source_of_the_same_name(cache: &Cache) -> i64 {
     promoted(cache);
+    let stale = cache.promoted_roots().unwrap().remove(0);
     cache.delete_source("tephra").unwrap();
+    cache
+        .connection()
+        .execute(
+            "INSERT INTO promoted_roots (parent, rel_path, source, created_at) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![stale.parent, stale.rel_path, stale.source, stale.created_at],
+        )
+        .unwrap();
     cache
         .register_source("tephra", "/unrelated", SourceStatus::Active)
         .unwrap();

@@ -544,6 +544,13 @@ fn listener_failure_reports_clear_error_and_nonzero_exit() {
 
 #[test]
 fn directory_stage_failure_reports_clear_error() {
+    // Checked before anything is spawned: root ignores the read-only
+    // parent, so tephrad would start and serve, and `.output()` below
+    // would wait forever for an exit that never comes.
+    if nix_root_can_bypass_permissions() {
+        eprintln!("skipped: running as a user that can bypass directory permissions (e.g. root)");
+        return;
+    }
     let home = tempfile::tempdir().expect("tempdir");
     let config_path = home.path().join(".config/tephra/config.toml");
     let readonly_parent = home.path().join("readonly-parent");
@@ -570,11 +577,6 @@ fn directory_stage_failure_reports_clear_error() {
     // Restore permissions so the TempDir can clean itself up, regardless
     // of the assertions below.
     fs::set_permissions(&readonly_parent, fs::Permissions::from_mode(0o755)).unwrap();
-
-    if nix_root_can_bypass_permissions() {
-        eprintln!("skipping assertions: running as a user that can bypass directory permissions (e.g. root)");
-        return;
-    }
 
     assert!(
         !output.status.success(),

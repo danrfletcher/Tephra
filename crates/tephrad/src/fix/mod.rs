@@ -123,12 +123,27 @@ impl FixSpelling {
     /// The spelling for target unit `id` in `graph`. `qualify_ambiguous`
     /// is the `qualify_ambiguous_links` setting.
     pub fn for_target(graph: &UnitGraph, id: &str, qualify_ambiguous: bool) -> Self {
+        Self::for_target_ignoring(graph, id, qualify_ambiguous, &[])
+    }
+
+    /// [`FixSpelling::for_target`] for a file that has moved to another
+    /// source while `graph` still holds it at its old id (`moved_from`):
+    /// that unit is the target itself, so it does not make the name
+    /// "also in another source".
+    pub fn for_target_ignoring(
+        graph: &UnitGraph,
+        id: &str,
+        qualify_ambiguous: bool,
+        moved_from: &[&str],
+    ) -> Self {
         let bare_resolves = graph
             .shortest_unique_target(id)
             .is_some_and(|t| !t.contains('/'));
         // The only branch of the Atlas fallback. A target at its source
         // root has no fuller same-source path: it stays the bare name.
-        let qualify = qualify_ambiguous && has_folder(id) && graph.name_in_other_source(id);
+        let qualify = qualify_ambiguous
+            && has_folder(id)
+            && graph.name_in_other_source_ignoring(id, moved_from);
         FixSpelling {
             bare_resolves,
             qualify,
@@ -170,7 +185,7 @@ impl FixSpelling {
 /// source, so a fuller same-source path than its bare name exists.
 fn has_folder(id: &str) -> bool {
     id.split_once(':')
-        .is_some_and(|(_, rel)| crate::refactor::strip_md_ext_pub(rel).0.contains('/'))
+        .is_some_and(|(_, rel)| crate::refactor::strip_md_ext(rel).0.contains('/'))
 }
 
 /// Rewrites every wikilink that named `old_path` of `source` so it

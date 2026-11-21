@@ -25,9 +25,28 @@ fn vault() -> Vec<(&'static str, &'static str)> {
 
 fn promoted() -> Daemon {
     let d = Daemon::start(&files(), &vault(), real_writer(), false);
+    // The promote's own push (kind "promoted") goes out through the
+    // forwarder, which can run behind on a loaded host, so a client that
+    // connects after `promote` returns may still be sent it a moment
+    // later and mistake it for a later push. Hold a client through the
+    // promote, wait for that push to come out, then let the client go:
+    // a client connecting after this gets nothing of the promote.
+    let mut early = d.connect();
     d.registry
         .promote("proj", d.notes_root().join("proj"), &d.engine)
         .expect("promote");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let push = early.next_push(left).expect("the promote's push");
+        if push["params"]["sources_changed"]
+            == serde_json::json!([{"kind": "promoted", "name": "proj"}])
+        {
+            break;
+        }
+    }
+    let _ = early.drain(Duration::from_millis(300));
+    drop(early);
     d
 }
 
@@ -37,6 +56,9 @@ fn state(d: &Daemon) -> Vec<(String, Vec<u8>)> {
         let mut snap: Vec<_> = fixtures::tree_snapshot(root)
             .into_iter()
             .map(|(p, (bytes, _))| (p, bytes))
+            // `Warmup.md` is the harness's own file: its text counts the
+            // rounds the warm-up needed, which differs between two daemons.
+            .filter(|(p, _)| p != "Warmup.md")
             .collect();
         out.append(&mut snap);
     }
@@ -136,9 +158,15 @@ fn a_second_unregister_of_the_same_promoted_name_is_ok_and_silent() {
 
     assert_eq!(state(&d), after_first);
     assert_eq!(d.entries().len(), entries, "no second log entry");
+    // No source-list marker and no fix. An ordinary watcher push is not
+    // what is checked: the OS can still hand the watcher the file the
+    // world's warm-up wrote, after the clients above went quiet.
+    let late = client.drain(Duration::from_millis(800));
     assert!(
-        client.next_push(Duration::from_millis(800)).is_none(),
-        "no second push"
+        late.iter()
+            .all(|p| p["params"].get("sources_changed").is_none()
+                && p["params"].get("fixes").is_none()),
+        "no second push: {late:?}"
     );
     d.close();
 }

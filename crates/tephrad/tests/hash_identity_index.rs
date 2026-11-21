@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use tephra_cache::{Cache, SourceStatus, UnitRow};
 use tephrad::file_kind::MAX_INDEXED_BYTES;
 use tephrad::ignore::IgnoreRules;
-use tephrad::registry::{DaemonEvent, SourceRegistry};
+use tephrad::registry::SourceRegistry;
 use tephrad::scan;
 
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -278,16 +278,26 @@ fn the_real_watcher_refreshes_the_hash_of_only_the_file_that_changed() {
     assert!(a0.hash.is_some() && a0.inode.is_some() && a0.device.is_some());
 
     fixture.write("a.md", "edited by the watcher test\n");
+    // Wait for the edit to be indexed, not for the first event: the OS can
+    // hand the watcher the files written to set the source up as a batch
+    // of its own after it started, and that batch re-indexes both files
+    // before the edit's batch comes.
     let fired = wait_until(Duration::from_secs(10), || {
-        matches!(events.try_recv(), Ok(DaemonEvent::SourceChanged { .. }))
+        while events.try_recv().is_ok() {}
+        read("a.md").hash != a0.hash
     });
-    assert!(fired, "expected a source_changed event after the edit");
+    assert!(fired, "the edit was never indexed");
 
     let (a1, b1) = (read("a.md"), read("b.md"));
-    assert_ne!(a1.hash, a0.hash);
     assert!(a1.hash.is_some());
     assert_eq!((a1.inode, a1.device), (a0.inode, a0.device));
-    assert_eq!(b1, b0);
+    // b.md was not written: its row says the same of the file. (A batch
+    // for the setup writes may have indexed it again under a new row id,
+    // which is not a change to the file.)
+    assert_eq!(
+        (b1.hash, b1.mtime, b1.size, b1.inode, b1.device),
+        (b0.hash, b0.mtime, b0.size, b0.inode, b0.device)
+    );
     registry.unregister("notes").unwrap();
 }
 

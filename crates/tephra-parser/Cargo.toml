@@ -30,3 +30,4 @@ tree-sitter-yaml = "0.7.2"
 zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 
 [dev-dependencies]
+libc = "0.2"

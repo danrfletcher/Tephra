@@ -58,6 +58,12 @@ fn register_survives_a_write_lock_held_past_the_busy_timeout() {
         .execute_batch("BEGIN IMMEDIATE;")
         .expect("blocker acquires the write lock");
 
+    // Taken before the blocker thread is spawned: the thread sleeps
+    // `hold_for` from its own start, so the lock is released no earlier
+    // than `held_since + hold_for`. Measuring from a later instant (after
+    // the thread spawn and the cache/registry setup) could read under
+    // `hold_for` when `register()` returns right at the release under load.
+    let held_since = Instant::now();
     let hold_for = Duration::from_millis(20_000);
     let release_handle = std::thread::spawn(move || {
         std::thread::sleep(hold_for);
@@ -69,9 +75,8 @@ fn register_survives_a_write_lock_held_past_the_busy_timeout() {
     let cache = Cache::open(&cache_path).expect("open cache under test");
     let registry = SourceRegistry::new(cache).expect("new registry");
 
-    let started = Instant::now();
     let outcome = registry.register("notes", fixture.root());
-    let elapsed = started.elapsed();
+    let elapsed = held_since.elapsed();
 
     release_handle.join().expect("blocker thread panicked");
 

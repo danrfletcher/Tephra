@@ -5,7 +5,6 @@
 
 mod fixtures;
 
-use std::io;
 use std::sync::{Arc, Mutex};
 
 use fixtures::{FixWorld, GP1_FILES};
@@ -14,38 +13,67 @@ use tephrad::refactor::fix_write::{FixWriter, ThreadSleeper};
 use tephrad::refactor::RealFs;
 use tephrad::rename_detect::RenameFixer;
 
-#[derive(Clone, Default)]
-struct Capture(Arc<Mutex<Vec<u8>>>);
+/// Log capture. One subscriber is installed for the whole test binary,
+/// once, and stays. A subscriber set per test with `with_default` races
+/// with the tests running on parallel threads (`tracing` caches, per
+/// callsite, whether anyone is listening, and a callsite first hit by a
+/// thread with no subscriber can stay silent for a test that sets one a
+/// moment later), which left some captures empty. The writer appends to
+/// a buffer of the emitting thread, and every test runs on its own
+/// thread, so a capture sees its own lines and no other test's.
+mod capture {
+    use std::cell::RefCell;
+    use std::io;
+    use std::sync::Once;
 
-impl io::Write for Capture {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
+    thread_local! {
+        static LOG: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+
+    struct ThreadLog;
+
+    impl io::Write for ThreadLog {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            LOG.with(|l| l.borrow_mut().extend_from_slice(buf));
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct MakeThreadLog;
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for MakeThreadLog {
+        type Writer = ThreadLog;
+        fn make_writer(&'a self) -> ThreadLog {
+            ThreadLog
+        }
+    }
+
+    /// Runs `f` and returns its result with the log lines it wrote on
+    /// this thread.
+    pub fn logged<T>(f: impl FnOnce() -> T) -> (T, String) {
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(MakeThreadLog)
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("no other global subscriber in this test binary");
+        });
+        LOG.with(|l| l.borrow_mut().clear());
+        let out = f();
+        let text = LOG.with(|l| String::from_utf8(std::mem::take(&mut *l.borrow_mut())).unwrap());
+        (out, text)
     }
 }
 
-/// The two tests hit the same `tracing::info!` callsite. tracing caches a
-/// callsite's interest across all live subscribers, so two scoped
-/// subscribers on parallel threads can leave one capture empty under host
-/// load. Every capture takes this lock, so they never overlap.
-static CAPTURE_LOCK: Mutex<()> = Mutex::new(());
-
-/// Runs `f` with an info-level subscriber and returns what it logged.
+/// Runs `f` and returns what it logged.
 fn logged(f: impl FnOnce()) -> String {
-    let _serial = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let capture = Capture::default();
-    let writer = capture.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_ansi(false)
-        .with_writer(move || writer.clone())
-        .finish();
-    tracing::subscriber::with_default(subscriber, f);
-    let bytes = capture.0.lock().unwrap().clone();
-    String::from_utf8(bytes).expect("utf8 log")
+    capture::logged(f).1
 }
 
 fn engine(w: &FixWorld) -> FixEngine {
