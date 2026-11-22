@@ -1,0 +1,11 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "error": {
+    "code": -32011,
+    "message": "no source is named nope",
+    "data": {
+      "reason": "unknown_source"
+    }
+  }
+}

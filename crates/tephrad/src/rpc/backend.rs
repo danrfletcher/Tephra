@@ -366,6 +366,34 @@ pub trait SourceBackend: Send + Sync {
             kind: None,
         })
     }
+    /// `cache.status` (PR-8): what the remote content cache takes, against
+    /// its cap. The default refuses.
+    fn cache_status(&self) -> Result<crate::remote::evict::CacheStatusWire, PromoteRpcError> {
+        Err(PromoteRpcError::Failed(
+            "cache.status is not supported by this source backend".to_string(),
+        ))
+    }
+    /// `cache.set_limit` (PR-8): saves and applies a new cap, then runs an
+    /// eviction pass. The default refuses.
+    fn set_cache_limit(
+        &self,
+        _limit: &str,
+    ) -> Result<crate::remote::evict::CacheSetLimitWire, PromoteRpcError> {
+        Err(PromoteRpcError::Failed(
+            "cache.set_limit is not supported by this source backend".to_string(),
+        ))
+    }
+    /// `source.set_cache` (PR-8, G20): a remote source's cache flag. The
+    /// default refuses.
+    fn set_source_cache(
+        &self,
+        _name: &str,
+        _on: bool,
+    ) -> Result<crate::remote::evict::SourceCacheWire, PromoteRpcError> {
+        Err(PromoteRpcError::Failed(
+            "source.set_cache is not supported by this source backend".to_string(),
+        ))
+    }
     /// `unit.list` (G1): one folder of `source` (`folder` already
     /// normalized by the dispatcher; `""` is the root). The default
     /// refuses, so a test double that only exercises the other four
@@ -485,6 +513,22 @@ impl SourceBackend for SourceRegistry {
         unit: &str,
     ) -> Result<crate::remote::fetch::FetchWire, crate::remote::fetch::FetchRpcError> {
         SourceRegistry::fetch_unit(self, unit)
+    }
+    fn cache_status(&self) -> Result<crate::remote::evict::CacheStatusWire, PromoteRpcError> {
+        SourceRegistry::cache_status(self)
+    }
+    fn set_cache_limit(
+        &self,
+        limit: &str,
+    ) -> Result<crate::remote::evict::CacheSetLimitWire, PromoteRpcError> {
+        SourceRegistry::set_cache_limit(self, limit)
+    }
+    fn set_source_cache(
+        &self,
+        name: &str,
+        on: bool,
+    ) -> Result<crate::remote::evict::SourceCacheWire, PromoteRpcError> {
+        SourceRegistry::set_source_cache(self, name, on)
     }
     fn search_names(&self, query: &str, limit: usize) -> Result<Vec<SearchHitWire>, SearchError> {
         SourceRegistry::search_names(self, query, limit)

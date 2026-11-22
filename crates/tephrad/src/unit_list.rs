@@ -88,6 +88,11 @@ pub struct UnitListWire {
     /// has not been rescanned, so its kind is a guess from the extension
     /// and its size is null.
     pub needs_rescan: bool,
+    /// A remote source's cache flag (G20): `false` means a fetched file is
+    /// dropped about ten minutes after its last use. Left out for a local
+    /// source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache: Option<bool>,
     pub entries: Vec<UnitEntryWire>,
 }
 
@@ -192,6 +197,7 @@ pub fn list_units(
         recursive,
         offline,
         needs_rescan: listing.needs_rescan,
+        cache: None,
         entries,
     })
 }
@@ -249,6 +255,7 @@ fn list_remote(
         recursive,
         offline: false,
         needs_rescan: false,
+        cache: cache.remote_source(source).ok().flatten().map(|s| s.cache),
         entries,
     })
 }

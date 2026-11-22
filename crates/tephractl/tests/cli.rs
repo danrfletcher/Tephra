@@ -33,6 +33,9 @@ mod link_commands;
 #[path = "cli/backlinks.rs"]
 mod backlinks;
 
+#[path = "cli/cache_commands.rs"]
+mod cache_commands;
+
 #[path = "cli/fixes_commands.rs"]
 mod fixes_commands;
 

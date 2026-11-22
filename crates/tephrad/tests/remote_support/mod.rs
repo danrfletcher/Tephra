@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use tephra_cache::Cache;
 use tephra_graph::UnitGraph;
 use tephra_remote::credentials::{CredentialError, CredentialStore, Provider, Secret};
-use tephra_remote::testing::{FakeGithub, LinkGate};
+use tephra_remote::testing::{FakeDrive, FakeGithub, LinkGate};
 use tephra_remote::{AdapterOptions, Clock, FakeClock, SystemClock};
 use tephrad::fixes::FixEngine;
 use tephrad::refactor::fix_write::FixWriter;
@@ -243,6 +243,36 @@ pub struct Daemon {
     _own_dir: Option<tempfile::TempDir>,
 }
 
+/// What a test sets of the cache cap (PR-8).
+#[derive(Debug, Clone, Copy)]
+pub struct Tuning {
+    /// The limit as `cache_limit` is written; `None`: what a former run of
+    /// this data dir saved, else 10 GB.
+    pub limit: Option<&'static str>,
+    /// Seconds a file must be unused before it may be dropped. The
+    /// product's is 600; tests that do not move the clock keep it, so
+    /// nothing is dropped under them.
+    pub idle_secs: u64,
+    /// The fake sits behind a switch, so `network_down` works.
+    pub gated: bool,
+    /// How often a poller looks at the (fake) clock, in real time. The
+    /// default 10 ms makes a poll that the clock has made due run at once;
+    /// a test that moves the clock far and then counts requests gives a
+    /// tick longer than the test, so no poll can land in between.
+    pub poll_tick: Duration,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Tuning {
+            limit: None,
+            idle_secs: 600,
+            gated: false,
+            poll_tick: Duration::from_millis(10),
+        }
+    }
+}
+
 impl Daemon {
     /// A signed-in daemon with a data dir of its own.
     pub fn start(fake: &Arc<Fake>) -> Daemon {
@@ -325,6 +355,31 @@ impl Daemon {
         disk: Option<Arc<dyn Disk>>,
         drive_url: Option<&str>,
     ) -> Daemon {
+        Self::start_tuned(
+            fake,
+            store,
+            data_dir,
+            clock,
+            options,
+            disk,
+            drive_url,
+            Tuning::default(),
+        )
+    }
+
+    /// [`Daemon::start_full_with_drive`] with the cache cap's settings
+    /// given (PR-8).
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_tuned(
+        fake: &Arc<Fake>,
+        store: Arc<MemStore>,
+        data_dir: Option<PathBuf>,
+        clock: Arc<dyn Clock>,
+        options: AdapterOptions,
+        disk: Option<Arc<dyn Disk>>,
+        drive_url: Option<&str>,
+        tuning: Tuning,
+    ) -> Daemon {
         let (own_dir, data_dir) = match data_dir {
             Some(d) => (None, d),
             None => {
@@ -347,11 +402,29 @@ impl Daemon {
                 .expect("hub")
                 .with_drive_api_url(drive_url)
                 .expect("the Drive adapter")
-                .with_poll_tick(Duration::from_millis(10));
+                .with_poll_tick(tuning.poll_tick);
         let hub = match disk {
             Some(disk) => hub.with_disk(disk),
             None => hub,
         };
+        // The cap (PR-8). The limit is kept in a file of the data dir, as
+        // the daemon keeps it in its config file: a restart on the same
+        // data dir starts with what `cache set-limit` saved. A test that
+        // names a limit starts with that one.
+        let limit_file = data_dir.join("cache_limit.saved");
+        let limit_text = tuning
+            .limit
+            .map(str::to_string)
+            .or_else(|| std::fs::read_to_string(&limit_file).ok())
+            .unwrap_or_else(|| "10 GB".to_string());
+        let limit_bytes = tephrad::cache_limit::parse_cache_limit(&limit_text).expect("a limit");
+        let hub = hub
+            .with_cache_limit(&limit_text, limit_bytes)
+            .with_limit_saver(Arc::new(move |text| {
+                std::fs::write(&limit_file, text).map_err(|e| e.to_string())
+            }))
+            .with_cache_idle_secs(tuning.idle_secs)
+            .with_evict_tick(Duration::from_millis(20));
         registry.set_remote_hub(Arc::new(hub));
 
         let graph_cache = Cache::open(&cache_path).expect("graph cache");
@@ -844,6 +917,10 @@ pub struct ProbeDisk {
     fail_file_sync: std::sync::atomic::AtomicBool,
     /// Fail the directory's fsync with `ENOSPC`.
     fail_dir_sync: std::sync::atomic::AtomicBool,
+    /// Every path a delete was asked for (PR-8's eviction), and whether
+    /// deletes fail (as a read-only folder would).
+    pub removes: Mutex<Vec<PathBuf>>,
+    fail_remove: std::sync::atomic::AtomicBool,
 }
 
 impl ProbeDisk {
@@ -854,7 +931,15 @@ impl ProbeDisk {
             fail_write_at: Mutex::new(None),
             fail_file_sync: Default::default(),
             fail_dir_sync: Default::default(),
+            removes: Mutex::new(Vec::new()),
+            fail_remove: Default::default(),
         })
+    }
+
+    /// Makes every delete fail with `EPERM`.
+    pub fn fail_remove(&self, on: bool) {
+        self.fail_remove
+            .store(on, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn fail_write_number(&self, n: usize) {
@@ -922,6 +1007,18 @@ impl Disk for ProbeHandle {
         }))
     }
 
+    fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+        self.0
+            .removes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(path.to_path_buf());
+        if self.0.fail_remove.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        }
+        RealDisk.remove_file(path)
+    }
+
     fn sync_dir(&self, dir: &Path) -> std::io::Result<()> {
         if self
             .0
@@ -942,6 +1039,8 @@ pub struct FetchRig {
     pub clock: Arc<FakeClock>,
     pub d: Daemon,
     pub probe: Arc<ProbeDisk>,
+    /// The data dir once a restart has taken it from the first daemon.
+    dir: Option<tempfile::TempDir>,
 }
 
 impl FetchRig {
@@ -951,12 +1050,25 @@ impl FetchRig {
 
     /// [`FetchRig::start`] with the Drive API at `drive_url`.
     pub fn start_with_drive(drive_url: Option<&str>, build: impl FnOnce(&Fake)) -> FetchRig {
+        Self::start_tuned(drive_url, Tuning::default(), build)
+    }
+
+    /// [`FetchRig::start`] with the cache cap's settings given (PR-8).
+    pub fn start_capped(tuning: Tuning, build: impl FnOnce(&Fake)) -> FetchRig {
+        Self::start_tuned(None, tuning, build)
+    }
+
+    fn start_tuned(drive_url: Option<&str>, tuning: Tuning, build: impl FnOnce(&Fake)) -> FetchRig {
         let clock = Arc::new(FakeClock::at_epoch_2026());
-        let fake = Fake::start_with_clock(clock.clone());
+        let fake = if tuning.gated {
+            Fake::start_gated(clock.clone())
+        } else {
+            Fake::start_with_clock(clock.clone())
+        };
         fake.atlas();
         build(&fake);
         let probe = ProbeDisk::new();
-        let d = Daemon::start_full_with_drive(
+        let d = Daemon::start_tuned(
             &fake,
             MemStore::signed_in(),
             None,
@@ -964,6 +1076,7 @@ impl FetchRig {
             AdapterOptions::default(),
             Some(Arc::new(ProbeHandle(probe.clone()))),
             drive_url,
+            tuning,
         );
         d.add_github("g", REPO);
         d.wait_active("g");
@@ -972,9 +1085,47 @@ impl FetchRig {
             clock,
             d,
             probe,
+            dir: None,
         };
         rig.d.connect().drain_graph_changed(QUIET);
         rig
+    }
+
+    /// A fresh start of the daemon on the same data dir, clock and fake
+    /// (the disk probe is the same one). `tuning.limit` of `None` starts
+    /// with the limit a former run saved.
+    pub fn restart(self, tuning: Tuning) -> FetchRig {
+        let FetchRig {
+            fake,
+            clock,
+            d,
+            probe,
+            dir,
+        } = self;
+        let dir = match dir {
+            Some(dir) => {
+                d.close();
+                dir
+            }
+            None => d.close_keeping_data(),
+        };
+        let d = Daemon::start_tuned(
+            &fake,
+            MemStore::signed_in(),
+            Some(dir.path().to_path_buf()),
+            clock.clone(),
+            AdapterOptions::default(),
+            Some(Arc::new(ProbeHandle(probe.clone()))),
+            None,
+            tuning,
+        );
+        FetchRig {
+            fake,
+            clock,
+            d,
+            probe,
+            dir: Some(dir),
+        }
     }
 
     /// `unit.fetch` of `path` of `g`, the whole reply.
@@ -1035,5 +1186,79 @@ pub fn seed_drive_source(cache_path: &Path, name: &str, items: &[(&str, &str, &s
                 rusqlite::params![name, path, kind, file_id, size],
             )
             .expect("seed a drive item");
+    }
+}
+
+/// Runs `sql` on the cache database: seeds what later PRs will write (a
+/// pin, an edit waiting to be pushed, a state).
+pub fn exec_sql(cache_path: &Path, sql: &str) {
+    let cache = Cache::open(cache_path).expect("open the cache");
+    cache.connection().execute_batch(sql).expect("seed sql");
+}
+
+/// `cache.status` of a daemon, unwrapped.
+pub fn cache_status(d: &Daemon) -> Value {
+    d.ok("cache.status", json!({}))
+}
+
+/// The `n`-th (0-based) file of a fixture repo, `size` bytes, named
+/// `big/<n>.bin`. A distinct byte per file so a mix-up shows.
+pub fn big_file(n: u8, size: usize) -> (String, Vec<u8>) {
+    (format!("big/{n}.bin"), vec![b'a' + n; size])
+}
+
+/// Hex-free stable stamp: seconds since the fake clock's epoch.
+pub fn stamp(clock: &FakeClock) -> i64 {
+    clock
+        .now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs() as i64
+}
+
+/// A daemon in front of a fake GitHub (unused) and a fake Drive that holds
+/// `files` (`id`, bytes); the Drive source `gdrive` has the rows `items`
+/// (`path`, kind, file id, listed size). Its files are fetched by the real
+/// `unit.fetch`, so each copy gets the stamp eviction compares it with.
+pub struct DriveRig {
+    pub rig: FetchRig,
+    pub drive: FakeDrive,
+    // The fake Drive's server runs on this runtime.
+    _rt: tokio::runtime::Runtime,
+}
+
+impl DriveRig {
+    pub fn start(files: &[(&str, &[u8])], items: &[(&str, &str, &str, i64)]) -> DriveRig {
+        let rt = tokio::runtime::Runtime::new().expect("a runtime");
+        let drive = rt.block_on(FakeDrive::start());
+        for (id, bytes) in files {
+            drive.add_file(id, id, "application/octet-stream", None, bytes);
+        }
+        let rig = FetchRig::start_with_drive(Some(drive.base_url()), |_| {});
+        seed_drive_source(&rig.d.cache_path, "gdrive", items);
+        DriveRig {
+            rig,
+            drive,
+            _rt: rt,
+        }
+    }
+
+    pub fn fetch(&self, path: &str) -> Value {
+        self.rig
+            .d
+            .rpc("unit.fetch", json!({ "unit": format!("@gdrive:{path}") }))
+    }
+
+    /// The content root of the source.
+    pub fn root(&self) -> PathBuf {
+        self.rig.d.data_dir.join("remote").join("gdrive")
+    }
+
+    pub fn state(&self, path: &str) -> String {
+        item_rows(&self.rig.d.cache_path, "gdrive")
+            .into_iter()
+            .find(|r| r.path == path)
+            .unwrap_or_else(|| panic!("{path} has a row"))
+            .state
     }
 }

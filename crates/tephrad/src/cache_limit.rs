@@ -18,9 +18,13 @@
 //!
 //! Choices the rule leaves open, made here:
 //!
-//! - **Zero is refused.** A limit of 0 would make every fetched file
-//!   over the cap at once; "cache nothing" is the per-source `cache`
-//!   flag, not a zero limit.
+//! - **Zero is accepted** (atlas-27 PR-8, G12): `0`, `0 MB` and `0.0 GiB`
+//!   are all 0 bytes, and a limit of 0 evicts everything that may be
+//!   evicted once it is past its 10-minute window. A bare `0` is the one
+//!   number that needs no unit: zero bytes is zero bytes in any of them.
+//!   (Earlier the parser refused zero; a limit that `cache set-limit`
+//!   accepts and writes to `config.toml` must load again at the next
+//!   start, so the file and the verb share this one rule.)
 //! - **A fraction of a byte is dropped** (`1.0000005 MB` is
 //!   1,000,000 bytes), computed in exact integer arithmetic, never in
 //!   floating point. More than 18 decimal places is refused.
@@ -58,8 +62,6 @@ pub enum SizeParseError {
     /// The unit is not `MB`, `GB`, `MiB` or `GiB`. Carries no text: the
     /// message goes to stderr and the log, and the value is not echoed.
     UnknownUnit,
-    /// The value is 0.
-    Zero,
     /// The value does not fit in a `u64`.
     TooLarge,
 }
@@ -81,7 +83,6 @@ impl fmt::Display for SizeParseError {
                 "has stray whitespace; use at most one space between the number and the unit and none around the value"
             ),
             SizeParseError::UnknownUnit => write!(f, "has an unknown unit; {FORM}"),
-            SizeParseError::Zero => write!(f, "is zero; the limit must be greater than zero"),
             SizeParseError::TooLarge => {
                 write!(f, "is too large; the limit must fit in 64 bits ({} bytes)", u64::MAX)
             }
@@ -117,6 +118,14 @@ pub fn parse_cache_limit(text: &str) -> Result<u64, SizeParseError> {
         }
         frac_part = &after_dot[..frac_len];
         rest = &after_dot[frac_len..];
+    }
+
+    // A bare zero (`0`, `0.0`) is 0 bytes in every unit, so it needs none.
+    if rest.is_empty()
+        && int_part.bytes().all(|b| b == b'0')
+        && frac_part.bytes().all(|b| b == b'0')
+    {
+        return Ok(0);
     }
 
     let unit_text = match rest.strip_prefix(' ') {
@@ -156,9 +165,6 @@ pub fn parse_cache_limit(text: &str) -> Result<u64, SizeParseError> {
             .ok_or(SizeParseError::TooLarge)?;
     }
 
-    if bytes == 0 {
-        return Err(SizeParseError::Zero);
-    }
     u64::try_from(bytes).map_err(|_| SizeParseError::TooLarge)
 }
 
@@ -204,6 +210,24 @@ mod tests {
         }
     }
 
+    /// atlas-27 PR-8 (G12): zero is a limit, in any spelling, and a bare
+    /// `0` needs no unit. It is also what a tiny fraction rounds down to.
+    #[test]
+    fn zero_is_accepted_with_or_without_a_unit() {
+        for text in [
+            "0",
+            "0.0",
+            "000",
+            "0 GB",
+            "0MB",
+            "0.0 MiB",
+            "0 GiB",
+            "0.000000000000000001 GB",
+        ] {
+            assert_eq!(parse_cache_limit(text), Ok(0), "{text:?}");
+        }
+    }
+
     #[test]
     fn the_largest_value_that_fits_is_accepted_and_one_more_byte_is_not() {
         // 2^34 GiB is 2^64 bytes: one over.
@@ -239,11 +263,12 @@ mod tests {
             ("-1 GB", SizeParseError::NotANumber),
             ("-0 GB", SizeParseError::NotANumber),
             ("+1 GB", SizeParseError::NotANumber),
-            // zero
-            ("0 GB", SizeParseError::Zero),
-            ("0MB", SizeParseError::Zero),
-            ("0.0 MiB", SizeParseError::Zero),
-            ("0.000000000000000001 GB", SizeParseError::Zero),
+            // a bare number that is not zero still has no unit
+            ("0.5", SizeParseError::MissingUnit),
+            ("00.1", SizeParseError::MissingUnit),
+            ("0 ", SizeParseError::BadSpacing),
+            ("-0", SizeParseError::NotANumber),
+            ("0.", SizeParseError::BadFraction),
             // unknown or wrong-case units
             ("5 KB", SizeParseError::UnknownUnit),
             ("5 TB", SizeParseError::UnknownUnit),
@@ -313,7 +338,6 @@ mod tests {
             "",
             "5",
             "5 KB",
-            "0 GB",
             "-1 GB",
             "5  GB",
             "99999999999999999999999 GB",

@@ -1,0 +1,9 @@
+cached      2000000 bytes (2.0 MB)
+limit       1MB (1000000 bytes)
+over limit  by 1000000 bytes: files used in the last 600 s, pinned files and edits not yet sent are kept; the rest go back to remote once idle
+pinned      2000000 bytes (never dropped)
+.git        0 bytes (not counted toward the limit, never dropped)
+warning: pinned files alone take 2000000 bytes, more than the limit of 1000000: pinned files are never dropped, so the cache stays over it (unpinned files are dropped first)
+
+SOURCE               CACHE CACHED BYTES   .GIT BYTES
+g                    on         2000000            0

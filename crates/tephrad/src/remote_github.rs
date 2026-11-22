@@ -137,6 +137,30 @@ pub struct RemoteHub {
     pub(crate) polls_done: std::sync::atomic::AtomicUsize,
     /// The downloads of `unit.fetch` running now, and the disk they write to.
     pub(crate) fetches: Arc<crate::remote::fetch::FetchEngine>,
+    /// The cap on the content cache (PR-8): what `cache set-limit` changes
+    /// live, and what the eviction pass reads.
+    pub(crate) cache_limit: Mutex<CacheLimit>,
+    /// What saves a new limit to the config file (`cache set-limit`); the
+    /// daemon's binary gives it, since the config file is its own. `None`
+    /// keeps the change for this run only (a test daemon with no file).
+    pub(crate) limit_saver: Option<LimitSaver>,
+    /// How long a file must be unused before the cache may drop it: ten
+    /// minutes, or the test-only config key.
+    pub(crate) idle_secs: i64,
+    /// How often the eviction pass looks at the clock. Real time, whatever
+    /// the clock is (see `poll_tick`).
+    pub(crate) evict_tick: Duration,
+}
+
+/// Saves a cache limit to where the daemon keeps it (its config file).
+pub type LimitSaver = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+
+/// The cache cap as set: the text the person wrote (kept for the config
+/// file and for `cache status`) and its value in bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CacheLimit {
+    pub(crate) text: String,
+    pub(crate) bytes: u64,
 }
 
 impl RemoteHub {
@@ -184,6 +208,13 @@ impl RemoteHub {
             fetches: Arc::new(crate::remote::fetch::FetchEngine::new(Arc::new(
                 crate::remote::fetch::RealDisk,
             ))),
+            cache_limit: Mutex::new(CacheLimit {
+                text: crate::cache_limit::DEFAULT_CACHE_LIMIT_TEXT.to_string(),
+                bytes: crate::cache_limit::DEFAULT_CACHE_LIMIT_BYTES,
+            }),
+            limit_saver: None,
+            idle_secs: tephra_cache::DEFAULT_IDLE_SECS,
+            evict_tick: crate::remote::evict::DEFAULT_EVICT_TICK,
         })
     }
 
@@ -212,6 +243,52 @@ impl RemoteHub {
     pub fn with_poll_tick(mut self, tick: Duration) -> Self {
         self.poll_tick = tick;
         self
+    }
+
+    /// The cap on the content cache, as the config file has it (`text` is
+    /// what the person wrote, already validated: `bytes` its value).
+    pub fn with_cache_limit(mut self, text: &str, bytes: u64) -> Self {
+        self.cache_limit = Mutex::new(CacheLimit {
+            text: text.to_string(),
+            bytes,
+        });
+        self
+    }
+
+    /// What `cache set-limit` calls to save the new limit (its text, already
+    /// checked) before it takes effect. An error refuses the change.
+    pub fn with_limit_saver(mut self, saver: LimitSaver) -> Self {
+        self.limit_saver = Some(saver);
+        self
+    }
+
+    /// How long a file must be unused before the cache may drop it (default
+    /// ten minutes; a test makes it short). Whole seconds, at least 1.
+    pub fn with_cache_idle_secs(mut self, secs: u64) -> Self {
+        self.idle_secs = i64::try_from(secs.max(1)).unwrap_or(i64::MAX);
+        self
+    }
+
+    /// How often the eviction pass looks at the clock (default 30 s).
+    pub fn with_evict_tick(mut self, tick: Duration) -> Self {
+        self.evict_tick = tick;
+        self
+    }
+
+    /// The cap now, in bytes.
+    pub(crate) fn limit_bytes(&self) -> u64 {
+        self.cache_limit
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .bytes
+    }
+
+    /// What the git data of `source` takes: the `.git` folder of its clone,
+    /// at the source's root or under `clone/`. Not part of the cap and
+    /// never evicted (see `docs/ARCHITECTURE.md`).
+    pub(crate) fn git_bytes(&self, source: &str) -> u64 {
+        let dir = self.cache_dir(source);
+        dir_bytes(&dir.join(".git")) + dir_bytes(&dir.join("clone").join(".git"))
     }
 
     /// The directory the content cache of `source` would use. Nothing here
@@ -412,7 +489,10 @@ impl SourceRegistry {
     /// Gives the registry what it needs to add and index remote sources.
     /// Set once; a second call is ignored.
     pub fn set_remote_hub(&self, hub: Arc<RemoteHub>) {
-        let _ = self.remote.set(hub);
+        if self.remote.set(hub.clone()).is_ok() {
+            // The cache cap is enforced from here on (PR-8).
+            self.start_eviction(hub);
+        }
     }
 
     /// How many polls the remote pollers have finished since the daemon
@@ -584,6 +664,7 @@ impl SourceRegistry {
     pub fn resume_remote_sources(&self) {
         if let Some(hub) = self.remote.get() {
             self.clean_up_after_downloads(hub);
+            self.reconcile_cache_copies();
         }
         let rows = {
             let cache = self.cache.lock().unwrap();
@@ -657,22 +738,16 @@ impl SourceRegistry {
         let progress = cache
             .remote_index_progress(&source.name, MAX_INDEXED_BYTES)
             .ok()?;
-        let dir = self
-            .remote
-            .get()
-            .map(|hub| hub.cache_dir(&source.name))
-            .unwrap_or_default();
         Some(RemoteListing {
             kind: source.kind.clone(),
             repo: source.target.clone(),
             branch: source.branch.clone(),
             cache: source.cache,
             cache_bytes: cache.remote_cache_bytes(&source.name).unwrap_or(0),
-            git_bytes: if dir.as_os_str().is_empty() {
-                0
-            } else {
-                dir_bytes(&dir.join(".git"))
-            },
+            git_bytes: self
+                .remote
+                .get()
+                .map_or(0, |hub| hub.git_bytes(&source.name)),
             status: source.status.clone(),
             status_reason: source.status_reason.clone(),
             index_done: progress.done,

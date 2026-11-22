@@ -1,0 +1,30 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "cache_bytes": 999975,
+    "limit_bytes": 1000000,
+    "limit": "1MB",
+    "over_limit": false,
+    "pinned_bytes": 75,
+    "git_bytes": 0,
+    "idle_seconds": 600,
+    "sources": [
+      {
+        "name": "g",
+        "cache": true,
+        "cache_bytes": 999900,
+        "git_bytes": 0
+      },
+      {
+        "name": "notes-drive",
+        "cache": false,
+        "cache_bytes": 75,
+        "git_bytes": 0
+      }
+    ],
+    "previous": "10 GB",
+    "dropped": 2,
+    "freed_bytes": 1999800
+  }
+}

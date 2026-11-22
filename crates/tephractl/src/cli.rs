@@ -34,6 +34,10 @@ USAGE:
     tephractl block-id <unit-id> --line <n> | --symbol <name> [--json]
     tephractl backlinks <id> [--json]
     tephractl fetch <id> [--json]
+    tephractl cache status [--json]
+    tephractl cache set-limit <limit> [--json]
+    tephractl cache on <source> [--json]
+    tephractl cache off <source> [--json]
     tephractl fixes [--since <30m|2h|7d|date>] [--json]
     tephractl link resolve [--source <name>] <target> [--json]
     tephractl link refactor --source <name> --old <path> --new <path> [--apply] [--yes] [--json]
@@ -110,6 +114,26 @@ FETCH:
                           fetched (Google Docs, Sheets, Slides, Forms and Drawings, shortcuts,
                           symlinks, submodules and Git LFS pointers: the message says where to
                           open it).
+
+CACHE:
+    cache status          What Tephra's content cache of remote files takes, against its limit:
+                          bytes cached, the limit, `over limit` while it is true, the bytes
+                          pinned files take, and the `.git` bytes on a line of their own (not
+                          counted toward the limit, never dropped). A warning says so when pinned
+                          files alone are over the limit. One line per source with its cache flag.
+    cache set-limit <l>   Change the limit now, save it to config.toml and run an eviction pass.
+                          <l> is a number and a unit: MB, GB (1000-based) or MiB, GiB, e.g.
+                          `10GB` or `500 MiB`; `0` is allowed and drops everything that may go.
+                          A value that does not parse is refused with the reason and the old
+                          limit is kept. Over the limit, the least recently used files go back to
+                          `remote` (still listed, links intact) once unused for 10 minutes;
+                          pinned files, edits not yet sent and files in use are never dropped.
+    cache on <source>     Keep fetched files of a remote source until the limit needs the room
+                          (the default).
+    cache off <source>    Drop a fetched file of a remote source about 10 minutes after its last
+                          use, even under the limit. Pinned files stay. The flag is kept across
+                          restarts. Nothing is ever sent to the remote: a dropped file is only
+                          the local copy.
 
 FIXES:
     fixes                 The log of automatic link fixes (fix.list), newest first, one line per
@@ -290,6 +314,18 @@ pub enum Command {
     Fetch {
         unit: String,
     },
+    /// `cache status`: `cache.status`.
+    CacheStatus,
+    /// `cache set-limit <limit>`: `cache.set_limit`. `limit` goes to the
+    /// daemon as typed (it owns the size rules), words joined by a space.
+    CacheSetLimit {
+        limit: String,
+    },
+    /// `cache on|off <source>`: `source.set_cache`.
+    CacheSet {
+        source: String,
+        on: bool,
+    },
     /// `fixes [--since <when>]`: `fix.list`. Read-only (F9).
     Fixes {
         since: Option<Since>,
@@ -446,6 +482,7 @@ where
         "block-id" => parse_block_id(&mut iter)?,
         "backlinks" => parse_backlinks(&mut iter)?,
         "fetch" => parse_fetch(&mut iter)?,
+        "cache" => parse_cache(&mut iter)?,
         "fixes" => parse_fixes(&mut iter)?,
         "daemon" => parse_daemon(&mut iter)?,
         "auth" => {
@@ -1146,6 +1183,78 @@ fn parse_fetch<'a>(
         }
     }
     Ok((Command::Fetch { unit }, json, addr))
+}
+
+/// `cache status | set-limit <limit> | on <source> | off <source>`, each
+/// with `[--json] [--addr <addr>]`. The limit is NOT checked here: the
+/// daemon owns the size rules, and `abc`, `-5MB` or an empty value must
+/// come back as its refusal, with the old limit named. `set-limit 10 GB`
+/// (two words) is read as `10 GB`.
+fn parse_cache<'a>(
+    iter: &mut impl Iterator<Item = &'a str>,
+) -> Result<(Command, bool, Option<String>), ArgsError> {
+    let sub = iter.next().ok_or_else(|| {
+        ArgsError("expected a cache subcommand: status, set-limit, on, or off".to_string())
+    })?;
+    let mut words: Vec<String> = Vec::new();
+    let mut json = false;
+    let mut addr = None;
+    while let Some(arg) = iter.next() {
+        match arg {
+            "--json" => json = true,
+            "--addr" => addr = Some(take_value(iter, "--addr")?),
+            other if other.starts_with("--") => {
+                return Err(ArgsError(format!("unrecognized argument: {other}")))
+            }
+            other => words.push(other.to_string()),
+        }
+    }
+    let command = match sub {
+        "status" => {
+            if let Some(extra) = words.first() {
+                return Err(ArgsError(format!(
+                    "cache status takes no argument; unexpected: {extra}"
+                )));
+            }
+            Command::CacheStatus
+        }
+        "set-limit" => {
+            if words.is_empty() {
+                return Err(ArgsError(
+                    "cache set-limit requires a limit like \"10GB\" or \"500 MiB\"".to_string(),
+                ));
+            }
+            if words.len() > 2 {
+                return Err(ArgsError(
+                    "cache set-limit takes one limit, like \"10GB\" or \"500 MiB\"".to_string(),
+                ));
+            }
+            Command::CacheSetLimit {
+                limit: words.join(" "),
+            }
+        }
+        "on" | "off" => {
+            let on = sub == "on";
+            match words.as_slice() {
+                [source] => Command::CacheSet {
+                    source: source.clone(),
+                    on,
+                },
+                [] => return Err(ArgsError(format!("cache {sub} requires a <source>"))),
+                [_, extra, ..] => {
+                    return Err(ArgsError(format!(
+                        "cache {sub} takes one source; unexpected extra argument: {extra}"
+                    )))
+                }
+            }
+        }
+        other => {
+            return Err(ArgsError(format!(
+                "unrecognized cache subcommand: {other} (expected status, set-limit, on, or off)"
+            )))
+        }
+    };
+    Ok((command, json, addr))
 }
 
 /// `fixes [--since <when>] [--json] [--addr <addr>]`. A bad `--since` is

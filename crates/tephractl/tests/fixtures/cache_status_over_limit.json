@@ -1,0 +1,21 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "cache_bytes": 2999775,
+    "limit_bytes": 1000000,
+    "limit": "1MB",
+    "over_limit": true,
+    "pinned_bytes": 75,
+    "git_bytes": 4096,
+    "idle_seconds": 600,
+    "sources": [
+      {
+        "name": "g",
+        "cache": true,
+        "cache_bytes": 2999775,
+        "git_bytes": 4096
+      }
+    ]
+  }
+}

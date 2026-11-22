@@ -523,8 +523,8 @@ fn no_rpc_method_was_added_for_the_key() {
     // `tests/unit/rpc_envelope.rs`); nothing here is named for the key.
     use tephrad::rpc::dispatch::METHOD_NAMES;
     // 18 before atlas-27 PR-5 added `source.add_github`, 19 before PR-7 added
-    // `unit.fetch`.
-    assert_eq!(METHOD_NAMES.len(), 20);
+    // `unit.fetch`, 20 before PR-8 added the three cache verbs.
+    assert_eq!(METHOD_NAMES.len(), 23);
     assert!(METHOD_NAMES
         .iter()
         .all(|m| !m.contains("qualif") && !m.contains("config")));

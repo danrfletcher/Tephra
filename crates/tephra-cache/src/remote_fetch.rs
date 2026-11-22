@@ -151,15 +151,20 @@ impl Cache {
     /// `downloading -> cached`, provided the row still has the `sha` and
     /// `size` the download was checked against (a poll that re-listed the
     /// file meanwhile makes the bytes stale). `false` when it does not.
+    ///
+    /// `last_used` is set to `now` in the same statement: a download that
+    /// took longer than the cache's idle window must not be dropped by an
+    /// eviction pass in the instant before the fetch notes its use.
     pub fn finish_remote_download(
         &self,
         source: &str,
         path: &str,
         sha: Option<&str>,
         size: Option<i64>,
+        now: i64,
     ) -> Result<bool, CacheError> {
         let n = self.connection().execute(
-            "UPDATE remote_items SET state = ?3 \
+            "UPDATE remote_items SET state = ?3, last_used = ?7 \
              WHERE source = ?1 AND path = ?2 AND state = ?4 AND sha IS ?5 AND size IS ?6",
             params![
                 source,
@@ -167,7 +172,8 @@ impl Cache {
                 ITEM_STATE_CACHED,
                 ITEM_STATE_DOWNLOADING,
                 sha,
-                size
+                size,
+                now
             ],
         )?;
         Ok(n > 0)

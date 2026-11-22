@@ -1,0 +1,26 @@
+{
+  "cache_bytes": 999975,
+  "dropped": 2,
+  "freed_bytes": 1999800,
+  "git_bytes": 0,
+  "idle_seconds": 600,
+  "limit": "1MB",
+  "limit_bytes": 1000000,
+  "over_limit": false,
+  "pinned_bytes": 75,
+  "previous": "10 GB",
+  "sources": [
+    {
+      "cache": true,
+      "cache_bytes": 999900,
+      "git_bytes": 0,
+      "name": "g"
+    },
+    {
+      "cache": false,
+      "cache_bytes": 75,
+      "git_bytes": 0,
+      "name": "notes-drive"
+    }
+  ]
+}

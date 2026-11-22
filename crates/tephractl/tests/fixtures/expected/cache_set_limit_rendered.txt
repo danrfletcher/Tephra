@@ -1,0 +1,11 @@
+Cache limit set to 1MB (was 10 GB); saved to config.toml.
+Dropped 2 file(s), 1999800 bytes, back to remote.
+
+cached      999975 bytes (1.0 MB)
+limit       1MB (1000000 bytes)
+pinned      75 bytes (never dropped)
+.git        0 bytes (not counted toward the limit, never dropped)
+
+SOURCE               CACHE CACHED BYTES   .GIT BYTES
+g                    on          999900            0
+notes-drive          off             75            0

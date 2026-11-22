@@ -52,6 +52,10 @@ pub const METHOD_NAMES: &[&str] = &[
     "source.add_github",
     // atlas-27 PR-7: the one method that PR adds.
     "unit.fetch",
+    // atlas-27 PR-8: the three methods that PR adds.
+    "cache.status",
+    "cache.set_limit",
+    "source.set_cache",
 ];
 
 /// The three backends one `dispatch` call reads through, bundled so
@@ -116,6 +120,9 @@ pub fn dispatch(
         "unit.list" => unit_list(params, backends.sources),
         "unit.search" => unit_search(params, backends.sources),
         "unit.fetch" => unit_fetch(params, backends.sources),
+        "cache.status" => cache_status(backends.sources),
+        "cache.set_limit" => cache_set_limit(params, backends.sources),
+        "source.set_cache" => source_set_cache(params, backends.sources),
         "block.ensure_id" => block_ensure_id(params, backends.blocks),
         "fix.list" => fix_list(params, backends.fixes),
         "link.rename_event" => link_rename_event(params, backends.fixes),
@@ -335,6 +342,45 @@ fn unit_fetch(params: &Value, sources: &dyn SourceBackend) -> DispatchResult {
         .fetch_unit(unit)
         .map(|wire| serde_json::to_value(wire).expect("FetchWire always serializes"))
         .map_err(|e| (SOURCE_ERROR, e.message.clone(), Some(e.data())))
+}
+
+/// `cache.status {}` (PR-8): what the remote content cache takes, the cap,
+/// whether it is over, the pinned bytes and the `.git` bytes.
+fn cache_status(sources: &dyn SourceBackend) -> DispatchResult {
+    sources
+        .cache_status()
+        .map(|wire| serde_json::to_value(wire).expect("CacheStatusWire always serializes"))
+        .map_err(source_refusal)
+}
+
+/// `cache.set_limit {limit}` (PR-8): `limit` is text such as `10GB` or
+/// `500 MiB` (`0` is allowed). A value that does not parse is a
+/// `SOURCE_ERROR` with `data.reason` `bad_limit`, and the old limit stays.
+fn cache_set_limit(params: &Value, sources: &dyn SourceBackend) -> DispatchResult {
+    let limit = match params.get("limit") {
+        Some(Value::String(s)) => s.as_str(),
+        _ => {
+            return Err(invalid_params(
+                "\"limit\" (a string such as \"10GB\") is required",
+            ))
+        }
+    };
+    sources
+        .set_cache_limit(limit)
+        .map(|wire| serde_json::to_value(wire).expect("CacheSetLimitWire always serializes"))
+        .map_err(source_refusal)
+}
+
+/// `source.set_cache {name, cache}` (PR-8, G20): `cache` is a boolean.
+fn source_set_cache(params: &Value, sources: &dyn SourceBackend) -> DispatchResult {
+    let name = require_str(params, "name")?;
+    let Some(on) = params.get("cache").and_then(Value::as_bool) else {
+        return Err(invalid_params("\"cache\" (true or false) is required"));
+    };
+    sources
+        .set_source_cache(name, on)
+        .map(|wire| serde_json::to_value(wire).expect("SourceCacheWire always serializes"))
+        .map_err(source_refusal)
 }
 
 /// `unit.search {query, scope?, in?, limit?}` (G8, G9). `query` is a
@@ -606,6 +652,9 @@ mod tests {
                 "link.rename_event",
                 "source.add_github",
                 "unit.fetch",
+                "cache.status",
+                "cache.set_limit",
+                "source.set_cache",
             ]
         );
     }
@@ -639,6 +688,7 @@ mod tests {
                 recursive: false,
                 offline: false,
                 needs_rescan: false,
+                cache: None,
                 entries: Vec::new(),
             }))
         }
@@ -761,6 +811,7 @@ mod tests {
             recursive: true,
             offline: true,
             needs_rescan: true,
+            cache: None,
             entries: vec![
                 UnitEntryWire {
                     id: "@s:d/a.md".into(),

@@ -16,6 +16,7 @@
 //! typed helpers exposed here.
 
 mod cache;
+mod evict;
 mod fix_log;
 mod fts;
 mod in_file;
@@ -23,6 +24,7 @@ mod listing;
 mod pending_fixes;
 mod promote;
 mod remote;
+mod remote_evict;
 mod remote_fetch;
 mod remote_ops;
 mod remote_sync;
@@ -35,6 +37,10 @@ mod units;
 use std::fmt;
 
 pub use cache::{Cache, FaultInjector};
+pub use evict::{
+    plan_eviction, protected_bytes, EvictItem, EvictPick, EvictReason, EvictionPlan,
+    DEFAULT_IDLE_SECS,
+};
 pub use fix_log::{
     FixLogChange, FixLogRow, FixLogSummary, NewFixLog, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT,
 };

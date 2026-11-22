@@ -1,0 +1,17 @@
+{
+  "cache_bytes": 2999775,
+  "git_bytes": 4096,
+  "idle_seconds": 600,
+  "limit": "1MB",
+  "limit_bytes": 1000000,
+  "over_limit": true,
+  "pinned_bytes": 75,
+  "sources": [
+    {
+      "cache": true,
+      "cache_bytes": 2999775,
+      "git_bytes": 4096,
+      "name": "g"
+    }
+  ]
+}

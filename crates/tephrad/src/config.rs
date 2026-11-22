@@ -55,6 +55,12 @@ pub struct Config {
     /// The field holds a path, never a credential.
     #[serde(default)]
     pub test_credential_file: Option<PathBuf>,
+    /// Test-only: how many seconds a remote file must have been unused
+    /// before the cache may drop it (atlas-27 PR-8). Unset means the
+    /// product's 600 (10 minutes). A test of the idle window sets a few
+    /// seconds, so it need not wait ten minutes. Whole seconds, at least 1.
+    #[serde(default)]
+    pub cache_idle_seconds: Option<u64>,
 }
 
 fn default_cache_limit() -> String {
@@ -75,6 +81,7 @@ impl Config {
             github_api_url: None,
             drive_api_url: None,
             test_credential_file: None,
+            cache_idle_seconds: None,
         }
     }
 
@@ -193,6 +200,8 @@ pub enum ConfigError {
     InvalidLogLevel(String),
     /// `cache_limit` is not a number and a unit; the text names the key.
     InvalidCacheLimit(String),
+    /// `cache_idle_seconds` is out of range; the text names the key.
+    InvalidCacheIdle(String),
     /// `github_api_url` or `drive_api_url` breaks the https / loopback-http
     /// rule; the text names the key.
     InvalidApiUrl(String),
@@ -211,6 +220,7 @@ impl fmt::Display for ConfigError {
             ConfigError::InvalidListenAddr(reason) => write!(f, "{reason}"),
             ConfigError::InvalidLogLevel(reason) => write!(f, "{reason}"),
             ConfigError::InvalidCacheLimit(reason) => write!(f, "{reason}"),
+            ConfigError::InvalidCacheIdle(reason) => write!(f, "{reason}"),
             ConfigError::InvalidApiUrl(reason) => write!(f, "{reason}"),
             ConfigError::TestCredentialFileNotBuilt(reason) => write!(f, "{reason}"),
         }
@@ -265,7 +275,20 @@ fn validate_config(config: &Config) -> Result<(), ConfigError> {
     validate_api_url_key("github_api_url", config.github_api_url.as_deref())?;
     validate_api_url_key("drive_api_url", config.drive_api_url.as_deref())?;
     validate_test_credential_file(config.test_credential_file.as_deref())?;
+    validate_cache_idle_seconds(config.cache_idle_seconds)?;
     Ok(())
+}
+
+/// `cache_idle_seconds` is at least 1 and at most a day: a zero window
+/// would let the cache drop a file in the instant after a fetch handed
+/// out its path.
+fn validate_cache_idle_seconds(seconds: Option<u64>) -> Result<(), ConfigError> {
+    match seconds {
+        Some(n) if !(1..=86_400).contains(&n) => Err(ConfigError::InvalidCacheIdle(
+            "cache_idle_seconds is not between 1 and 86400".to_string(),
+        )),
+        _ => Ok(()),
+    }
 }
 
 fn validate_cache_limit(text: &str) -> Result<(), ConfigError> {
@@ -354,7 +377,8 @@ pub fn render_default_toml(cfg: &Config) -> String {
          \n\
          # cache_limit: the most disk the remote-source cache may use, as a\n\
          # number and a unit: MB and GB are 1000-based, MiB and GiB are\n\
-         # 1024-based (for example \"500 MB\", \"1.5 GiB\"). Must be above zero.\n\
+         # 1024-based (for example \"500 MB\", \"1.5 GiB\"). Zero is allowed:\n\
+         # every file that is not pinned or edited is dropped once idle.\n\
          # Default 10 GB (10,000,000,000 bytes).\n\
          cache_limit = {cache_limit}\n\
          \n\
@@ -375,7 +399,12 @@ pub fn render_default_toml(cfg: &Config) -> String {
          # with the test-credential-store feature accepts this key; every\n\
          # other build refuses to start while it is set. Never set it in\n\
          # normal use.\n\
-         {test_credential_file}\n",
+         {test_credential_file}\n\
+         \n\
+         # TEST ONLY - cache_idle_seconds: how long a remote file must be\n\
+         # unused before the cache may drop it. Default 600 (10 minutes).\n\
+         # Leave it commented out in normal use.\n\
+         {cache_idle_seconds}\n",
         listen_addr = cfg.listen_addr,
         data_dir = data_dir_literal,
         log_level = cfg.log_level,
@@ -396,6 +425,10 @@ pub fn render_default_toml(cfg: &Config) -> String {
             cfg.drive_api_url.as_deref(),
             "http://127.0.0.1:8081"
         ),
+        cache_idle_seconds = match cfg.cache_idle_seconds {
+            Some(n) => format!("cache_idle_seconds = {n}"),
+            None => "# cache_idle_seconds = 5".to_string(),
+        },
         test_credential_file = optional_path_line(
             "test_credential_file",
             cfg.test_credential_file.as_deref(),
@@ -419,6 +452,80 @@ fn optional_path_line(key: &str, value: Option<&Path>, example: &str) -> String 
         value.map(|p| p.display().to_string()).as_deref(),
         example,
     )
+}
+
+/// Writes `cache_limit = "<text>"` into the config file at `path`
+/// (`cache set-limit`, atlas-27 PR-8): the line is replaced in place, so
+/// every comment and every other key stays as the person wrote it. A file
+/// with no such line gets one before its first `[table]` header (or at the
+/// end when it has none).
+///
+/// `text` must parse as a cache limit ([`crate::cache_limit::parse_cache_limit`]):
+/// the caller has checked it, and it is checked again here, together with
+/// the whole file: the new text is parsed as a [`Config`] and validated
+/// before anything is written, so a limit that would stop the daemon at its
+/// next start is never saved. The file is replaced by a rename of a
+/// finished temporary file next to it: a reader sees the old file or the
+/// whole new one. The error text names no secret (the file holds none).
+pub fn write_cache_limit(path: &Path, text: &str) -> Result<(), String> {
+    tephrad::cache_limit::parse_cache_limit(text).map_err(|e| format!("cache_limit {e}"))?;
+    let raw = fs::read_to_string(path)
+        .map_err(|e| format!("the config file could not be read ({})", e.kind()))?;
+    let line = format!("cache_limit = {}", toml::Value::String(text.to_string()));
+
+    let mut out: Vec<String> = Vec::new();
+    let mut replaced = false;
+    let mut first_table: Option<usize> = None;
+    for existing in raw.lines() {
+        let trimmed = existing.trim_start();
+        if trimmed.starts_with('[') && first_table.is_none() {
+            first_table = Some(out.len());
+        }
+        let is_key = first_table.is_none()
+            && trimmed
+                .strip_prefix("cache_limit")
+                .is_some_and(|rest| rest.trim_start().starts_with('='));
+        if is_key && !replaced {
+            out.push(line.clone());
+            replaced = true;
+        } else if is_key {
+            // A second `cache_limit` is a duplicate key the parser refuses
+            // anyway; the one that is kept is the one just written.
+            continue;
+        } else {
+            out.push(existing.to_string());
+        }
+    }
+    if !replaced {
+        out.insert(first_table.unwrap_or(out.len()), line);
+    }
+    let mut new_text = out.join("\n");
+    new_text.push('\n');
+
+    let parsed: Config = toml::from_str(&new_text)
+        .map_err(|e| format!("the config file would no longer load: {}", e.message()))?;
+    validate_config(&parsed).map_err(|e| format!("the config file would no longer load: {e}"))?;
+
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = dir.join(format!(".config.toml.{}.tmp", std::process::id()));
+    let result = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut file = fs::File::create(&tmp)?;
+        file.write_all(new_text.as_bytes())?;
+        file.sync_all()?;
+        if let Ok(md) = fs::metadata(path) {
+            let _ = fs::set_permissions(&tmp, md.permissions());
+        }
+        fs::rename(&tmp, path)
+    })();
+    if let Err(e) = result {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!(
+            "the config file could not be written ({})",
+            e.kind()
+        ));
+    }
+    Ok(())
 }
 
 /// Outcome of loading the config: either it already existed and was
@@ -626,6 +733,58 @@ mod tests {
     }
 
     #[test]
+    fn write_cache_limit_replaces_the_line_and_keeps_everything_else() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let text = format!("# my notes\n{THREE_KEYS}cache_limit = \"10 GB\"  # old\n# after\n");
+        fs::write(&path, &text).unwrap();
+        write_cache_limit(&path, "1MB").unwrap();
+        let after = fs::read_to_string(&path).unwrap();
+        assert!(after.contains("cache_limit = \"1MB\"\n"), "{after}");
+        assert!(after.contains("# my notes\n") && after.contains("# after\n"));
+        assert_eq!(after.matches("cache_limit").count(), 1);
+        let cfg = load_or_create(&path, dir.path().join("data"))
+            .unwrap()
+            .config;
+        assert_eq!(cfg.cache_limit_bytes(), Ok(1_000_000));
+    }
+
+    #[test]
+    fn write_cache_limit_adds_a_missing_line_and_survives_a_second_write() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, THREE_KEYS).unwrap();
+        write_cache_limit(&path, "0").unwrap();
+        write_cache_limit(&path, "2 GiB").unwrap();
+        let after = fs::read_to_string(&path).unwrap();
+        assert_eq!(after.matches("cache_limit = ").count(), 1, "{after}");
+        let cfg = load_or_create(&path, dir.path().join("data"))
+            .unwrap()
+            .config;
+        assert_eq!(cfg.cache_limit_bytes(), Ok(2 * 1024 * 1024 * 1024));
+    }
+
+    #[test]
+    fn write_cache_limit_refuses_a_bad_value_and_leaves_the_file_alone() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, THREE_KEYS).unwrap();
+        for bad in ["abc", "-5MB", "1.5.2GB", "", "5", "99999999999999999999 GB"] {
+            assert!(write_cache_limit(&path, bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(fs::read_to_string(&path).unwrap(), THREE_KEYS);
+        // No temporary file is left behind.
+        let names: Vec<_> = fs::read_dir(dir.path()).unwrap().flatten().collect();
+        assert_eq!(names.len(), 1);
+    }
+
+    #[test]
+    fn write_cache_limit_needs_the_file_to_be_there() {
+        let dir = tempdir().unwrap();
+        assert!(write_cache_limit(&dir.path().join("none.toml"), "1MB").is_err());
+    }
+
+    #[test]
     fn qualify_key_absent_parses_to_false() {
         let (result, after) = load_text(THREE_KEYS);
         assert!(
@@ -770,6 +929,18 @@ mod tests {
         }
     }
 
+    /// atlas-27 PR-8: a limit `cache set-limit 0` writes to the file loads
+    /// again at the next start.
+    #[test]
+    fn a_zero_cache_limit_loads() {
+        for zero in ["0", "0 MB", "0 GiB"] {
+            let text = format!("{THREE_KEYS}cache_limit = \"{zero}\"\n");
+            let (result, _) = load_text(&text);
+            let cfg = result.unwrap_or_else(|e| panic!("{zero}: {e:?}")).config;
+            assert_eq!(cfg.cache_limit_bytes(), Ok(0), "{zero}");
+        }
+    }
+
     #[test]
     fn every_bad_cache_limit_is_a_startup_error_naming_the_key() {
         for bad in [
@@ -779,8 +950,6 @@ mod tests {
             "5 KB",
             "5 gb",
             "-1 GB",
-            "0 GB",
-            "0",
             "5  GB",
             " 5 GB",
             ".5 GB",

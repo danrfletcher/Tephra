@@ -1054,6 +1054,129 @@ pub fn render_fetched(result: &Value) -> String {
     format!("{}\n", result["path"].as_str().unwrap_or_default())
 }
 
+/// A size for people: 1000-based, one decimal, the unit the limit is
+/// written in (`3.0 MB`). Exact bytes are always printed next to it.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [(&str, u64); 3] = [("GB", 1_000_000_000), ("MB", 1_000_000), ("KB", 1_000)];
+    for (unit, size) in UNITS {
+        let tenths = (bytes as u128 * 10 + size as u128 / 2) / size as u128;
+        // A value that rounds to 1.0 of a unit is shown in it, so 999 975
+        // bytes read `1.0 MB`, not `1000.0 KB`.
+        if tenths >= 10 && (bytes >= 1_000 || unit != "KB") {
+            return format!("{}.{} {unit}", tenths / 10, tenths % 10);
+        }
+    }
+    format!("{bytes} bytes")
+}
+
+/// `cache status`: what the content cache takes against its limit.
+///
+/// `over limit` appears only while it is true; the `.git` bytes are on a
+/// line of their own because they are not counted and never dropped; a
+/// warning follows when pinned files alone are over the limit.
+pub fn render_cache_status(result: &Value) -> String {
+    let n = |key: &str| result.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let cached = n("cache_bytes");
+    let limit_bytes = n("limit_bytes");
+    let idle = result
+        .get("idle_seconds")
+        .and_then(Value::as_u64)
+        .unwrap_or(600);
+    let mut out = format!("cached      {cached} bytes ({})\n", human_bytes(cached));
+    out.push_str(&format!(
+        "limit       {} ({limit_bytes} bytes)\n",
+        printable(str_field(result, "limit"))
+    ));
+    if bool_field(result, "over_limit") {
+        out.push_str(&format!(
+            "over limit  by {} bytes: files used in the last {idle} s, pinned files and edits not yet sent are kept; the rest go back to remote once idle\n",
+            cached.saturating_sub(limit_bytes)
+        ));
+    }
+    out.push_str(&format!(
+        "pinned      {} bytes (never dropped)\n",
+        n("pinned_bytes")
+    ));
+    out.push_str(&format!(
+        ".git        {} bytes (not counted toward the limit, never dropped)\n",
+        n("git_bytes")
+    ));
+    if let Some(warning) = result.get("warning").and_then(Value::as_str) {
+        out.push_str(&format!("warning: {}\n", printable(warning)));
+    }
+    let sources = result
+        .get("sources")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    if !sources.is_empty() {
+        out.push_str(&format!(
+            "\n{:<20} {:<5} {:>12} {:>12}\n",
+            "SOURCE", "CACHE", "CACHED BYTES", ".GIT BYTES"
+        ));
+        for row in sources {
+            let flag = if bool_field(row, "cache") {
+                "on"
+            } else {
+                "off"
+            };
+            let bytes = |key: &str| row.get(key).and_then(Value::as_u64).unwrap_or(0);
+            out.push_str(&format!(
+                "{:<20} {flag:<5} {:>12} {:>12}\n",
+                printable(str_field(row, "name")),
+                bytes("cache_bytes"),
+                bytes("git_bytes"),
+            ));
+        }
+    }
+    out
+}
+
+/// `cache set-limit` success: the change, what the pass did, and the
+/// status after it.
+pub fn render_cache_limit_set(result: &Value) -> String {
+    let dropped = result.get("dropped").and_then(Value::as_u64).unwrap_or(0);
+    let freed = result
+        .get("freed_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let mut out = format!(
+        "Cache limit set to {} (was {}); saved to config.toml.\n",
+        printable(str_field(result, "limit")),
+        printable(str_field(result, "previous")),
+    );
+    if dropped == 0 {
+        out.push_str("No files dropped.\n");
+    } else {
+        out.push_str(&format!(
+            "Dropped {dropped} file(s), {freed} bytes, back to remote.\n"
+        ));
+    }
+    out.push('\n');
+    out.push_str(&render_cache_status(result));
+    out
+}
+
+/// `cache on|off`: the flag after the call.
+pub fn render_cache_flag(result: &Value) -> String {
+    let name = printable(str_field(result, "name"));
+    let on = bool_field(result, "cache");
+    let was = bool_field(result, "was");
+    if on == was {
+        return format!(
+            "Cache for \"{name}\" is already {}.\n",
+            if on { "on" } else { "off" }
+        );
+    }
+    if on {
+        format!("Cache for \"{name}\" is on: fetched files stay until the limit needs the room.\n")
+    } else {
+        format!(
+            "Cache for \"{name}\" is off: a fetched file is dropped about 10 minutes after its last use. Pinned files stay.\n"
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -277,6 +277,22 @@ const CREATE_REMOTE_CURSORS: &str = "\
         updated_at INTEGER \
     )";
 
+/// What a Drive copy was when Tephra wrote it (atlas-27 PR-8): one row per
+/// source and path, `hash` the git blob sha of the bytes Tephra put on the
+/// disk. A Drive listing has no checksum, so this is how eviction tells a
+/// copy nobody touched from one Dan saved over (same length or not) before
+/// the watcher reported it. Durable and foreign-key free like the remote
+/// tables; a bookkeeping table of the content cache, not one of
+/// [`crate::REMOTE_TABLES`]. A missing row means "unknown": the copy is
+/// kept.
+const CREATE_REMOTE_COPY_STAMPS: &str = "\
+    CREATE TABLE IF NOT EXISTS remote_copy_stamps (\
+        source TEXT NOT NULL, \
+        path TEXT NOT NULL, \
+        hash TEXT NOT NULL, \
+        PRIMARY KEY (source, path) \
+    )";
+
 /// One row per link occurrence. `line` is the link's 1-based line in
 /// its file (what a backlink reports); NULL for a link in a document
 /// and for a row carried over from a cache that had no such column.
@@ -481,6 +497,7 @@ pub(crate) fn create_bootstrap_tables(conn: &Connection) -> Result<(), CacheErro
     conn.execute(CREATE_UPLOAD_QUEUE, [])?;
     conn.execute(CREATE_REMOTE_PINS, [])?;
     conn.execute(CREATE_REMOTE_CURSORS, [])?;
+    conn.execute(CREATE_REMOTE_COPY_STAMPS, [])?;
     Ok(())
 }
 

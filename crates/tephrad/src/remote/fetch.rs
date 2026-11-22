@@ -23,9 +23,13 @@
 //! that was adopted is never deleted by a fetch. A file with
 //! unsent or unpushed edits (any state but `remote`, `downloading` and an
 //! unedited `cached`/`pinned`) is returned as it is. A fetch never fails
-//! because of the cache cap (the cap, PR-8, evicts; it does not refuse).
+//! because of the cache cap (the cap, PR-8, evicts; it does not refuse: see
+//! `remote/evict.rs`, whose eviction takes the same one-per-file slot as a
+//! download, so a fetch and an eviction of one file never overlap).
 //!
-//! Every call touches `last_used`, a call that did nothing included.
+//! Every call touches `last_used`, a call that did nothing included, and
+//! does it FIRST (before it reads the row), so an eviction pass that is
+//! deciding at the same moment sees the file as in use.
 
 use std::collections::HashMap;
 use std::fs;
@@ -66,6 +70,9 @@ pub trait Disk: Send + Sync {
     fn create_new(&self, path: &Path) -> io::Result<Box<dyn SinkFile>>;
     /// fsync of a directory, so a rename in it survives a crash.
     fn sync_dir(&self, dir: &Path) -> io::Result<()>;
+    /// Deletes the file at `path` (a cache eviction, PR-8). Never follows a
+    /// symlink: it removes the name it is given.
+    fn remove_file(&self, path: &Path) -> io::Result<()>;
 }
 
 /// The real disk.
@@ -94,6 +101,10 @@ impl Disk for RealDisk {
 
     fn sync_dir(&self, dir: &Path) -> io::Result<()> {
         fs::File::open(dir)?.sync_all()
+    }
+
+    fn remove_file(&self, path: &Path) -> io::Result<()> {
+        fs::remove_file(path)
     }
 }
 
@@ -160,7 +171,7 @@ pub(crate) struct FetchFailure {
     pub message: String,
 }
 
-fn failure(code: &'static str, message: impl Into<String>) -> FetchFailure {
+pub(crate) fn failure(code: &'static str, message: impl Into<String>) -> FetchFailure {
     FetchFailure {
         code,
         message: message.into(),
@@ -312,9 +323,9 @@ pub(crate) struct FetchDone {
     pub state: String,
 }
 
-type Outcome = Result<Arc<FetchDone>, Arc<FetchFailure>>;
+pub(crate) type Outcome = Result<Arc<FetchDone>, Arc<FetchFailure>>;
 
-struct Flight {
+pub(crate) struct Flight {
     slot: Mutex<Option<Outcome>>,
     done: Condvar,
 }
@@ -341,7 +352,7 @@ impl FetchEngine {
     }
 }
 
-enum Role {
+pub(crate) enum Role {
     Lead(LeaderGuard),
     Follow(Arc<Flight>),
 }
@@ -349,7 +360,7 @@ enum Role {
 /// Held by the caller that runs a download. However it ends (even a panic),
 /// the flight leaves the map first and its waiters are woken after, so a
 /// call that comes later starts afresh instead of reading a stale result.
-struct LeaderGuard {
+pub(crate) struct LeaderGuard {
     engine: Arc<FetchEngine>,
     key: (String, String),
     flight: Arc<Flight>,
@@ -357,7 +368,7 @@ struct LeaderGuard {
 }
 
 impl LeaderGuard {
-    fn publish(mut self, outcome: Outcome) {
+    pub(crate) fn publish(mut self, outcome: Outcome) {
         self.finish(outcome);
     }
 
@@ -385,7 +396,7 @@ impl Drop for LeaderGuard {
     }
 }
 
-fn join_or_lead(engine: &Arc<FetchEngine>, source: &str, path: &str) -> Role {
+pub(crate) fn join_or_lead(engine: &Arc<FetchEngine>, source: &str, path: &str) -> Role {
     let key = (source.to_string(), path.to_string());
     let mut flights = engine.flights.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(flight) = flights.get(&key) {
@@ -473,7 +484,10 @@ fn not_fetchable(row: &RemoteFetchRow) -> Option<FetchRpcError> {
 
 impl SourceRegistry {
     /// Runs `f` on the registry's cache connection under the writer gate.
-    fn fetch_db<T>(&self, f: impl Fn(&Cache) -> Result<T, CacheError>) -> Result<T, FetchFailure> {
+    pub(crate) fn fetch_db<T>(
+        &self,
+        f: impl Fn(&Cache) -> Result<T, CacheError>,
+    ) -> Result<T, FetchFailure> {
         let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         retry_cache_on_busy(&self.gate, || f(&cache)).map_err(db_failure)
     }
@@ -534,6 +548,13 @@ impl SourceRegistry {
         // A lost race (the row changed between reading and acting) reads
         // the row again; three goes are more than a race needs.
         for _ in 0..3 {
+            // First, before the row is read: the eviction pass's claim is
+            // conditional on `last_used`, so from here the file counts as
+            // used and cannot be dropped under this call.
+            let now = now_secs(&*hub.clock);
+            if let Err(e) = self.fetch_db(|c| c.touch_remote_last_used(source, rel, now)) {
+                tracing::warn!(source, error = %e.message, "could not note the use of a file being fetched");
+            }
             let row = self
                 .fetch_db(|c| c.remote_fetch_row(source, rel))
                 .map_err(cache_err)?
@@ -544,8 +565,9 @@ impl SourceRegistry {
             match self.fetch_step(&hub, &remote_source, &row)? {
                 Step::Done(done) => {
                     let now = now_secs(&*hub.clock);
-                    // Not touching `last_used` is no reason to fail a fetch
-                    // that has its file.
+                    // Touched again: a download can take a while. Not
+                    // touching is no reason to fail a fetch that has its
+                    // file.
                     if let Err(e) = self.fetch_db(|c| c.touch_remote_last_used(source, rel, now)) {
                         tracing::warn!(source, error = %e.message, "could not note the use of a fetched file");
                     }
@@ -617,6 +639,9 @@ impl SourceRegistry {
         match join_or_lead(&hub.fetches, &row.source, &row.path) {
             Role::Follow(flight) => Ok(match wait_for(&flight) {
                 Ok(done) => Step::Done(done),
+                // The flight was a cache eviction of this file (PR-8): it
+                // is `remote` now, so this call downloads it itself.
+                Err(f) if f.code == crate::remote::evict::EVICTED => Step::Again,
                 Err(f) => Step::Failed(f),
             }),
             Role::Lead(guard) => {
@@ -662,9 +687,25 @@ impl SourceRegistry {
                 path,
                 size,
                 renamed,
+                stamp,
             }) => {
+                // The stamp goes in first: a copy with a `cached` row and no
+                // stamp is kept by eviction (unknown), never deleted.
+                if let Some(hash) = &stamp {
+                    if let Err(e) =
+                        self.fetch_db(|c| c.record_remote_copy_stamp(&row.source, &row.path, hash))
+                    {
+                        tracing::warn!(source = %row.source, error = %e.message, "could not note what a Drive copy was when it was written; it will not be dropped from the cache");
+                    }
+                }
                 let finished = self.fetch_db(|c| {
-                    c.finish_remote_download(&row.source, &row.path, row.sha.as_deref(), row.size)
+                    c.finish_remote_download(
+                        &row.source,
+                        &row.path,
+                        row.sha.as_deref(),
+                        row.size,
+                        now_secs(&*hub.clock),
+                    )
                 });
                 match finished {
                     Ok(true) => Lead::Finished(Ok(Arc::new(FetchDone {
@@ -732,7 +773,8 @@ impl SourceRegistry {
         match &origin {
             Origin::Github { sha, .. } => {
                 if let Some(found) = layout.existing(false)? {
-                    return self.adopt_or_keep(row, found, |path| file_has_blob_sha(path, sha));
+                    return self
+                        .adopt_or_keep(row, found, None, |path| file_has_blob_sha(path, sha));
                 }
             }
             // A symlink or a directory in the way is refused before any
@@ -760,6 +802,7 @@ impl SourceRegistry {
         &self,
         row: &RemoteFetchRow,
         found: Found,
+        stamp: Option<String>,
         is_remotes: impl FnOnce(&Path) -> bool,
     ) -> Result<Downloaded, FetchFailure> {
         if is_remotes(&found.path) {
@@ -767,6 +810,7 @@ impl SourceRegistry {
                 path: found.path,
                 size: found.size,
                 renamed: false,
+                stamp,
             });
         }
         let reason =
@@ -832,6 +876,17 @@ impl SourceRegistry {
             .map_err(|e| io_failure(&e, "flushing the file to the disk"))?;
         drop(sink);
 
+        // What a Drive copy is as written, read before it is in place (and
+        // so before anyone can have saved over it).
+        let stamp = match origin {
+            Origin::Drive { .. } => Some(
+                hash_file(temp)
+                    .map_err(|e| io_failure(&e, "checking the file"))?
+                    .1,
+            ),
+            Origin::Github { .. } => None,
+        };
+
         if let Origin::Github { sha, .. } = origin {
             let got = match hasher {
                 Some(h) => h.finish(),
@@ -859,7 +914,7 @@ impl SourceRegistry {
                 Origin::Github { sha, .. } => file_has_blob_sha(path, sha),
                 Origin::Drive { .. } => same_bytes(path, temp),
             };
-            return self.adopt_or_keep(row, found, same).inspect(|_| {
+            return self.adopt_or_keep(row, found, stamp, same).inspect(|_| {
                 let _ = fs::remove_file(temp);
             });
         }
@@ -873,6 +928,7 @@ impl SourceRegistry {
             path: final_path,
             size: written,
             renamed: true,
+            stamp,
         })
     }
 }
@@ -997,6 +1053,10 @@ enum Downloaded {
         /// This fetch renamed the file into place (false: a copy that was
         /// already there was adopted, and is not Tephra's to delete).
         renamed: bool,
+        /// A Drive copy's hash as it was written (a git blob sha), for the
+        /// stamp eviction compares the file with; `None` for GitHub, whose
+        /// listing has a sha of its own.
+        stamp: Option<String>,
     },
     /// A file Tephra did not write is there: left alone.
     Existing {
@@ -1008,24 +1068,24 @@ enum Downloaded {
 
 // ---- where a file goes ----------------------------------------------------------------
 
-struct Found {
-    path: PathBuf,
-    size: u64,
+pub(crate) struct Found {
+    pub(crate) path: PathBuf,
+    pub(crate) size: u64,
 }
 
 /// Where one item's file lives: the content root of its source and the
 /// names below it.
-struct Layout {
-    cache_dir: PathBuf,
+pub(crate) struct Layout {
+    pub(crate) cache_dir: PathBuf,
     /// Names from `cache_dir` down to the file (`clone` first for GitHub).
-    segments: Vec<String>,
+    pub(crate) segments: Vec<String>,
 }
 
 impl Layout {
     /// `case_sibling`: another file of the source differs from this one
     /// only by letter case, so its name is made distinct (on a
     /// case-insensitive disk the two would be one file).
-    fn of(
+    pub(crate) fn of(
         hub: &RemoteHub,
         source: &RemoteSourceRow,
         row: &RemoteFetchRow,
@@ -1070,7 +1130,7 @@ impl Layout {
 
     /// The file at the destination if there is a regular one. A symlink, a
     /// directory or any other thing there is a failure (never followed).
-    fn existing(&self, create: bool) -> Result<Option<Found>, FetchFailure> {
+    pub(crate) fn existing(&self, create: bool) -> Result<Option<Found>, FetchFailure> {
         let path = safe_path::resolve_under(&self.cache_dir, &self.segments, create)
             .map_err(path_failure)?;
         match fs::symlink_metadata(&path) {
@@ -1092,7 +1152,7 @@ impl Layout {
 }
 
 /// The length and the git blob sha of a file, read in pieces.
-fn hash_file(path: &Path) -> io::Result<(u64, String)> {
+pub(crate) fn hash_file(path: &Path) -> io::Result<(u64, String)> {
     let len = fs::metadata(path)?.len();
     let mut file = fs::File::open(path)?;
     let mut hasher = GitBlobHasher::new(len);
@@ -1116,7 +1176,7 @@ fn hash_file(path: &Path) -> io::Result<(u64, String)> {
 }
 
 /// Whether the file's bytes are the git blob `sha`.
-fn file_has_blob_sha(path: &Path, sha: &str) -> bool {
+pub(crate) fn file_has_blob_sha(path: &Path, sha: &str) -> bool {
     hash_file(path).is_ok_and(|(_, got)| got == sha)
 }
 

@@ -1205,7 +1205,6 @@ fn run_to_exit_with_extra_config(extra: &str) -> (bool, String, bool) {
 fn bad_cache_limit_and_bad_api_urls_fail_startup_naming_the_key() {
     for (extra, key) in [
         ("cache_limit = \"5 KB\"", "cache_limit"),
-        ("cache_limit = \"0 GB\"", "cache_limit"),
         ("cache_limit = \"5000\"", "cache_limit"),
         ("cache_limit = \"-1 GB\"", "cache_limit"),
         ("cache_limit = \"\"", "cache_limit"),

@@ -115,6 +115,9 @@ pub fn execute_with_prompt_writer<R: BufRead, W: Write>(
         Command::BlockId { unit, target } => block_id(unit, target, json, client),
         Command::Backlinks { id } => backlinks(id, json, client),
         Command::Fetch { unit } => fetch(unit, json, client),
+        Command::CacheStatus => cache_status(json, client),
+        Command::CacheSetLimit { limit } => cache_set_limit(limit, json, client),
+        Command::CacheSet { source, on } => cache_set(source, *on, json, client),
         Command::Fixes { since } => fixes(*since, json, client),
         Command::LinkResolve {
             target,
@@ -500,6 +503,44 @@ fn fetch(unit: &str, json: bool, client: &RpcClient) -> CommandOutcome {
         Ok(result) => {
             CommandOutcome::ok(json_or(&result, || render::render_fetched(&result), json))
         }
+        Err(e) => CommandOutcome::err(describe_error(&e)),
+    }
+}
+
+/// `cache status`: one `cache.status`, read-only.
+fn cache_status(json: bool, client: &RpcClient) -> CommandOutcome {
+    match client.call("cache.status", json!({})) {
+        Ok(result) => CommandOutcome::ok(json_or(
+            &result,
+            || render::render_cache_status(&result),
+            json,
+        )),
+        Err(e) => CommandOutcome::err(describe_error(&e)),
+    }
+}
+
+/// `cache set-limit <limit>`: one `cache.set_limit`. A limit the daemon
+/// refuses is exit 1 with its reason (and the limit that was kept) on
+/// stderr; the limit is not checked here.
+fn cache_set_limit(limit: &str, json: bool, client: &RpcClient) -> CommandOutcome {
+    match client.call("cache.set_limit", json!({"limit": limit})) {
+        Ok(result) => CommandOutcome::ok(json_or(
+            &result,
+            || render::render_cache_limit_set(&result),
+            json,
+        )),
+        Err(e) => CommandOutcome::err(describe_error(&e)),
+    }
+}
+
+/// `cache on|off <source>`: one `source.set_cache`.
+fn cache_set(source: &str, on: bool, json: bool, client: &RpcClient) -> CommandOutcome {
+    match client.call("source.set_cache", json!({"name": source, "cache": on})) {
+        Ok(result) => CommandOutcome::ok(json_or(
+            &result,
+            || render::render_cache_flag(&result),
+            json,
+        )),
         Err(e) => CommandOutcome::err(describe_error(&e)),
     }
 }

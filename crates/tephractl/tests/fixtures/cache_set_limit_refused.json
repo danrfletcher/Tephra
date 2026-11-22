@@ -1,0 +1,11 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "error": {
+    "code": -32011,
+    "message": "abc is not a usable cache limit: it has an unknown unit; expected a number and a unit, such as \"10 GB\" (units: MB, GB, MiB, GiB); the limit stays 10 GB",
+    "data": {
+      "reason": "bad_limit"
+    }
+  }
+}

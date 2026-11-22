@@ -49,9 +49,10 @@ fn subcommands() -> Vec<Vec<String>> {
 }
 
 #[test]
-fn the_dispatch_closed_list_is_twenty_and_every_method_is_in_architecture() {
-    // 18 before `source.add_github` (atlas-27 PR-5), 19 before `unit.fetch` (PR-7).
-    assert_eq!(METHOD_NAMES.len(), 20);
+fn the_dispatch_closed_list_is_twenty_three_and_every_method_is_in_architecture() {
+    // 18 before `source.add_github` (atlas-27 PR-5), 19 before `unit.fetch`
+    // (PR-7), 20 before the three cache verbs (PR-8).
+    assert_eq!(METHOD_NAMES.len(), 23);
     let architecture = doc("docs/ARCHITECTURE.md");
     for method in METHOD_NAMES {
         assert!(
@@ -76,6 +77,10 @@ fn every_tephractl_subcommand_is_in_the_readme() {
         vec!["block-id"],
         vec!["backlinks"],
         vec!["fetch"],
+        vec!["cache", "status"],
+        vec!["cache", "set-limit"],
+        vec!["cache", "on"],
+        vec!["cache", "off"],
         vec!["fixes"],
         vec!["daemon", "install"],
         vec!["daemon", "uninstall"],

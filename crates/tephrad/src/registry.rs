@@ -893,6 +893,8 @@ pub struct SourceRegistry {
     /// adapter, the clock. Set once by the daemon; while unset a remote
     /// source cannot be added and none is indexed.
     pub(crate) remote: std::sync::OnceLock<Arc<crate::remote_github::RemoteHub>>,
+    /// Runs the cache's eviction passes (PR-8). Set with the hub.
+    pub(crate) evict: std::sync::OnceLock<Arc<crate::remote::evict::EvictRunner>>,
     /// Sources whose root exists but the OS won't list (E13: macOS
     /// Full Disk Access not granted). A runtime status only: it is
     /// never written to the `sources` table (whose `status` CHECK
@@ -1076,6 +1078,7 @@ impl SourceRegistry {
             running: Mutex::new(HashMap::new()),
             events_tx,
             remote: std::sync::OnceLock::new(),
+            evict: std::sync::OnceLock::new(),
             permission_denied: Mutex::new(HashSet::new()),
             write_pause: Mutex::new(WritePause::default()),
             rename_fixer,

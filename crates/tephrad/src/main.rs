@@ -221,6 +221,12 @@ fn main() -> ExitCode {
 
     // The GitHub adapter reads the token from the store on each call and
     // never holds it. Building it makes no request.
+    // `cache set-limit` saves the new limit to this config file, in place.
+    let limit_file = config_path.clone();
+    let limit_saver: tephrad::remote_github::LimitSaver =
+        std::sync::Arc::new(move |text| config::write_cache_limit(&limit_file, text));
+    let cache_limit_text = cfg.cache_limit.trim().to_string();
+    let cache_limit_value = cfg.cache_limit_bytes().unwrap_or_default();
     let remote_hub = match tephrad::remote_github::RemoteHub::new(
         credential_store,
         cfg.github_api_url.as_deref(),
@@ -228,7 +234,15 @@ fn main() -> ExitCode {
         cfg.data_dir.clone(),
     )
     .and_then(|hub| hub.with_drive_api_url(cfg.drive_api_url.as_deref()))
-    {
+    .map(|hub| {
+        let hub = hub
+            .with_cache_limit(&cache_limit_text, cache_limit_value)
+            .with_limit_saver(limit_saver);
+        match cfg.cache_idle_seconds {
+            Some(secs) => hub.with_cache_idle_secs(secs),
+            None => hub,
+        }
+    }) {
         Ok(hub) => Some(std::sync::Arc::new(hub)),
         Err(e) => {
             tracing::warn!(error = %e, "the GitHub adapter could not be built; GitHub sources are off");
