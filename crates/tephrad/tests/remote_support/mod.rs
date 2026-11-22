@@ -20,8 +20,8 @@ use serde_json::{json, Value};
 use tephra_cache::Cache;
 use tephra_graph::UnitGraph;
 use tephra_remote::credentials::{CredentialError, CredentialStore, Provider, Secret};
-use tephra_remote::testing::FakeGithub;
-use tephra_remote::SystemClock;
+use tephra_remote::testing::{FakeGithub, LinkGate};
+use tephra_remote::{AdapterOptions, Clock, FakeClock, SystemClock};
 use tephrad::fixes::FixEngine;
 use tephrad::refactor::fix_write::FixWriter;
 use tephrad::refactor::RefactorEngine;
@@ -47,17 +47,54 @@ type Ws =
 pub struct Fake {
     rt: tokio::runtime::Runtime,
     pub gh: FakeGithub,
+    /// A switch in front of the fake (see [`Fake::start_gated`]).
+    gate: Option<LinkGate>,
 }
 
 impl Fake {
     pub fn start() -> Arc<Fake> {
+        Self::start_with_clock(Arc::new(SystemClock))
+    }
+
+    /// A fake whose rate-limit windows are read off `clock`.
+    pub fn start_with_clock(clock: Arc<dyn Clock>) -> Arc<Fake> {
+        Self::build(clock, false)
+    }
+
+    /// A fake behind a [`LinkGate`]: `network_down` and `network_up` take
+    /// the connection away and bring it back, on the same URL.
+    pub fn start_gated(clock: Arc<dyn Clock>) -> Arc<Fake> {
+        Self::build(clock, true)
+    }
+
+    fn build(clock: Arc<dyn Clock>, gated: bool) -> Arc<Fake> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
             .expect("fake runtime");
-        let gh = rt.block_on(FakeGithub::start());
-        Arc::new(Fake { rt, gh })
+        let gh = rt.block_on(FakeGithub::start_with_clock(clock));
+        let gate = gated.then(|| rt.block_on(LinkGate::in_front_of(gh.base_url())));
+        Arc::new(Fake { rt, gh, gate })
+    }
+
+    /// What a daemon is pointed at: the fake, or its gate.
+    pub fn url(&self) -> String {
+        match &self.gate {
+            Some(gate) => gate.base_url(),
+            None => self.gh.base_url().to_string(),
+        }
+    }
+
+    /// The connection goes away: connect errors, open connections cut.
+    pub fn network_down(&self) {
+        self.gate.as_ref().expect("a gated fake").down();
+    }
+
+    /// The connection is back.
+    pub fn network_up(&self) {
+        let gate = self.gate.as_ref().expect("a gated fake");
+        self.rt.block_on(gate.up());
     }
 
     /// The usual fixture repo: a README that links into a vault note, a
@@ -99,6 +136,32 @@ impl Fake {
             .iter()
             .map(|r| r.target())
             .filter(|t| t.contains("/git/blobs/") || t.contains("/contents/"))
+            .collect()
+    }
+
+    /// The polls: requests for the head commit of a branch.
+    pub fn polls(&self) -> Vec<tephra_remote::testing::LoggedRequest> {
+        self.gh.request_log().matching("/commits/")
+    }
+
+    /// Requests that list a tree.
+    pub fn tree_reads(&self) -> Vec<String> {
+        self.gh
+            .request_log()
+            .matching("/git/trees/")
+            .iter()
+            .map(|r| r.target())
+            .collect()
+    }
+
+    /// Every request that is not a GET.
+    pub fn non_get_requests(&self) -> Vec<String> {
+        self.gh
+            .request_log()
+            .all()
+            .iter()
+            .filter(|r| r.method != "GET")
+            .map(|r| format!("{} {}", r.method, r.target()))
             .collect()
     }
 
@@ -188,6 +251,45 @@ impl Daemon {
     }
 
     pub fn start_with(fake: &Arc<Fake>, store: Arc<MemStore>, data_dir: Option<PathBuf>) -> Daemon {
+        Self::start_full(
+            fake,
+            store,
+            data_dir,
+            Arc::new(SystemClock),
+            AdapterOptions::default(),
+        )
+    }
+
+    /// A signed-in daemon whose clock is `clock`: its pollers are due when
+    /// the clock says so, and look at it every 10 ms.
+    pub fn start_clocked(fake: &Arc<Fake>, clock: Arc<dyn Clock>) -> Daemon {
+        Self::start_full(
+            fake,
+            MemStore::signed_in(),
+            None,
+            clock,
+            AdapterOptions::default(),
+        )
+    }
+
+    /// A restart of a daemon on `data_dir`, with a clock.
+    pub fn restart_clocked(fake: &Arc<Fake>, data_dir: &Path, clock: Arc<dyn Clock>) -> Daemon {
+        Self::start_full(
+            fake,
+            MemStore::signed_in(),
+            Some(data_dir.to_path_buf()),
+            clock,
+            AdapterOptions::default(),
+        )
+    }
+
+    pub fn start_full(
+        fake: &Arc<Fake>,
+        store: Arc<MemStore>,
+        data_dir: Option<PathBuf>,
+        clock: Arc<dyn Clock>,
+        options: AdapterOptions,
+    ) -> Daemon {
         let (own_dir, data_dir) = match data_dir {
             Some(d) => (None, d),
             None => {
@@ -205,13 +307,10 @@ impl Daemon {
             SourceRegistry::new(Cache::open(&cache_path).expect("registry cache"))
                 .expect("registry"),
         );
-        let hub = RemoteHub::new(
-            store,
-            Some(fake.gh.base_url()),
-            Arc::new(SystemClock),
-            data_dir.clone(),
-        )
-        .expect("hub");
+        let hub =
+            RemoteHub::with_options(store, Some(&fake.url()), clock, data_dir.clone(), options)
+                .expect("hub")
+                .with_poll_tick(Duration::from_millis(10));
         registry.set_remote_hub(Arc::new(hub));
 
         let graph_cache = Cache::open(&cache_path).expect("graph cache");
@@ -263,7 +362,7 @@ impl Daemon {
             stop_rx,
         )));
         // Start-up, as `main.rs` does it: remote sources answer from the
-        // cache; a first index that was cut short is finished.
+        // cache; a first index that was cut short is read again from scratch.
         registry.resume_remote_sources();
         Daemon {
             registry,
@@ -454,6 +553,29 @@ impl Client {
         }
     }
 
+    /// The next `graph:changed` notification of any kind, or `None` when
+    /// none arrives within `timeout`.
+    pub fn next_graph_changed(&mut self, timeout: Duration) -> Option<Value> {
+        let start = Instant::now();
+        loop {
+            let left = timeout.checked_sub(start.elapsed())?;
+            let frame = self.frame(left)?;
+            if frame["method"] == json!("graph:changed") {
+                return Some(frame["params"].clone());
+            }
+        }
+    }
+
+    /// Reads and drops every `graph:changed` that arrives until none has for
+    /// `quiet`; how many there were.
+    pub fn drain_graph_changed(&mut self, quiet: Duration) -> usize {
+        let mut n = 0;
+        while self.next_graph_changed(quiet).is_some() {
+            n += 1;
+        }
+        n
+    }
+
     /// The next `graph:changed` notification carrying `sources_changed`,
     /// skipping the ordinary ones (the index's progress pushes).
     pub fn next_sources_changed(&mut self, timeout: Duration) -> Option<Value> {
@@ -486,4 +608,184 @@ pub fn files_under(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     walk(dir, dir, &mut out);
     out
+}
+
+/// How long the tests wait to see that NOTHING happens: a bounded quiet
+/// window. A poller looks at its clock every 10 ms in these tests, so this
+/// is many looks.
+pub const QUIET: Duration = Duration::from_millis(400);
+/// The poll interval.
+pub const INTERVAL: Duration = Duration::from_secs(60);
+
+/// A signed-in daemon on a fake clock, in front of a gated fake GitHub that
+/// holds the PR-5 `atlas` repository, with the source `g` added and its
+/// first index finished. Time moves only when a test says so.
+pub struct Rig {
+    pub fake: Arc<Fake>,
+    pub clock: Arc<FakeClock>,
+    pub d: Daemon,
+    /// The daemon's credential store: a test signs in again through it.
+    pub store: Arc<MemStore>,
+    /// The data dir once a restart has taken it from the first daemon.
+    dir: Option<tempfile::TempDir>,
+}
+
+impl Rig {
+    pub fn start() -> Rig {
+        Self::start_with(AdapterOptions::default())
+    }
+
+    /// Like [`Rig::start`] with the adapter's timeouts given.
+    pub fn start_with(options: AdapterOptions) -> Rig {
+        let clock = Arc::new(FakeClock::at_epoch_2026());
+        let fake = Fake::start_gated(clock.clone());
+        fake.atlas();
+        let store = MemStore::signed_in();
+        let d = Daemon::start_full(&fake, store.clone(), None, clock.clone(), options);
+        d.add_github("g", REPO);
+        d.wait_active("g");
+        let rig = Rig {
+            fake,
+            clock,
+            d,
+            store,
+            dir: None,
+        };
+        rig.let_pushes_settle();
+        rig
+    }
+
+    /// The first index and its graph refresh may still be pushing when the
+    /// source turns `active`: wait until a client sees no more, so a test's
+    /// count of pushes is the poll's alone.
+    fn let_pushes_settle(&self) {
+        let mut client = self.d.connect();
+        client.drain_graph_changed(QUIET);
+    }
+
+    /// A fresh start of the daemon on the same data dir, clock and fake.
+    pub fn restart(self) -> Rig {
+        let Rig {
+            fake,
+            clock,
+            d,
+            store: _,
+            dir,
+        } = self;
+        let dir = match dir {
+            Some(dir) => {
+                d.close();
+                dir
+            }
+            None => d.close_keeping_data(),
+        };
+        let store = MemStore::signed_in();
+        let d = Daemon::start_full(
+            &fake,
+            store.clone(),
+            Some(dir.path().to_path_buf()),
+            clock.clone(),
+            AdapterOptions::default(),
+        );
+        Rig {
+            fake,
+            clock,
+            d,
+            store,
+            dir: Some(dir),
+        }
+    }
+
+    /// The user signs in again with another token.
+    pub fn sign_in_again(&self, token: &str) {
+        self.store
+            .set(Provider::Github, &Secret::new(token.to_string()))
+            .expect("store the new token");
+    }
+
+    /// Moves the clock.
+    pub fn advance(&self, by: Duration) {
+        self.clock.advance(by);
+    }
+
+    /// Waits (bounded) until the fake has seen `n` polls of the branch.
+    pub fn wait_polls(&self, n: usize) {
+        self.d.wait_for(&format!("{n} polls"), || {
+            (self.fake.polls().len() >= n).then_some(())
+        });
+    }
+
+    /// Waits until `source.list` shows `g` with this status.
+    pub fn wait_status(&self, status: &str) -> Value {
+        self.d.wait_for(&format!("g is {status}"), || {
+            self.d
+                .source_row("g")
+                .filter(|r| r["status"] == json!(status))
+        })
+    }
+
+    /// Lets a poller that would act do so, and waits for nothing.
+    pub fn quiet(&self) {
+        std::thread::sleep(QUIET);
+    }
+}
+
+/// Everything the index holds for a remote source, as one string: the
+/// units (with their hashes), the links, the items, the cursor, the queue
+/// and the pins. The source's own row (status, `last_sync_at`) is NOT in it:
+/// that is what a poll is allowed to change. Two equal snapshots mean "no
+/// index row was written".
+pub fn index_snapshot(cache_path: &Path) -> String {
+    let cache = Cache::open_read_only(cache_path).expect("open the cache");
+    let one = |sql: &str| -> String {
+        cache
+            .connection()
+            .query_row(sql, [], |r| r.get::<_, Option<String>>(0))
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .unwrap_or_default()
+    };
+    [
+        one("SELECT group_concat(rel_path || '|' || COALESCE(hash, '-') || '|' || id, ';') FROM (SELECT * FROM units ORDER BY id)"),
+        one("SELECT group_concat(from_unit_id || '>' || to_raw || '>' || COALESCE(to_unit_id, '-') || '@' || COALESCE(line, '-'), ';') FROM (SELECT * FROM links ORDER BY id)"),
+        one("SELECT group_concat(source || '|' || path || '|' || COALESCE(kind, '-') || '|' || COALESCE(sha, '-') || '|' || COALESCE(size, '-') || '|' || state || '|' || COALESCE(reason, '-'), ';') FROM (SELECT * FROM remote_items ORDER BY source, path)"),
+        one("SELECT group_concat(source || '|' || COALESCE(cursor, '-') || '|' || index_complete || '|' || COALESCE(updated_at, '-'), ';') FROM remote_cursors"),
+        one("SELECT group_concat(source || '|' || path || '|' || COALESCE(base_revision, '-') || '|' || attempts || '|' || created_at, ';') FROM upload_queue"),
+        one("SELECT group_concat(source || '|' || path || '|' || is_folder, ';') FROM remote_pins"),
+        one("SELECT group_concat(rel_path, ';') FROM (SELECT rel_path FROM units u JOIN headings h ON h.unit_id = u.id ORDER BY h.id)"),
+    ]
+    .join("\n")
+}
+
+/// Puts a row in the upload queue, as PR-12's edit path will: an edit of
+/// `path` waiting to be pushed.
+pub fn seed_queued_upload(cache_path: &Path, source: &str, path: &str) {
+    let cache = Cache::open(cache_path).expect("open the cache");
+    cache
+        .connection()
+        .execute(
+            "INSERT INTO upload_queue (source, path, base_revision, attempts, created_at) \
+             VALUES (?1, ?2, 'base-rev', 2, 1795132000)",
+            [source, path],
+        )
+        .expect("seed an upload-queue row");
+}
+
+/// Writes a cached copy where PR-7's fetch will: `remote/<source>/clone/<path>`.
+pub fn seed_cached_copy(data_dir: &Path, source: &str, path: &str, bytes: &[u8]) -> PathBuf {
+    let file = data_dir
+        .join("remote")
+        .join(source)
+        .join("clone")
+        .join(path);
+    std::fs::create_dir_all(file.parent().unwrap()).expect("clone dir");
+    std::fs::write(&file, bytes).expect("a cached copy");
+    file
+}
+
+/// The kind and state of a source's items, read from the cache.
+pub fn item_rows(cache_path: &Path, source: &str) -> Vec<tephra_cache::RemoteItemRow> {
+    Cache::open_read_only(cache_path)
+        .expect("open the cache")
+        .remote_items(source)
+        .expect("items")
 }

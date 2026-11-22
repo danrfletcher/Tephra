@@ -45,10 +45,12 @@ use crate::clock::Clock;
 mod drive;
 mod github;
 mod google_oauth;
+mod link_gate;
 
 pub use drive::{DriveLimit, FakeDrive};
 pub use github::{FakeGithub, GithubLimit};
 pub use google_oauth::{AuthorizeRequest, FakeGoogleOAuth, TokenRequest};
+pub use link_gate::LinkGate;
 
 /// One request the fake saw.
 #[derive(Debug, Clone, PartialEq, Eq)]

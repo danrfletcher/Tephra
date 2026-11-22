@@ -408,7 +408,7 @@ fn a_restart_answers_from_the_cache_with_no_adapter_call() {
 }
 
 #[test]
-fn a_restart_finishes_an_interrupted_index() {
+fn a_restart_indexes_an_interrupted_index_again_from_scratch() {
     let fake = Fake::start();
     fake.atlas();
     // A slow fake keeps the first index unfinished while the daemon stops.
@@ -427,7 +427,7 @@ fn a_restart_finishes_an_interrupted_index() {
 
     let d2 = Daemon::restart(&fake, kept.path());
     d2.wait_active("github-atlas");
-    // The index read what was left, and only the text files.
+    // The index read the text files again, and only those.
     let reads = fake.reads();
     assert!(reads.iter().any(|t| t.contains("/git/blobs/")), "{reads:?}");
     assert!(

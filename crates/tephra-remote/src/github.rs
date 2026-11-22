@@ -194,6 +194,43 @@ pub trait GithubAdapter: Send + Sync {
     ) -> BoxFut<'a, RemoteResult<Conditional<RefHead>>>;
 }
 
+/// The sha git gives a file's bytes: SHA-1 over `blob <len>\0` and the bytes.
+/// What a tree entry's `sha` is for a regular file, so a file on disk can be
+/// compared with the remote's own value without asking the remote.
+pub fn git_blob_sha(bytes: &[u8]) -> String {
+    let mut hasher = GitBlobHasher::new(bytes.len() as u64);
+    hasher.update(bytes);
+    hasher.finish()
+}
+
+/// [`git_blob_sha`] for bytes that arrive in pieces: the total length is
+/// needed first (git hashes it ahead of the bytes), so a file is hashed
+/// without being held in memory.
+pub struct GitBlobHasher(sha1::Sha1);
+
+impl GitBlobHasher {
+    pub fn new(len: u64) -> Self {
+        use sha1::Digest;
+        let mut hasher = sha1::Sha1::new();
+        hasher.update(format!("blob {len}\0").as_bytes());
+        GitBlobHasher(hasher)
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) {
+        use sha1::Digest;
+        self.0.update(bytes);
+    }
+
+    pub fn finish(self) -> String {
+        use sha1::Digest;
+        self.0
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+}
+
 /// The real GitHub adapter. Never sleeps, never follows a redirect, never
 /// opens a listener.
 pub struct GithubClient {
@@ -268,6 +305,32 @@ impl GithubClient {
 /// A ref or a path with `/` kept and each segment encoded.
 fn ref_path(git_ref: &str) -> RemoteResult<String> {
     encode_path(git_ref).map_err(|_| RemoteError::InvalidInput("ref"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_blob_sha_is_what_git_hash_object_prints() {
+        // `printf '' | git hash-object --stdin` and `printf 'hello\n' | ...`.
+        assert_eq!(
+            git_blob_sha(b""),
+            "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+        );
+        assert_eq!(
+            git_blob_sha(b"hello\n"),
+            "ce013625030ba8dba906f756967f9e9ca394464a"
+        );
+    }
+
+    #[test]
+    fn a_blob_sha_in_pieces_is_the_same_sha() {
+        let mut h = GitBlobHasher::new(6);
+        h.update(b"hel");
+        h.update(b"lo\n");
+        assert_eq!(h.finish(), git_blob_sha(b"hello\n"));
+    }
 }
 
 #[derive(Deserialize)]

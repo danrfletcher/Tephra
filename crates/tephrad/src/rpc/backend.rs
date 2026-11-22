@@ -255,8 +255,9 @@ pub struct SourceRowWire {
 
 /// The extra fields of a remote `source.list` row. For a remote source
 /// `path` is `<kind>:<owner/repo>` (there is no folder), `status` is
-/// `indexing`, `active` or `auth_required`, and `last_scanned_at` is the
-/// last sync.
+/// `indexing`, `active`, `offline`, `syncing`, `auth_required` or
+/// `needs_attention` (with `status_reason` saying why), and
+/// `last_scanned_at` is the last sync.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RemoteRowWire {
     pub kind: String,

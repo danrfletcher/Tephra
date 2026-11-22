@@ -162,15 +162,31 @@ pub fn search_in_file(
         .map_err(source_error)?
         .ok_or_else(no_such_unit)?;
 
+    // A remote source has no folder to probe (its path is a marker): it is
+    // offline when its stored status says so, and nothing is read from disk.
+    let remote = source.is_remote();
     let root = Path::new(&source.path);
-    let probe = probe_path(root);
+    let probe = if remote {
+        PathProbe::Ok
+    } else {
+        probe_path(root)
+    };
     if probe.is_permission_denied() {
         return Err(SearchError::Source(format!(
             "source {source_name} can't be read (permission denied)"
         )));
     }
-    let offline = source.status == SourceStatus::Offline || probe == PathProbe::Missing;
-    let online = !offline && probe == PathProbe::Ok;
+    let offline = if remote {
+        // A remote source's status is in its own table (`offline` is what
+        // a poll that could not reach GitHub leaves).
+        cache
+            .remote_source(source_name)
+            .map_err(source_error)?
+            .is_some_and(|r| r.status == tephra_cache::STATUS_OFFLINE)
+    } else {
+        source.status == SourceStatus::Offline || probe == PathProbe::Missing
+    };
+    let online = !remote && !offline && probe == PathProbe::Ok;
 
     let candidates = cache
         .in_file_candidates(&unit, scope)

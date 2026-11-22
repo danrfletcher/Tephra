@@ -3,11 +3,12 @@
 //!
 //! The DDL is in [`crate::schema`] and the tables are created with the
 //! bootstrap tables on every open (see there for why they survive a
-//! rebuild). Nothing in this crate reads or writes them yet: the sync
-//! engine, the upload buffer and the pins come in later PRs, which add
-//! their typed helpers here. What lives here now are the closed value
-//! sets the tables' `CHECK` constraints enforce, so a writer names them
-//! from one place; `tests/remote_tables.rs` checks each list against the
+//! rebuild). The typed helpers that read and write them are in
+//! `remote_ops` (the listing and its restore) and `remote_sync` (the
+//! poll cursor and the steps of a poll); the upload buffer and the pins
+//! add theirs in later PRs.
+//! What lives here are the closed value sets the tables' `CHECK`
+//! constraints enforce, so a writer names them from one place; `tests/remote_tables.rs` checks each list against the
 //! constraint it mirrors, in both directions.
 
 /// The five remote tables, in the order a dump lists them. Every one is

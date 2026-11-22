@@ -201,6 +201,17 @@ impl fmt::Display for ScanError {
 
 impl std::error::Error for ScanError {}
 
+/// A failed [`write_remote_unit`] as the cache error it is, so that a busy
+/// database stays a busy database (the caller's retry on busy keys on it)
+/// and is not flattened into an I/O error with the same text.
+pub(crate) fn cache_error_of(e: ScanError) -> tephra_cache::CacheError {
+    match e {
+        ScanError::Cache(e) => e,
+        ScanError::Sqlite(e) => tephra_cache::CacheError::Sqlite(e),
+        other => tephra_cache::CacheError::Io(std::io::Error::other(other.to_string())),
+    }
+}
+
 impl From<std::io::Error> for ScanError {
     fn from(e: std::io::Error) -> Self {
         ScanError::Io(e)
@@ -1965,6 +1976,38 @@ mod tests {
     use super::*;
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
+
+    /// A busy database met while writing a remote file stays busy when it
+    /// is turned into a cache error, so the retry on busy sees it (a
+    /// first index used to stop on "database is locked" instead).
+    #[test]
+    fn a_busy_write_of_a_remote_file_is_still_busy_as_a_cache_error() {
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("database is locked".to_string()),
+        );
+        for e in [
+            ScanError::Sqlite(busy),
+            ScanError::Cache(tephra_cache::CacheError::Sqlite(
+                rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                    None,
+                ),
+            )),
+        ] {
+            let converted = cache_error_of(e);
+            assert!(
+                matches!(
+                    &converted,
+                    tephra_cache::CacheError::Sqlite(rusqlite::Error::SqliteFailure(inner, _))
+                        if inner.code == rusqlite::ErrorCode::DatabaseBusy
+                ),
+                "{converted:?}"
+            );
+        }
+        let other = cache_error_of(ScanError::PermissionDenied(PathBuf::from("/x")));
+        assert!(matches!(other, tephra_cache::CacheError::Io(_)));
+    }
 
     /// E26 (pinned, unchanged by the char-boundary fix): a path component
     /// that is not valid UTF-8 is dropped by `to_rel_string`, not

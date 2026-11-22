@@ -17,25 +17,33 @@
 //! is written to disk (F1, F12). A symlink or a submodule is listed by name
 //! and never followed (F11), a file over [`MAX_INDEXED_BYTES`] or with a
 //! known binary extension is never read, and a Git LFS pointer is kept by
-//! name and its object never fetched (F11). The index finishes on the next
-//! start if it was cut short: what is left is what has no content hash yet.
+//! name and its object never fetched (F11). Each file is written in ONE
+//! transaction, so a file has its content hash only when all its rows are
+//! there. An index cut short by a kill is read again from scratch at the
+//! next start (nothing it read is trusted). One cut short by a network
+//! failure while the daemon runs is finished from what has no content hash
+//! yet by the source's poller (the source shows `offline` meanwhile).
 //!
 //! The indexer holds no `Arc<SourceRegistry>` (the registry owns the runtime
 //! it runs on, and the last drop of the registry must not happen on one of
 //! that runtime's workers): only the cache path, the writer gate, the event
 //! sender and the hub.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tephra_cache::{
-    Cache, NewRemoteItem, NewRemoteSource, RemoteSourceRow, ITEM_KIND_SUBMODULE, ITEM_KIND_SYMLINK,
-    REASON_LFS_POINTER, STATUS_ACTIVE, STATUS_INDEXING,
+    encode_cursor, Cache, NewRemoteItem, NewRemoteSource, RemoteSourceRow, ITEM_KIND_SUBMODULE,
+    ITEM_KIND_SYMLINK, REASON_LFS_POINTER, STATUS_ACTIVE, STATUS_AUTH_REQUIRED, STATUS_INDEXING,
+    STATUS_OFFLINE,
 };
 use tephra_remote::credentials::{credential_state, CredentialState, CredentialStore, Provider};
-use tephra_remote::github::{full_tree, GithubAdapter, GithubClient, RepoRef, TreeEntryKind};
-use tephra_remote::{Clock, Conditional, RemoteError};
+use tephra_remote::github::{
+    full_tree, GithubAdapter, GithubClient, RepoRef, TreeEntry, TreeEntryKind,
+};
+use tephra_remote::{AdapterOptions, Clock, Conditional, RemoteError};
 
 use crate::file_kind::{kind_from_name, MAX_INDEXED_BYTES};
 use crate::registry::{
@@ -61,7 +69,7 @@ const LFS_POINTER_MAX_BYTES: usize = 1024;
 const RATE_LIMIT_SLICE: Duration = Duration::from_secs(1);
 
 /// Tries a file's read gets for a failure that may pass (a dropped
-/// connection, a 5xx) before the pass is left for the next start.
+/// connection, a 5xx) before the pass stops and the source is `offline`.
 const READ_TRIES: u32 = 3;
 
 /// Why `source.add_github` refused or failed. A refusal changes nothing.
@@ -101,10 +109,24 @@ fn refused(reason: &'static str, message: impl Into<String>) -> RegistryError {
 /// token from `store` on every call), the clock, and where the remote
 /// content cache would live.
 pub struct RemoteHub {
-    adapter: Arc<dyn GithubAdapter>,
+    pub(crate) adapter: Arc<dyn GithubAdapter>,
     store: Arc<dyn CredentialStore>,
-    clock: Arc<dyn Clock>,
+    pub(crate) clock: Arc<dyn Clock>,
     data_dir: PathBuf,
+    /// How often a waiting poller looks at the clock. Real time, whatever
+    /// the clock is: a poll is due when the CLOCK says so (a test moves a
+    /// fake clock), and this only bounds how late it notices.
+    pub(crate) poll_tick: Duration,
+    /// The sources that have a poller: one each, however often it is asked
+    /// for.
+    pub(crate) polling: Mutex<HashSet<String>>,
+    /// The sources with an index job reading right now: one each. A job
+    /// that finds its source here does nothing.
+    indexing: Mutex<HashSet<String>>,
+    /// How many polls the pollers have finished (a poll that only found the
+    /// first index still reading is not one). A test waits on it to know a
+    /// poller has acted when nothing else shows it (a network that is away).
+    pub(crate) polls_done: std::sync::atomic::AtomicUsize,
 }
 
 impl RemoteHub {
@@ -115,14 +137,43 @@ impl RemoteHub {
         clock: Arc<dyn Clock>,
         data_dir: PathBuf,
     ) -> Result<Self, String> {
-        let client = GithubClient::new(github_api_url, store.clone(), clock.clone())
-            .map_err(|e| e.to_string())?;
+        Self::with_options(
+            store,
+            github_api_url,
+            clock,
+            data_dir,
+            AdapterOptions::default(),
+        )
+    }
+
+    /// [`RemoteHub::new`] with the adapter's timeouts given (a test makes
+    /// them short).
+    pub fn with_options(
+        store: Arc<dyn CredentialStore>,
+        github_api_url: Option<&str>,
+        clock: Arc<dyn Clock>,
+        data_dir: PathBuf,
+        options: AdapterOptions,
+    ) -> Result<Self, String> {
+        let client =
+            GithubClient::with_options(github_api_url, store.clone(), clock.clone(), options)
+                .map_err(|e| e.to_string())?;
         Ok(RemoteHub {
             adapter: Arc::new(client),
             store,
             clock,
             data_dir,
+            poll_tick: crate::remote::poll::DEFAULT_POLL_TICK,
+            polling: Mutex::new(HashSet::new()),
+            indexing: Mutex::new(HashSet::new()),
+            polls_done: std::sync::atomic::AtomicUsize::new(0),
         })
+    }
+
+    /// How often a waiting poller looks at the clock (default one second).
+    pub fn with_poll_tick(mut self, tick: Duration) -> Self {
+        self.poll_tick = tick;
+        self
     }
 
     /// The directory the content cache of `source` would use. Nothing here
@@ -165,7 +216,7 @@ pub struct RemoteListing {
     pub last_sync_at: Option<i64>,
 }
 
-fn now_secs(clock: &dyn Clock) -> i64 {
+pub(crate) fn now_secs(clock: &dyn Clock) -> i64 {
     clock
         .now()
         .duration_since(UNIX_EPOCH)
@@ -207,7 +258,7 @@ fn parse_one_repo(text: &str) -> Result<RepoRef, RegistryError> {
 }
 
 /// `text` with control characters shown as `?`, for a message.
-fn printable(text: &str) -> String {
+pub(crate) fn printable(text: &str) -> String {
     text.chars()
         .map(|c| if c.is_control() { '?' } else { c })
         .collect()
@@ -268,11 +319,70 @@ fn refuse_remote(e: RemoteError, repo: &RepoRef, branch: Option<&str>) -> Regist
     }
 }
 
+/// One file of a repository's tree, as the index lists it: a symlink and a
+/// submodule by name only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TreeItem {
+    pub path: String,
+    pub kind: &'static str,
+    pub sha: String,
+    pub size: Option<i64>,
+}
+
+impl TreeItem {
+    pub(crate) fn as_new(&self) -> NewRemoteItem<'_> {
+        NewRemoteItem {
+            path: &self.path,
+            kind: self.kind,
+            sha: &self.sha,
+            size: self.size,
+        }
+    }
+}
+
+/// The files of a tree (directories are not items; an empty path or one
+/// with a NUL is skipped).
+pub(crate) fn tree_items(tree: &[TreeEntry]) -> Vec<TreeItem> {
+    let mut items = Vec::with_capacity(tree.len());
+    for entry in tree {
+        if entry.path.is_empty() || entry.path.contains('\0') {
+            continue;
+        }
+        let name_part = entry.path.rsplit('/').next().unwrap_or(&entry.path);
+        let (kind, size) = match entry.kind {
+            TreeEntryKind::Tree => continue,
+            TreeEntryKind::Commit => (ITEM_KIND_SUBMODULE, None),
+            TreeEntryKind::Blob if entry.mode == MODE_SYMLINK => {
+                (ITEM_KIND_SYMLINK, entry.size.map(|s| s as i64))
+            }
+            TreeEntryKind::Blob => (
+                kind_from_name(name_part).as_str(),
+                entry.size.map(|s| s as i64),
+            ),
+        };
+        items.push(TreeItem {
+            path: entry.path.clone(),
+            kind,
+            sha: entry.sha.clone(),
+            size,
+        });
+    }
+    items
+}
+
 impl SourceRegistry {
     /// Gives the registry what it needs to add and index remote sources.
     /// Set once; a second call is ignored.
     pub fn set_remote_hub(&self, hub: Arc<RemoteHub>) {
         let _ = self.remote.set(hub);
+    }
+
+    /// How many polls the remote pollers have finished since the daemon
+    /// started (0 with no remote hub). See [`RemoteHub::polls_done`].
+    pub fn remote_polls_done(&self) -> usize {
+        self.remote.get().map_or(0, |h| {
+            h.polls_done.load(std::sync::atomic::Ordering::SeqCst)
+        })
     }
 
     /// `source.add_github`: registers ONE repository on ONE branch and takes
@@ -340,7 +450,7 @@ impl SourceRegistry {
 
         // 2. The repository, the branch and the tree at one commit.
         let adapter = hub.adapter.clone();
-        let (branch_name, commit, tree) = self.runtime.block_on(async {
+        let (branch_name, commit, etag, tree) = self.runtime.block_on(async {
             let info = adapter
                 .get_repo(&repo)
                 .await
@@ -355,41 +465,19 @@ impl SourceRegistry {
                 }
                 // A repository with no commit: 0 files, nothing to index.
                 Err(RemoteError::Unexpected { status: 409 }) => {
-                    return Ok((branch_name, String::new(), Vec::new()))
+                    return Ok((branch_name, String::new(), None, Vec::new()))
                 }
                 Err(e) => return Err(refuse_remote(e, &repo, Some(&branch_name))),
             };
             let tree = full_tree(&*adapter, &repo, &head.sha)
                 .await
                 .map_err(|e| refuse_remote(e, &repo, Some(&branch_name)))?;
-            Ok::<_, RegistryError>((branch_name, head.sha, tree.entries))
+            Ok::<_, RegistryError>((branch_name, head.sha, head.etag, tree.entries))
         })?;
 
         // 3. The listing, as rows: a symlink and a submodule by name only.
-        let mut items: Vec<NewRemoteItem<'_>> = Vec::with_capacity(tree.len());
-        for entry in &tree {
-            if entry.path.is_empty() || entry.path.contains('\0') {
-                continue;
-            }
-            let name_part = entry.path.rsplit('/').next().unwrap_or(&entry.path);
-            let (kind, size) = match entry.kind {
-                TreeEntryKind::Tree => continue,
-                TreeEntryKind::Commit => (ITEM_KIND_SUBMODULE, None),
-                TreeEntryKind::Blob if entry.mode == MODE_SYMLINK => {
-                    (ITEM_KIND_SYMLINK, entry.size.map(|s| s as i64))
-                }
-                TreeEntryKind::Blob => (
-                    kind_from_name(name_part).as_str(),
-                    entry.size.map(|s| s as i64),
-                ),
-            };
-            items.push(NewRemoteItem {
-                path: &entry.path,
-                kind,
-                sha: &entry.sha,
-                size,
-            });
-        }
+        let listed = tree_items(&tree);
+        let items: Vec<NewRemoteItem<'_>> = listed.iter().map(TreeItem::as_new).collect();
         let files = items.len();
         {
             let cache = self.cache.lock().unwrap();
@@ -398,7 +486,7 @@ impl SourceRegistry {
                 kind: GITHUB_KIND,
                 target: &repo.full_name(),
                 branch: Some(&branch_name),
-                cursor: &commit,
+                cursor: &encode_cursor(&commit, etag.as_deref()),
                 now: now_secs(&*hub.clock),
             };
             retry_cache_on_busy(&self.gate, || {
@@ -410,6 +498,7 @@ impl SourceRegistry {
         // 4. Tell the clients, then read the text in the background.
         self.announce_sources_changed(vec![SourceChange::new(SourceChangeKind::Added, name)]);
         self.spawn_remote_index(name);
+        self.spawn_remote_poll(name);
         let progress = {
             let cache = self.cache.lock().unwrap();
             cache.remote_index_progress(name, MAX_INDEXED_BYTES)?
@@ -435,22 +524,21 @@ impl SourceRegistry {
             tracing::warn!(source = %name, "no remote hub: the source is listed but not indexed");
             return;
         };
-        let job = IndexJob {
-            name: name.to_string(),
-            cache_path: self.cache_path.clone(),
-            conn: Arc::new(std::sync::Mutex::new(None)),
-            reason_set: std::sync::atomic::AtomicBool::new(false),
-            gate: self.gate.clone(),
-            events_tx: self.events_tx.clone(),
+        let job = IndexJob::new(
+            name,
+            self.cache_path.clone(),
+            self.gate.clone(),
+            self.events_tx.clone(),
             hub,
-        };
+        );
         self.runtime.spawn(job.run());
     }
 
     /// Start-up for the remote sources: makes again the rows a schema
     /// rebuild dropped (from `remote_items`, with no remote call), then
-    /// finishes every first index that was cut short. A source whose index
-    /// is complete costs no adapter call.
+    /// indexes again from scratch every source whose first index was cut
+    /// short or whose cursor row is lost. A source whose index is complete
+    /// costs no adapter call.
     pub fn resume_remote_sources(&self) {
         let rows = {
             let cache = self.cache.lock().unwrap();
@@ -463,6 +551,37 @@ impl SourceRegistry {
             }
         };
         for row in rows {
+            // A source whose cursor row is lost, or whose first index was
+            // cut short (a kill), is read again from scratch: nothing it
+            // has read is trusted to be current.
+            let from_scratch = {
+                let cache = self.cache.lock().unwrap();
+                match cache.remote_cursor(&row.name) {
+                    Ok(Some(c)) => (!c.index_complete).then_some("the first index was cut short"),
+                    Ok(None) => Some("the cursor row was lost"),
+                    Err(_) => None,
+                }
+            };
+            if let Some(why) = from_scratch {
+                let now = self.remote.get().map_or(0, |h| now_secs(&*h.clock));
+                let reset = {
+                    let cache = self.cache.lock().unwrap();
+                    retry_cache_on_busy(&self.gate, || {
+                        cache.reset_remote_index(&row.name, now, MAX_INDEXED_BYTES)
+                    })
+                };
+                match reset {
+                    Ok(_) => {
+                        tracing::info!(source = %row.name, "{why}; the source is indexed again from scratch");
+                        self.spawn_remote_index(&row.name);
+                        self.spawn_remote_poll(&row.name);
+                    }
+                    Err(e) => {
+                        tracing::warn!(source = %row.name, error = %e, "could not reset a remote source that must be indexed again");
+                    }
+                }
+                continue;
+            }
             let restored = {
                 let cache = self.cache.lock().unwrap();
                 retry_cache_on_busy(&self.gate, || {
@@ -479,18 +598,7 @@ impl SourceRegistry {
                     continue;
                 }
             }
-            let complete = {
-                let cache = self.cache.lock().unwrap();
-                cache
-                    .remote_cursor(&row.name)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|c| c.index_complete)
-            };
-            if !complete {
-                tracing::info!(source = %row.name, "the first index was cut short; finishing it");
-                self.spawn_remote_index(&row.name);
-            }
+            self.spawn_remote_poll(&row.name);
         }
     }
 
@@ -533,8 +641,9 @@ impl SourceRegistry {
     }
 }
 
-/// One background first index.
-struct IndexJob {
+/// One background first index (and the catch-up of a poll that left files
+/// unread).
+pub(crate) struct IndexJob {
     name: String,
     cache_path: PathBuf,
     /// The job's one connection, opened on first use (a connection per
@@ -551,25 +660,90 @@ struct IndexJob {
 /// How a pass over the pending files ended.
 enum PassEnd {
     Done,
-    /// Left for the next start (the failure is recorded on the source).
+    /// Stopped (the failure is recorded on the source). Another run, from
+    /// the source's poller or the next start, reads what is left.
     Stopped,
 }
 
+/// What one [`IndexJob::run`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunEnd {
+    /// Another job was already reading this source: nothing was done.
+    Skipped,
+    /// Every pending file was read; the source is `active`.
+    Finished,
+    /// Stopped before the end (offline, a rejected token, a failure).
+    Stopped,
+}
+
+/// Holds a source's place among the running index jobs.
+struct IndexingSlot {
+    hub: Arc<RemoteHub>,
+    name: String,
+}
+
+impl Drop for IndexingSlot {
+    fn drop(&mut self) {
+        self.hub
+            .indexing
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.name);
+    }
+}
+
 impl IndexJob {
-    /// Runs the whole first index. Never panics the runtime: every failure
-    /// is recorded on the source and logged.
-    async fn run(self) {
+    pub(crate) fn new(
+        name: &str,
+        cache_path: PathBuf,
+        gate: Arc<WriterGate>,
+        events_tx: tokio::sync::broadcast::Sender<DaemonEvent>,
+        hub: Arc<RemoteHub>,
+    ) -> Self {
+        IndexJob {
+            name: name.to_string(),
+            cache_path,
+            conn: Arc::new(std::sync::Mutex::new(None)),
+            reason_set: std::sync::atomic::AtomicBool::new(false),
+            gate,
+            events_tx,
+            hub,
+        }
+    }
+
+    /// Runs the whole first index, unless another job is reading this
+    /// source. Never panics the runtime: every failure is recorded on the
+    /// source and logged.
+    pub(crate) async fn run(self) -> RunEnd {
         let name = self.name.clone();
+        let first = self
+            .hub
+            .indexing
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(name.clone());
+        if !first {
+            return RunEnd::Skipped;
+        }
+        let _slot = IndexingSlot {
+            hub: self.hub.clone(),
+            name: name.clone(),
+        };
         match self.index().await {
-            Ok(PassEnd::Done) => tracing::info!(source = %name, "first index finished"),
+            Ok(PassEnd::Done) => {
+                tracing::info!(source = %name, "first index finished");
+                RunEnd::Finished
+            }
             Ok(PassEnd::Stopped) => {
-                tracing::warn!(source = %name, "first index stopped; it resumes at the next start")
+                tracing::warn!(source = %name, "first index stopped; the source's poller tries again");
+                RunEnd::Stopped
             }
             Err(e) => {
                 tracing::warn!(source = %name, error = %e, "first index failed");
                 let _ = self
                     .db(move |c, name| c.set_remote_status(name, STATUS_INDEXING, Some(&e), None))
                     .await;
+                RunEnd::Stopped
             }
         }
     }
@@ -610,6 +784,12 @@ impl IndexJob {
             .await?
             .ok_or_else(|| "the source is gone".to_string())?;
         let repo = RepoRef::parse(&source.target).map_err(|e| e.to_string())?;
+        // A run after a stop starts on a source that says `offline` or
+        // `auth_required`: its first good read puts `indexing` back.
+        if source.status == STATUS_OFFLINE || source.status == STATUS_AUTH_REQUIRED {
+            self.reason_set
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         let pending = self
             .db(|c, n| c.remote_pending_items(n, MAX_INDEXED_BYTES))
             .await?;
@@ -627,15 +807,18 @@ impl IndexJob {
                     continue;
                 }
                 Err(ReadStop::AuthRejected) => {
-                    self.db(|c, n| {
-                        c.set_remote_status(
-                            n,
-                            "auth_required",
-                            Some("GitHub rejected the token: run `tephractl auth github`"),
-                            None,
-                        )
-                    })
+                    self.stop_with(
+                        &source,
+                        STATUS_AUTH_REQUIRED,
+                        "GitHub rejected the token: run `tephractl auth github`".to_string(),
+                    )
                     .await?;
+                    return Ok(PassEnd::Stopped);
+                }
+                // The remote cannot be reached: the source is `offline`, as
+                // a failed poll makes it, and the poller reads again.
+                Err(ReadStop::Offline(why)) => {
+                    self.stop_with(&source, STATUS_OFFLINE, why).await?;
                     return Ok(PassEnd::Stopped);
                 }
                 Err(ReadStop::Failed(why)) => {
@@ -665,8 +848,31 @@ impl IndexJob {
         Ok(PassEnd::Done)
     }
 
+    /// Records why the pass stops (the status and its reason) and tells the
+    /// clients when that is news. Nothing is written for a status the source
+    /// already has: a poller that tries again every interval while the
+    /// remote stays away leaves the index and the row alone.
+    async fn stop_with(
+        &self,
+        source: &RemoteSourceRow,
+        status: &'static str,
+        reason: String,
+    ) -> Result<(), String> {
+        let unchanged =
+            source.status == status && source.status_reason.as_deref() == Some(reason.as_str());
+        if unchanged {
+            return Ok(());
+        }
+        self.db(move |c, n| c.set_remote_status(n, status, Some(&reason), None))
+            .await?;
+        self.announce();
+        Ok(())
+    }
+
     /// Writes the rows of one file from its bytes, or notes it is an LFS
-    /// pointer and keeps it by name.
+    /// pointer and keeps it by name. The file's rows go in one transaction:
+    /// a reader sees the file as it was or whole, and a kill leaves no unit
+    /// with a content hash and part of its rows.
     async fn write_one(&self, path: String, bytes: Vec<u8>) -> Result<(), String> {
         // The bytes move into the blocking task, are parsed there and
         // dropped there.
@@ -677,9 +883,11 @@ impl IndexJob {
             let Some(row) = cache.get_source(name)? else {
                 return Ok(());
             };
+            let tx = cache.connection().unchecked_transaction()?;
             crate::scan::write_remote_unit(cache, row.id, &path, &bytes)
-                .map(|_| ())
-                .map_err(|e| tephra_cache::CacheError::Io(std::io::Error::other(e.to_string())))
+                .map_err(crate::scan::cache_error_of)?;
+            tx.commit()?;
+            Ok(())
         })
         .await
     }
@@ -710,7 +918,7 @@ impl IndexJob {
                 Err(e @ (RemoteError::Unreachable(_) | RemoteError::Server { .. })) => {
                     tries += 1;
                     if tries >= READ_TRIES {
-                        return Err(ReadStop::Failed(format!("could not read from GitHub: {e}")));
+                        return Err(ReadStop::Offline(crate::remote::poll::offline_reason(&e)));
                     }
                     tokio::time::sleep(Duration::from_millis(200 * u64::from(tries))).await;
                 }
@@ -757,16 +965,19 @@ enum ReadStop {
     /// The blob is no longer there.
     Gone,
     AuthRejected,
+    /// GitHub cannot be reached (a connect error, a timeout, a 5xx), with
+    /// the reason the source shows.
+    Offline(String),
     Failed(String),
     Shutdown,
 }
 
-fn is_lfs_pointer(bytes: &[u8]) -> bool {
+pub(crate) fn is_lfs_pointer(bytes: &[u8]) -> bool {
     bytes.len() <= LFS_POINTER_MAX_BYTES && bytes.starts_with(LFS_POINTER_PREFIX)
 }
 
 /// `HH:MM` (UTC) of a Unix time in seconds.
-fn hhmm_utc(secs: u64) -> String {
+pub(crate) fn hhmm_utc(secs: u64) -> String {
     let day = secs % 86_400;
     format!("{:02}:{:02} UTC", day / 3600, (day % 3600) / 60)
 }

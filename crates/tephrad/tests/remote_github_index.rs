@@ -399,3 +399,68 @@ fn a_rejected_token_mid_index_leaves_the_listing_and_says_auth_required() {
     assert_eq!(files, 4, "the listing stays");
     d.close();
 }
+
+/// Every file is written in one transaction: while the background index
+/// runs, a reader never sees a file missing from the listing, and never sees
+/// a file that has its content hash but not all its links.
+#[test]
+fn a_reader_during_the_index_never_sees_a_file_missing_or_half_written() {
+    const N: usize = 400;
+    const LINKS: i64 = 3;
+    let fake = Fake::start();
+    fake.gh.add_repo(REPO, "main");
+    let files: Vec<(String, Vec<u8>)> = (0..N)
+        .map(|i| {
+            (
+                format!("dir{}/file{i}.md", i % 20),
+                format!("# File {i}\n\nSee [[a{i}]], [[b{i}]] and [[c{i}]].\n").into_bytes(),
+            )
+        })
+        .collect();
+    fake.gh.put_files(
+        REPO,
+        "main",
+        files.iter().map(|(p, b)| (p.clone(), b.as_slice())),
+    );
+    let d = Daemon::start(&fake);
+    d.add_github("g", REPO);
+
+    let cache = Cache::open_read_only(&d.cache_path).expect("a reader");
+    let mut looks = 0u32;
+    let mut saw_half_done = false;
+    loop {
+        let (units, half_written, complete): (i64, i64, i64) = cache
+            .connection()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM units WHERE rel_path LIKE '%.md'), \
+                        (SELECT COUNT(*) FROM units u WHERE u.hash IS NOT NULL AND \
+                           (SELECT COUNT(*) FROM links l WHERE l.from_unit_id = u.id) != ?1), \
+                        (SELECT COALESCE(MAX(index_complete), 0) FROM remote_cursors)",
+                [LINKS],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(units, N as i64, "a file went missing from the listing");
+        assert_eq!(half_written, 0, "a file has its hash and not all its links");
+        let hashed: i64 = cache
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM units WHERE hash IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        saw_half_done |= hashed > 0 && hashed < N as i64;
+        looks += 1;
+        if complete == 1 {
+            break;
+        }
+        assert!(looks < 2_000_000, "the index did not finish");
+    }
+    assert!(
+        saw_half_done,
+        "the reader looked while the index was running"
+    );
+    d.wait_active("g");
+    d.close();
+}

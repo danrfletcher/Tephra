@@ -637,3 +637,100 @@ fn source_remove_of_a_promoted_name_still_lists_first_then_unregisters() {
     assert_eq!(received[1].body["method"], "source.unregister");
     assert_eq!(received[1].body["params"]["name"], "tephrad");
 }
+
+// ---- PR-6: a remote source the poller could not keep current -------------
+
+/// `{SYNC}` in an expected file stands for the machine's local reading of
+/// 1_700_000_000 (the fixture's last sync), so the golden text does not
+/// depend on the time zone.
+fn with_sync(expected: String) -> String {
+    expected.replace("{SYNC}", &tephractl::render::local_time(1_700_000_000))
+}
+
+fn list_remote_health(json: bool) -> (commands::CommandOutcome, MockServer) {
+    let server = MockServer::start(vec![Behavior::Respond {
+        status: 200,
+        body: load_fixture("source_list_remote_health"),
+    }]);
+    let client = client_for(&server);
+    let mut stdin: &[u8] = &[];
+    let outcome = commands::execute(&Command::SourceList, json, &client, &mut stdin);
+    (outcome, server)
+}
+
+#[test]
+fn source_list_shows_offline_syncing_auth_required_and_needs_attention_with_the_reason() {
+    let (outcome, server) = list_remote_health(false);
+    assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
+    assert_eq!(
+        outcome.stdout,
+        with_sync(load_expected("source_list_remote_health_rendered"))
+    );
+    assert_eq!(outcome.stderr, "");
+    assert_eq!(server.received()[0].body["method"], "source.list");
+}
+
+#[test]
+fn source_list_text_says_why_for_each_unhealthy_status() {
+    let (outcome, _server) = list_remote_health(false);
+    let text = outcome.stdout;
+    for (status, reason) in [
+        ("offline", "note: cannot reach GitHub (connection failed)"),
+        (
+            "syncing",
+            "note: rate limited by GitHub; polling resumes at 14:05 UTC",
+        ),
+        (
+            "auth_required",
+            "note: GitHub rejected the token: run `tephractl auth github`",
+        ),
+        (
+            "needs_attention",
+            "note: danrfletcher/old-name has moved to https://api.github.com/repositories/9",
+        ),
+    ] {
+        assert!(text.contains(status), "{status} in:\n{text}");
+        assert!(text.contains(reason), "{reason} in:\n{text}");
+    }
+    // The last sync of a source that has one, and `never` for one that has not.
+    assert!(text.contains(&format!(
+        "last sync {}",
+        tephractl::render::local_time(1_700_000_000)
+    )));
+    assert!(text.contains("last sync never"));
+    // Every line is clean: no trailing spaces, no control characters.
+    for line in text.lines() {
+        assert_eq!(line, line.trim_end(), "{line:?}");
+        assert!(!line.chars().any(char::is_control), "{line:?}");
+    }
+}
+
+#[test]
+fn source_list_json_is_the_daemons_answer_byte_for_byte_and_carries_no_token() {
+    let (outcome, _server) = list_remote_health(true);
+    assert_eq!(outcome.exit_code, 0);
+    assert_eq!(
+        outcome.stdout,
+        load_expected("source_list_remote_health_json")
+    );
+    // `client_for` dials with the token "test-token": it is on the wire, and
+    // nowhere in what the command prints.
+    for out in [&outcome.stdout, &outcome.stderr] {
+        assert!(!out.contains("test-token"), "{out}");
+        assert!(!out.contains("Bearer"), "{out}");
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&outcome.stdout).unwrap();
+    for row in parsed.as_array().unwrap() {
+        let keys: Vec<&str> = row
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert!(
+            keys.iter()
+                .all(|k| !k.to_ascii_lowercase().contains("token")),
+            "no token field: {keys:?}"
+        );
+    }
+}

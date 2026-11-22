@@ -150,7 +150,7 @@ impl Branch {
                 path.clone(),
                 TreeNode::Blob {
                     mode,
-                    sha: fake_sha(&[bytes]),
+                    sha: crate::github::git_blob_sha(bytes),
                     size: bytes.len(),
                 },
             ));
@@ -185,7 +185,7 @@ impl Branch {
         for (path, bytes) in &self.files {
             if path.starts_with(&prefix) {
                 parts.push(path.as_bytes().to_vec());
-                parts.push(fake_sha(&[bytes]).into_bytes());
+                parts.push(crate::github::git_blob_sha(bytes).into_bytes());
             }
         }
         for (path, sha) in &self.submodules {
@@ -202,7 +202,7 @@ impl Branch {
         let mut parts: Vec<Vec<u8>> = Vec::new();
         for (path, bytes) in &self.files {
             parts.push(path.as_bytes().to_vec());
-            parts.push(fake_sha(&[bytes]).into_bytes());
+            parts.push(crate::github::git_blob_sha(bytes).into_bytes());
             if let Some(mode) = self.modes.get(path) {
                 parts.push(mode.as_bytes().to_vec());
             }
@@ -412,9 +412,10 @@ impl FakeGithub {
         state.repos[full_name].branches[branch].head_sha()
     }
 
-    /// The blob sha the fake gives to this content.
+    /// The blob sha of this content: what `git hash-object` prints, and what the
+    /// fake gives the file in its trees.
     pub fn blob_sha(bytes: &[u8]) -> String {
-        fake_sha(&[bytes])
+        crate::github::git_blob_sha(bytes)
     }
 
     /// A repo the token cannot see: GitHub answers 404 for a private repo
@@ -623,7 +624,7 @@ async fn blob(
             .branches
             .values()
             .flat_map(|b| b.files.values())
-            .find(|bytes| fake_sha(&[bytes]) == sha);
+            .find(|bytes| crate::github::git_blob_sha(bytes) == sha);
         match found {
             Some(bytes) => Ok(etagged(&headers, "application/octet-stream", bytes.clone())),
             None => Err(not_found()),

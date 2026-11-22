@@ -150,7 +150,7 @@ fn source_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RemoteSourceRow> {
 const SOURCE_COLUMNS: &str =
     "name, kind, target, branch, cache, status, status_reason, created_at, last_sync_at";
 
-fn insert_unit_for_item(
+pub(crate) fn insert_unit_for_item(
     cache: &Cache,
     source_id: i64,
     item: &NewRemoteItem<'_>,
@@ -412,7 +412,12 @@ impl Cache {
         if have > 0 || items.is_empty() {
             return Ok(false);
         }
-        for item in &items {
+        // A file the remote deleted while its cached copy had edits is not
+        // in the index: it gets no unit back, and keeps its reason.
+        for item in items
+            .iter()
+            .filter(|i| !crate::remote_sync::is_kept_deleted(i))
+        {
             insert_unit_for_item(
                 self,
                 source_id,
@@ -426,8 +431,13 @@ impl Cache {
             )?;
         }
         self.connection().execute(
-            "UPDATE remote_items SET reason = NULL WHERE source = ?1",
-            [name],
+            "UPDATE remote_items SET reason = NULL WHERE source = ?1 \
+             AND (reason IS NULL OR reason NOT IN (?2, ?3))",
+            params![
+                name,
+                crate::remote_sync::REASON_DELETED_ON_REMOTE,
+                crate::remote_sync::REASON_READDED_AFTER_DELETE
+            ],
         )?;
         self.set_remote_index_complete(name, false, 0)?;
         self.set_remote_status(name, STATUS_INDEXING, None, None)?;

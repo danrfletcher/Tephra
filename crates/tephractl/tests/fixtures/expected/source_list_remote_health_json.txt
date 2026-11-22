@@ -1,0 +1,68 @@
+[
+  {
+    "last_scanned_at": 1700000000,
+    "name": "notes",
+    "path": "/home/dan/Notes",
+    "status": "active"
+  },
+  {
+    "branch": "main",
+    "cache": true,
+    "cache_bytes": 0,
+    "git_bytes": 0,
+    "index_done": 3,
+    "index_total": 3,
+    "kind": "github",
+    "last_scanned_at": 1700000000,
+    "name": "gh-offline",
+    "path": "github:danrfletcher/atlas",
+    "repo": "danrfletcher/atlas",
+    "status": "offline",
+    "status_reason": "cannot reach GitHub (connection failed)"
+  },
+  {
+    "branch": "main",
+    "cache": true,
+    "cache_bytes": 0,
+    "git_bytes": 0,
+    "index_done": 7,
+    "index_total": 7,
+    "kind": "github",
+    "last_scanned_at": 1700000000,
+    "name": "gh-limited",
+    "path": "github:danrfletcher/other",
+    "repo": "danrfletcher/other",
+    "status": "syncing",
+    "status_reason": "rate limited by GitHub; polling resumes at 14:05 UTC"
+  },
+  {
+    "branch": "main",
+    "cache": true,
+    "cache_bytes": 0,
+    "git_bytes": 0,
+    "index_done": 0,
+    "index_total": 0,
+    "kind": "github",
+    "last_scanned_at": null,
+    "name": "gh-signed-out",
+    "path": "github:danrfletcher/private",
+    "repo": "danrfletcher/private",
+    "status": "auth_required",
+    "status_reason": "GitHub rejected the token: run `tephractl auth github`"
+  },
+  {
+    "branch": "main",
+    "cache": true,
+    "cache_bytes": 0,
+    "git_bytes": 0,
+    "index_done": 2,
+    "index_total": 2,
+    "kind": "github",
+    "last_scanned_at": 1700000000,
+    "name": "gh-moved",
+    "path": "github:danrfletcher/old-name",
+    "repo": "danrfletcher/old-name",
+    "status": "needs_attention",
+    "status_reason": "danrfletcher/old-name has moved to https://api.github.com/repositories/9: add it under its new name; nothing was removed"
+  }
+]

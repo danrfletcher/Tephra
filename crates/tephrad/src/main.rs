@@ -601,8 +601,9 @@ fn run_server(
                 rescan_registry.start_all(|| *rescan_shutdown_rx.borrow())
             };
             let started_count = started.len();
-            // PR-5: remote sources answer from the cache; finish the first
-            // index of any that was cut short. No adapter call otherwise.
+            // PR-5: remote sources answer from the cache; index again from
+            // scratch any whose first index was cut short. No adapter call
+            // otherwise.
             if !*rescan_shutdown_rx.borrow() {
                 rescan_registry.resume_remote_sources();
             }

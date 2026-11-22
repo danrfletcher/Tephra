@@ -24,6 +24,7 @@ mod pending_fixes;
 mod promote;
 mod remote;
 mod remote_ops;
+mod remote_sync;
 mod schema;
 mod search;
 mod source_rename;
@@ -52,6 +53,11 @@ pub use remote_ops::{
     is_text_item_kind, remote_root, IndexProgress, NewRemoteItem, NewRemoteSource, RemoteCursor,
     RemoteItemRow, RemoteSourceRow, ITEM_KIND_SUBMODULE, ITEM_KIND_SYMLINK, REASON_LFS_POINTER,
     REMOTE_ROOT_PREFIX, STATUS_ACTIVE, STATUS_INDEXING,
+};
+pub use remote_sync::{
+    decode_cursor, encode_cursor, is_kept_deleted, PollState, ITEM_STATE_NEEDS_ATTENTION,
+    REASON_DELETED_ON_REMOTE, REASON_READDED_AFTER_DELETE, STATUS_AUTH_REQUIRED,
+    STATUS_NEEDS_ATTENTION, STATUS_OFFLINE, STATUS_SYNCING,
 };
 pub use schema::KindInferrer;
 pub use search::{compare_hits, file_stem, resolve_title, NameCandidate, NameHit, NAME_SEARCH_SQL};

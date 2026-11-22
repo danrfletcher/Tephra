@@ -1,0 +1,14 @@
+NAME                 STATUS          PATH
+notes                active          /home/dan/Notes
+gh-offline           offline         github:danrfletcher/atlas
+                     branch main, cache on, cached 0 bytes, .git 0 bytes, last sync {SYNC}
+                     note: cannot reach GitHub (connection failed)
+gh-limited           syncing         github:danrfletcher/other
+                     branch main, cache on, cached 0 bytes, .git 0 bytes, last sync {SYNC}
+                     note: rate limited by GitHub; polling resumes at 14:05 UTC
+gh-signed-out        auth_required   github:danrfletcher/private
+                     branch main, cache on, cached 0 bytes, .git 0 bytes, last sync never
+                     note: GitHub rejected the token: run `tephractl auth github`
+gh-moved             needs_attention github:danrfletcher/old-name
+                     branch main, cache on, cached 0 bytes, .git 0 bytes, last sync {SYNC}
+                     note: danrfletcher/old-name has moved to https://api.github.com/repositories/9: add it under its new name; nothing was removed
