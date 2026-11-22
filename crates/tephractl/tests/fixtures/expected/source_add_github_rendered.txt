@@ -1,0 +1,3 @@
+Registered GitHub source "github-atlas": danrfletcher/atlas @ main (commit 3fa2b1c)
+  4 files listed, all remote, 0 bytes cached; nothing is written to disk
+  indexing 3 text files in the background: see `tephractl source list`

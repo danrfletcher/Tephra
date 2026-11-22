@@ -28,6 +28,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 
@@ -172,6 +173,10 @@ pub(crate) struct Common<S> {
     pub auth: Mutex<AuthMode>,
     pub clock: Arc<dyn Clock>,
     pub flavor: Flavor<S>,
+    /// Error answers (status 400 and up) carry the request's
+    /// `Authorization` header in their body, like a careless server that
+    /// reflects what it was sent. Off by default.
+    pub echo_auth: AtomicBool,
 }
 
 impl<S> Common<S> {
@@ -182,6 +187,7 @@ impl<S> Common<S> {
             auth: Mutex::new(AuthMode::Any),
             clock,
             flavor,
+            echo_auth: AtomicBool::new(false),
         }
     }
 
@@ -215,10 +221,43 @@ fn epoch_secs(t: SystemTime) -> u64 {
         .unwrap_or(0)
 }
 
+/// [`control`], then (when [`Common::echo_auth`] is on) an error answer's
+/// body is replaced by one that reflects the request's `Authorization`
+/// header: the shape of a server that echoes what it was sent.
+async fn control<S: Send + Sync + 'static>(
+    State(common): State<Arc<Common<S>>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let sent = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let echo = common.echo_auth.load(Ordering::Relaxed);
+    let response = control_inner(State(common), request, next).await;
+    match (echo, sent) {
+        (true, Some(sent)) if response.status().as_u16() >= 400 => {
+            let (mut parts, _) = response.into_parts();
+            parts.headers.remove(header::CONTENT_LENGTH);
+            parts.headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            let body = serde_json::json!({
+                "message": "Error",
+                "debug_request_authorization": sent,
+            });
+            Response::from_parts(parts, Body::from(body.to_string()))
+        }
+        (_, _) => response,
+    }
+}
+
 /// The middleware every request passes through, in this order: log,
 /// latency, token check, scripted failure, scripted rate limit, the
 /// route, then (if scripted) a cut body.
-async fn control<S: Send + Sync + 'static>(
+async fn control_inner<S: Send + Sync + 'static>(
     State(common): State<Arc<Common<S>>>,
     request: Request,
     next: Next,
@@ -524,6 +563,16 @@ macro_rules! scripting_methods {
         /// body (what a broken proxy or a bug would send).
         pub fn empty_next_bodies(&self, n: u32) {
             self.common.script().empty_next = n;
+        }
+
+        /// Make every error answer (status 400 and up) carry the request's
+        /// `Authorization` header in its body, like a careless server
+        /// that reflects what it was sent. For tests that a token never
+        /// reaches an error message, a log or an answer.
+        pub fn echo_authorization_in_errors(&self, on: bool) {
+            self.common
+                .echo_auth
+                .store(on, ::std::sync::atomic::Ordering::Relaxed);
         }
 
         /// Cut the body of the next `n` successful responses halfway:

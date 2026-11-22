@@ -136,6 +136,7 @@ fn f2_f3_neither_trait_can_write_delete_move_rename_or_rewrite_history() {
             "get_file",
             "get_repo",
             "list_tree",
+            "list_tree_level",
             "poll_ref",
             "whoami"
         ]

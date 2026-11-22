@@ -21,7 +21,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tephrad::refactor::{AtomicFs, RealFs};
@@ -465,20 +465,31 @@ fn a_rename_with_nothing_to_rewrite_sends_no_fixes_entry_and_no_fixes_push() {
 fn an_ordinary_edit_push_is_byte_identical_to_the_old_shape() {
     let d = Daemon::start(&GP1_FILES, &[], real_writer(), false);
     let mut client = d.connect();
-    fs::write(
-        d.notes.root().join("Unrelated.md"),
-        "# Unrelated\n\nedited by Dan\n",
-    )
-    .unwrap();
-    let (push, text) = loop {
-        let (p, t) = client.next_push_text(WAIT).expect("a push for the edit");
-        if p["params"]["paths"].as_array().is_some_and(|a| {
-            a.iter()
-                .any(|x| x.as_str().is_some_and(|x| x.ends_with("/Unrelated.md")))
-        }) {
-            break (p, t);
+    // An event the OS watcher drops under load is not delivered again, so
+    // the edit is made again (new text each time) until its push arrives.
+    let mut found = None;
+    'rounds: for round in 1..=4 {
+        fs::write(
+            d.notes.root().join("Unrelated.md"),
+            format!("# Unrelated\n\nedited by Dan {round}\n"),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(6);
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let Some((p, t)) = client.next_push_text(left) else {
+                continue 'rounds;
+            };
+            if p["params"]["paths"].as_array().is_some_and(|a| {
+                a.iter()
+                    .any(|x| x.as_str().is_some_and(|x| x.ends_with("/Unrelated.md")))
+            }) {
+                found = Some((p, t));
+                break 'rounds;
+            }
         }
-    };
+    }
+    let (push, text) = found.expect("a push for the edit");
     let path = d.notes_root().join("Unrelated.md").display().to_string();
     let want = format!(
         "{{\"jsonrpc\":\"2.0\",\"method\":\"graph:changed\",\"params\":{{\"paths\":[{}],\"source\":\"notes\"}}}}",

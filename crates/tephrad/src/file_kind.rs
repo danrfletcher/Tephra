@@ -166,6 +166,34 @@ pub fn infer_kind_from_path(rel_path: &str) -> &'static str {
     .as_str()
 }
 
+/// Extensions of files that are binary whatever their bytes: images,
+/// archives, compiled code, audio, video, fonts, databases and the like.
+/// A remote file with one of these is listed by name and never read (the
+/// first index spends a read only where the answer is not known from the
+/// name). `pdf`, `docx` and `pptx` are not here: their text is indexed.
+const KNOWN_BINARY_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "webp", "ico", "bmp", "tif", "tiff", "heic", "psd", "zip", "gz",
+    "tgz", "bz2", "xz", "zst", "7z", "rar", "tar", "jar", "war", "class", "o", "a", "so", "dylib",
+    "dll", "exe", "bin", "mp3", "mp4", "m4a", "mov", "avi", "mkv", "wav", "flac", "ogg", "webm",
+    "woff", "woff2", "ttf", "otf", "eot", "pyc", "wasm", "sqlite", "db", "dmg", "iso", "xlsx",
+    "xls", "doc", "ppt", "odt", "ods", "odp", "keystore", "p12", "pfx", "lock",
+];
+
+/// The kind a file gets from its NAME alone, with no read: a known binary
+/// extension is `binary`, a document, prose or code extension is that
+/// kind, anything else (an unknown or missing extension) is `text-other`
+/// until the first index reads it once to classify it. Used for a remote
+/// listing, which has names and sizes but no bytes.
+pub fn kind_from_name(file_name: &str) -> FileKind {
+    match extension_of(file_name).as_deref() {
+        Some(e) if KNOWN_BINARY_EXTENSIONS.contains(&e) => FileKind::Binary,
+        Some(e) if DOCUMENT_EXTENSIONS.contains(&e) => FileKind::Document,
+        Some(e) if PROSE_EXTENSIONS.contains(&e) => FileKind::Prose,
+        Some(e) if Language::from_extension(e).is_some() => FileKind::Code,
+        _ => FileKind::TextOther,
+    }
+}
+
 /// The text check: no NUL byte, and valid UTF-8. When `truncated`, a
 /// multi-byte character cut off at the very end of the window is fine.
 fn is_text(window: &[u8], truncated: bool) -> bool {

@@ -1,0 +1,3 @@
+Registered GitHub source "empty-repo": danrfletcher/empty @ main (no commits yet)
+  0 files listed, all remote, 0 bytes cached; nothing is written to disk
+  no text files to index

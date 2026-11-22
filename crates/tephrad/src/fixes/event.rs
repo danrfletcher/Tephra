@@ -623,6 +623,8 @@ impl RenameEvents {
             .map_err(|e| RenameEventError::Failed(e.to_string()))?;
         let roots: Vec<(String, PathBuf)> = rows
             .iter()
+            // A remote source has no folder: its root is a marker.
+            .filter(|r| !r.is_remote())
             .map(|r| (r.name.clone(), PathBuf::from(&r.path)))
             .collect();
         let offline = |source: &str| {

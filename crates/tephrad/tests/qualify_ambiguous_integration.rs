@@ -522,7 +522,8 @@ fn no_rpc_method_was_added_for_the_key() {
     // F12: the method list is the PR-3 set (the full list is pinned in
     // `tests/unit/rpc_envelope.rs`); nothing here is named for the key.
     use tephrad::rpc::dispatch::METHOD_NAMES;
-    assert_eq!(METHOD_NAMES.len(), 18);
+    // 18 before atlas-27 PR-5 added `source.add_github`.
+    assert_eq!(METHOD_NAMES.len(), 19);
     assert!(METHOD_NAMES
         .iter()
         .all(|m| !m.contains("qualif") && !m.contains("config")));

@@ -64,8 +64,28 @@ fn limited(style: &GithubLimit, secs: u64, now: u64) -> Response {
     }
 }
 
+enum TreeNode {
+    Blob {
+        mode: String,
+        sha: String,
+        size: usize,
+    },
+    Dir {
+        sha: String,
+    },
+    Commit {
+        sha: String,
+    },
+}
+
 struct Branch {
     files: BTreeMap<String, Vec<u8>>,
+    /// A git file mode other than `100644` (a symlink is `120000`, an
+    /// executable `100755`), by path.
+    modes: BTreeMap<String, String>,
+    /// Submodule entries (mode `160000`, type `commit`): path to the
+    /// commit sha in the other repo. Nothing is ever served for them.
+    submodules: BTreeMap<String, String>,
     /// Counts commits, so every change gives a new head sha.
     commits: u64,
 }
@@ -78,20 +98,118 @@ struct Repo {
     hidden: bool,
     /// Every route is a 301 to this location.
     moved_to: Option<String>,
+    /// A repo with no commit: GitHub answers 409 to the tree and commit
+    /// routes, though the repo itself exists.
+    empty: bool,
 }
 
 struct State_ {
     login: String,
     next_id: u64,
     repos: BTreeMap<String, Repo>,
+    /// A recursive tree longer than this is cut and says `truncated`.
+    tree_limit: Option<usize>,
 }
 
 impl Branch {
+    fn new(commits: u64) -> Branch {
+        Branch {
+            files: BTreeMap::new(),
+            modes: BTreeMap::new(),
+            submodules: BTreeMap::new(),
+            commits,
+        }
+    }
+
+    /// Every entry below `dir` (`""` is the root): `(path from the root,
+    /// is a directory, mode, sha, size)`, directories included, in path
+    /// order.
+    fn entries_under(&self, dir: &str) -> Vec<(String, TreeNode)> {
+        let prefix = if dir.is_empty() {
+            String::new()
+        } else {
+            format!("{dir}/")
+        };
+        let mut dirs = BTreeSet::new();
+        let mut out: Vec<(String, TreeNode)> = Vec::new();
+        for (path, bytes) in &self.files {
+            let Some(rest) = path.strip_prefix(&prefix) else {
+                continue;
+            };
+            let mut at = 0;
+            while let Some(i) = rest[at..].find('/') {
+                dirs.insert(format!("{prefix}{}", &rest[..at + i]));
+                at += i + 1;
+            }
+            let mode = self
+                .modes
+                .get(path)
+                .cloned()
+                .unwrap_or_else(|| "100644".to_string());
+            out.push((
+                path.clone(),
+                TreeNode::Blob {
+                    mode,
+                    sha: fake_sha(&[bytes]),
+                    size: bytes.len(),
+                },
+            ));
+        }
+        for (path, sha) in &self.submodules {
+            let Some(rest) = path.strip_prefix(&prefix) else {
+                continue;
+            };
+            let mut at = 0;
+            while let Some(i) = rest[at..].find('/') {
+                dirs.insert(format!("{prefix}{}", &rest[..at + i]));
+                at += i + 1;
+            }
+            out.push((path.clone(), TreeNode::Commit { sha: sha.clone() }));
+        }
+        for d in dirs {
+            let sha = self.dir_sha(&d);
+            out.push((d, TreeNode::Dir { sha }));
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// The sha of the directory `dir` (`""` is the root tree), over
+    /// everything below it.
+    fn dir_sha(&self, dir: &str) -> String {
+        if dir.is_empty() {
+            return self.tree_sha();
+        }
+        let mut parts: Vec<Vec<u8>> = vec![b"tree".to_vec(), dir.as_bytes().to_vec()];
+        let prefix = format!("{dir}/");
+        for (path, bytes) in &self.files {
+            if path.starts_with(&prefix) {
+                parts.push(path.as_bytes().to_vec());
+                parts.push(fake_sha(&[bytes]).into_bytes());
+            }
+        }
+        for (path, sha) in &self.submodules {
+            if path.starts_with(&prefix) {
+                parts.push(path.as_bytes().to_vec());
+                parts.push(sha.as_bytes().to_vec());
+            }
+        }
+        let refs: Vec<&[u8]> = parts.iter().map(|p| p.as_slice()).collect();
+        fake_sha(&refs)
+    }
+
     fn tree_sha(&self) -> String {
         let mut parts: Vec<Vec<u8>> = Vec::new();
         for (path, bytes) in &self.files {
             parts.push(path.as_bytes().to_vec());
             parts.push(fake_sha(&[bytes]).into_bytes());
+            if let Some(mode) = self.modes.get(path) {
+                parts.push(mode.as_bytes().to_vec());
+            }
+        }
+        for (path, sha) in &self.submodules {
+            parts.push(path.as_bytes().to_vec());
+            parts.push(sha.as_bytes().to_vec());
         }
         let refs: Vec<&[u8]> = parts.iter().map(|p| p.as_slice()).collect();
         fake_sha(&refs)
@@ -128,6 +246,7 @@ impl FakeGithub {
             login: "fake-user".to_string(),
             next_id: 1000,
             repos: BTreeMap::new(),
+            tree_limit: None,
         }));
         let common = Arc::new(Common::new(
             clock,
@@ -171,13 +290,7 @@ impl FakeGithub {
         let id = state.next_id;
         state.next_id += 1;
         let mut branches = BTreeMap::new();
-        branches.insert(
-            default_branch.to_string(),
-            Branch {
-                files: BTreeMap::new(),
-                commits: 1,
-            },
-        );
+        branches.insert(default_branch.to_string(), Branch::new(1));
         state.repos.insert(
             full_name.to_string(),
             Repo {
@@ -186,8 +299,62 @@ impl FakeGithub {
                 branches,
                 hidden: false,
                 moved_to: None,
+                empty: false,
             },
         );
+    }
+
+    /// Makes the repo one with no commit at all: the tree and commit
+    /// routes answer 409 ("Git Repository is empty."), as GitHub does.
+    pub fn set_empty(&self, full_name: &str, empty: bool) {
+        self.state()
+            .repos
+            .get_mut(full_name)
+            .expect("repo was added")
+            .empty = empty;
+    }
+
+    /// Cuts every recursive tree longer than `limit` entries and marks
+    /// it `truncated: true`, as GitHub does for a very large repo. A
+    /// non-recursive tree (one directory) is never cut.
+    pub fn set_tree_limit(&self, limit: Option<usize>) {
+        self.state().tree_limit = limit;
+    }
+
+    /// Writes a symlink (mode `120000`; the blob is the target path).
+    /// Returns the new head sha.
+    pub fn put_symlink(&self, full_name: &str, branch: &str, path: &str, target: &str) -> String {
+        let mut state = self.state();
+        let repo = state.repos.get_mut(full_name).expect("repo was added");
+        let b = repo
+            .branches
+            .entry(branch.to_string())
+            .or_insert_with(|| Branch::new(0));
+        b.files.insert(path.to_string(), target.as_bytes().to_vec());
+        b.modes.insert(path.to_string(), "120000".to_string());
+        b.commits += 1;
+        b.head_sha()
+    }
+
+    /// Writes a submodule entry (mode `160000`, type `commit`). Returns
+    /// the new head sha.
+    pub fn put_submodule(
+        &self,
+        full_name: &str,
+        branch: &str,
+        path: &str,
+        commit_sha: &str,
+    ) -> String {
+        let mut state = self.state();
+        let repo = state.repos.get_mut(full_name).expect("repo was added");
+        let b = repo
+            .branches
+            .entry(branch.to_string())
+            .or_insert_with(|| Branch::new(0));
+        b.submodules
+            .insert(path.to_string(), commit_sha.to_string());
+        b.commits += 1;
+        b.head_sha()
     }
 
     /// Writes a file on a branch (creating the branch if need be) as a
@@ -195,11 +362,36 @@ impl FakeGithub {
     pub fn put_file(&self, full_name: &str, branch: &str, path: &str, bytes: &[u8]) -> String {
         let mut state = self.state();
         let repo = state.repos.get_mut(full_name).expect("repo was added");
-        let b = repo.branches.entry(branch.to_string()).or_insert(Branch {
-            files: BTreeMap::new(),
-            commits: 0,
-        });
+        let b = repo
+            .branches
+            .entry(branch.to_string())
+            .or_insert_with(|| Branch::new(0));
         b.files.insert(path.to_string(), bytes.to_vec());
+        b.modes.remove(path);
+        b.commits += 1;
+        b.head_sha()
+    }
+
+    /// Writes many files as ONE commit (creating the branch if need be);
+    /// returns the new head sha. `put_file` hashes the whole tree for its
+    /// return value, so building a repo of thousands of files with it is
+    /// quadratic: use this for a big fixture.
+    pub fn put_files<'a>(
+        &self,
+        full_name: &str,
+        branch: &str,
+        files: impl IntoIterator<Item = (String, &'a [u8])>,
+    ) -> String {
+        let mut state = self.state();
+        let repo = state.repos.get_mut(full_name).expect("repo was added");
+        let b = repo
+            .branches
+            .entry(branch.to_string())
+            .or_insert_with(|| Branch::new(0));
+        for (path, bytes) in files {
+            b.modes.remove(&path);
+            b.files.insert(path, bytes.to_vec());
+        }
         b.commits += 1;
         b.head_sha()
     }
@@ -332,42 +524,87 @@ async fn repo_info(
     }))
 }
 
+/// The branch and directory a `/git/trees/{ref}` names: a branch, `HEAD`
+/// or a head sha is that branch's root; a directory's tree sha is that
+/// directory of the branch that has it.
+fn resolve_tree<'a>(repo: &'a Repo, git_ref: &str) -> Option<(&'a Branch, String)> {
+    if let Some(b) = resolve(repo, git_ref) {
+        return Some((b, String::new()));
+    }
+    for b in repo.branches.values() {
+        if b.tree_sha() == git_ref {
+            return Some((b, String::new()));
+        }
+        for (path, node) in b.entries_under("") {
+            if let TreeNode::Dir { sha } = node {
+                if sha == git_ref {
+                    return Some((b, path));
+                }
+            }
+        }
+    }
+    None
+}
+
 async fn tree(
     State(shared): State<Shared>,
     Path((owner, repo, git_ref)): Path<(String, String, String)>,
+    Query(query): Query<BTreeMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
+    let limit = shared
+        .0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .tree_limit;
+    let recursive = query.contains_key("recursive");
     unwrap(with_repo(&shared, &owner, &repo, |r| {
-        let Some(branch) = resolve(r, &git_ref) else {
+        if r.empty {
+            return Err(Box::new(json_response(
+                409,
+                &json!({ "message": "Git Repository is empty." }),
+            )));
+        }
+        let Some((branch, dir)) = resolve_tree(r, &git_ref) else {
             return Err(not_found());
         };
-        let mut dirs = BTreeSet::new();
-        for path in branch.files.keys() {
-            let mut at = 0;
-            while let Some(i) = path[at..].find('/') {
-                dirs.insert(path[..at + i].to_string());
-                at += i + 1;
-            }
-        }
+        let strip = if dir.is_empty() {
+            String::new()
+        } else {
+            format!("{dir}/")
+        };
         let mut entries = Vec::new();
-        for dir in &dirs {
-            entries.push(json!({
-                "path": dir, "mode": "040000", "type": "tree",
-                "sha": fake_sha(&[b"tree", dir.as_bytes()]),
-            }));
-        }
-        for (path, bytes) in &branch.files {
-            entries.push(json!({
-                "path": path, "mode": "100644", "type": "blob",
-                "sha": fake_sha(&[bytes]), "size": bytes.len(),
-            }));
+        for (path, node) in branch.entries_under(&dir) {
+            let rel = path.strip_prefix(&strip).unwrap_or(&path).to_string();
+            if !recursive && rel.contains('/') {
+                continue;
+            }
+            entries.push(match node {
+                TreeNode::Blob { mode, sha, size } => {
+                    json!({ "path": rel, "mode": mode, "type": "blob", "sha": sha, "size": size })
+                }
+                TreeNode::Dir { sha } => {
+                    json!({ "path": rel, "mode": "040000", "type": "tree", "sha": sha })
+                }
+                TreeNode::Commit { sha } => {
+                    json!({ "path": rel, "mode": "160000", "type": "commit", "sha": sha })
+                }
+            });
         }
         entries.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
-        let body = json!({
-            "sha": branch.tree_sha(),
-            "tree": entries,
-            "truncated": false,
-        });
+        let mut truncated = false;
+        if let Some(limit) = limit.filter(|_| recursive) {
+            if entries.len() > limit {
+                entries.truncate(limit);
+                truncated = true;
+            }
+        }
+        let sha = if dir.is_empty() {
+            branch.tree_sha()
+        } else {
+            branch.dir_sha(&dir)
+        };
+        let body = json!({ "sha": sha, "tree": entries, "truncated": truncated });
         Ok(etagged(
             &headers,
             "application/json",
@@ -422,6 +659,12 @@ async fn commit(
     headers: HeaderMap,
 ) -> Response {
     unwrap(with_repo(&shared, &owner, &repo, |r| {
+        if r.empty {
+            return Err(Box::new(json_response(
+                409,
+                &json!({ "message": "Git Repository is empty." }),
+            )));
+        }
         let Some(branch) = resolve(r, &git_ref) else {
             return Err(not_found());
         };

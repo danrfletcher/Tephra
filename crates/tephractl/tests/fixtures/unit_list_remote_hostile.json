@@ -1,0 +1,23 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "source": "github-atlas",
+    "folder": "",
+    "recursive": false,
+    "offline": false,
+    "needs_rescan": false,
+    "entries": [
+      {
+        "id": "@github-atlas:evil\u001b[31m\nname‮txt.md",
+        "kind": "text-other",
+        "name": "evil\u001b[31m\nname‮txt.md",
+        "rel_path": "evil\u001b[31m\nname‮txt.md",
+        "size": 3,
+        "mtime": null,
+        "cache_bytes": 0,
+        "state": "remote"
+      }
+    ]
+  }
+}

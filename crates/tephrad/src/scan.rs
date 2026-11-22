@@ -858,6 +858,115 @@ fn write_unit(
     Ok(Some(stats))
 }
 
+/// Writes the unit of one REMOTE file from the `bytes` the first index read
+/// through the API: the same kind rules and the same parsers as
+/// [`write_unit`] (links, tags, blocks, headings, symbols, the `^^` rows,
+/// a document's text layer), with nothing read from a disk. The bytes are
+/// the caller's and are dropped by it; only the rows and the content hash
+/// are kept. `rel_path` is the path in the repository.
+///
+/// The kind comes from the name and the first bytes, as for a local file,
+/// so a file the listing could only call `text-other` by its name becomes
+/// `code`, or `binary` (NUL bytes, not UTF-8), here. A file whose bytes are
+/// not valid text is kept by name as `binary`. Writes no file anywhere and
+/// edits nothing: there is no duplicate-ID rename for a file that cannot be
+/// written to (F2).
+pub(crate) fn write_remote_unit(
+    cache: &Cache,
+    source_id: i64,
+    rel_path: &str,
+    bytes: &[u8],
+) -> Result<ScanStats, ScanError> {
+    let file_name = rel_path.rsplit('/').next().unwrap_or(rel_path);
+    let abs_path = Path::new(rel_path);
+    let size = bytes.len() as u64;
+    let head = &bytes[..bytes.len().min(file_kind::SNIFF_BYTES + 1)];
+    let mut kind = file_kind::classify(file_name, head);
+    let mut stamp = ContentStamp::default();
+    stamp.set_hash(bytes);
+
+    let mut parsed = None;
+    let mut parsed_doc = None;
+    let mut index_rows: Vec<IndexRow> = Vec::new();
+    match kind {
+        FileKind::Document => parsed_doc = parse_document(abs_path, bytes),
+        FileKind::Prose | FileKind::Code => {
+            match parse_file(kind, abs_path, file_name, head, bytes) {
+                Ok(Some((unit, rows))) => {
+                    parsed = Some(unit);
+                    index_rows = rows;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(path = %rel_path, error = %e, kind = kind.as_str(), "remote file is not valid UTF-8; indexed by name only as binary");
+                    kind = FileKind::Binary;
+                }
+            }
+        }
+        FileKind::TextOther => {
+            if let Some(text) = text_of(bytes) {
+                index_rows = tephra_parser::text_other_rows(&text);
+            }
+        }
+        FileKind::Binary => {}
+    }
+
+    delete_existing_unit(cache, source_id, rel_path)?;
+    let mut stats = ScanStats {
+        files_seen: 0,
+        files_ignored: 0,
+        units_written: 1,
+        links_written: 0,
+        tags_written: 0,
+        blocks_written: 0,
+    };
+    if let Some(doc) = &parsed_doc {
+        return write_document(cache, source_id, rel_path, None, size, &stamp, doc, stats);
+    }
+    let Some(parsed) = parsed else {
+        let unit_id = cache.insert_unit(&NewUnit {
+            source_id,
+            rel_path,
+            mtime: None,
+            frontmatter_json: None,
+            kind: kind.as_str(),
+            size: Some(size as i64),
+            too_large: false,
+            hash: stamp.hash.as_deref(),
+            inode: None,
+            device: None,
+        })?;
+        insert_index_rows(cache, unit_id, &index_rows)?;
+        return Ok(stats);
+    };
+    let mut new_unit = parsed.to_new_unit(source_id, rel_path, None);
+    new_unit.kind = kind.as_str();
+    new_unit.size = Some(size as i64);
+    stamp.apply(&mut new_unit);
+    let unit_id = cache.insert_unit(&new_unit)?;
+    for link in parsed.to_new_links(unit_id) {
+        cache.insert_link(&link)?;
+        stats.links_written += 1;
+    }
+    for tag in parsed.to_new_tags(unit_id) {
+        cache.insert_tag(&tag)?;
+        stats.tags_written += 1;
+    }
+    let mut symbol_ids = Vec::with_capacity(parsed.symbols.len());
+    for symbol in parsed.to_new_symbols(unit_id) {
+        symbol_ids.push(cache.insert_symbol(&symbol)?);
+    }
+    for block in parsed.to_new_blocks_with_symbols(unit_id, &symbol_ids) {
+        cache.insert_block(&block)?;
+        stats.blocks_written += 1;
+    }
+    for heading in parsed.to_new_headings(unit_id) {
+        cache.insert_heading(&heading)?;
+    }
+    insert_index_rows(cache, unit_id, &index_rows)?;
+    Ok(stats)
+}
+
 /// The text of a file's `bytes`: UTF-16 with a BOM decoded, else strict
 /// UTF-8. `None` when it is neither.
 fn text_of(bytes: &[u8]) -> Option<std::borrow::Cow<'_, str>> {

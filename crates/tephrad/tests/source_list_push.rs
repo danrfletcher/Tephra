@@ -269,6 +269,19 @@ impl Client {
     fn push(&mut self) -> Value {
         self.next_push(WAIT).expect("a push within the timeout")
     }
+
+    /// The next push that carries `sources_changed`. An ordinary push for
+    /// a path (the source's own watcher reporting a file the test wrote
+    /// just before the register, which macOS can deliver late) may come
+    /// first and is not what the caller waits for.
+    fn push_with_sources_changed(&mut self) -> Value {
+        loop {
+            let push = self.push();
+            if sources_changed(&push).is_some() {
+                return push;
+            }
+        }
+    }
 }
 
 /// The `sources_changed` list of a push, or `None` for an ordinary one.
@@ -304,7 +317,7 @@ fn register_then_unregister_over_rpc_send_one_push_each_and_a_requery_agrees_at_
 
     let reply = d.register("notes", &src);
     assert!(reply.get("error").is_none(), "{reply}");
-    let push = client.push();
+    let push = client.push_with_sources_changed();
     assert_eq!(push["params"]["sources_changed"], added("notes"), "{push}");
     // `source` and `paths` stay, `paths` empty (the whole-source form).
     assert_eq!(push["params"]["source"], json!("notes"));
@@ -326,7 +339,7 @@ fn register_then_unregister_over_rpc_send_one_push_each_and_a_requery_agrees_at_
 
     let reply = d.unregister("notes");
     assert!(reply.get("error").is_none(), "{reply}");
-    let push = client.push();
+    let push = client.push_with_sources_changed();
     assert_eq!(
         push["params"]["sources_changed"],
         removed("notes"),
@@ -338,7 +351,10 @@ fn register_then_unregister_over_rpc_send_one_push_each_and_a_requery_agrees_at_
     // Exactly one push each: the next one is the next call's.
     let reply = d.register("again", &src);
     assert!(reply.get("error").is_none(), "{reply}");
-    assert_eq!(client.push()["params"]["sources_changed"], added("again"));
+    assert_eq!(
+        client.push_with_sources_changed()["params"]["sources_changed"],
+        added("again")
+    );
     d.close();
 }
 
@@ -352,7 +368,7 @@ fn a_client_that_ignores_sources_changed_still_reads_source_and_paths() {
     let d = Daemon::start();
     let mut client = d.connect();
     d.register("notes", &notes());
-    let push = client.push();
+    let push = client.push_with_sources_changed();
     let old: Old = serde_json::from_value(push["params"].clone()).unwrap();
     assert_eq!(old.source, "notes");
     assert!(old.paths.is_empty());
@@ -370,7 +386,7 @@ fn the_forwarder_refreshes_the_graph_before_it_broadcasts_a_direct_register() {
     let registry = d.registry.clone();
     let root = src.root().to_path_buf();
     let worker = std::thread::spawn(move || registry.register("notes", root).map(|_| ()));
-    let push = client.push();
+    let push = client.push_with_sources_changed();
     worker.join().unwrap().expect("register");
     assert_eq!(push["params"]["sources_changed"], added("notes"));
     assert!(
@@ -381,7 +397,7 @@ fn the_forwarder_refreshes_the_graph_before_it_broadcasts_a_direct_register() {
 
     let registry = d.registry.clone();
     let worker = std::thread::spawn(move || registry.unregister("notes"));
-    let push = client.push();
+    let push = client.push_with_sources_changed();
     worker.join().unwrap().expect("unregister");
     assert_eq!(push["params"]["sources_changed"], removed("notes"));
     assert!(
@@ -431,7 +447,10 @@ fn a_failed_register_and_an_unknown_unregister_send_no_push() {
     let mut client = d.connect();
     let src = notes();
     assert!(d.register("notes", &src).get("error").is_none());
-    assert_eq!(client.push()["params"]["sources_changed"], added("notes"));
+    assert_eq!(
+        client.push_with_sources_changed()["params"]["sources_changed"],
+        added("notes")
+    );
 
     // Missing path, not a folder, duplicate name, duplicate root, nested
     // and ancestor roots: all refused.
@@ -458,7 +477,7 @@ fn a_failed_register_and_an_unknown_unregister_send_no_push() {
 
     // The first push after all that is the next real change's.
     assert!(d.register("sentinel", &other).get("error").is_none());
-    let push = client.push();
+    let push = client.push_with_sources_changed();
     assert_eq!(
         push["params"]["sources_changed"],
         added("sentinel"),
@@ -481,7 +500,7 @@ fn a_register_that_rolls_back_sends_no_added_push() {
 
     assert!(d.register("sentinel", &notes()).get("error").is_none());
     assert_eq!(
-        client.push()["params"]["sources_changed"],
+        client.push_with_sources_changed()["params"]["sources_changed"],
         added("sentinel")
     );
     d.close();
@@ -495,8 +514,8 @@ fn add_then_remove_with_no_read_between_sends_two_pushes_in_that_order() {
     assert!(d.register("notes", &src).get("error").is_none());
     assert!(d.unregister("notes").get("error").is_none());
 
-    let first = client.push();
-    let second = client.push();
+    let first = client.push_with_sources_changed();
+    let second = client.push_with_sources_changed();
     assert_eq!(
         first["params"]["sources_changed"],
         added("notes"),
@@ -563,7 +582,7 @@ fn two_concurrent_registers_send_two_pushes_and_both_sources_resolve() {
 
     let mut names: Vec<String> = (0..2)
         .map(|_| {
-            let push = client.push();
+            let push = client.push_with_sources_changed();
             let list = push["params"]["sources_changed"]
                 .as_array()
                 .unwrap()

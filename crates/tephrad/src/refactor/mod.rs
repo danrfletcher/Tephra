@@ -1300,6 +1300,16 @@ struct StoredPreview {
 pub const DOCUMENT_READ_ONLY: &str =
     "read-only document: links inside a docx, pptx or pdf are never rewritten";
 
+/// Why a referring file of a remote source is left out of a refactor: a
+/// remote file is never written (F2), so a link inside one stays as it is.
+pub const REMOTE_READ_ONLY: &str =
+    "remote file: it is never edited, so a link inside it is not rewritten";
+
+/// Whether a source row's `path` is a remote source's marker, not a folder.
+fn is_remote_root(root: &str) -> bool {
+    root.starts_with(tephra_cache::REMOTE_ROOT_PREFIX)
+}
+
 /// One referring file [`RefactorEngine::preview`] could not read or
 /// stat, and therefore could not scan for incoming links at all.
 ///
@@ -1378,21 +1388,39 @@ impl RefactorEngine {
             .sources
             .list()?
             .into_iter()
-            .map(|r| (r.name, r.path))
+            // A remote source's wire path is a display string, not a
+            // folder: give it the marker root so no path is made from it.
+            .map(|r| {
+                let root = if r.remote.is_some() {
+                    format!("{}{}", tephra_cache::REMOTE_ROOT_PREFIX, r.name)
+                } else {
+                    r.path
+                };
+                (r.name, root)
+            })
             .collect())
     }
 
     fn require_source(&self, roots: &HashMap<String, String>, source: &str) -> Result<(), String> {
-        if roots.contains_key(source) {
-            Ok(())
-        } else {
-            Err(format!("no source named '{source}' is registered"))
+        match roots.get(source) {
+            None => Err(format!("no source named '{source}' is registered")),
+            // F2: a remote file is never written, moved or renamed.
+            Some(root) if is_remote_root(root) => Err(format!(
+                "source '{source}' is a remote source: its files are never written or renamed"
+            )),
+            Some(_) => Ok(()),
         }
     }
 
+    /// The file on disk behind a unit id. `None` for an unregistered source
+    /// and for a remote one: a remote source has no folder (its root is a
+    /// marker, not a path), and a remote file is never written (F2).
     fn resolve_abs_path(&self, id: &str, roots: &HashMap<String, String>) -> Option<PathBuf> {
         let (source, rel_path) = split_federated_id(id)?;
         let root = roots.get(source)?;
+        if is_remote_root(root) {
+            return None;
+        }
         Some(Path::new(root).join(rel_path))
     }
 
@@ -1424,6 +1452,18 @@ impl RefactorEngine {
                     continue;
                 }
                 let Some(abs) = self.resolve_abs_path(&edge.from, &roots) else {
+                    // A link inside a remote file is not rewritten (F2):
+                    // the file is reported as skipped, once.
+                    if split_federated_id(&edge.from)
+                        .and_then(|(s, _)| roots.get(s))
+                        .is_some_and(|r| is_remote_root(r))
+                        && !skipped.iter().any(|s: &SkippedFile| s.file == edge.from)
+                    {
+                        skipped.push(SkippedFile {
+                            file: edge.from.clone(),
+                            error: REMOTE_READ_ONLY.to_string(),
+                        });
+                    }
                     continue;
                 };
                 // G5/F4: a docx, pptx or PDF is read-only. A link inside
@@ -2874,6 +2914,7 @@ mod tests {
                 path: self.path.clone(),
                 status: "active".to_string(),
                 last_scanned_at: None,
+                remote: None,
             }])
         }
         fn rescan(&self, _name: &str) -> Result<ScanStatsWire, String> {

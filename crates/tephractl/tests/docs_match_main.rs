@@ -49,8 +49,9 @@ fn subcommands() -> Vec<Vec<String>> {
 }
 
 #[test]
-fn the_dispatch_closed_list_is_eighteen_and_every_method_is_in_architecture() {
-    assert_eq!(METHOD_NAMES.len(), 18);
+fn the_dispatch_closed_list_is_nineteen_and_every_method_is_in_architecture() {
+    // 18 before `source.add_github` (atlas-27 PR-5).
+    assert_eq!(METHOD_NAMES.len(), 19);
     let architecture = doc("docs/ARCHITECTURE.md");
     for method in METHOD_NAMES {
         assert!(

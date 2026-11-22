@@ -163,6 +163,15 @@ pub trait GithubAdapter: Send + Sync {
         git_ref: &'a str,
     ) -> BoxFut<'a, RemoteResult<Tree>>;
 
+    /// The direct entries of one tree (`tree_sha`, or a ref), not the
+    /// whole subtree: one request. What finishes a recursive listing
+    /// GitHub cut short (`Tree::truncated`), see [`full_tree`].
+    fn list_tree_level<'a>(
+        &'a self,
+        repo: &'a RepoRef,
+        tree_sha: &'a str,
+    ) -> BoxFut<'a, RemoteResult<Tree>>;
+
     /// The bytes of the blob with this sha.
     fn get_blob<'a>(&'a self, repo: &'a RepoRef, sha: &'a str)
         -> BoxFut<'a, RemoteResult<Vec<u8>>>;
@@ -285,6 +294,100 @@ fn is_hex_sha(s: &str) -> bool {
     (4..=64).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+impl GithubClient {
+    /// `/git/trees/<git_ref>`, whole (`recursive`) or one level.
+    async fn tree(&self, repo: &RepoRef, git_ref: &str, recursive: bool) -> RemoteResult<Tree> {
+        let path = format!("{}/git/trees/{}", repo.path(), ref_path(git_ref)?);
+        let reply = self
+            .core
+            .get(Request {
+                path,
+                query: if recursive {
+                    vec![("recursive", "1".to_string())]
+                } else {
+                    Vec::new()
+                },
+                accept: Some(JSON),
+                ..Request::default()
+            })
+            .await?;
+        let wire: TreeWire =
+            serde_json::from_slice(&reply.body).map_err(|_| RemoteError::BadResponse("tree"))?;
+        let entries = wire
+            .tree
+            .into_iter()
+            .map(|e| {
+                let kind = match e.kind.as_str() {
+                    "blob" => TreeEntryKind::Blob,
+                    "tree" => TreeEntryKind::Tree,
+                    "commit" => TreeEntryKind::Commit,
+                    _ => return Err(RemoteError::BadResponse("tree entry type")),
+                };
+                Ok(TreeEntry {
+                    path: e.path,
+                    mode: e.mode,
+                    kind,
+                    sha: e.sha,
+                    size: e.size,
+                })
+            })
+            .collect::<RemoteResult<Vec<_>>>()?;
+        Ok(Tree {
+            sha: wire.sha,
+            entries,
+            truncated: wire.truncated,
+        })
+    }
+}
+
+/// The whole tree of `git_ref` with no entry lost, even when GitHub cuts
+/// the recursive listing short (`truncated`): the cut listing is dropped
+/// and the tree is walked one level at a time, each directory by its own
+/// sha, recursively again below a directory whose own listing is cut. Each
+/// path is listed once. The result is never `truncated`. A repo with no
+/// commit answers `Unexpected { status: 409 }`, which is passed on.
+pub async fn full_tree(
+    adapter: &dyn GithubAdapter,
+    repo: &RepoRef,
+    git_ref: &str,
+) -> RemoteResult<Tree> {
+    let first = adapter.list_tree(repo, git_ref).await?;
+    if !first.truncated {
+        return Ok(first);
+    }
+    let root = adapter.list_tree_level(repo, git_ref).await?;
+    let mut entries: std::collections::BTreeMap<String, TreeEntry> =
+        std::collections::BTreeMap::new();
+    // (directory path, directory tree sha), still to list.
+    let mut pending: Vec<(String, String)> = Vec::new();
+    for e in root.entries {
+        if e.kind == TreeEntryKind::Tree {
+            pending.push((e.path.clone(), e.sha.clone()));
+        }
+        entries.insert(e.path.clone(), e);
+    }
+    while let Some((dir, sha)) = pending.pop() {
+        let sub = adapter.list_tree(repo, &sha).await?;
+        let (listing, cut) = if sub.truncated {
+            (adapter.list_tree_level(repo, &sha).await?, true)
+        } else {
+            (sub, false)
+        };
+        for e in listing.entries {
+            let path = format!("{dir}/{}", e.path);
+            if cut && e.kind == TreeEntryKind::Tree {
+                pending.push((path.clone(), e.sha.clone()));
+            }
+            entries.insert(path.clone(), TreeEntry { path, ..e });
+        }
+    }
+    Ok(Tree {
+        sha: root.sha,
+        entries: entries.into_values().collect(),
+        truncated: false,
+    })
+}
+
 impl GithubAdapter for GithubClient {
     fn whoami(&self) -> BoxFut<'_, RemoteResult<GithubUser>> {
         Box::pin(self.json("/user".to_string(), "user"))
@@ -299,44 +402,15 @@ impl GithubAdapter for GithubClient {
         repo: &'a RepoRef,
         git_ref: &'a str,
     ) -> BoxFut<'a, RemoteResult<Tree>> {
-        Box::pin(async move {
-            let path = format!("{}/git/trees/{}", repo.path(), ref_path(git_ref)?);
-            let reply = self
-                .core
-                .get(Request {
-                    path,
-                    query: vec![("recursive", "1".to_string())],
-                    accept: Some(JSON),
-                    ..Request::default()
-                })
-                .await?;
-            let wire: TreeWire = serde_json::from_slice(&reply.body)
-                .map_err(|_| RemoteError::BadResponse("tree"))?;
-            let entries = wire
-                .tree
-                .into_iter()
-                .map(|e| {
-                    let kind = match e.kind.as_str() {
-                        "blob" => TreeEntryKind::Blob,
-                        "tree" => TreeEntryKind::Tree,
-                        "commit" => TreeEntryKind::Commit,
-                        _ => return Err(RemoteError::BadResponse("tree entry type")),
-                    };
-                    Ok(TreeEntry {
-                        path: e.path,
-                        mode: e.mode,
-                        kind,
-                        sha: e.sha,
-                        size: e.size,
-                    })
-                })
-                .collect::<RemoteResult<Vec<_>>>()?;
-            Ok(Tree {
-                sha: wire.sha,
-                entries,
-                truncated: wire.truncated,
-            })
-        })
+        Box::pin(self.tree(repo, git_ref, true))
+    }
+
+    fn list_tree_level<'a>(
+        &'a self,
+        repo: &'a RepoRef,
+        tree_sha: &'a str,
+    ) -> BoxFut<'a, RemoteResult<Tree>> {
+        Box::pin(self.tree(repo, tree_sha, false))
     }
 
     fn get_blob<'a>(

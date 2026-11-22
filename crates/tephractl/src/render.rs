@@ -74,6 +74,9 @@ pub fn render_unit_list_with(result: &Value, format_time: &dyn Fn(i64) -> String
 
     let base_depth = path_depth(str_field(result, "folder"));
     let recursive = bool_field(result, "recursive");
+    // A remote source's entries carry `state` and `cache_bytes`; a local
+    // listing has neither and keeps its layout byte for byte.
+    let remote = entries.iter().any(|e| e.get("state").is_some());
     for entry in entries {
         let kind = str_field(entry, "kind");
         let size = entry
@@ -94,6 +97,23 @@ pub fn render_unit_list_with(result: &Value, format_time: &dyn Fn(i64) -> String
             Some(t) if !t.is_empty() => format!("  # {}", printable(t)),
             _ => String::new(),
         };
+        if remote {
+            let state = entry.get("state").and_then(Value::as_str).unwrap_or("-");
+            let cached = entry
+                .get("cache_bytes")
+                .and_then(Value::as_u64)
+                .map_or_else(|| "-".to_string(), |n| n.to_string());
+            let reason = match entry.get("reason").and_then(Value::as_str) {
+                Some(r) => format!("  [{}]", printable(r)),
+                None => String::new(),
+            };
+            out.push_str(&format!(
+                "{kind:<10} {size:>10} {state:<8} {cached:>10} {modified:<16} {indent}{name}{title}{reason}\n",
+                state = printable(state),
+                indent = "  ".repeat(depth),
+            ));
+            continue;
+        }
         out.push_str(&format!(
             "{kind:<10} {size:>10} {modified:<16} {indent}{name}{title}\n",
             indent = "  ".repeat(depth),
@@ -318,8 +338,25 @@ fn path_depth(rel: &str) -> usize {
 /// `text` with every control character replaced by `?`.
 fn printable(text: &str) -> String {
     text.chars()
-        .map(|c| if c.is_control() { '?' } else { c })
+        .map(|c| {
+            if c.is_control() || is_bidi_format(c) {
+                '?'
+            } else {
+                c
+            }
+        })
         .collect()
+}
+
+/// Unicode direction controls (embeddings, overrides, isolates, marks): a
+/// file name holding one can make the line around it read in a different
+/// order than it is (a hostile name in a remote repo), so they are shown as
+/// `?` like control characters.
+fn is_bidi_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
 }
 
 /// A Unix timestamp as local `YYYY-MM-DD HH:MM`. Falls back to the UTC
@@ -474,8 +511,21 @@ pub fn error_means_not_found(message: &str) -> bool {
 /// Zero rows renders the "no sources registered"
 /// line the spec requires instead of an empty table.
 pub fn render_source_table(rows: &[Value]) -> String {
+    render_source_table_with(rows, &local_time)
+}
+
+/// [`render_source_table`] with the time formatter supplied (a GitHub
+/// source's last sync), so tests don't depend on the machine's time zone.
+///
+/// A list of local sources only is the table above, byte for byte. A source
+/// with a `kind` (GitHub) shows `indexing done/total` as its status, its
+/// `github:owner/repo` as the path and one detail line under it.
+pub fn render_source_table_with(rows: &[Value], format_time: &dyn Fn(i64) -> String) -> String {
     if rows.is_empty() {
         return "no sources registered\n".to_string();
+    }
+    if rows.iter().any(|row| row.get("kind").is_some()) {
+        return render_source_table_remote(rows, format_time);
     }
 
     // `permission_denied` (E13) is longer than the other statuses;
@@ -496,6 +546,103 @@ pub fn render_source_table(rows: &[Value]) -> String {
         };
         out.push_str(&format!(
             "{name:<20} {status:<status_width$} {path}{offline_marker}\n"
+        ));
+    }
+    out
+}
+
+fn remote_status(row: &Value) -> String {
+    let status = str_field(row, "status");
+    if status == "indexing" {
+        let done = row.get("index_done").and_then(Value::as_u64).unwrap_or(0);
+        let total = row.get("index_total").and_then(Value::as_u64).unwrap_or(0);
+        return format!("indexing {done}/{total}");
+    }
+    printable(status)
+}
+
+fn render_source_table_remote(rows: &[Value], format_time: &dyn Fn(i64) -> String) -> String {
+    let status_width = rows
+        .iter()
+        .map(|row| {
+            if row.get("kind").is_some() {
+                remote_status(row).chars().count()
+            } else {
+                str_field(row, "status").chars().count()
+            }
+        })
+        .fold(9, usize::max);
+    let mut out = format!("{:<20} {:<status_width$} PATH\n", "NAME", "STATUS");
+    for row in rows {
+        let name = printable(str_field(row, "name"));
+        let path = printable(str_field(row, "path"));
+        if row.get("kind").is_none() {
+            let status = str_field(row, "status");
+            let marker = if status == "offline" {
+                " (offline)"
+            } else {
+                ""
+            };
+            out.push_str(&format!(
+                "{name:<20} {status:<status_width$} {path}{marker}\n"
+            ));
+            continue;
+        }
+        let status = remote_status(row);
+        out.push_str(&format!("{name:<20} {status:<status_width$} {path}\n"));
+        let branch = row
+            .get("branch")
+            .and_then(Value::as_str)
+            .map_or_else(|| "-".to_string(), printable);
+        let cache = if bool_field(row, "cache") {
+            "on"
+        } else {
+            "off"
+        };
+        let bytes = |key: &str| row.get(key).and_then(Value::as_u64).unwrap_or(0);
+        let synced = row
+            .get("last_scanned_at")
+            .and_then(Value::as_i64)
+            .map_or_else(|| "never".to_string(), format_time);
+        out.push_str(&format!(
+            "{:<20} branch {branch}, cache {cache}, cached {} bytes, .git {} bytes, last sync {synced}\n",
+            "",
+            bytes("cache_bytes"),
+            bytes("git_bytes"),
+        ));
+        if let Some(reason) = row.get("status_reason").and_then(Value::as_str) {
+            out.push_str(&format!("{:<20} note: {}\n", "", printable(reason)));
+        }
+    }
+    out
+}
+
+/// `source add github` success: what was listed, at which commit, and that
+/// the text index carries on in the background.
+pub fn render_github_source_added(result: &Value) -> String {
+    let name = printable(str_field(result, "name"));
+    let repo = printable(str_field(result, "repo"));
+    let branch = printable(str_field(result, "branch"));
+    let commit: String = str_field(result, "commit").chars().take(7).collect();
+    let files = result.get("files").and_then(Value::as_u64).unwrap_or(0);
+    let total = result
+        .get("index_total")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let at = if commit.is_empty() {
+        "no commits yet".to_string()
+    } else {
+        format!("commit {commit}")
+    };
+    let mut out = format!("Registered GitHub source \"{name}\": {repo} @ {branch} ({at})\n");
+    out.push_str(&format!(
+        "  {files} files listed, all remote, 0 bytes cached; nothing is written to disk\n"
+    ));
+    if total == 0 {
+        out.push_str("  no text files to index\n");
+    } else {
+        out.push_str(&format!(
+            "  indexing {total} text files in the background: see `tephractl source list`\n"
         ));
     }
     out

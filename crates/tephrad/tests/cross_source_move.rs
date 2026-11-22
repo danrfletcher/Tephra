@@ -56,8 +56,20 @@ fn daemon() -> Daemon {
     Daemon::start(&notes(), &others(), fix_world::real_writer(), false)
 }
 
-/// `Ideas/Target.md` of notes goes to `docs/target.md` of other, on disk.
+/// `Ideas/Target.md` of notes goes to `docs/target.md` of other, on disk,
+/// with the real watchers held: a daemon without a rename fixer deletes
+/// the old file's rows as soon as its watcher sees the move (some 250 ms
+/// on), so on a loaded machine the test's own engine calls ran after
+/// that and found fewer links to rewrite. The watchers only queue what
+/// they see; the engine calls and the explicit rescans do the indexing.
 fn move_on_disk(d: &Daemon) {
+    d.registry.pause_all_watchers();
+    move_on_disk_to_the_watchers(d);
+}
+
+/// The same move with the watchers listening, for the tests of the
+/// watchers' own pairing.
+fn move_on_disk_to_the_watchers(d: &Daemon) {
     let to = d.other.root().join("docs/target.md");
     std::fs::create_dir_all(to.parent().unwrap()).unwrap();
     std::fs::rename(d.notes.root().join("Ideas/Target.md"), to).expect("move on disk");
@@ -221,7 +233,7 @@ fn the_real_watchers_pair_a_move_across_sources_after_the_hold() {
     let d = Daemon::start(&notes(), &others(), fix_world::real_writer(), true);
     d.registry
         .set_rename_hold(std::time::Duration::from_millis(300));
-    move_on_disk(&d);
+    move_on_disk_to_the_watchers(&d);
     let done = wait_until(WAIT, || !moves(&d).is_empty());
     if !done && !d.watcher_live {
         eprintln!("the OS watcher was deaf; nothing to check");
@@ -296,7 +308,7 @@ fn a_kill_between_the_rewrites_resumes_the_rest_and_leaves_one_entry_and_no_half
 
         // Restart: a new engine over the same cache finishes the work.
         let summary = fresh_engine(&d).resume().expect("resume");
-        assert_eq!(summary.written, 3 - n, "n={n}");
+        assert_eq!(summary.written, 3 - n, "n={n}: {:?}", d.entries());
         assert_eq!(fixed(&d), [true; 3], "n={n}");
         let m = moves(&d);
         assert_eq!(m.len(), 1, "n={n}: still one entry");
@@ -408,6 +420,7 @@ fn a_move_into_a_source_that_is_offline_is_refused_and_nothing_is_written() {
 
 /// `docs/target.md` of other goes back to `Ideas/Target.md` of notes.
 fn move_back_on_disk(d: &Daemon) {
+    d.registry.pause_all_watchers();
     let to = d.notes.root().join("Ideas/Target.md");
     fs::create_dir_all(to.parent().unwrap()).unwrap();
     fs::rename(d.other.root().join("docs/target.md"), to).expect("move back on disk");

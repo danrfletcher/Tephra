@@ -246,6 +246,30 @@ pub struct SourceRowWire {
     pub path: String,
     pub status: String,
     pub last_scanned_at: Option<i64>,
+    /// The remote half of a row: present for a remote source only, and left
+    /// out of the JSON for a local one, so a local row keeps its wire shape
+    /// byte for byte.
+    #[serde(flatten)]
+    pub remote: Option<RemoteRowWire>,
+}
+
+/// The extra fields of a remote `source.list` row. For a remote source
+/// `path` is `<kind>:<owner/repo>` (there is no folder), `status` is
+/// `indexing`, `active` or `auth_required`, and `last_scanned_at` is the
+/// last sync.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RemoteRowWire {
+    pub kind: String,
+    pub repo: String,
+    pub branch: Option<String>,
+    pub cache: bool,
+    pub cache_bytes: u64,
+    pub git_bytes: u64,
+    /// Text files read so far, and the text files to read.
+    pub index_done: usize,
+    pub index_total: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_reason: Option<String>,
 }
 
 impl From<SourceRow> for SourceRowWire {
@@ -255,6 +279,7 @@ impl From<SourceRow> for SourceRowWire {
             path: r.path,
             status: status_str(r.status).to_string(),
             last_scanned_at: r.last_scanned_at,
+            remote: None,
         }
     }
 }
@@ -266,6 +291,22 @@ impl From<SourceListing> for SourceRowWire {
         let status = l.status_str().to_string();
         let mut wire = SourceRowWire::from(l.row);
         wire.status = status;
+        if let Some(remote) = l.remote {
+            wire.path = format!("{}:{}", remote.kind, remote.repo);
+            wire.status = remote.status;
+            wire.last_scanned_at = remote.last_sync_at;
+            wire.remote = Some(RemoteRowWire {
+                kind: remote.kind,
+                repo: remote.repo,
+                branch: remote.branch,
+                cache: remote.cache,
+                cache_bytes: remote.cache_bytes,
+                git_bytes: remote.git_bytes,
+                index_done: remote.index_done,
+                index_total: remote.index_total,
+                status_reason: remote.status_reason,
+            });
+        }
         wire
     }
 }
@@ -298,6 +339,18 @@ pub trait SourceBackend: Send + Sync {
     fn unregister(&self, name: &str) -> Result<(), String>;
     fn list(&self) -> Result<Vec<SourceRowWire>, String>;
     fn rescan(&self, name: &str) -> Result<ScanStatsWire, String>;
+    /// `source.add_github` (PR-5): one repository on one branch. The
+    /// default refuses, so a test double needn't implement it.
+    fn register_github(
+        &self,
+        _name: &str,
+        _repo: &str,
+        _branch: Option<&str>,
+    ) -> Result<serde_json::Value, PromoteRpcError> {
+        Err(PromoteRpcError::Failed(
+            "source.add_github is not supported by this source backend".to_string(),
+        ))
+    }
     /// `unit.list` (G1): one folder of `source` (`folder` already
     /// normalized by the dispatcher; `""` is the root). The default
     /// refuses, so a test double that only exercises the other four
@@ -364,6 +417,26 @@ impl SourceBackend for SourceRegistry {
         SourceRegistry::register(self, name, root)
             .map(ScanStatsWire::from)
             .map_err(|e| match e {
+                RegistryError::Validation(v) => PromoteRpcError::Refused {
+                    reason: v.reason(),
+                    message: v.to_string(),
+                },
+                e => PromoteRpcError::Failed(e.to_string()),
+            })
+    }
+    fn register_github(
+        &self,
+        name: &str,
+        repo: &str,
+        branch: Option<&str>,
+    ) -> Result<serde_json::Value, PromoteRpcError> {
+        SourceRegistry::register_github(self, name, repo, branch)
+            .map(|added| serde_json::to_value(added).expect("RemoteAddWire always serializes"))
+            .map_err(|e| match e {
+                RegistryError::Remote(crate::remote_github::RemoteAddError::Refused {
+                    reason,
+                    message,
+                }) => PromoteRpcError::Refused { reason, message },
                 RegistryError::Validation(v) => PromoteRpcError::Refused {
                     reason: v.reason(),
                     message: v.to_string(),

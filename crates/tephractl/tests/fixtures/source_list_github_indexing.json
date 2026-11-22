@@ -1,0 +1,26 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": [
+    {
+      "name": "notes",
+      "path": "/home/dan/Notes",
+      "status": "active",
+      "last_scanned_at": 1700000000
+    },
+    {
+      "name": "github-atlas",
+      "path": "github:danrfletcher/atlas",
+      "status": "indexing",
+      "last_scanned_at": null,
+      "kind": "github",
+      "repo": "danrfletcher/atlas",
+      "branch": "main",
+      "cache": true,
+      "cache_bytes": 0,
+      "git_bytes": 0,
+      "index_done": 2,
+      "index_total": 3
+    }
+  ]
+}

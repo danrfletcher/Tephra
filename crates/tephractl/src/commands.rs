@@ -90,6 +90,9 @@ pub fn execute_with_prompt_writer<R: BufRead, W: Write>(
 ) -> CommandOutcome {
     match command {
         Command::SourceAdd { name, path } => source_add(name, path, json, client),
+        Command::SourceAddGithub { name, repo, branch } => {
+            source_add_github(name, repo, branch.as_deref(), json, client)
+        }
         Command::SourcePromote { name, path } => source_promote(name, path, json, client),
         Command::SourceUnpromote { name } => source_unpromote(name, json, client),
         Command::SourceRename { old, new } => source_rename(old, new, json, client),
@@ -173,6 +176,32 @@ fn source_add(name: &str, path: &str, json: bool, client: &RpcClient) -> Command
         Ok(stats) => CommandOutcome::ok(json_or(
             &stats,
             || render::render_source_added(name, path, &stats),
+            json,
+        )),
+        Err(e) => CommandOutcome::err(describe_error(&e)),
+    }
+}
+
+/// `source add github <name> <owner/repo> [--branch <b>]`: one
+/// `source.add_github` call. The daemon lists the repo's whole tree at one
+/// commit before it answers; the text index then runs in the background, so
+/// a refusal prints the daemon's plain reason and exits 1 with nothing
+/// registered.
+fn source_add_github(
+    name: &str,
+    repo: &str,
+    branch: Option<&str>,
+    json: bool,
+    client: &RpcClient,
+) -> CommandOutcome {
+    let mut params = json!({"name": name, "repo": repo});
+    if let Some(branch) = branch {
+        params["branch"] = json!(branch);
+    }
+    match client.call("source.add_github", params) {
+        Ok(result) => CommandOutcome::ok(json_or(
+            &result,
+            || render::render_github_source_added(&result),
             json,
         )),
         Err(e) => CommandOutcome::err(describe_error(&e)),

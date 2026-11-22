@@ -668,6 +668,8 @@ pub enum RegistryError {
     /// The link rewrites of a promote or an unpromote failed after it was
     /// recorded; what is left is finished at the next start.
     Fix(String),
+    /// A remote (GitHub) source call refused or failed.
+    Remote(crate::remote_github::RemoteAddError),
 }
 
 impl fmt::Display for RegistryError {
@@ -683,6 +685,7 @@ impl fmt::Display for RegistryError {
             RegistryError::Unpromote(e) => write!(f, "{e}"),
             RegistryError::Rename(e) => write!(f, "{e}"),
             RegistryError::Fix(m) => write!(f, "{m}"),
+            RegistryError::Remote(e) => write!(f, "{e}"),
         }
     }
 }
@@ -871,8 +874,8 @@ pub(crate) fn retry_cache_on_busy<T>(
 /// not hold that shared lock, and so cannot stall another source's
 /// `list`/`register`/`rescan` call or its own debounced watcher.
 pub struct SourceRegistry {
-    cache: Arc<Mutex<Cache>>,
-    cache_path: PathBuf,
+    pub(crate) cache: Arc<Mutex<Cache>>,
+    pub(crate) cache_path: PathBuf,
     /// The same fair writer gate (R18, see `crate::writer_gate`)
     /// every write against `cache_path`'s database file goes through
     /// — this registry's own quick writes below, and (via
@@ -882,10 +885,14 @@ pub struct SourceRegistry {
     /// time) purely so every call site shares one `Arc` without
     /// re-hashing the path on every write; `writer_gate::for_path`
     /// would return the exact same instance either way.
-    gate: Arc<WriterGate>,
-    runtime: tokio::runtime::Runtime,
+    pub(crate) gate: Arc<WriterGate>,
+    pub(crate) runtime: tokio::runtime::Runtime,
     running: Mutex<HashMap<String, RunningSource>>,
-    events_tx: tokio::sync::broadcast::Sender<DaemonEvent>,
+    pub(crate) events_tx: tokio::sync::broadcast::Sender<DaemonEvent>,
+    /// What a remote (GitHub) source needs: the credential store, the
+    /// adapter, the clock. Set once by the daemon; while unset a remote
+    /// source cannot be added and none is indexed.
+    pub(crate) remote: std::sync::OnceLock<Arc<crate::remote_github::RemoteHub>>,
     /// Sources whose root exists but the OS won't list (E13: macOS
     /// Full Disk Access not granted). A runtime status only: it is
     /// never written to the `sources` table (whose `status` CHECK
@@ -1004,6 +1011,9 @@ struct WritePause {
 pub struct SourceListing {
     pub row: SourceRow,
     pub permission_denied: bool,
+    /// Set for a remote source: its kind, repository, branch, progress and
+    /// cache sizes, all read from the cache.
+    pub remote: Option<crate::remote_github::RemoteListing>,
 }
 
 impl SourceListing {
@@ -1065,6 +1075,7 @@ impl SourceRegistry {
             runtime,
             running: Mutex::new(HashMap::new()),
             events_tx,
+            remote: std::sync::OnceLock::new(),
             permission_denied: Mutex::new(HashSet::new()),
             write_pause: Mutex::new(WritePause::default()),
             rename_fixer,
@@ -1528,6 +1539,7 @@ impl SourceRegistry {
         engine: &crate::fixes::FixEngine,
     ) -> Result<RenameOutcome, RegistryError> {
         let _one_at_a_time = self.promote_lock.lock().unwrap_or_else(|p| p.into_inner());
+        self.refuse_if_remote(name, "be renamed")?;
         let check = {
             let cache = self.cache.lock().unwrap();
             let rows = cache.list_sources()?;
@@ -2081,6 +2093,7 @@ impl SourceRegistry {
     /// really removed a registered source announces it (G16): one `removed`
     /// event, and none for an unknown name, since nothing changed.
     pub fn unregister(&self, name: &str) -> Result<(), RegistryError> {
+        self.refuse_if_remote(name, "be removed yet")?;
         if let Some(running) = self.running.lock().unwrap().remove(name) {
             running.handle.stop();
             // A batch already running for this source can no longer send
@@ -2135,14 +2148,30 @@ impl SourceRegistry {
     /// whether it is currently `permission_denied`.
     pub fn list_with_runtime_status(&self) -> Result<Vec<SourceListing>, RegistryError> {
         let rows = self.list()?;
+        let remotes: HashMap<String, crate::remote_github::RemoteListing> =
+            if rows.iter().any(|r| r.is_remote()) {
+                let cache = Cache::open_read_only(&self.cache_path)?;
+                cache
+                    .remote_sources()?
+                    .iter()
+                    .filter_map(|s| {
+                        self.remote_listing_of(&cache, s)
+                            .map(|l| (s.name.clone(), l))
+                    })
+                    .collect()
+            } else {
+                HashMap::new()
+            };
         let denied = self.permission_denied.lock().unwrap();
         Ok(rows
             .into_iter()
             .map(|row| {
                 let permission_denied = denied.contains(&row.name);
+                let remote = remotes.get(&row.name).cloned();
                 SourceListing {
                     row,
                     permission_denied,
+                    remote,
                 }
             })
             .collect())
@@ -2226,6 +2255,9 @@ impl SourceRegistry {
     pub fn refresh_access(&self) -> Result<Vec<String>, RegistryError> {
         let mut marked = Vec::new();
         for row in self.list()? {
+            if row.is_remote() {
+                continue;
+            }
             let probe = probe_path(Path::new(&row.path));
             if probe.is_permission_denied() {
                 if !self.is_permission_denied(&row.name) {
@@ -2311,6 +2343,10 @@ impl SourceRegistry {
 
         // 1. Which sources are online, and their OS watch.
         for row in rows {
+            // A remote source has no folder to watch, scan or catch up.
+            if row.is_remote() {
+                continue;
+            }
             if should_stop() {
                 outcomes.push((row.name, BootOutcome::Stopped));
                 continue;
@@ -2671,6 +2707,12 @@ impl SourceRegistry {
             let row = cache
                 .get_source(name)?
                 .ok_or_else(|| RegistryError::NotFound(name.to_string()))?;
+            if row.is_remote() {
+                // Nothing on disk to walk: a remote source's rows come from
+                // its listing and its first index, never from a rescan, and
+                // its `path` is a marker, not a folder that could go missing.
+                return Ok(ScanStats::default());
+            }
             (row.id, PathBuf::from(row.path), row.status)
         };
 
@@ -2786,6 +2828,10 @@ impl SourceRegistry {
         let Some(row) = cache.get_source(source)? else {
             return Ok(None);
         };
+        if row.is_remote() {
+            // Nothing is written into a remote file (F2): no id to ensure.
+            return Ok(None);
+        }
         let unit = cache.get_unit_by_rel_path(row.id, rel_path)?;
         Ok(Some(CachedUnit {
             source_id: row.id,
@@ -2927,6 +2973,23 @@ pub struct CachedUnit {
     /// The cached row for the file; `None` for a path that is no file of
     /// this source (or was never indexed).
     pub unit: Option<tephra_cache::UnitRow>,
+}
+
+impl SourceRegistry {
+    /// Refuses (`remote_source`) an action a remote source does not take
+    /// yet. `what` completes "a remote source cannot ...".
+    fn refuse_if_remote(&self, name: &str, what: &str) -> Result<(), RegistryError> {
+        let cache = self.cache.lock().unwrap();
+        if cache.get_source(name)?.is_some_and(|row| row.is_remote()) {
+            return Err(RegistryError::Remote(
+                crate::remote_github::RemoteAddError::Refused {
+                    reason: "remote_source",
+                    message: format!("\"{name}\" is a remote source and cannot {what}"),
+                },
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

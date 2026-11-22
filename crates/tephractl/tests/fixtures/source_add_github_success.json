@@ -1,0 +1,15 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "name": "github-atlas",
+    "kind": "github",
+    "repo": "danrfletcher/atlas",
+    "branch": "main",
+    "commit": "3fa2b1c9d0e4a5b6c7d8e9f00112233445566778",
+    "files": 4,
+    "status": "indexing",
+    "index_done": 0,
+    "index_total": 3
+  }
+}

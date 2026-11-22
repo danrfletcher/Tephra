@@ -35,6 +35,12 @@ use tephrad::rpc::backend::{FixBackend, FixService, SourceBackend};
 const WAIT: Duration = Duration::from_secs(20);
 /// What a test shortens the two-second hold to.
 const HOLD: Duration = Duration::from_millis(100);
+/// The hold of a test that needs the second source's facts in the pool
+/// before a hash pair is decided or given up. The sources are caught up
+/// one after the other, so the second one's files reach the pool some time
+/// after the first one's; on a loaded machine that took longer than
+/// [`HOLD`] and the first source's pair was decided without them.
+const CROSS_SOURCE_HOLD: Duration = Duration::from_secs(3);
 
 fn wait_until(timeout: Duration, mut check: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + timeout;
@@ -146,7 +152,13 @@ impl World {
     }
 
     fn boot(&self) -> Boot {
+        self.boot_holding(HOLD)
+    }
+
+    /// [`World::boot`] with the pool's hold set to `hold`.
+    fn boot_holding(&self, hold: Duration) -> Boot {
         let (registry, engine) = self.registry();
+        registry.set_rename_hold(hold);
         let outcomes = registry.start_all(|| false);
         Boot {
             registry,
@@ -162,6 +174,20 @@ impl World {
             .get_unit_by_rel_path(s.id, rel)
             .unwrap()
             .and_then(|u| u.hash)
+    }
+
+    /// Whether the cache's hash of `rel` in `source` is the hash of the
+    /// file on disk now.
+    fn cached_as_on_disk(&self, source: &str, rel: &str) -> bool {
+        let root = if source == "notes" {
+            self.notes.root()
+        } else {
+            self.tephra.root()
+        };
+        match hash_file(&root.join(rel)) {
+            Ok(Some(disk)) => self.unit_hash(source, rel).is_some_and(|c| c == disk),
+            _ => false,
+        }
     }
 
     fn indexed(&self, source: &str, rel: &str) -> bool {
@@ -339,7 +365,7 @@ fn a_file_moved_to_another_source_while_down_is_fixed_as_one_move() {
     fs::remove_file(w.root().join("Training Plan.md")).unwrap();
     w.tephra.write("Training Plan.md", &text);
 
-    let b = w.boot();
+    let b = w.boot_holding(CROSS_SOURCE_HOLD);
 
     assert!(
         wait_until(WAIT, || b.kinds("move").len() == 1
@@ -367,7 +393,7 @@ fn a_hash_in_two_sources_is_not_used_to_pair_a_rename_inside_one() {
     w.rename("Training Plan.md", "Plan.md");
     let weekly = w.text("Weekly Review.md");
 
-    let b = w.boot();
+    let b = w.boot_holding(CROSS_SOURCE_HOLD);
 
     assert!(
         wait_until(WAIT, || b.uncertain()
@@ -704,8 +730,16 @@ fn e18_a_second_start_with_nothing_changed_writes_nothing_and_announces_nothing(
         );
         assert!(wait_until(WAIT, || read(w.notes.root(), "Design.md")
             .contains("overview")));
-        // The fix's own writes settle in the cache before the next start.
-        assert!(wait_until(WAIT, || w.indexed("tephra", "docs/Guide.md")));
+        // The fix's own writes settle in the cache before the next start:
+        // each file the fix rewrote is in the cache as it is on disk. (A
+        // file that was indexed at the first scan is "indexed" from the
+        // start, so only the hash tells the rewrite has been taken in.)
+        assert!(
+            wait_until(WAIT, || w.cached_as_on_disk("tephra", "docs/Guide.md")
+                && w.cached_as_on_disk("notes", "Design.md")),
+            "the fix's writes were not indexed: {:?}",
+            b.entries()
+        );
     }
     let notes_before = tree(w.notes.root());
     let tephra_before = tree(w.tephra.root());

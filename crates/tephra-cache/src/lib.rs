@@ -23,6 +23,7 @@ mod listing;
 mod pending_fixes;
 mod promote;
 mod remote;
+mod remote_ops;
 mod schema;
 mod search;
 mod source_rename;
@@ -47,6 +48,11 @@ pub use pending_fixes::{
 };
 pub use promote::{NewPromote, NewUnpromote, Promoted, PromotedRootRow, Unpromoted};
 pub use remote::{REMOTE_ITEM_STATES, REMOTE_SOURCE_KINDS, REMOTE_TABLES};
+pub use remote_ops::{
+    is_text_item_kind, remote_root, IndexProgress, NewRemoteItem, NewRemoteSource, RemoteCursor,
+    RemoteItemRow, RemoteSourceRow, ITEM_KIND_SUBMODULE, ITEM_KIND_SYMLINK, REASON_LFS_POINTER,
+    REMOTE_ROOT_PREFIX, STATUS_ACTIVE, STATUS_INDEXING,
+};
 pub use schema::KindInferrer;
 pub use search::{compare_hits, file_stem, resolve_title, NameCandidate, NameHit, NAME_SEARCH_SQL};
 pub use source_rename::{NewSourceRename, SourceRenamed};

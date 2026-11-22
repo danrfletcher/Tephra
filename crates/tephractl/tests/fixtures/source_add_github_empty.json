@@ -1,0 +1,15 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "name": "empty-repo",
+    "kind": "github",
+    "repo": "danrfletcher/empty",
+    "branch": "main",
+    "commit": "",
+    "files": 0,
+    "status": "active",
+    "index_done": 0,
+    "index_total": 0
+  }
+}

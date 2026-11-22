@@ -60,6 +60,8 @@ const EVENT_CHANNEL_CAPACITY: usize = 1024;
 /// running daemon already sees the update — no restart required.
 const MUTATING_SOURCE_METHODS: &[&str] = &[
     "source.register",
+    // PR-5: a GitHub source adds its listing, and its links, to the graph.
+    "source.add_github",
     "source.unregister",
     "source.rescan",
     // FR22: a promote re-owns files and rewrites links; the push it sends

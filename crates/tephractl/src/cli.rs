@@ -20,6 +20,7 @@ tephractl - command-line client for the tephrad daemon
 
 USAGE:
     tephractl source add <name> <path> [--json]
+    tephractl source add github <name> <owner/repo> [--branch <b>] [--json]
     tephractl source promote <name> <path> [--json]
     tephractl source unpromote <name> [--json]
     tephractl source rename <old> <new> [--json]
@@ -43,6 +44,21 @@ USAGE:
     tephractl auth status [--json]
     tephractl auth logout github|google
     tephractl -h | --help
+
+GITHUB SOURCES:
+    source add github <name> <owner/repo> [--branch <b>]
+                          Register ONE GitHub repository on ONE branch (default: the repo's
+                          default branch). Needs `tephractl auth github` first. The whole file
+                          list shows within seconds, every file `remote` with 0 bytes cached;
+                          nothing is written to disk. Text files are then read once through
+                          the API in the background (`source list` shows indexing done/total,
+                          then active) for links, headings, blocks and symbols, and the bytes
+                          are dropped. Only owner/repo is accepted: an owner alone, owner/*,
+                          a URL or a path inside the repo is refused (pick one repo).
+                          A local source literally named github: `source add github <path>`
+                          (ONE argument after `github`) adds the folder <path> as the source
+                          named github; TWO arguments after `github` are always the GitHub
+                          form.
 
 LS:
     ls <source> [folder]  List one folder of a source: kind, size, modified time and name.
@@ -176,6 +192,13 @@ pub enum Command {
     SourceAdd {
         name: String,
         path: String,
+    },
+    /// `source add github <name> <owner/repo> [--branch <b>]`: one repo, one
+    /// branch (`None`: the repo's default branch).
+    SourceAddGithub {
+        name: String,
+        repo: String,
+        branch: Option<String>,
     },
     SourceRemove {
         name: String,
@@ -460,6 +483,9 @@ fn parse_source<'a>(
                 .next()
                 .ok_or_else(|| ArgsError("source add requires <name> <path>".to_string()))?
                 .to_string();
+            if name == "github" {
+                return parse_source_add_github(iter);
+            }
             validate_source_name(&name)?;
             let path = iter
                 .next()
@@ -520,6 +546,112 @@ fn parse_source<'a>(
             "unrecognized source subcommand: {other} (expected add, promote, unpromote, rename, remove, or list)"
         ))),
     }
+}
+
+/// What follows `source add github`: the GitHub form (`<name> <owner/repo>
+/// [--branch <b>]`) when two positional arguments come before any flag, and
+/// otherwise a local source literally named `github` (`source add github
+/// <path>`, one positional). The rule looks at the argument list alone, so
+/// it needs no daemon: a local `<path>` is never taken for a repo, and a
+/// repo is never taken for a path.
+fn parse_source_add_github<'a>(
+    iter: &mut impl Iterator<Item = &'a str>,
+) -> Result<(Command, bool, Option<String>), ArgsError> {
+    let rest: Vec<&str> = iter.collect();
+    let positionals = rest.iter().take_while(|t| !t.starts_with("--")).count();
+    match positionals {
+        0 => Err(ArgsError(
+            "source add requires <name> <path> (or `source add github <name> <owner/repo>`)"
+                .to_string(),
+        )),
+        1 => {
+            // A local source named "github".
+            let mut tail = rest[1..].iter().copied();
+            let (json, addr) = parse_trailing_flags(&mut tail)?;
+            Ok((
+                Command::SourceAdd {
+                    name: "github".to_string(),
+                    path: rest[0].to_string(),
+                },
+                json,
+                addr,
+            ))
+        }
+        2 => {
+            let name = rest[0].to_string();
+            validate_source_name(&name)?;
+            validate_repo_spec(rest[1])?;
+            let repo = rest[1].to_string();
+            let mut json = false;
+            let mut addr = None;
+            let mut branch = None;
+            let mut tail = rest[2..].iter().copied();
+            while let Some(arg) = tail.next() {
+                match arg {
+                    "--json" => json = true,
+                    "--addr" => addr = Some(take_value(&mut tail, "--addr")?),
+                    "--branch" => {
+                        if branch.is_some() {
+                            return Err(ArgsError(
+                                "--branch given twice: a GitHub source has one branch".to_string(),
+                            ));
+                        }
+                        let b = take_value(&mut tail, "--branch")?;
+                        validate_branch(&b)?;
+                        branch = Some(b);
+                    }
+                    other => {
+                        return Err(ArgsError(format!("unrecognized argument: {other}")));
+                    }
+                }
+            }
+            Ok((Command::SourceAddGithub { name, repo, branch }, json, addr))
+        }
+        _ => Err(ArgsError(
+            "source add github takes <name> <owner/repo>: pick one repo".to_string(),
+        )),
+    }
+}
+
+/// `text` with control characters shown as `?`, for an error message.
+fn shown(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
+/// F4: a GitHub source is exactly one `owner/repo`. An owner alone, a
+/// wildcard, a URL, a path inside the repo and anything else that could name
+/// more than one repository is refused here, before the daemon (and GitHub)
+/// hear of it. Mirrors the daemon's own check.
+fn validate_repo_spec(repo: &str) -> Result<(), ArgsError> {
+    let part_ok = |p: &str| {
+        !p.is_empty()
+            && p != "."
+            && p != ".."
+            && p.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+    let mut parts = repo.split('/');
+    let (owner, name, extra) = (parts.next(), parts.next(), parts.next());
+    match (owner, name, extra) {
+        (Some(o), Some(n), None) if part_ok(o) && part_ok(n) => Ok(()),
+        _ => Err(ArgsError(format!(
+            "\"{}\" is not one repository: give owner/repo (pick one repo; a whole account or a \
+             list of repos cannot be added)",
+            shown(repo)
+        ))),
+    }
+}
+
+fn validate_branch(branch: &str) -> Result<(), ArgsError> {
+    if branch.is_empty() || branch.starts_with('-') || branch.chars().any(char::is_control) {
+        return Err(ArgsError(format!(
+            "invalid branch name \"{}\"",
+            shown(branch)
+        )));
+    }
+    Ok(())
 }
 
 fn parse_status<'a>(

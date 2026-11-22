@@ -21,6 +21,7 @@ pub mod forward;
 pub mod ignore;
 pub mod refactor;
 pub mod registry;
+pub mod remote_github;
 pub mod rename_detect;
 pub mod rpc;
 pub mod scan;

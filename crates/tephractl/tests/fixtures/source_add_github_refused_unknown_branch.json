@@ -1,0 +1,11 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "error": {
+    "code": -32011,
+    "message": "danrfletcher/atlas has no branch \"nope\"",
+    "data": {
+      "reason": "unknown_branch"
+    }
+  }
+}

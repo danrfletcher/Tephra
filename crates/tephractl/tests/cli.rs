@@ -50,3 +50,6 @@ mod google_loopback;
 
 #[path = "cli/auth_secrets.rs"]
 mod auth_secrets;
+
+#[path = "cli/source_add_github.rs"]
+mod source_add_github;

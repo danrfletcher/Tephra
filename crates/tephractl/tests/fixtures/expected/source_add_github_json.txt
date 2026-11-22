@@ -1,0 +1,11 @@
+{
+  "branch": "main",
+  "commit": "3fa2b1c9d0e4a5b6c7d8e9f00112233445566778",
+  "files": 4,
+  "index_done": 0,
+  "index_total": 3,
+  "kind": "github",
+  "name": "github-atlas",
+  "repo": "danrfletcher/atlas",
+  "status": "indexing"
+}

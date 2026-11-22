@@ -202,20 +202,21 @@ fn gp12_every_link_of_every_kind_is_respelled_with_its_anchor_alias_and_form_int
         other_before.keys().collect::<Vec<_>>(),
         other_after.keys().collect::<Vec<_>>()
     );
-    for (rel, (bytes, _)) in notes_before.iter().chain(other_before.iter()) {
-        let now = notes_after
-            .get(rel)
-            .or_else(|| other_after.get(rel))
-            .map(|(b, _)| String::from_utf8(b.clone()).unwrap())
-            .unwrap();
-        let was = String::from_utf8(bytes.clone()).unwrap();
-        assert_eq!(
-            now,
-            was.replace("[[@tephrad:", "[[@daemon:")
-                .replace("![[@tephrad:", "![[@daemon:"),
-            "{rel}"
-        );
-        assert!(!now.contains("[[@tephrad:"), "{rel}");
+    // Each source is compared with its own "after": both sources hold a
+    // `Warmup.md` (the daemon fixture's watcher check), and the number of
+    // warm-up rounds, so its text, differs between them under load.
+    for (before, after) in [(&notes_before, &notes_after), (&other_before, &other_after)] {
+        for (rel, (bytes, _)) in before.iter() {
+            let now = String::from_utf8(after.get(rel).unwrap().0.clone()).unwrap();
+            let was = String::from_utf8(bytes.clone()).unwrap();
+            assert_eq!(
+                now,
+                was.replace("[[@tephrad:", "[[@daemon:")
+                    .replace("![[@tephrad:", "![[@daemon:"),
+                "{rel}"
+            );
+            assert!(!now.contains("[[@tephrad:"), "{rel}");
+        }
     }
 
     // Every link reaches the same file as before.

@@ -1,0 +1,6 @@
+prose              54 remote            0 -                README.md
+folder              - -                 0 -                assets
+binary              7 remote            0 -                logo.png
+binary              9 remote            0 -                latest  [symlink]
+code               32 remote            0 -                lib.rs
+binary              - remote            0 -                lib  [submodule]

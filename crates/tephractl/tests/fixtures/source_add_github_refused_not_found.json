@@ -1,0 +1,11 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "error": {
+    "code": -32011,
+    "message": "danrfletcher/nope does not exist, or the token has no access to it (GitHub answers the same for both)",
+    "data": {
+      "reason": "not_found"
+    }
+  }
+}

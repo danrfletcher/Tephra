@@ -1,0 +1,74 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "source": "github-atlas",
+    "folder": "",
+    "recursive": false,
+    "offline": false,
+    "needs_rescan": false,
+    "entries": [
+      {
+        "id": "@github-atlas:README.md",
+        "kind": "prose",
+        "name": "README.md",
+        "rel_path": "README.md",
+        "size": 54,
+        "mtime": null,
+        "cache_bytes": 0,
+        "state": "remote"
+      },
+      {
+        "id": "@github-atlas:assets",
+        "kind": "folder",
+        "name": "assets",
+        "rel_path": "assets",
+        "size": null,
+        "mtime": null,
+        "cache_bytes": 0
+      },
+      {
+        "id": "@github-atlas:assets/logo.png",
+        "kind": "binary",
+        "name": "logo.png",
+        "rel_path": "assets/logo.png",
+        "size": 7,
+        "mtime": null,
+        "cache_bytes": 0,
+        "state": "remote"
+      },
+      {
+        "id": "@github-atlas:latest",
+        "kind": "binary",
+        "name": "latest",
+        "rel_path": "latest",
+        "size": 9,
+        "mtime": null,
+        "cache_bytes": 0,
+        "state": "remote",
+        "reason": "symlink"
+      },
+      {
+        "id": "@github-atlas:src/lib.rs",
+        "kind": "code",
+        "name": "lib.rs",
+        "rel_path": "src/lib.rs",
+        "size": 32,
+        "mtime": null,
+        "cache_bytes": 0,
+        "state": "remote"
+      },
+      {
+        "id": "@github-atlas:vendor/lib",
+        "kind": "binary",
+        "name": "lib",
+        "rel_path": "vendor/lib",
+        "size": null,
+        "mtime": null,
+        "cache_bytes": 0,
+        "state": "remote",
+        "reason": "submodule"
+      }
+    ]
+  }
+}

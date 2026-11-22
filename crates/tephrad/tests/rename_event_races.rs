@@ -265,6 +265,11 @@ fn an_exact_event_leaves_a_file_changed_since_the_guess_and_logs_it_needs_manual
     for i in 0..REPS {
         let (old, guess, new) = (format!("T{i}.md"), format!("G{i}.md"), format!("N{i}.md"));
         let linker = format!("L{i}.md");
+        // The real watcher indexes in the background, and the event reads a
+        // graph built from the cache while a reindex of the same file is
+        // running (the file then has no links in it). The watcher is held
+        // for the round, so only the explicit rescan indexes `linker`.
+        d.registry.pause_for_write();
         d.mv_and_rescan(&old, &guess);
         d.notes.write(&new, &format!("# T{i}\\n"));
         d.engine.fix_rename("notes", &old, &guess).expect("guess");
@@ -293,6 +298,7 @@ fn an_exact_event_leaves_a_file_changed_since_the_guess_and_logs_it_needs_manual
             "round {i}"
         );
         assert_eq!(d.text(&linker), changed, "round {i}: still as it is");
+        d.registry.resume_after_write(&Default::default());
     }
     // One entry for the guess, one for the event; the event's entry
     // carries each changed file as needs_manual_fix.

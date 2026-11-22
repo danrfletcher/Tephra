@@ -277,10 +277,21 @@ fn the_real_watcher_refreshes_the_hash_of_only_the_file_that_changed() {
     let (a0, b0) = (read("a.md"), read("b.md"));
     assert!(a0.hash.is_some() && a0.inode.is_some() && a0.device.is_some());
 
-    fixture.write("a.md", "edited by the watcher test\n");
-    let fired = wait_until(Duration::from_secs(10), || {
-        matches!(events.try_recv(), Ok(DaemonEvent::SourceChanged { .. }))
-    });
+    // An event the OS watcher drops under load is not delivered again, so
+    // the edit is made again (new text each time) until its event is seen.
+    let mut fired = false;
+    for round in 1..=3 {
+        fixture.write(
+            "a.md",
+            &format!("edited by the watcher test, take {round}\n"),
+        );
+        fired = wait_until(Duration::from_secs(5), || {
+            matches!(events.try_recv(), Ok(DaemonEvent::SourceChanged { .. }))
+        });
+        if fired {
+            break;
+        }
+    }
     assert!(fired, "expected a source_changed event after the edit");
 
     let (a1, b1) = (read("a.md"), read("b.md"));

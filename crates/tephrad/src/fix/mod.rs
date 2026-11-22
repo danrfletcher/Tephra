@@ -207,10 +207,25 @@ pub fn fix_rename_with(
     let roots: HashMap<String, String> = sources
         .list()?
         .into_iter()
-        .map(|r| (r.name, r.path))
+        // A remote source's wire path is a display string, not a folder.
+        .map(|r| {
+            let root = if r.remote.is_some() {
+                format!("{}{}", tephra_cache::REMOTE_ROOT_PREFIX, r.name)
+            } else {
+                r.path
+            };
+            (r.name, root)
+        })
         .collect();
-    if !roots.contains_key(source) {
-        return Err(format!("no source named '{source}' is registered"));
+    match roots.get(source) {
+        None => return Err(format!("no source named '{source}' is registered")),
+        // F2: a remote file is never written, so nothing is fixed in one.
+        Some(root) if root.starts_with(tephra_cache::REMOTE_ROOT_PREFIX) => {
+            return Err(format!(
+                "source '{source}' is a remote source: its files are never edited"
+            ));
+        }
+        Some(_) => {}
     }
     let old_id = format!("@{source}:{old_path}");
     let new_id = format!("@{source}:{new_path}");
@@ -384,5 +399,10 @@ fn owner_write_off(meta: &fs::Metadata) -> bool {
 
 fn abs_path(id: &str, roots: &HashMap<String, String>) -> Option<PathBuf> {
     let (source, rel_path) = id.strip_prefix('@')?.split_once(':')?;
-    Some(Path::new(roots.get(source)?).join(rel_path))
+    let root = roots.get(source)?;
+    // A remote source's root is a marker, not a folder (F2).
+    if root.starts_with(tephra_cache::REMOTE_ROOT_PREFIX) {
+        return None;
+    }
+    Some(Path::new(root).join(rel_path))
 }

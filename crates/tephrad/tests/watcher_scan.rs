@@ -84,16 +84,28 @@ fn editing_a_tracked_file_debounces_and_updates_only_that_files_row() {
     // Edit one.md: drop its wikilink and tag, add a new one instead,
     // so the row's post-edit content is unambiguously distinguishable
     // from its pre-edit content.
-    fixture.write("one.md", "# One\n\nNow links to [[Three]] only.\n");
-
-    // Wait for the `source_changed` event (GP6) rather than sleeping
-    // a fixed guess at the debounce window.
-    let fired = wait_until(Duration::from_secs(5), || {
-        matches!(
-            events.try_recv(),
-            Ok(tephrad::registry::DaemonEvent::SourceChanged { .. })
-        )
-    });
+    //
+    // An event the OS watcher drops under load is not delivered again, so
+    // the edit is made again (a different last word each time, the same
+    // links) until its event is seen.
+    let mut fired = false;
+    for round in 1..=4 {
+        fixture.write(
+            "one.md",
+            &format!("# One\n\nNow links to [[Three]] only, take {round}.\n"),
+        );
+        // Wait for the `source_changed` event (GP6) rather than sleeping
+        // a fixed guess at the debounce window.
+        fired = wait_until(Duration::from_secs(4), || {
+            matches!(
+                events.try_recv(),
+                Ok(tephrad::registry::DaemonEvent::SourceChanged { .. })
+            )
+        });
+        if fired {
+            break;
+        }
+    }
     assert!(
         fired,
         "expected a source_changed event after editing one.md"

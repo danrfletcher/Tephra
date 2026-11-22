@@ -454,15 +454,23 @@ fn concurrent_refresh_calls_are_serialized_not_run_in_parallel() {
         .register("base", base.path())
         .expect("register base");
 
-    // Calibrate against this machine's own speed: time one call alone
-    // first, with nothing else contending for the lock.
-    let single_call_started = std::time::Instant::now();
-    graph_refresh.refresh().expect("calibration refresh");
-    let single_call_duration = single_call_started.elapsed();
+    // Calibrate against this machine's own speed: time a call alone, with
+    // nothing else contending for the lock. The first call is slower than
+    // the rest (cold caches; seen 314 ms against 193 ms warm), and a
+    // loaded machine adds time to any one of them, so the calibration is
+    // the fastest of five: a calibration that is too slow is what made a
+    // serialized pair look like a parallel one.
+    let single_call_duration = (0..5)
+        .map(|_| {
+            let started = std::time::Instant::now();
+            graph_refresh.refresh().expect("calibration refresh");
+            started.elapsed()
+        })
+        .min()
+        .expect("five calibration calls");
 
-    // Now fire two calls at once, released from a `Barrier` together,
-    // and time each one independently from the moment it was
-    // released.
+    // Now fire two calls at once, released from a `Barrier` together.
+    // Each thread notes when its own call started and ended.
     let barrier = Arc::new(std::sync::Barrier::new(2));
     let other = {
         let graph_refresh = graph_refresh.clone();
@@ -473,7 +481,7 @@ fn concurrent_refresh_calls_are_serialized_not_run_in_parallel() {
             graph_refresh
                 .refresh()
                 .expect("concurrent refresh (other thread)");
-            started.elapsed()
+            (started, std::time::Instant::now())
         })
     };
     barrier.wait();
@@ -481,23 +489,27 @@ fn concurrent_refresh_calls_are_serialized_not_run_in_parallel() {
     graph_refresh
         .refresh()
         .expect("concurrent refresh (this thread)");
-    let this_duration = this_started.elapsed();
-    let other_duration = other.join().expect("other thread must not panic");
+    let this_ended = std::time::Instant::now();
+    let (other_started, other_ended) = other.join().expect("other thread must not panic");
 
-    // Whichever of the two calls had to wait for the lock takes
-    // roughly as long as *two* calibrated calls; if they instead ran
-    // in parallel, both would take roughly as long as *one*. A
-    // 1.5x-single threshold sits cleanly between those two outcomes.
-    let slower = this_duration.max(other_duration);
+    // The two calls are measured as a pair: from the first one starting to
+    // the last one ending. Serialized by `rebuild_lock`, the pair takes
+    // about *two* calibrated calls (the second waits for the first to
+    // finish: read, build and replace); racing in parallel, about *one*.
+    // A 1.5x-single threshold sits between those two outcomes. Timing one
+    // call alone was not enough: on a loaded machine the thread that is
+    // released second can start after the other has finished, so neither
+    // waits and each takes one call's time even though they are
+    // serialized.
+    let pair = this_ended.max(other_ended) - this_started.min(other_started);
     let threshold = single_call_duration + single_call_duration / 2;
     assert!(
-        slower >= threshold,
-        "two concurrent refresh() calls completed in {this_duration:?} and {other_duration:?} \
-         (a single calibrated call took {single_call_duration:?}); the slower of the two must \
-         take at least ~1.5x a single call's duration, proving it waited for the other to fully \
-         finish (read, build, and replace) rather than racing it — got {slower:?}, which is \
-         consistent with the two calls having run concurrently instead of being serialized by \
-         `rebuild_lock` (R9)"
+        pair >= threshold,
+        "two concurrent refresh() calls took {pair:?} together (a single calibrated call took \
+         {single_call_duration:?}); the pair must take at least ~1.5x a single call's duration, \
+         proving the second waited for the first to fully finish (read, build, and replace) \
+         rather than racing it — which is consistent with the two calls having run concurrently \
+         instead of being serialized by `rebuild_lock` (R9)"
     );
 }
 

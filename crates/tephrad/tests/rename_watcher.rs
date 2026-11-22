@@ -40,6 +40,34 @@ fn wait_until(timeout: Duration, mut check: impl FnMut() -> bool) -> bool {
     }
 }
 
+/// Writes `Warmup.md` into `source` until the registry reports a change
+/// of `notes`: from then on the watcher is known to see what is written.
+fn watcher_hears(registry: &SourceRegistry, source: &TempSource) -> bool {
+    let mut events = registry.subscribe();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut round = 0;
+    while Instant::now() < deadline {
+        round += 1;
+        source.write("Warmup.md", &format!("# Warm-up {round}\n"));
+        let heard = wait_until(Duration::from_millis(1500), || loop {
+            match events.try_recv() {
+                Ok(tephrad::registry::DaemonEvent::SourceChanged { source, paths, .. })
+                    if source == "notes" && !paths.is_empty() =>
+                {
+                    return true
+                }
+                Ok(_) => continue,
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(_) => return false,
+            }
+        });
+        if heard {
+            return true;
+        }
+    }
+    false
+}
+
 struct World {
     notes: TempSource,
     cache_path: PathBuf,
@@ -77,6 +105,18 @@ impl World {
         registry.set_rename_fixer(engine.clone());
         registry.register("notes", notes.root()).expect("notes");
         registry.register("tephra", tephra.root()).expect("tephra");
+        // A watcher that is deaf (seen under load on this Mac: no event
+        // for the whole life of a source) makes every wait below run out.
+        // It is shown to hear before the test starts, and made again if
+        // it does not.
+        for _ in 0..3 {
+            if watcher_hears(&registry, &notes) {
+                break;
+            }
+            eprintln!("the watcher of notes was deaf; registering it again");
+            registry.unregister("notes").expect("unregister notes");
+            registry.register("notes", notes.root()).expect("notes");
+        }
         World {
             notes,
             cache_path,

@@ -49,6 +49,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// already changed (R1).
 const MUTATING_METHODS: &[&str] = &[
     "source.register",
+    "source.add_github",
     "source.unregister",
     "source.rescan",
     "source.promote",
@@ -62,6 +63,7 @@ const MUTATING_METHODS: &[&str] = &[
 /// (not just under failure).
 const LONG_RUNNING_METHODS: &[&str] = &[
     "source.register",
+    "source.add_github",
     "source.rescan",
     "source.promote",
     "source.unpromote",

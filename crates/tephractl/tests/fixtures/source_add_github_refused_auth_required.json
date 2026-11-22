@@ -1,0 +1,11 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "error": {
+    "code": -32011,
+    "message": "no GitHub token is stored: run `tephractl auth github` first",
+    "data": {
+      "reason": "auth_required"
+    }
+  }
+}

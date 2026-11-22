@@ -652,3 +652,89 @@ async fn names_that_could_change_the_request_are_refused_before_anything_is_sent
     }
     assert_eq!(env.fake.request_log().count(), 0);
 }
+
+// ---- tree walks, empty repos, symlinks, submodules (PR-5) --------------------
+
+#[tokio::test]
+async fn a_truncated_recursive_tree_is_finished_level_by_level_with_nothing_lost() {
+    let env = github_env("ghp_x").await;
+    for i in 0..6 {
+        env.fake.put_file(
+            "octo/hello",
+            "main",
+            &format!("dir{}/sub/file{i}.md", i % 2),
+            b"x",
+        );
+        env.fake
+            .put_file("octo/hello", "main", &format!("top{i}.md"), b"y");
+    }
+    let whole = tephra_remote::github::full_tree(&env.client, &env.repo, "main")
+        .await
+        .unwrap();
+    assert!(!whole.truncated);
+
+    env.fake.set_tree_limit(Some(3));
+    assert!(
+        env.client
+            .list_tree(&env.repo, "main")
+            .await
+            .unwrap()
+            .truncated
+    );
+    let walked = tephra_remote::github::full_tree(&env.client, &env.repo, "main")
+        .await
+        .unwrap();
+    assert!(!walked.truncated);
+
+    let mut a: Vec<&str> = whole.entries.iter().map(|e| e.path.as_str()).collect();
+    let mut b: Vec<&str> = walked.entries.iter().map(|e| e.path.as_str()).collect();
+    a.sort_unstable();
+    b.sort_unstable();
+    assert_eq!(a, b, "no file lost");
+    let mut dedup = b.clone();
+    dedup.dedup();
+    assert_eq!(dedup, b, "no file listed twice");
+    assert_eq!(whole.sha, walked.sha);
+}
+
+#[tokio::test]
+async fn a_repo_with_no_commit_answers_409_to_the_tree_and_the_commit() {
+    let env = github_env("ghp_x").await;
+    env.fake.set_empty("octo/hello", true);
+    assert_eq!(
+        env.client.list_tree(&env.repo, "main").await.unwrap_err(),
+        RemoteError::Unexpected { status: 409 }
+    );
+    assert_eq!(
+        env.client
+            .poll_ref(&env.repo, "main", None)
+            .await
+            .unwrap_err(),
+        RemoteError::Unexpected { status: 409 }
+    );
+    env.client.get_repo(&env.repo).await.unwrap();
+}
+
+#[tokio::test]
+async fn symlinks_and_submodules_are_tree_entries_with_their_modes() {
+    let env = github_env("ghp_x").await;
+    env.fake
+        .put_symlink("octo/hello", "main", "link.md", "README.md");
+    env.fake.put_submodule(
+        "octo/hello",
+        "main",
+        "vendor/lib",
+        "0123456789abcdef0123456789abcdef01234567",
+    );
+    let tree = env.client.list_tree(&env.repo, "main").await.unwrap();
+    let link = tree.entries.iter().find(|e| e.path == "link.md").unwrap();
+    assert_eq!(link.mode, "120000");
+    assert_eq!(link.kind, TreeEntryKind::Blob);
+    let sub = tree
+        .entries
+        .iter()
+        .find(|e| e.path == "vendor/lib")
+        .unwrap();
+    assert_eq!(sub.mode, "160000");
+    assert_eq!(sub.kind, TreeEntryKind::Commit);
+}

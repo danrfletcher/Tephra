@@ -118,8 +118,7 @@ fn assert_not_a_host_share(path: &Path) {
         };
         let mountpoint = before.split(' ').nth(4).unwrap_or("");
         let fstype = after.split(' ').next().unwrap_or("").to_string();
-        if path.starts_with(mountpoint)
-            && best.as_ref().map_or(true, |(n, _)| mountpoint.len() >= *n)
+        if path.starts_with(mountpoint) && best.as_ref().is_none_or(|(n, _)| mountpoint.len() >= *n)
         {
             best = Some((mountpoint.len(), fstype));
         }
@@ -1091,8 +1090,9 @@ fn f5_a_rename_plus_edit_with_no_pair_and_no_event_stays_unfixed() {
     });
 }
 
-/// F12: this PR adds no method. The dispatch table is the same eighteen
-/// verbs, and a test or injection method is not answered by a real daemon.
+/// F12: the dispatch table is the closed list of nineteen verbs (the last
+/// added is `source.add_github`), and a test or injection method is not
+/// answered by a real daemon.
 #[test]
 fn f12_the_method_list_is_unchanged_and_there_is_no_injection_method() {
     let expected = [
@@ -1114,6 +1114,7 @@ fn f12_the_method_list_is_unchanged_and_there_is_no_injection_method() {
         "block.ensure_id",
         "fix.list",
         "link.rename_event",
+        "source.add_github",
     ];
     assert_eq!(tephrad::rpc::dispatch::METHOD_NAMES, expected);
 

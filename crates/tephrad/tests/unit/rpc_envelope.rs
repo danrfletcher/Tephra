@@ -215,7 +215,7 @@ fn unknown_method_returns_method_not_found() {
 /// (atlas-25 PR-8, G3), `source.promote` / `source.unpromote` (PR-12, PR-13)
 /// and `source.rename` (PR-14, G13). Adding a method
 /// means changing this list on purpose.
-const EXPECTED_METHODS: [&str; 18] = [
+const EXPECTED_METHODS: [&str; 19] = [
     "unit.resolve_link",
     "graph.get_backlinks",
     "graph.get_forward_links",
@@ -234,10 +234,12 @@ const EXPECTED_METHODS: [&str; 18] = [
     "block.ensure_id",
     "fix.list",
     "link.rename_event",
+    // atlas-27 PR-5: the one method that PR adds.
+    "source.add_github",
 ];
 
 #[test]
-fn method_table_is_exactly_the_eighteen_named_verbs() {
+fn method_table_is_exactly_the_nineteen_named_verbs() {
     assert_eq!(METHOD_NAMES, EXPECTED_METHODS);
     // No duplicates either.
     let mut sorted = METHOD_NAMES.to_vec();

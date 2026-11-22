@@ -54,6 +54,25 @@ pub struct UnitEntryWire {
     pub mtime: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Present for an entry of a remote source only, and left out of the
+    /// JSON for a local one: a local entry keeps its wire shape.
+    #[serde(flatten)]
+    pub remote: Option<RemoteEntryWire>,
+}
+
+/// What a remote source adds to a `unit.list` entry (G8). `state` is the
+/// file's state (`remote` until PR-7's fetch makes it anything else);
+/// a folder has none. `cache_bytes` is what the file takes in Tephra's
+/// cache: 0 until it is fetched.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RemoteEntryWire {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    pub cache_bytes: u64,
+    /// Why a file is listed by name only (`symlink`, `submodule`,
+    /// `lfs_pointer`, `not_found`), when it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// The `unit.list` result. `offline` and `needs_rescan` are on the
@@ -131,6 +150,9 @@ pub fn list_units(
         .get_source(source)
         .map_err(source_error)?
         .ok_or_else(|| UnitListError::Source(format!("no such source: {source}")))?;
+    if row.is_remote() {
+        return list_remote(&cache, source, &folder, recursive);
+    }
     let root = Path::new(&row.path);
 
     // `Missing` is an unmounted or moved root the watcher hasn't noticed
@@ -174,6 +196,61 @@ pub fn list_units(
     })
 }
 
+/// A remote source, from the cache alone: no adapter call, no disk access.
+/// Folders are derived from the cached paths, as for an offline source, but
+/// the source is not offline. Each file carries its state and the bytes it
+/// takes in the cache (0: nothing is fetched).
+fn list_remote(
+    cache: &Cache,
+    source: &str,
+    folder: &str,
+    recursive: bool,
+) -> Result<UnitListWire, UnitListError> {
+    let listing = cache
+        .list_folder(source, folder, recursive)
+        .map_err(source_error)?;
+    match listing.state {
+        FolderState::Missing => return Err(no_such_folder(folder)),
+        FolderState::File => return Err(not_a_folder(folder)),
+        FolderState::Folder => {}
+    }
+    let items: HashMap<String, tephra_cache::RemoteItemRow> = cache
+        .remote_items(source)
+        .map_err(source_error)?
+        .into_iter()
+        .map(|i| (i.path.clone(), i))
+        .collect();
+    let entries = listing
+        .entries
+        .into_iter()
+        .map(|e| {
+            let item = items.get(&e.rel_path);
+            let is_folder = e.is_folder();
+            let remote = RemoteEntryWire {
+                state: item.map(|i| i.state.clone()).filter(|_| !is_folder),
+                cache_bytes: 0,
+                // A symlink and a submodule are `binary` units listed by
+                // name; the reason says which.
+                reason: item.and_then(|i| match i.kind.as_deref() {
+                    Some(k @ ("symlink" | "submodule")) => Some(k.to_string()),
+                    _ => i.reason.clone(),
+                }),
+            };
+            let mut wire = wire_entry(source, e);
+            wire.remote = Some(remote);
+            wire
+        })
+        .collect();
+    Ok(UnitListWire {
+        source: source.to_string(),
+        folder: folder.to_string(),
+        recursive,
+        offline: false,
+        needs_rescan: false,
+        entries,
+    })
+}
+
 fn source_error(e: impl std::fmt::Display) -> UnitListError {
     UnitListError::Source(e.to_string())
 }
@@ -195,6 +272,7 @@ fn wire_entry(source: &str, e: FolderEntry) -> UnitEntryWire {
         size: e.size,
         mtime: e.mtime,
         title: e.title,
+        remote: None,
     }
 }
 
@@ -376,6 +454,7 @@ impl Walk<'_> {
                         size: Some(size),
                         mtime: folder.mtime,
                         title: None,
+                        remote: None,
                     });
                     if self.recursive {
                         // An unreadable subfolder lists as empty rather

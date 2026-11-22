@@ -48,6 +48,8 @@ pub const METHOD_NAMES: &[&str] = &[
     "block.ensure_id",
     "fix.list",
     "link.rename_event",
+    // atlas-27 PR-5: the one method that PR adds.
+    "source.add_github",
 ];
 
 /// The three backends one `dispatch` call reads through, bundled so
@@ -100,6 +102,7 @@ pub fn dispatch(
         "graph.get_forward_links" => graph_get_forward_links(params, backends.graph),
         "graph.get_edges" => graph_get_edges(backends.graph),
         "source.register" => source_register(params, backends.sources),
+        "source.add_github" => source_add_github(params, backends.sources),
         "source.unregister" => source_unregister(params, backends.sources, backends.fixes),
         "source.list" => source_list(backends.sources),
         "source.rescan" => source_rescan(params, backends.sources),
@@ -153,6 +156,27 @@ fn source_register(params: &Value, sources: &dyn SourceBackend) -> DispatchResul
     sources
         .register_checked(name, root)
         .map(|stats| serde_json::to_value(stats).expect("ScanStatsWire always serializes"))
+        .map_err(source_refusal)
+}
+
+/// `source.add_github {name, repo, branch?}` (PR-5): one repository on one
+/// branch. A refusal is a `SOURCE_ERROR` with the stable `data.reason`.
+fn source_add_github(params: &Value, sources: &dyn SourceBackend) -> DispatchResult {
+    let name = require_str(params, "name")?;
+    let repo = require_str(params, "repo")?;
+    let branch = match params.get("branch") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(b)) => Some(b.as_str()),
+        Some(_) => {
+            return Err((
+                INVALID_PARAMS,
+                "\"branch\" must be a string".to_string(),
+                None,
+            ))
+        }
+    };
+    sources
+        .register_github(name, repo, branch)
         .map_err(source_refusal)
 }
 
@@ -562,6 +586,7 @@ mod tests {
                 "block.ensure_id",
                 "fix.list",
                 "link.rename_event",
+                "source.add_github",
             ]
         );
     }
@@ -726,6 +751,7 @@ mod tests {
                     size: None,
                     mtime: Some(5),
                     title: Some("A".into()),
+                    remote: None,
                 },
                 UnitEntryWire {
                     id: "@s:d/b.bin".into(),
@@ -735,6 +761,7 @@ mod tests {
                     size: Some(3),
                     mtime: None,
                     title: None,
+                    remote: None,
                 },
             ],
         }));

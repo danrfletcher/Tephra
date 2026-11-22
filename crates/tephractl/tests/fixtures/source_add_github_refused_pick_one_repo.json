@@ -1,0 +1,11 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "error": {
+    "code": -32011,
+    "message": "\"danrfletcher\" is not one repository: give owner/repo (pick one repo; a whole account or a list of repos cannot be added)",
+    "data": {
+      "reason": "pick_one_repo"
+    }
+  }
+}

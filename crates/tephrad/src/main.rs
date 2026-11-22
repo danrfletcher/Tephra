@@ -151,15 +151,19 @@ fn main() -> ExitCode {
     // reports it. `cache_limit` was validated by the config stage, so the
     // conversion cannot fail here; it is logged in bytes. No secret is
     // read, held or logged at this stage.
-    match tephrad::credentials::open_store(cfg.test_credential_file.as_deref(), &cfg.data_dir) {
-        Ok((_store, kind)) => {
+    let credential_store = match tephrad::credentials::open_store(
+        cfg.test_credential_file.as_deref(),
+        &cfg.data_dir,
+    ) {
+        Ok((store, kind)) => {
             tracing::info!(store = kind.as_str(), "credential store selected");
             if kind == tephrad::credentials::StoreKind::Unavailable {
                 tracing::warn!("this build has no credential store; remote sources cannot sign in");
             }
+            std::sync::Arc::<dyn tephrad::credentials::CredentialStore>::from(store)
         }
         Err(e) => return fail(stage::CREDENTIALS, e),
-    }
+    };
     match cfg.cache_limit_bytes() {
         Ok(bytes) => tracing::info!(cache_limit_bytes = bytes, "remote cache limit"),
         Err(e) => return fail(stage::CONFIG, format!("cache_limit {e}")),
@@ -215,11 +219,27 @@ fn main() -> ExitCode {
         tracing::info!("qualify_ambiguous_links is on: link fixes write the fuller same-source path for a name that also exists in another source");
     }
 
+    // The GitHub adapter reads the token from the store on each call and
+    // never holds it. Building it makes no request.
+    let remote_hub = match tephrad::remote_github::RemoteHub::new(
+        credential_store,
+        cfg.github_api_url.as_deref(),
+        std::sync::Arc::new(tephra_remote::SystemClock),
+        cfg.data_dir.clone(),
+    ) {
+        Ok(hub) => Some(std::sync::Arc::new(hub)),
+        Err(e) => {
+            tracing::warn!(error = %e, "the GitHub adapter could not be built; GitHub sources are off");
+            None
+        }
+    };
+
     run_server(
         &cfg.listen_addr,
         &cache_path,
         &cfg.data_dir.join("token"),
         cfg.qualify_ambiguous_links,
+        remote_hub,
     )
 }
 
@@ -309,6 +329,7 @@ fn run_server(
     cache_path: &std::path::Path,
     token_path: &std::path::Path,
     qualify_ambiguous_links: bool,
+    remote_hub: Option<std::sync::Arc<tephrad::remote_github::RemoteHub>>,
 ) -> ExitCode {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -396,6 +417,9 @@ fn run_server(
             Ok(r) => Arc::new(r),
             Err(e) => return (fail(stage::CACHE, e), None),
         };
+        if let Some(hub) = remote_hub {
+            registry.set_remote_hub(hub);
+        }
 
         // R8 fix: sweep every registered source's root for stale
         // `.{name}.tephra-tmp-{n}` leftovers right here, at startup —
@@ -420,6 +444,10 @@ fn run_server(
             }
             let rows = registry_for_sweep.list().map_err(|e| e.to_string())?;
             for row in rows {
+                // A remote source has no folder on disk to sweep.
+                if row.is_remote() {
+                    continue;
+                }
                 if registry_for_sweep.is_permission_denied(&row.name) {
                     // Nothing to sweep in a tree we can't list.
                     continue;
@@ -573,6 +601,11 @@ fn run_server(
                 rescan_registry.start_all(|| *rescan_shutdown_rx.borrow())
             };
             let started_count = started.len();
+            // PR-5: remote sources answer from the cache; finish the first
+            // index of any that was cut short. No adapter call otherwise.
+            if !*rescan_shutdown_rx.borrow() {
+                rescan_registry.resume_remote_sources();
+            }
             drop(rescan_registry);
             // G9: with the scans done, retry every pending fix of every
             // source. Rows of an offline source wait.

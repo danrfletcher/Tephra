@@ -131,7 +131,8 @@ fn root_is_missing(cache: &Cache, source: &str) -> Result<bool, SearchError> {
     // A source unregistered since the search ran has no row any more:
     // its hit is already gone from the next search, so treat it as online.
     Ok(match cache.get_source(source).map_err(source_error)? {
-        Some(row) if row.status != SourceStatus::Offline => {
+        // A remote source has no folder to probe: its root is a marker.
+        Some(row) if row.status != SourceStatus::Offline && !row.is_remote() => {
             probe_path(Path::new(&row.path)) == PathProbe::Missing
         }
         _ => false,

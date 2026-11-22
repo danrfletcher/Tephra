@@ -34,8 +34,12 @@ fn promoted() -> Daemon {
 fn state(d: &Daemon) -> Vec<(String, Vec<u8>)> {
     let mut out = Vec::new();
     for root in [d.notes.root(), d.other.root()] {
+        // `Warmup.md` is the daemon fixture's watcher check: how many
+        // rounds it took (so its text) depends on the load, and the test
+        // compares two daemons.
         let mut snap: Vec<_> = fixtures::tree_snapshot(root)
             .into_iter()
+            .filter(|(p, _)| p != "Warmup.md")
             .map(|(p, (bytes, _))| (p, bytes))
             .collect();
         out.append(&mut snap);

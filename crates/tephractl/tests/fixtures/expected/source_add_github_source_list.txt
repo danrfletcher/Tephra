@@ -1,0 +1,4 @@
+NAME                 STATUS       PATH
+notes                active       /home/dan/Notes
+github-atlas         indexing 2/3 github:danrfletcher/atlas
+                     branch main, cache on, cached 0 bytes, .git 0 bytes, last sync never
