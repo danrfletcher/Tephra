@@ -352,6 +352,20 @@ pub trait SourceBackend: Send + Sync {
             "source.add_github is not supported by this source backend".to_string(),
         ))
     }
+    /// `unit.fetch` (G10): puts the file of a remote unit in the content
+    /// cache and answers where it is. Blocks until it is there. The default
+    /// refuses, so a test double needn't implement it.
+    fn fetch_unit(
+        &self,
+        _unit: &str,
+    ) -> Result<crate::remote::fetch::FetchWire, crate::remote::fetch::FetchRpcError> {
+        Err(crate::remote::fetch::FetchRpcError {
+            reason: "fetch_unavailable",
+            message: "unit.fetch is not supported by this source backend".to_string(),
+            url: None,
+            kind: None,
+        })
+    }
     /// `unit.list` (G1): one folder of `source` (`folder` already
     /// normalized by the dispatcher; `""` is the root). The default
     /// refuses, so a test double that only exercises the other four
@@ -465,6 +479,12 @@ impl SourceBackend for SourceRegistry {
         recursive: bool,
     ) -> Result<UnitListWire, UnitListError> {
         SourceRegistry::list_units(self, source, folder, recursive)
+    }
+    fn fetch_unit(
+        &self,
+        unit: &str,
+    ) -> Result<crate::remote::fetch::FetchWire, crate::remote::fetch::FetchRpcError> {
+        SourceRegistry::fetch_unit(self, unit)
     }
     fn search_names(&self, query: &str, limit: usize) -> Result<Vec<SearchHitWire>, SearchError> {
         SourceRegistry::search_names(self, query, limit)

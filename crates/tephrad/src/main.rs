@@ -226,7 +226,9 @@ fn main() -> ExitCode {
         cfg.github_api_url.as_deref(),
         std::sync::Arc::new(tephra_remote::SystemClock),
         cfg.data_dir.clone(),
-    ) {
+    )
+    .and_then(|hub| hub.with_drive_api_url(cfg.drive_api_url.as_deref()))
+    {
         Ok(hub) => Some(std::sync::Arc::new(hub)),
         Err(e) => {
             tracing::warn!(error = %e, "the GitHub adapter could not be built; GitHub sources are off");

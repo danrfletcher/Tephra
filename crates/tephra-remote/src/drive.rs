@@ -18,7 +18,7 @@ use crate::clock::Clock;
 use crate::credentials::{CredentialStore, Provider};
 use crate::error::RemoteError;
 use crate::rate_limit::Api;
-use crate::transport::{AdapterOptions, Core, Request};
+use crate::transport::{AdapterOptions, BodyStream, Core, Request};
 use crate::{BoxFut, RemoteResult};
 
 /// The `mimeType` of a native Google Doc.
@@ -137,6 +137,13 @@ pub trait DriveAdapter: Send + Sync {
 
     /// The bytes of a binary or text file.
     fn download<'a>(&'a self, file_id: &'a str) -> BoxFut<'a, RemoteResult<Vec<u8>>>;
+
+    /// The bytes of a binary or text file as a body read piece by piece:
+    /// a file of any size is written to disk without being held whole.
+    /// The same request, and the same failures, as [`DriveAdapter::download`].
+    fn stream_download<'a>(&'a self, file_id: &'a str) -> BoxFut<'a, RemoteResult<BodyStream>> {
+        Box::pin(async move { Ok(BodyStream::from_bytes(self.download(file_id).await?)) })
+    }
 
     /// A native Google Doc exported as `text/markdown`.
     fn export_markdown<'a>(&'a self, file_id: &'a str) -> BoxFut<'a, RemoteResult<Vec<u8>>>;
@@ -308,6 +315,19 @@ impl DriveAdapter for DriveClient {
                 })
                 .await?;
             Ok(reply.body)
+        })
+    }
+
+    fn stream_download<'a>(&'a self, file_id: &'a str) -> BoxFut<'a, RemoteResult<BodyStream>> {
+        Box::pin(async move {
+            let id = check_id(file_id)?;
+            self.core
+                .stream(Request {
+                    path: format!("/files/{id}"),
+                    query: vec![("alt", "media".to_string())],
+                    ..Request::default()
+                })
+                .await
         })
     }
 

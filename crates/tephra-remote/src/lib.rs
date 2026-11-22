@@ -37,7 +37,7 @@ pub mod testing;
 pub use clock::{Clock, FakeClock, SystemClock};
 pub use error::{Conditional, RemoteError, UnreachableCause};
 pub use health::{health_for_error, SourceHealth};
-pub use transport::AdapterOptions;
+pub use transport::{AdapterOptions, BodyStream};
 
 /// The future an adapter method returns. Boxed so the adapter traits are
 /// object safe (`Arc<dyn GithubAdapter>`).

@@ -199,7 +199,7 @@ pub fn list_units(
 /// A remote source, from the cache alone: no adapter call, no disk access.
 /// Folders are derived from the cached paths, as for an offline source, but
 /// the source is not offline. Each file carries its state and the bytes it
-/// takes in the cache (0: nothing is fetched).
+/// takes in the cache (0 until it is fetched).
 fn list_remote(
     cache: &Cache,
     source: &str,
@@ -228,7 +228,9 @@ fn list_remote(
             let is_folder = e.is_folder();
             let remote = RemoteEntryWire {
                 state: item.map(|i| i.state.clone()).filter(|_| !is_folder),
-                cache_bytes: 0,
+                cache_bytes: item
+                    .filter(|_| !is_folder)
+                    .map_or(0, |i| tephra_cache::item_cache_bytes(&i.state, i.size)),
                 // A symlink and a submodule are `binary` units listed by
                 // name; the reason says which.
                 reason: item.and_then(|i| match i.kind.as_deref() {

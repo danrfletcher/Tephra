@@ -33,6 +33,7 @@ USAGE:
     tephractl search \"^^<query>\" [--limit <n>] [--json]
     tephractl block-id <unit-id> --line <n> | --symbol <name> [--json]
     tephractl backlinks <id> [--json]
+    tephractl fetch <id> [--json]
     tephractl fixes [--since <30m|2h|7d|date>] [--json]
     tephractl link resolve [--source <name>] <target> [--json]
     tephractl link refactor --source <name> --old <path> --new <path> [--apply] [--yes] [--json]
@@ -94,6 +95,21 @@ BACKLINKS:
                           file:line, then the link text. A link to a block that now sits in
                           another file (it moved) still counts, once it finds the block there.
                           An id nothing links to prints \"no backlinks\" and exits 0.
+
+FETCH:
+    fetch <id>            Download ONE file of a remote (GitHub) source into Tephra's own cache
+                          (unit.fetch) and print where it is: <data_dir>/remote/<source>/clone/
+                          <path>, and nothing else, so `cat \"$(tephractl fetch @g:README.md)\"`
+                          works. <id> is @source:path/to/file. A file already fetched is not
+                          downloaded again. Nothing is downloaded unless you ask: this is the
+                          only command that does it. A file with edits of yours waiting to be
+                          pushed is printed as it is, never overwritten. Exits 1 with the reason
+                          on stderr when there is no file: the source is offline or needs
+                          `tephractl auth github`, the download failed (the file stays
+                          remote and `ls` says why), the disk is full, or the item is never
+                          fetched (Google Docs, Sheets, Slides, Forms and Drawings, shortcuts,
+                          symlinks, submodules and Git LFS pointers: the message says where to
+                          open it).
 
 FIXES:
     fixes                 The log of automatic link fixes (fix.list), newest first, one line per
@@ -270,6 +286,10 @@ pub enum Command {
     Backlinks {
         id: String,
     },
+    /// `fetch <id>`: `unit.fetch`. `unit` is a unit id, `@source:path`.
+    Fetch {
+        unit: String,
+    },
     /// `fixes [--since <when>]`: `fix.list`. Read-only (F9).
     Fixes {
         since: Option<Since>,
@@ -425,6 +445,7 @@ where
         "link" => parse_link(&mut iter)?,
         "block-id" => parse_block_id(&mut iter)?,
         "backlinks" => parse_backlinks(&mut iter)?,
+        "fetch" => parse_fetch(&mut iter)?,
         "fixes" => parse_fixes(&mut iter)?,
         "daemon" => parse_daemon(&mut iter)?,
         "auth" => {
@@ -1086,6 +1107,45 @@ fn parse_backlinks<'a>(
     })?;
     validate_backlinks_id(&id)?;
     Ok((Command::Backlinks { id }, json, addr))
+}
+
+/// `fetch <id> [--json] [--addr <addr>]`. A bad id is a usage error, decided
+/// here, before any request.
+fn parse_fetch<'a>(
+    iter: &mut impl Iterator<Item = &'a str>,
+) -> Result<(Command, bool, Option<String>), ArgsError> {
+    let mut unit: Option<String> = None;
+    let mut json = false;
+    let mut addr = None;
+
+    while let Some(arg) = iter.next() {
+        match arg {
+            "--json" => json = true,
+            "--addr" => addr = Some(take_value(iter, "--addr")?),
+            other if other.starts_with('-') && other.len() > 1 => {
+                return Err(ArgsError(format!("unrecognized argument: {other}")))
+            }
+            other if unit.is_none() => unit = Some(other.to_string()),
+            other => {
+                return Err(ArgsError(format!(
+                    "fetch takes one id; unexpected extra argument: {other}"
+                )))
+            }
+        }
+    }
+
+    let unit = unit.ok_or_else(|| {
+        ArgsError("fetch requires an <id> like \"@source:path/to/file\"".to_string())
+    })?;
+    match unit.strip_prefix('@').and_then(|r| r.split_once(':')) {
+        Some((source, path)) if !source.is_empty() && !path.is_empty() => {}
+        _ => {
+            return Err(ArgsError(format!(
+                "fetch needs an id like \"@source:path/to/file\", got \"{unit}\""
+            )))
+        }
+    }
+    Ok((Command::Fetch { unit }, json, addr))
 }
 
 /// `fixes [--since <when>] [--json] [--addr <addr>]`. A bad `--since` is

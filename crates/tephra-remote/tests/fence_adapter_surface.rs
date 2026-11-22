@@ -138,6 +138,7 @@ fn f2_f3_neither_trait_can_write_delete_move_rename_or_rewrite_history() {
             "list_tree",
             "list_tree_level",
             "poll_ref",
+            "stream_blob",
             "whoami"
         ]
     );
@@ -152,6 +153,7 @@ fn f2_f3_neither_trait_can_write_delete_move_rename_or_rewrite_history() {
             "list_changes",
             "list_children",
             "start_page_token",
+            "stream_download",
             "whoami"
         ]
     );

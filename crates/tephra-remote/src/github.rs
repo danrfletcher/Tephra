@@ -18,7 +18,7 @@ use crate::clock::Clock;
 use crate::credentials::{CredentialStore, Provider};
 use crate::error::{Conditional, RemoteError};
 use crate::rate_limit::Api;
-use crate::transport::{encode_path, AdapterOptions, Core, Request};
+use crate::transport::{encode_path, AdapterOptions, BodyStream, Core, Request};
 use crate::{BoxFut, RemoteResult};
 
 /// One repository, `owner/name`.
@@ -175,6 +175,17 @@ pub trait GithubAdapter: Send + Sync {
     /// The bytes of the blob with this sha.
     fn get_blob<'a>(&'a self, repo: &'a RepoRef, sha: &'a str)
         -> BoxFut<'a, RemoteResult<Vec<u8>>>;
+
+    /// The bytes of the blob with this sha, as a body read piece by piece:
+    /// a file of any size is written to disk without being held whole.
+    /// The same request, and the same failures, as [`GithubAdapter::get_blob`].
+    fn stream_blob<'a>(
+        &'a self,
+        repo: &'a RepoRef,
+        sha: &'a str,
+    ) -> BoxFut<'a, RemoteResult<BodyStream>> {
+        Box::pin(async move { Ok(BodyStream::from_bytes(self.get_blob(repo, sha).await?)) })
+    }
 
     /// The bytes of the file at `path` on `git_ref`.
     fn get_file<'a>(
@@ -494,6 +505,25 @@ impl GithubAdapter for GithubClient {
                 })
                 .await?;
             Ok(reply.body)
+        })
+    }
+
+    fn stream_blob<'a>(
+        &'a self,
+        repo: &'a RepoRef,
+        sha: &'a str,
+    ) -> BoxFut<'a, RemoteResult<BodyStream>> {
+        Box::pin(async move {
+            if !is_hex_sha(sha) {
+                return Err(RemoteError::InvalidInput("blob sha"));
+            }
+            self.core
+                .stream(Request {
+                    path: format!("{}/git/blobs/{sha}", repo.path()),
+                    accept: Some(RAW),
+                    ..Request::default()
+                })
+                .await
         })
     }
 

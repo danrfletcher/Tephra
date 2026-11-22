@@ -50,6 +50,8 @@ pub const METHOD_NAMES: &[&str] = &[
     "link.rename_event",
     // atlas-27 PR-5: the one method that PR adds.
     "source.add_github",
+    // atlas-27 PR-7: the one method that PR adds.
+    "unit.fetch",
 ];
 
 /// The three backends one `dispatch` call reads through, bundled so
@@ -113,6 +115,7 @@ pub fn dispatch(
         "link.apply_refactor" => link_apply_refactor(params, backends.refactor),
         "unit.list" => unit_list(params, backends.sources),
         "unit.search" => unit_search(params, backends.sources),
+        "unit.fetch" => unit_fetch(params, backends.sources),
         "block.ensure_id" => block_ensure_id(params, backends.blocks),
         "fix.list" => fix_list(params, backends.fixes),
         "link.rename_event" => link_rename_event(params, backends.fixes),
@@ -317,6 +320,21 @@ fn unit_list(params: &Value, sources: &dyn SourceBackend) -> DispatchResult {
             UnitListError::InvalidParams(message) => invalid_params(message),
             UnitListError::Source(message) => (SOURCE_ERROR, message, None),
         })
+}
+
+/// `unit.fetch {unit}` (G10). `unit` is a unit id, `@source:path`. A
+/// refusal (`not_remote`, `unknown_unit`, `not_fetchable`) or a failed
+/// download is a `SOURCE_ERROR` whose `data` says `reason` (and, for
+/// `not_fetchable`, the `url` and the `kind`).
+fn unit_fetch(params: &Value, sources: &dyn SourceBackend) -> DispatchResult {
+    let unit = require_str(params, "unit")?;
+    if !unit.starts_with('@') || !unit.contains(':') {
+        return Err(invalid_params("\"unit\" must be a unit id, @source:path"));
+    }
+    sources
+        .fetch_unit(unit)
+        .map(|wire| serde_json::to_value(wire).expect("FetchWire always serializes"))
+        .map_err(|e| (SOURCE_ERROR, e.message.clone(), Some(e.data())))
 }
 
 /// `unit.search {query, scope?, in?, limit?}` (G8, G9). `query` is a
@@ -587,6 +605,7 @@ mod tests {
                 "fix.list",
                 "link.rename_event",
                 "source.add_github",
+                "unit.fetch",
             ]
         );
     }

@@ -23,6 +23,7 @@ mod listing;
 mod pending_fixes;
 mod promote;
 mod remote;
+mod remote_fetch;
 mod remote_ops;
 mod remote_sync;
 mod schema;
@@ -49,6 +50,11 @@ pub use pending_fixes::{
 };
 pub use promote::{NewPromote, NewUnpromote, Promoted, PromotedRootRow, Unpromoted};
 pub use remote::{REMOTE_ITEM_STATES, REMOTE_SOURCE_KINDS, REMOTE_TABLES};
+pub use remote_fetch::{
+    item_cache_bytes, state_has_copy, RemoteFetchRow, FETCH_REASON_PREFIX, ITEM_STATE_CACHED,
+    ITEM_STATE_DOWNLOADING, ITEM_STATE_MISSING, ITEM_STATE_NOT_PUSHED, ITEM_STATE_PENDING_UPLOAD,
+    ITEM_STATE_PINNED, ITEM_STATE_REMOTE,
+};
 pub use remote_ops::{
     is_text_item_kind, remote_root, IndexProgress, NewRemoteItem, NewRemoteSource, RemoteCursor,
     RemoteItemRow, RemoteSourceRow, ITEM_KIND_SUBMODULE, ITEM_KIND_SYMLINK, REASON_LFS_POINTER,

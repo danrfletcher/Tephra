@@ -13,6 +13,9 @@
 //!   move LOCATION      the repo answers 301 with that Location from now on
 //!   unmove             the repo is back where it was
 //!   down | up          the connection is refused / back, same port
+//!   cut N              the next N file bodies are cut short (the connection
+//!                      drops part way through)
+//!   latency MS         every answer takes MS milliseconds more
 //!   clear              forget the requests so far
 //!   dump               write the requests so far to REQUEST_LOG, one
 //!                      `METHOD PATH [if-none-match]` line each (never a header
@@ -55,6 +58,9 @@ async fn main() {
         "src/lib.rs",
         b"// the library\npub fn atlas() {}\n",
     );
+    // A 6 MB file, to fetch in pieces and to cut off.
+    let big: Vec<u8> = (0..6 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    github.put_file(REPO, "main", "data/big.bin", &big);
     let gate = LinkGate::in_front_of(github.base_url()).await;
     std::fs::write(&url_file, gate.base_url()).expect("write the URL file");
 
@@ -102,6 +108,20 @@ async fn main() {
                 gate.up().await;
                 "ok up".to_string()
             }
+            "cut" => match rest.trim().parse::<u32>() {
+                Ok(n) => {
+                    github.truncate_next_bodies(n);
+                    format!("ok cut {n}")
+                }
+                Err(_) => "error: cut N".to_string(),
+            },
+            "latency" => match rest.trim().parse::<u64>() {
+                Ok(ms) => {
+                    github.set_latency(std::time::Duration::from_millis(ms));
+                    format!("ok latency {ms}")
+                }
+                Err(_) => "error: latency MS".to_string(),
+            },
             "clear" => {
                 github.request_log().clear();
                 "ok clear".to_string()

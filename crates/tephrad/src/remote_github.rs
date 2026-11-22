@@ -40,6 +40,7 @@ use tephra_cache::{
     STATUS_OFFLINE,
 };
 use tephra_remote::credentials::{credential_state, CredentialState, CredentialStore, Provider};
+use tephra_remote::drive::{DriveAdapter, DriveClient};
 use tephra_remote::github::{
     full_tree, GithubAdapter, GithubClient, RepoRef, TreeEntry, TreeEntryKind,
 };
@@ -54,6 +55,8 @@ use crate::writer_gate::WriterGate;
 
 /// The `kind` of a GitHub source in `remote_sources` and on the wire.
 pub const GITHUB_KIND: &str = "github";
+/// The `kind` of a Google Drive source in `remote_sources`.
+pub const DRIVE_KIND: &str = "drive";
 
 /// Git's mode for a symlink: listed by name, never followed.
 const MODE_SYMLINK: &str = "120000";
@@ -110,7 +113,12 @@ fn refused(reason: &'static str, message: impl Into<String>) -> RegistryError {
 /// content cache would live.
 pub struct RemoteHub {
     pub(crate) adapter: Arc<dyn GithubAdapter>,
+    /// The Drive adapter `unit.fetch` reads a Drive file through (it reads
+    /// the Google token from `store` on every call). It lists nothing on
+    /// its own: Drive sources are added and synced by PR-10.
+    pub(crate) drive: Arc<dyn DriveAdapter>,
     store: Arc<dyn CredentialStore>,
+    options: AdapterOptions,
     pub(crate) clock: Arc<dyn Clock>,
     data_dir: PathBuf,
     /// How often a waiting poller looks at the clock. Real time, whatever
@@ -127,6 +135,8 @@ pub struct RemoteHub {
     /// first index still reading is not one). A test waits on it to know a
     /// poller has acted when nothing else shows it (a network that is away).
     pub(crate) polls_done: std::sync::atomic::AtomicUsize,
+    /// The downloads of `unit.fetch` running now, and the disk they write to.
+    pub(crate) fetches: Arc<crate::remote::fetch::FetchEngine>,
 }
 
 impl RemoteHub {
@@ -158,16 +168,44 @@ impl RemoteHub {
         let client =
             GithubClient::with_options(github_api_url, store.clone(), clock.clone(), options)
                 .map_err(|e| e.to_string())?;
+        let drive = DriveClient::with_options(None, store.clone(), clock.clone(), options)
+            .map_err(|e| e.to_string())?;
         Ok(RemoteHub {
             adapter: Arc::new(client),
+            drive: Arc::new(drive),
             store,
+            options,
             clock,
             data_dir,
             poll_tick: crate::remote::poll::DEFAULT_POLL_TICK,
             polling: Mutex::new(HashSet::new()),
             indexing: Mutex::new(HashSet::new()),
             polls_done: std::sync::atomic::AtomicUsize::new(0),
+            fetches: Arc::new(crate::remote::fetch::FetchEngine::new(Arc::new(
+                crate::remote::fetch::RealDisk,
+            ))),
         })
+    }
+
+    /// Reads Drive files from `drive_api_url` (the config key; `None`: the
+    /// real API) instead of the default.
+    pub fn with_drive_api_url(mut self, drive_api_url: Option<&str>) -> Result<Self, String> {
+        let client = DriveClient::with_options(
+            drive_api_url,
+            self.store.clone(),
+            self.clock.clone(),
+            self.options,
+        )
+        .map_err(|e| e.to_string())?;
+        self.drive = Arc::new(client);
+        Ok(self)
+    }
+
+    /// The disk a fetch writes to (a test makes it fail the way a full
+    /// disk does).
+    pub fn with_disk(mut self, disk: Arc<dyn crate::remote::fetch::Disk>) -> Self {
+        self.fetches = Arc::new(crate::remote::fetch::FetchEngine::new(disk));
+        self
     }
 
     /// How often a waiting poller looks at the clock (default one second).
@@ -539,7 +577,14 @@ impl SourceRegistry {
     /// indexes again from scratch every source whose first index was cut
     /// short or whose cursor row is lost. A source whose index is complete
     /// costs no adapter call.
+    ///
+    /// No download survives a restart: an item that says `downloading` is
+    /// `remote` again and the temporary files of a fetch that was cut off
+    /// are swept ([`SourceRegistry::clean_up_after_downloads`]).
     pub fn resume_remote_sources(&self) {
+        if let Some(hub) = self.remote.get() {
+            self.clean_up_after_downloads(hub);
+        }
         let rows = {
             let cache = self.cache.lock().unwrap();
             match cache.remote_sources() {
@@ -622,11 +667,7 @@ impl SourceRegistry {
             repo: source.target.clone(),
             branch: source.branch.clone(),
             cache: source.cache,
-            cache_bytes: if dir.as_os_str().is_empty() {
-                0
-            } else {
-                dir_bytes(&dir.join("blobs"))
-            },
+            cache_bytes: cache.remote_cache_bytes(&source.name).unwrap_or(0),
             git_bytes: if dir.as_os_str().is_empty() {
                 0
             } else {

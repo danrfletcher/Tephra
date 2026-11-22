@@ -101,6 +101,72 @@ pub(crate) struct Reply {
     pub body: Vec<u8>,
 }
 
+/// How long a streamed body may take in all. The client's own
+/// `request_timeout` is for answers that are read whole; a file is read as
+/// it arrives, and a stalled connection is cut by the read timeout (the
+/// same `request_timeout`, between two chunks), not by this.
+const STREAM_TOTAL_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
+/// The body of a 2xx answer, read piece by piece: what a file download
+/// needs, so no file is held whole in memory. Built by [`Core::stream`] or,
+/// for bytes that are already in hand, by [`BodyStream::from_bytes`].
+///
+/// It never carries a token or a header: a failure is a [`RemoteError`].
+pub struct BodyStream {
+    inner: Inner,
+    length: Option<u64>,
+}
+
+enum Inner {
+    Http(reqwest::Response),
+    Memory(Option<Vec<u8>>),
+}
+
+impl fmt::Debug for BodyStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BodyStream")
+            .field("length", &self.length)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BodyStream {
+    /// A body that is already whole (one piece).
+    pub fn from_bytes(bytes: Vec<u8>) -> BodyStream {
+        BodyStream {
+            length: Some(bytes.len() as u64),
+            inner: Inner::Memory(Some(bytes)),
+        }
+    }
+
+    /// The length the server announced, if it did.
+    pub fn content_length(&self) -> Option<u64> {
+        self.length
+    }
+
+    /// The next piece, or `None` at the end. A body that is cut short is
+    /// `Unreachable(BodyCut)` (or `Timeout` when the connection went
+    /// quiet).
+    pub async fn chunk(&mut self) -> Result<Option<Vec<u8>>, RemoteError> {
+        match &mut self.inner {
+            Inner::Memory(bytes) => Ok(bytes.take().filter(|b| !b.is_empty())),
+            Inner::Http(response) => match response.chunk().await {
+                Ok(piece) => Ok(piece.map(|b| b.to_vec())),
+                Err(e) => Err(RemoteError::Unreachable(match classify_transport(&e) {
+                    UnreachableCause::Timeout => UnreachableCause::Timeout,
+                    _ => UnreachableCause::BodyCut,
+                })),
+            },
+        }
+    }
+}
+
+/// What one exchange gave back.
+enum Answer {
+    Whole(Reply),
+    Stream(BodyStream),
+}
+
 #[derive(Default)]
 struct State {
     gate: RateGate,
@@ -157,6 +223,7 @@ impl Core {
             // Authorization header cannot go to another location.
             .redirect(reqwest::redirect::Policy::none())
             .timeout(options.request_timeout)
+            .read_timeout(options.request_timeout)
             .connect_timeout(options.connect_timeout)
             .user_agent(concat!("tephra-remote/", env!("CARGO_PKG_VERSION")));
         if crate::api_url::is_loopback_url(&base) {
@@ -214,6 +281,23 @@ impl Core {
     }
 
     pub(crate) async fn get(&self, request: Request) -> Result<Reply, RemoteError> {
+        match self.exchange(request, false).await? {
+            Answer::Whole(reply) => Ok(reply),
+            Answer::Stream(_) => unreachable!("a whole read never answers with a stream"),
+        }
+    }
+
+    /// Like [`Core::get`], but a 2xx answer's body is handed over unread:
+    /// the caller reads it piece by piece. Every other outcome, and every
+    /// step before the body, is the same as for `get`.
+    pub(crate) async fn stream(&self, request: Request) -> Result<BodyStream, RemoteError> {
+        match self.exchange(request, true).await? {
+            Answer::Stream(body) => Ok(body),
+            Answer::Whole(reply) => Ok(BodyStream::from_bytes(reply.body)),
+        }
+    }
+
+    async fn exchange(&self, request: Request, streaming: bool) -> Result<Answer, RemoteError> {
         let token = self.token()?;
         let now = self.clock.now();
         {
@@ -246,6 +330,9 @@ impl Core {
                 HeaderValue::from_str(etag).map_err(|_| RemoteError::InvalidInput("etag"))?;
             builder = builder.header(IF_NONE_MATCH, value);
         }
+        if streaming {
+            builder = builder.timeout(STREAM_TOTAL_TIMEOUT);
+        }
         if self.api == Api::Github {
             builder = builder.header("x-github-api-version", "2022-11-28").header(
                 USER_AGENT,
@@ -262,6 +349,13 @@ impl Core {
         let headers = response.headers().clone();
 
         match status {
+            200..=299 if streaming => {
+                self.succeeded();
+                Ok(Answer::Stream(BodyStream {
+                    length: response.content_length(),
+                    inner: Inner::Http(response),
+                }))
+            }
             200..=299 => {
                 let body = response.bytes().await.map_err(|e| {
                     let cause = match classify_transport(&e) {
@@ -271,19 +365,19 @@ impl Core {
                     RemoteError::Unreachable(cause)
                 })?;
                 self.succeeded();
-                Ok(Reply {
+                Ok(Answer::Whole(Reply {
                     status,
                     headers,
                     body: body.to_vec(),
-                })
+                }))
             }
             304 if conditional => {
                 self.succeeded();
-                Ok(Reply {
+                Ok(Answer::Whole(Reply {
                     status,
                     headers,
                     body: Vec::new(),
-                })
+                }))
             }
             300..=399 => {
                 let location = headers

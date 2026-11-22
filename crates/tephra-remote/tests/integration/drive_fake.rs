@@ -577,3 +577,26 @@ async fn ids_and_tokens_that_could_change_the_request_are_refused_before_anythin
     );
     assert_eq!(env.fake.request_log().count(), 0);
 }
+
+#[tokio::test]
+async fn stream_download_gives_the_bytes_and_fails_like_download() {
+    let env = drive_env("ya29.x").await;
+    let mut body = env.client.stream_download("f1").await.unwrap();
+    assert_eq!(body.content_length(), Some(8));
+    let mut all = Vec::new();
+    while let Some(piece) = body.chunk().await.unwrap() {
+        all.extend_from_slice(&piece);
+    }
+    assert_eq!(all, b"# notes\n");
+    // A native Doc has no bytes; an unknown id and a bad id are refused as
+    // `download` refuses them.
+    assert!(env.client.stream_download("d1").await.is_err());
+    assert_eq!(
+        env.client.stream_download("nope").await.unwrap_err(),
+        RemoteError::NotFound
+    );
+    assert_eq!(
+        env.client.stream_download("a/b").await.unwrap_err(),
+        RemoteError::InvalidInput("file id")
+    );
+}

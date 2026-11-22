@@ -1115,6 +1115,7 @@ fn f12_the_method_list_is_unchanged_and_there_is_no_injection_method() {
         "fix.list",
         "link.rename_event",
         "source.add_github",
+        "unit.fetch",
     ];
     assert_eq!(tephrad::rpc::dispatch::METHOD_NAMES, expected);
 

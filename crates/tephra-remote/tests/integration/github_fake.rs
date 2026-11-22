@@ -738,3 +738,75 @@ async fn symlinks_and_submodules_are_tree_entries_with_their_modes() {
     assert_eq!(sub.mode, "160000");
     assert_eq!(sub.kind, TreeEntryKind::Commit);
 }
+
+// ---- streamed blobs ----------------------------------------------------------
+
+/// Reads a whole stream, piece by piece, and counts the pieces.
+async fn drain(mut body: tephra_remote::BodyStream) -> Result<(Vec<u8>, usize), RemoteError> {
+    let mut all = Vec::new();
+    let mut pieces = 0;
+    while let Some(piece) = body.chunk().await? {
+        pieces += 1;
+        all.extend_from_slice(&piece);
+    }
+    Ok((all, pieces))
+}
+
+#[tokio::test]
+async fn stream_blob_gives_the_same_bytes_as_get_blob_in_more_than_one_piece() {
+    let env = github_env("ghp_x").await;
+    let big: Vec<u8> = (0..5 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    env.fake.put_file("octo/hello", "main", "big.bin", &big);
+    let sha = FakeGithub::blob_sha(&big);
+
+    let body = env.client.stream_blob(&env.repo, &sha).await.unwrap();
+    assert_eq!(body.content_length(), Some(big.len() as u64));
+    let (bytes, pieces) = drain(body).await.unwrap();
+    assert_eq!(bytes, big);
+    assert!(pieces > 1, "one piece for 5 MB is not a stream");
+    assert_eq!(env.client.get_blob(&env.repo, &sha).await.unwrap(), big);
+}
+
+#[tokio::test]
+async fn stream_blob_fails_like_get_blob_before_any_body() {
+    let env = github_env("ghp_x").await;
+    assert_eq!(
+        env.client
+            .stream_blob(&env.repo, "0123456789abcdef")
+            .await
+            .unwrap_err(),
+        RemoteError::NotFound
+    );
+    assert_eq!(
+        env.client
+            .stream_blob(&env.repo, "not-hex!")
+            .await
+            .unwrap_err(),
+        RemoteError::InvalidInput("blob sha")
+    );
+    let sha = FakeGithub::blob_sha(b"# hello\n");
+    env.fake.fail_next(1, 503);
+    assert_eq!(
+        env.client.stream_blob(&env.repo, &sha).await.unwrap_err(),
+        RemoteError::Server { status: 503 }
+    );
+    env.fake.revoke_token();
+    assert_eq!(
+        env.client.stream_blob(&env.repo, &sha).await.unwrap_err(),
+        RemoteError::AuthRejected
+    );
+}
+
+#[tokio::test]
+async fn a_streamed_body_that_is_cut_fails_with_body_cut_after_some_pieces() {
+    let env = github_env("ghp_x").await;
+    let big = vec![7u8; 256 * 1024];
+    env.fake.put_file("octo/hello", "main", "big.bin", &big);
+    let sha = FakeGithub::blob_sha(&big);
+    env.fake.truncate_next_bodies(1);
+    let body = env.client.stream_blob(&env.repo, &sha).await.unwrap();
+    assert_eq!(
+        drain(body).await.unwrap_err(),
+        RemoteError::Unreachable(UnreachableCause::BodyCut)
+    );
+}

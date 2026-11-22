@@ -26,6 +26,7 @@ use tephrad::fixes::FixEngine;
 use tephrad::refactor::fix_write::FixWriter;
 use tephrad::refactor::RefactorEngine;
 use tephrad::registry::SourceRegistry;
+use tephrad::remote::fetch::{Disk, RealDisk, SinkFile};
 use tephrad::remote_github::RemoteHub;
 use tephrad::rpc::backend::{
     FixService, GraphBackend, GraphRefresh, RefactorBackend, SharedGraph, SourceBackend,
@@ -37,6 +38,8 @@ pub const WAIT: Duration = Duration::from_secs(30);
 /// A token that is a plain, recognisable sentinel: no test may find it
 /// anywhere it must not be.
 pub const TOKEN: &str = "ghp_SENTINEL_remote_token_do_not_leak";
+/// The Google token of a signed-in test store.
+pub const GOOGLE_TOKEN: &str = "ya29.SENTINEL_google_token_do_not_leak";
 pub const REPO: &str = "danrfletcher/atlas";
 
 type Ws =
@@ -187,6 +190,11 @@ impl MemStore {
             .lock()
             .unwrap()
             .insert(Provider::Github, TOKEN.to_string());
+        store
+            .items
+            .lock()
+            .unwrap()
+            .insert(Provider::Google, GOOGLE_TOKEN.to_string());
         Arc::new(store)
     }
 
@@ -290,6 +298,33 @@ impl Daemon {
         clock: Arc<dyn Clock>,
         options: AdapterOptions,
     ) -> Daemon {
+        Self::start_full_with_disk(fake, store, data_dir, clock, options, None)
+    }
+
+    /// [`Daemon::start_full`] with the disk a fetch writes to given (a
+    /// [`ProbeDisk`] makes a write or an fsync fail).
+    pub fn start_full_with_disk(
+        fake: &Arc<Fake>,
+        store: Arc<MemStore>,
+        data_dir: Option<PathBuf>,
+        clock: Arc<dyn Clock>,
+        options: AdapterOptions,
+        disk: Option<Arc<dyn Disk>>,
+    ) -> Daemon {
+        Self::start_full_with_drive(fake, store, data_dir, clock, options, disk, None)
+    }
+
+    /// [`Daemon::start_full_with_disk`] with the Drive API at `drive_url`
+    /// (a `FakeDrive`'s `base_url()`).
+    pub fn start_full_with_drive(
+        fake: &Arc<Fake>,
+        store: Arc<MemStore>,
+        data_dir: Option<PathBuf>,
+        clock: Arc<dyn Clock>,
+        options: AdapterOptions,
+        disk: Option<Arc<dyn Disk>>,
+        drive_url: Option<&str>,
+    ) -> Daemon {
         let (own_dir, data_dir) = match data_dir {
             Some(d) => (None, d),
             None => {
@@ -310,7 +345,13 @@ impl Daemon {
         let hub =
             RemoteHub::with_options(store, Some(&fake.url()), clock, data_dir.clone(), options)
                 .expect("hub")
+                .with_drive_api_url(drive_url)
+                .expect("the Drive adapter")
                 .with_poll_tick(Duration::from_millis(10));
+        let hub = match disk {
+            Some(disk) => hub.with_disk(disk),
+            None => hub,
+        };
         registry.set_remote_hub(Arc::new(hub));
 
         let graph_cache = Cache::open(&cache_path).expect("graph cache");
@@ -788,4 +829,211 @@ pub fn item_rows(cache_path: &Path, source: &str) -> Vec<tephra_cache::RemoteIte
         .expect("open the cache")
         .remote_items(source)
         .expect("items")
+}
+
+/// A disk that does what the real one does, counts what is written, and can
+/// be told to fail the way a full disk does (E16).
+pub struct ProbeDisk {
+    /// How many `write_all` calls reached the disk.
+    pub writes: std::sync::atomic::AtomicUsize,
+    /// The largest single write.
+    pub largest_write: std::sync::atomic::AtomicUsize,
+    /// Fail the write with this number (1 is the first) with `ENOSPC`.
+    fail_write_at: Mutex<Option<usize>>,
+    /// Fail the file's fsync with `ENOSPC`.
+    fail_file_sync: std::sync::atomic::AtomicBool,
+    /// Fail the directory's fsync with `ENOSPC`.
+    fail_dir_sync: std::sync::atomic::AtomicBool,
+}
+
+impl ProbeDisk {
+    pub fn new() -> Arc<ProbeDisk> {
+        Arc::new(ProbeDisk {
+            writes: Default::default(),
+            largest_write: Default::default(),
+            fail_write_at: Mutex::new(None),
+            fail_file_sync: Default::default(),
+            fail_dir_sync: Default::default(),
+        })
+    }
+
+    pub fn fail_write_number(&self, n: usize) {
+        *self.fail_write_at.lock().unwrap() = Some(n);
+    }
+
+    pub fn fail_file_sync(&self, on: bool) {
+        self.fail_file_sync
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn fail_dir_sync(&self, on: bool) {
+        self.fail_dir_sync
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn heal(&self) {
+        *self.fail_write_at.lock().unwrap() = None;
+        self.fail_file_sync(false);
+        self.fail_dir_sync(false);
+    }
+}
+
+fn enospc() -> std::io::Error {
+    std::io::Error::from_raw_os_error(28)
+}
+
+struct ProbeFile {
+    inner: Box<dyn SinkFile>,
+    probe: Arc<ProbeDisk>,
+}
+
+impl SinkFile for ProbeFile {
+    fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let n = self.probe.writes.fetch_add(1, SeqCst) + 1;
+        self.probe.largest_write.fetch_max(bytes.len(), SeqCst);
+        if *self.probe.fail_write_at.lock().unwrap() == Some(n) {
+            return Err(enospc());
+        }
+        self.inner.write_all(bytes)
+    }
+
+    fn sync_all(&mut self) -> std::io::Result<()> {
+        if self
+            .probe
+            .fail_file_sync
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(enospc());
+        }
+        self.inner.sync_all()
+    }
+}
+
+/// `Disk` for a `ProbeDisk` held in an `Arc` (the daemon owns one clone, the
+/// test keeps the other).
+pub struct ProbeHandle(pub Arc<ProbeDisk>);
+
+impl Disk for ProbeHandle {
+    fn create_new(&self, path: &Path) -> std::io::Result<Box<dyn SinkFile>> {
+        Ok(Box::new(ProbeFile {
+            inner: RealDisk.create_new(path)?,
+            probe: self.0.clone(),
+        }))
+    }
+
+    fn sync_dir(&self, dir: &Path) -> std::io::Result<()> {
+        if self
+            .0
+            .fail_dir_sync
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(enospc());
+        }
+        RealDisk.sync_dir(dir)
+    }
+}
+
+/// A daemon on a fake clock in front of a fake GitHub: `build` puts files in
+/// the fake, then the source `g` is added and indexed. No poll is due unless
+/// the test moves the clock.
+pub struct FetchRig {
+    pub fake: Arc<Fake>,
+    pub clock: Arc<FakeClock>,
+    pub d: Daemon,
+    pub probe: Arc<ProbeDisk>,
+}
+
+impl FetchRig {
+    pub fn start(build: impl FnOnce(&Fake)) -> FetchRig {
+        Self::start_with_drive(None, build)
+    }
+
+    /// [`FetchRig::start`] with the Drive API at `drive_url`.
+    pub fn start_with_drive(drive_url: Option<&str>, build: impl FnOnce(&Fake)) -> FetchRig {
+        let clock = Arc::new(FakeClock::at_epoch_2026());
+        let fake = Fake::start_with_clock(clock.clone());
+        fake.atlas();
+        build(&fake);
+        let probe = ProbeDisk::new();
+        let d = Daemon::start_full_with_drive(
+            &fake,
+            MemStore::signed_in(),
+            None,
+            clock.clone(),
+            AdapterOptions::default(),
+            Some(Arc::new(ProbeHandle(probe.clone()))),
+            drive_url,
+        );
+        d.add_github("g", REPO);
+        d.wait_active("g");
+        let rig = FetchRig {
+            fake,
+            clock,
+            d,
+            probe,
+        };
+        rig.d.connect().drain_graph_changed(QUIET);
+        rig
+    }
+
+    /// `unit.fetch` of `path` of `g`, the whole reply.
+    pub fn fetch(&self, path: &str) -> Value {
+        self.d
+            .rpc("unit.fetch", json!({ "unit": format!("@g:{path}") }))
+    }
+
+    /// The row of `path` of `g`.
+    pub fn row(&self, path: &str) -> tephra_cache::RemoteFetchRow {
+        Cache::open_read_only(&self.d.cache_path)
+            .expect("open the cache")
+            .remote_fetch_row("g", path)
+            .expect("read the row")
+            .unwrap_or_else(|| panic!("{path} has a row"))
+    }
+
+    /// Where `path` of `g` is fetched to.
+    pub fn cached_path(&self, path: &str) -> PathBuf {
+        self.d
+            .data_dir
+            .join("remote")
+            .join("g")
+            .join("clone")
+            .join(path)
+    }
+
+    /// Everything under the content cache of `g`.
+    pub fn cache_files(&self) -> Vec<PathBuf> {
+        files_under(&self.d.data_dir.join("remote").join("g"))
+    }
+
+    /// Content requests the fake has seen (index reads included).
+    pub fn reads(&self) -> usize {
+        self.fake.reads().len()
+    }
+}
+
+/// A source of kind `drive` with items, written straight into the remote
+/// tables: PR-10 adds the real thing. `items` are
+/// `(path, kind, file_id, size)`.
+pub fn seed_drive_source(cache_path: &Path, name: &str, items: &[(&str, &str, &str, i64)]) {
+    let cache = Cache::open(cache_path).expect("open the cache");
+    cache
+        .connection()
+        .execute(
+            "INSERT INTO remote_sources (name, kind, target, created_at, status) \
+             VALUES (?1, 'drive', 'folder-id', 1795132000, 'active')",
+            [name],
+        )
+        .expect("seed a drive source");
+    for (path, kind, file_id, size) in items {
+        cache
+            .connection()
+            .execute(
+                "INSERT INTO remote_items (source, path, kind, file_id, size, state) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'remote')",
+                rusqlite::params![name, path, kind, file_id, size],
+            )
+            .expect("seed a drive item");
+    }
 }

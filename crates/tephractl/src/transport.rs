@@ -61,7 +61,13 @@ const MUTATING_METHODS: &[&str] = &[
 /// Methods long/expensive enough on the daemon side that they need
 /// more than [`REQUEST_TIMEOUT`] to complete under normal operation
 /// (not just under failure).
+///
+/// `unit.fetch` is here because it answers once the file is on disk (a
+/// big file over a slow link takes longer than ten seconds). It is not
+/// in [`MUTATING_METHODS`]: a fetch is safe to repeat, and a repeat while
+/// one runs joins it.
 const LONG_RUNNING_METHODS: &[&str] = &[
+    "unit.fetch",
     "source.register",
     "source.add_github",
     "source.rescan",

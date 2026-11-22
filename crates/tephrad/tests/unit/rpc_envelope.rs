@@ -215,7 +215,7 @@ fn unknown_method_returns_method_not_found() {
 /// (atlas-25 PR-8, G3), `source.promote` / `source.unpromote` (PR-12, PR-13)
 /// and `source.rename` (PR-14, G13). Adding a method
 /// means changing this list on purpose.
-const EXPECTED_METHODS: [&str; 19] = [
+const EXPECTED_METHODS: [&str; 20] = [
     "unit.resolve_link",
     "graph.get_backlinks",
     "graph.get_forward_links",
@@ -234,12 +234,13 @@ const EXPECTED_METHODS: [&str; 19] = [
     "block.ensure_id",
     "fix.list",
     "link.rename_event",
-    // atlas-27 PR-5: the one method that PR adds.
+    // atlas-27 PR-5 adds `source.add_github`, PR-7 adds `unit.fetch`.
     "source.add_github",
+    "unit.fetch",
 ];
 
 #[test]
-fn method_table_is_exactly_the_nineteen_named_verbs() {
+fn method_table_is_exactly_the_twenty_named_verbs() {
     assert_eq!(METHOD_NAMES, EXPECTED_METHODS);
     // No duplicates either.
     let mut sorted = METHOD_NAMES.to_vec();
@@ -302,6 +303,51 @@ fn source_rename_params_are_validated_and_near_misses_are_not_methods() {
             &p,
             typo,
             &json!({"name": "notes", "new_name": "x"}),
+            &backends(&graph, &sources),
+        )
+        .unwrap_err();
+        assert_eq!(err.0, METHOD_NOT_FOUND, "{typo}");
+    }
+}
+
+/// `unit.fetch` (atlas-27 PR-7, G10) needs one non-empty string `unit` that
+/// is a unit id (`@source:path`); anything else is `INVALID_PARAMS` before
+/// a backend runs. A well-formed id is routed (the default backend refuses
+/// with a source error), and near-misses are not methods.
+#[test]
+fn unit_fetch_params_are_validated_and_near_misses_are_not_methods() {
+    let graph = NullGraph;
+    let sources = NullSources;
+    let p = proof();
+
+    for params in [
+        json!({}),
+        json!({"unit": ""}),
+        json!({"unit": 7}),
+        json!({"unit": null}),
+        json!({"unit": "notes:README.md"}),
+        json!({"unit": "@notes"}),
+        json!({"id": "@notes:README.md"}),
+    ] {
+        let err = dispatch(&p, "unit.fetch", &params, &backends(&graph, &sources)).unwrap_err();
+        assert_eq!(err.0, INVALID_PARAMS, "{params}");
+    }
+    let err = dispatch(
+        &p,
+        "unit.fetch",
+        &json!({"unit": "@notes:README.md"}),
+        &backends(&graph, &sources),
+    )
+    .unwrap_err();
+    assert_ne!(err.0, METHOD_NOT_FOUND);
+    assert_ne!(err.0, INVALID_PARAMS);
+    assert_eq!(err.2.unwrap()["reason"], "fetch_unavailable");
+
+    for typo in ["unit.fetch_", "unit.Fetch", "unit.download", "source.fetch"] {
+        let err = dispatch(
+            &p,
+            typo,
+            &json!({"unit": "@notes:README.md"}),
             &backends(&graph, &sources),
         )
         .unwrap_err();
@@ -764,4 +810,292 @@ fn unit_search_all_blocks_refuses_an_in_param_and_a_bad_limit_and_reaches_nothin
         assert!(message.contains("limit"), "limit {limit}: {message}");
     }
     assert!(sources.all_blocks.lock().unwrap().is_empty());
+}
+
+// -- unit.fetch: result and error shapes, and the bearer-token gate -------
+
+/// A backend whose `fetch_unit` answers by unit id, and remembers every id
+/// it was asked for: what the dispatcher and the transport do with a
+/// `unit.fetch` is read from what reaches it and what comes back.
+struct FetchSources {
+    asked: std::sync::Mutex<Vec<String>>,
+}
+
+impl FetchSources {
+    fn new() -> Self {
+        FetchSources {
+            asked: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn asked(&self) -> Vec<String> {
+        self.asked.lock().unwrap().clone()
+    }
+}
+
+impl tephrad::rpc::backend::SourceBackend for FetchSources {
+    fn register(
+        &self,
+        _name: &str,
+        _root: &str,
+    ) -> Result<tephrad::rpc::backend::ScanStatsWire, String> {
+        unreachable!("not a unit.fetch path")
+    }
+    fn unregister(&self, _name: &str) -> Result<(), String> {
+        unreachable!("not a unit.fetch path")
+    }
+    fn list(&self) -> Result<Vec<tephrad::rpc::backend::SourceRowWire>, String> {
+        Ok(Vec::new())
+    }
+    fn rescan(&self, _name: &str) -> Result<tephrad::rpc::backend::ScanStatsWire, String> {
+        unreachable!("not a unit.fetch path")
+    }
+    fn fetch_unit(
+        &self,
+        unit: &str,
+    ) -> Result<tephrad::remote::fetch::FetchWire, tephrad::remote::fetch::FetchRpcError> {
+        use tephrad::remote::fetch::{FetchRpcError, FetchWire};
+        self.asked.lock().unwrap().push(unit.to_string());
+        match unit {
+            "@g:docs/Guide.md" => Ok(FetchWire {
+                unit: unit.to_string(),
+                path: "/data/remote/g/clone/docs/Guide.md".to_string(),
+                state: "cached".to_string(),
+                size: 29,
+            }),
+            "@gdrive:Plan" => Err(FetchRpcError {
+                reason: "not_fetchable",
+                message: "a Google Doc has no file to download; open it at https://docs.google.com/document/d/doc-1/edit".to_string(),
+                url: Some("https://docs.google.com/document/d/doc-1/edit".to_string()),
+                kind: Some("gdoc".to_string()),
+            }),
+            "@g:link" => Err(FetchRpcError {
+                reason: "not_fetchable",
+                message: "a symbolic link is listed by name only".to_string(),
+                url: None,
+                kind: Some("symlink".to_string()),
+            }),
+            _ => Err(FetchRpcError {
+                reason: "disk_full",
+                message: "the disk is full".to_string(),
+                url: None,
+                kind: None,
+            }),
+        }
+    }
+}
+
+struct SharedFetch(std::sync::Arc<FetchSources>);
+
+impl tephrad::rpc::backend::SourceBackend for SharedFetch {
+    fn register(&self, n: &str, r: &str) -> Result<tephrad::rpc::backend::ScanStatsWire, String> {
+        self.0.register(n, r)
+    }
+    fn unregister(&self, n: &str) -> Result<(), String> {
+        self.0.unregister(n)
+    }
+    fn list(&self) -> Result<Vec<tephrad::rpc::backend::SourceRowWire>, String> {
+        self.0.list()
+    }
+    fn rescan(&self, n: &str) -> Result<tephrad::rpc::backend::ScanStatsWire, String> {
+        self.0.rescan(n)
+    }
+    fn fetch_unit(
+        &self,
+        unit: &str,
+    ) -> Result<tephrad::remote::fetch::FetchWire, tephrad::remote::fetch::FetchRpcError> {
+        self.0.fetch_unit(unit)
+    }
+}
+
+fn fetch_dispatch(
+    sources: &FetchSources,
+    unit: &str,
+) -> Result<serde_json::Value, (i64, String, Option<serde_json::Value>)> {
+    let graph = NullGraph;
+    static NULL_REFACTOR: tephrad::rpc::backend::UnsupportedRefactor =
+        tephrad::rpc::backend::UnsupportedRefactor;
+    dispatch(
+        &proof(),
+        "unit.fetch",
+        &json!({ "unit": unit }),
+        &Backends {
+            graph: &graph,
+            sources,
+            refactor: &NULL_REFACTOR,
+            blocks: &tephrad::rpc::backend::UnsupportedBlockIds,
+            fixes: &tephrad::rpc::backend::UnsupportedFixes,
+        },
+    )
+}
+
+/// The result of a `unit.fetch` that works is exactly `{unit, path, state,
+/// size}`: the unit id as asked, an absolute path, the state and the size
+/// in bytes.
+#[test]
+fn unit_fetch_result_is_unit_path_state_and_size_and_nothing_else() {
+    let sources = FetchSources::new();
+    let result = fetch_dispatch(&sources, "@g:docs/Guide.md").expect("a fetch that works");
+    assert_eq!(
+        result,
+        json!({
+            "unit": "@g:docs/Guide.md",
+            "path": "/data/remote/g/clone/docs/Guide.md",
+            "state": "cached",
+            "size": 29,
+        })
+    );
+    let keys: Vec<&String> = result.as_object().unwrap().keys().collect();
+    assert_eq!(keys.len(), 4, "{keys:?}");
+    assert!(result["path"].as_str().unwrap().starts_with('/'));
+    assert!(result["size"].is_u64());
+    assert_eq!(sources.asked(), vec!["@g:docs/Guide.md".to_string()]);
+}
+
+/// A refusal is a `SOURCE_ERROR` whose `data` names the `reason`; a
+/// `not_fetchable` one adds the file's `url` (when it has one) and its
+/// `kind`, and no other reason carries either.
+#[test]
+fn unit_fetch_error_data_is_reason_and_for_not_fetchable_url_and_kind() {
+    use tephrad::rpc::protocol::SOURCE_ERROR;
+    let sources = FetchSources::new();
+
+    let (code, message, data) = fetch_dispatch(&sources, "@gdrive:Plan").unwrap_err();
+    assert_eq!(code, SOURCE_ERROR);
+    assert!(message.contains("https://docs.google.com/document/d/doc-1/edit"));
+    assert_eq!(
+        data.unwrap(),
+        json!({
+            "reason": "not_fetchable",
+            "url": "https://docs.google.com/document/d/doc-1/edit",
+            "kind": "gdoc",
+        })
+    );
+
+    // No URL to give: the key is absent, not null.
+    let (code, _, data) = fetch_dispatch(&sources, "@g:link").unwrap_err();
+    assert_eq!(code, SOURCE_ERROR);
+    assert_eq!(
+        data.unwrap(),
+        json!({ "reason": "not_fetchable", "kind": "symlink" })
+    );
+
+    // Any other refusal: the reason alone.
+    let (code, _, data) = fetch_dispatch(&sources, "@g:big.bin").unwrap_err();
+    assert_eq!(code, SOURCE_ERROR);
+    assert_eq!(data.unwrap(), json!({ "reason": "disk_full" }));
+}
+
+fn fetch_request(id: u64, unit: &str) -> serde_json::Value {
+    json!({"jsonrpc": "2.0", "id": id, "method": "unit.fetch", "params": {"unit": unit}})
+}
+
+/// Through the real router: a `unit.fetch` with no token, a wrong one, an
+/// empty one or the wrong scheme is 401 and never reaches the backend,
+/// whatever it asks for; with the right token the same request is
+/// dispatched and answers in the shapes above.
+#[tokio::test]
+async fn unit_fetch_with_no_or_a_wrong_token_is_401_and_the_right_token_reaches_the_backend() {
+    use crate::rpc_fixtures::{spawn_with_token_and_any_sources, MockGraph};
+
+    let sources = std::sync::Arc::new(FetchSources::new());
+    let token = "k".repeat(64);
+    let server = spawn_with_token_and_any_sources(
+        MockGraph::new(),
+        SharedFetch(sources.clone()),
+        token.as_str(),
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    // A good id, a Doc, and a malformed request: auth comes first, so none
+    // of them is ever told "invalid params" or answered by the backend.
+    for body in [
+        fetch_request(1, "@g:docs/Guide.md"),
+        fetch_request(2, "@gdrive:Plan"),
+        json!({"jsonrpc": "2.0", "id": 3, "method": "unit.fetch", "params": {}}),
+    ] {
+        let none = client
+            .post(server.http_url())
+            .json(&body)
+            .send()
+            .await
+            .expect("request completes");
+        assert_eq!(none.status(), reqwest::StatusCode::UNAUTHORIZED, "{body}");
+        let parsed: serde_json::Value = none.json().await.expect("JSON-RPC error body");
+        assert!(
+            parsed.get("result").is_none()
+                && parsed["error"]["code"] != json!(tephrad::rpc::protocol::INVALID_PARAMS),
+            "{body}: {parsed}"
+        );
+        for wrong in ["not-the-right-token", "", &format!("{token}x")] {
+            let response = client
+                .post(server.http_url())
+                .header("Authorization", format!("Bearer {wrong}"))
+                .json(&body)
+                .send()
+                .await
+                .expect("request completes");
+            assert_eq!(
+                response.status(),
+                reqwest::StatusCode::UNAUTHORIZED,
+                "{body} with token {wrong:?}"
+            );
+        }
+        let basic = client
+            .post(server.http_url())
+            .header("Authorization", "Basic dXNlcjpwYXNz")
+            .json(&body)
+            .send()
+            .await
+            .expect("request completes");
+        assert_eq!(basic.status(), reqwest::StatusCode::UNAUTHORIZED, "{body}");
+    }
+    assert!(
+        sources.asked().is_empty(),
+        "a refused request reached the backend: {:?}",
+        sources.asked()
+    );
+
+    // The right token: the same requests are dispatched.
+    let ok: serde_json::Value = client
+        .post(server.http_url())
+        .bearer_auth(&token)
+        .json(&fetch_request(10, "@g:docs/Guide.md"))
+        .send()
+        .await
+        .expect("request completes")
+        .json()
+        .await
+        .expect("JSON-RPC body");
+    assert_eq!(ok["id"], json!(10));
+    assert_eq!(
+        ok["result"],
+        json!({
+            "unit": "@g:docs/Guide.md",
+            "path": "/data/remote/g/clone/docs/Guide.md",
+            "state": "cached",
+            "size": 29,
+        })
+    );
+    let refused: serde_json::Value = client
+        .post(server.http_url())
+        .bearer_auth(&token)
+        .json(&fetch_request(11, "@gdrive:Plan"))
+        .send()
+        .await
+        .expect("request completes")
+        .json()
+        .await
+        .expect("JSON-RPC body");
+    assert_eq!(refused["error"]["data"]["reason"], json!("not_fetchable"));
+    assert_eq!(
+        refused["error"]["data"]["url"],
+        json!("https://docs.google.com/document/d/doc-1/edit")
+    );
+    assert_eq!(refused["error"]["data"]["kind"], json!("gdoc"));
+    assert_eq!(
+        sources.asked(),
+        vec!["@g:docs/Guide.md".to_string(), "@gdrive:Plan".to_string()]
+    );
 }

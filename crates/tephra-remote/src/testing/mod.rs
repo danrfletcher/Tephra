@@ -145,6 +145,7 @@ pub(crate) struct Script<S> {
     pub latency: Duration,
     pub truncate_next: u32,
     pub empty_next: u32,
+    pub corrupt_next: u32,
 }
 
 impl<S> Default for Script<S> {
@@ -157,6 +158,7 @@ impl<S> Default for Script<S> {
             latency: Duration::ZERO,
             truncate_next: 0,
             empty_next: 0,
+            corrupt_next: 0,
         }
     }
 }
@@ -330,7 +332,7 @@ async fn control_inner<S: Send + Sync + 'static>(
 
     let response = next.run(request).await;
 
-    let (cut, empty) = {
+    let (cut, empty, corrupt) = {
         let mut script = common.script();
         let ok = response.status().is_success();
         let cut = ok && script.truncate_next > 0;
@@ -341,8 +343,15 @@ async fn control_inner<S: Send + Sync + 'static>(
         if empty {
             script.empty_next -= 1;
         }
-        (cut, empty)
+        let corrupt = ok && !cut && !empty && script.corrupt_next > 0;
+        if corrupt {
+            script.corrupt_next -= 1;
+        }
+        (cut, empty, corrupt)
     };
+    if corrupt {
+        return corrupt_body(response).await;
+    }
     if cut {
         return cut_body(response).await;
     }
@@ -352,6 +361,17 @@ async fn control_inner<S: Send + Sync + 'static>(
         return Response::from_parts(parts, Body::empty());
     }
     response
+}
+
+/// Sends a body of the length it declares whose bytes are not the file's:
+/// every byte is changed.
+async fn corrupt_body(response: Response) -> Response {
+    let (parts, body) = response.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, usize::MAX).await else {
+        return Response::from_parts(parts, Body::empty());
+    };
+    let flipped: Vec<u8> = bytes.iter().map(|b| !b).collect();
+    Response::from_parts(parts, Body::from(flipped))
 }
 
 /// Sends the first half of the body, declares the full length, then fails
@@ -565,6 +585,12 @@ macro_rules! scripting_methods {
         /// body (what a broken proxy or a bug would send).
         pub fn empty_next_bodies(&self, n: u32) {
             self.common.script().empty_next = n;
+        }
+
+        /// Answer the next `n` successful requests with a body of the right
+        /// length whose bytes are wrong (what a corrupting proxy would send).
+        pub fn corrupt_next_bodies(&self, n: u32) {
+            self.common.script().corrupt_next = n;
         }
 
         /// Make every error answer (status 400 and up) carry the request's

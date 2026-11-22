@@ -114,6 +114,7 @@ pub fn execute_with_prompt_writer<R: BufRead, W: Write>(
         Command::SearchAllBlocks { query, limit } => search_all_blocks(query, *limit, json, client),
         Command::BlockId { unit, target } => block_id(unit, target, json, client),
         Command::Backlinks { id } => backlinks(id, json, client),
+        Command::Fetch { unit } => fetch(unit, json, client),
         Command::Fixes { since } => fixes(*since, json, client),
         Command::LinkResolve {
             target,
@@ -485,6 +486,19 @@ fn backlinks(id: &str, json: bool, client: &RpcClient) -> CommandOutcome {
     match client.call("graph.get_backlinks", json!({"id": id})) {
         Ok(result) => {
             CommandOutcome::ok(json_or(&result, || render::render_backlinks(&result), json))
+        }
+        Err(e) => CommandOutcome::err(describe_error(&e)),
+    }
+}
+
+/// `fetch <id>`: one `unit.fetch`. The daemon answers when the file is in
+/// its cache, so a slow download is a slow call. Plain output is the path
+/// and nothing else (a script can use it as it is); `--json` is the whole
+/// answer. A refusal prints the daemon's reason on stderr and exits 1.
+fn fetch(unit: &str, json: bool, client: &RpcClient) -> CommandOutcome {
+    match client.call("unit.fetch", json!({"unit": unit})) {
+        Ok(result) => {
+            CommandOutcome::ok(json_or(&result, || render::render_fetched(&result), json))
         }
         Err(e) => CommandOutcome::err(describe_error(&e)),
     }

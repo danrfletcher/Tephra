@@ -140,6 +140,8 @@ fn f2_the_rpc_method_list_is_the_one_before_this_pr_plus_fix_list_rename_event_p
         "link.rename_event",
         // atlas-27 PR-5: the one method that PR adds.
         "source.add_github",
+        // atlas-27 PR-7: the one method that PR adds.
+        "unit.fetch",
     ]
     .iter()
     .map(|s| s.to_string())

@@ -1049,6 +1049,11 @@ fn pretty(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
+/// `fetch`: the path of the fetched file on a line of its own, nothing else.
+pub fn render_fetched(result: &Value) -> String {
+    format!("{}\n", result["path"].as_str().unwrap_or_default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

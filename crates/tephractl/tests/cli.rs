@@ -53,3 +53,6 @@ mod auth_secrets;
 
 #[path = "cli/source_add_github.rs"]
 mod source_add_github;
+
+#[path = "cli/fetch_commands.rs"]
+mod fetch_commands;

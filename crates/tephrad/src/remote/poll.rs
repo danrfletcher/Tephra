@@ -47,6 +47,7 @@ use tephra_remote::{Conditional, RemoteError, UnreachableCause};
 
 use crate::file_kind::MAX_INDEXED_BYTES;
 use crate::registry::{retry_cache_on_busy, DaemonEvent, SourceRegistry};
+use crate::remote::safe_path;
 use crate::remote_github::{
     hhmm_utc, is_lfs_pointer, now_secs, printable, tree_items, IndexJob, RemoteHub, RunEnd,
     TreeItem,
@@ -741,7 +742,8 @@ enum CopyState {
     Unsafe,
 }
 
-/// Looks for the cached copy of `rel` under `clone_root`.
+/// Looks for the cached copy of `rel` under `clone_root`, at the name
+/// `unit.fetch` writes it under ([`safe_path::safe_segments`]).
 fn clone_copy(clone_root: &Path, rel: &str) -> CopyState {
     if rel.is_empty() || rel.starts_with('/') {
         return CopyState::Unsafe;
@@ -756,7 +758,9 @@ fn clone_copy(clone_root: &Path, rel: &str) -> CopyState {
         {
             return CopyState::Unsafe;
         }
-        parts.push(part);
+        // The name a fetch gives the file on disk (a `%`, a control character
+        // or a `.git` is written another way; see `safe_path`).
+        parts.push(safe_path::safe_segment(part));
     }
     // The root itself, then every step below it.
     let mut path = clone_root.to_path_buf();
@@ -841,6 +845,18 @@ mod tests {
         }
         std::fs::create_dir_all(&root).unwrap();
         (dir, root)
+    }
+
+    /// A fetch writes a name under the mapped name (`%` is `%25`); the poller
+    /// must look there, or a remote delete would leave the copy behind.
+    #[test]
+    fn a_copy_is_looked_for_under_the_name_a_fetch_gives_it() {
+        let (_d, root) = clone_with(&["50%25 off/100%25.md"]);
+        assert_eq!(
+            clone_copy(&root, "50% off/100%.md"),
+            CopyState::File(root.join("50%25 off").join("100%25.md"))
+        );
+        assert_eq!(clone_copy(&root, "50%25 off/100%25.md"), CopyState::Absent);
     }
 
     #[test]
