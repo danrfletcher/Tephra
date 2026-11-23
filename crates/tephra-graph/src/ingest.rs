@@ -212,6 +212,10 @@ fn remove_edge(graph: &mut UnitGraph, slot: usize) {
     graph.free_slots.push(slot);
 }
 
+/// What a Google Drive source's `sources.path` starts with
+/// (`tephra_cache::remote_root("drive", name)`).
+const DRIVE_ROOT_PREFIX: &str = "remote:drive:";
+
 impl UnitGraph {
     /// Inserts/replaces one node's facts and its stem/basename index
     /// entries (no edge resolution/rebuild — callers batching
@@ -251,6 +255,23 @@ impl UnitGraph {
             .or_default();
         if !basename_bucket.contains(&id) {
             basename_bucket.push(id.clone());
+        }
+        // E9: a Drive duplicate is also found under the name it duplicates.
+        if let Some(plain) = self.duplicate_alias(source, rel_path) {
+            let plain_base = basename_of(&plain).to_string();
+            for (index, key) in [
+                (&mut self.stem_index, plain),
+                (&mut self.basename_index, plain_base),
+            ] {
+                let bucket = index
+                    .entry(source.to_string())
+                    .or_default()
+                    .entry(key)
+                    .or_default();
+                if !bucket.contains(&id) {
+                    bucket.push(id.clone());
+                }
+            }
         }
 
         // A re-upsert replaces the node: drop what the old copy put in
@@ -338,6 +359,27 @@ impl UnitGraph {
                 v.retain(|existing| existing != &id);
             }
         }
+        if let Some(plain) = self.duplicate_alias(source, rel_path) {
+            let plain_base = basename_of(&plain).to_string();
+            for (index, key) in [
+                (&mut self.stem_index, plain),
+                (&mut self.basename_index, plain_base),
+            ] {
+                if let Some(v) = index.get_mut(source).and_then(|m| m.get_mut(&key)) {
+                    v.retain(|existing| existing != &id);
+                }
+            }
+        }
+    }
+
+    /// The normalized stem the unit at `rel_path` is a duplicate of, when
+    /// `source` names duplicates `name (N)` (E9).
+    fn duplicate_alias(&self, source: &str, rel_path: &str) -> Option<String> {
+        if !self.duplicate_suffix_sources.contains(source) {
+            return None;
+        }
+        let stem = normalize_key(strip_markdown_extension(rel_path));
+        crate::resolver::duplicate_base(&stem).map(str::to_string)
     }
 
     /// Inserts or replaces one unit's facts, then recomputes only the
@@ -522,6 +564,13 @@ impl UnitGraph {
                 if basename != stem {
                     keys.push((source.to_string(), basename));
                 }
+                if let Some(plain) = self.duplicate_alias(source, rel_path) {
+                    let plain_base = basename_of(&plain).to_string();
+                    if plain_base != plain {
+                        keys.push((source.to_string(), plain_base));
+                    }
+                    keys.push((source.to_string(), plain));
+                }
                 for key in keys {
                     let Some(idxs) = self.match_index.get(&key).cloned() else {
                         continue;
@@ -587,6 +636,9 @@ impl UnitGraph {
 
         for source in cache.list_sources()? {
             graph.register_source(&source.name);
+            if source.path.starts_with(DRIVE_ROOT_PREFIX) {
+                graph.set_duplicate_suffix_source(&source.name);
+            }
             if source.status == SourceStatus::Offline {
                 graph.offline_sources.insert(source.name.clone());
             }
@@ -619,6 +671,9 @@ impl UnitGraph {
             .ok_or_else(|| GraphError::UnknownSource(note.source.clone()))?;
 
         self.register_source(&note.source);
+        if source_row.path.starts_with(DRIVE_ROOT_PREFIX) {
+            self.duplicate_suffix_sources.insert(note.source.clone());
+        }
         let was_offline = self.offline_sources.contains(&note.source);
         let now_offline = source_row.status == SourceStatus::Offline;
         if now_offline {

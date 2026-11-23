@@ -1,0 +1,10 @@
+{
+  "files": 400,
+  "folder": "1AbCdEfGhIjK",
+  "folder_name": "Notes",
+  "index_done": 0,
+  "index_total": 120,
+  "kind": "drive",
+  "name": "gdrive",
+  "status": "indexing"
+}

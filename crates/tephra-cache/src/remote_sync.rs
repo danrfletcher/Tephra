@@ -149,23 +149,64 @@ impl Cache {
         item: &NewRemoteItem<'_>,
     ) -> Result<(), CacheError> {
         self.connection().execute(
-            "INSERT INTO remote_items (source, path, kind, sha, size, state) \
-             VALUES (?1, ?2, ?3, ?4, ?5, 'remote') \
+            "INSERT INTO remote_items (source, path, kind, sha, size, file_id, revision, state) \
+             VALUES (?1, ?2, ?3, NULLIF(?4, ''), ?5, ?6, ?7, 'remote') \
              ON CONFLICT(source, path) DO UPDATE SET \
                 kind = excluded.kind, sha = excluded.sha, size = excluded.size, \
-                state = CASE WHEN remote_items.reason = ?6 THEN ?7 ELSE remote_items.state END, \
-                reason = CASE WHEN remote_items.reason = ?6 THEN ?8 ELSE NULL END",
+                file_id = excluded.file_id, revision = excluded.revision, \
+                state = CASE WHEN remote_items.reason = ?8 THEN ?9 ELSE remote_items.state END, \
+                reason = CASE WHEN remote_items.reason = ?8 THEN ?10 ELSE NULL END",
             params![
                 source,
                 item.path,
                 item.kind,
                 item.sha,
                 item.size,
+                item.file_id,
+                item.revision,
                 REASON_DELETED_ON_REMOTE,
                 ITEM_STATE_NEEDS_ATTENTION,
                 REASON_READDED_AFTER_DELETE,
             ],
         )?;
+        Ok(())
+    }
+
+    /// Gives items of `source` (id `source_id`) new paths, keeping their rows
+    /// (and so what the index parsed out of them): the `remote_items` row,
+    /// the `units` row and with it every link, heading and block that hangs
+    /// on it. `moves` is `(old path, new path)`; it may swap two names, so it
+    /// goes through a name nobody has first. A path that is not there is
+    /// skipped. Call it inside the caller's transaction.
+    pub fn rename_remote_items(
+        &self,
+        source: &str,
+        source_id: i64,
+        moves: &[(String, String)],
+    ) -> Result<(), CacheError> {
+        let conn = self.connection();
+        for (n, (old, _)) in moves.iter().enumerate() {
+            let temp = format!("\u{0}moving:{n}");
+            conn.execute(
+                "UPDATE remote_items SET path = ?3 WHERE source = ?1 AND path = ?2",
+                params![source, old, temp],
+            )?;
+            conn.execute(
+                "UPDATE units SET rel_path = ?3 WHERE source_id = ?1 AND rel_path = ?2",
+                params![source_id, old, temp],
+            )?;
+        }
+        for (n, (_, new)) in moves.iter().enumerate() {
+            let temp = format!("\u{0}moving:{n}");
+            conn.execute(
+                "UPDATE remote_items SET path = ?3 WHERE source = ?1 AND path = ?2",
+                params![source, temp, new],
+            )?;
+            conn.execute(
+                "UPDATE units SET rel_path = ?3 WHERE source_id = ?1 AND rel_path = ?2",
+                params![source_id, temp, new],
+            )?;
+        }
         Ok(())
     }
 
@@ -260,6 +301,8 @@ impl Cache {
                     kind: item.kind.as_deref().unwrap_or("text-other"),
                     sha: item.sha.as_deref().unwrap_or(""),
                     size: item.size,
+                    file_id: item.file_id.as_deref(),
+                    revision: item.revision.as_deref(),
                 },
                 max_indexed_bytes,
             )?;

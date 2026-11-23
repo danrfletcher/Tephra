@@ -1,0 +1,45 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": [
+    {
+      "name": "notes",
+      "path": "/home/dan/Notes",
+      "status": "active",
+      "last_scanned_at": 1700000000
+    },
+    {
+      "name": "gdrive",
+      "path": "drive:Notes",
+      "status": "indexing",
+      "last_scanned_at": null,
+      "kind": "drive",
+      "repo": "Notes",
+      "branch": null,
+      "cache": true,
+      "cache_bytes": 0,
+      "git_bytes": 0,
+      "index_done": 120,
+      "index_total": 400,
+      "not_pushed": 0,
+      "behind": 0
+    },
+    {
+      "name": "gd2",
+      "path": "drive:Plans",
+      "status": "syncing",
+      "last_scanned_at": null,
+      "kind": "drive",
+      "repo": "Plans",
+      "branch": null,
+      "cache": false,
+      "cache_bytes": 0,
+      "git_bytes": 0,
+      "index_done": 400,
+      "index_total": 400,
+      "not_pushed": 0,
+      "behind": 0,
+      "status_reason": "Google is rate limiting requests; trying again at 12:04 UTC"
+    }
+  ]
+}

@@ -352,6 +352,22 @@ pub(crate) fn basename_of(stem: &str) -> &str {
     stem.rsplit('/').next().unwrap_or(stem)
 }
 
+/// The stem a Drive duplicate `name (N)` (N of 2 or more) is a duplicate of:
+/// `plan (2)` gives `plan`. `None` for any other stem. Only a source marked
+/// with [`crate::UnitGraph::set_duplicate_suffix_source`] ever indexes a
+/// unit under this name (E9).
+pub(crate) fn duplicate_base(stem: &str) -> Option<&str> {
+    let open = stem.rfind(" (")?;
+    let digits = stem[open + 2..].strip_suffix(')')?;
+    let n: u64 = digits.parse().ok().filter(|n| *n >= 2)?;
+    // "(02)" is a name somebody typed, not a suffix this daemon made.
+    if digits != n.to_string() {
+        return None;
+    }
+    let base = &stem[..open];
+    (!base.is_empty() && !base.ends_with('/')).then_some(base)
+}
+
 /// Bundles the three pieces of [`crate::UnitGraph`] state that
 /// resolution reads but never mutates (`nodes`, `stem_index`,
 /// `basename_index`), so [`resolve_in_scope`] and
@@ -421,12 +437,29 @@ pub(crate) fn resolve_in_scope(
             .unwrap_or(&[])
     };
 
+    // A Drive duplicate `Plan (2)` is also indexed under `plan` (E9) so that
+    // the plain name is ambiguous while both files exist. It ties with the
+    // file that really has that name, by the length of the plain name. With
+    // no such file the plain name stays unresolved: a link is never quietly
+    // pointed at the later file when the first one goes.
+    let by_stem = !allow_basename || target.contains('/');
     let mut matches: Vec<(String, usize)> = Vec::new();
+    let mut exact = false;
     for id in candidate_ids {
         if let Some(facts) = index.nodes.get(id) {
             let stem = normalize_key(strip_markdown_extension(&facts.rel_path));
-            matches.push((id.clone(), stem.chars().count()));
+            let own_key = if by_stem { &stem } else { basename_of(&stem) };
+            if own_key == target {
+                exact = true;
+                matches.push((id.clone(), stem.chars().count()));
+            } else {
+                let plain = duplicate_base(&stem).unwrap_or(&stem);
+                matches.push((id.clone(), plain.chars().count()));
+            }
         }
+    }
+    if !exact {
+        return ResolveOutcome::NotFound;
     }
 
     if matches.is_empty() {

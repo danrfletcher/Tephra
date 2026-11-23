@@ -19,6 +19,8 @@ fn item<'a>(path: &'a str, sha: &'a str) -> NewRemoteItem<'a> {
         kind: "prose",
         sha,
         size: Some(10),
+        file_id: None,
+        revision: None,
     }
 }
 

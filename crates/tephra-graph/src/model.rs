@@ -182,6 +182,8 @@ pub struct UnitGraph {
     /// (the specific edge case this graph must tell apart).
     pub(crate) known_sources: HashSet<String>,
     pub(crate) offline_sources: HashSet<String>,
+    /// Sources whose `name (2)` units are duplicates of `name` (E9).
+    pub(crate) duplicate_suffix_sources: HashSet<String>,
     /// Source name -> set of federated ids belonging to it, kept in
     /// sync with `nodes` on every insert/remove.
     pub(crate) by_source: HashMap<String, HashSet<String>>,
@@ -293,6 +295,7 @@ impl UnitGraph {
             known_sources: HashSet::new(),
             offline_sources: HashSet::new(),
             by_source: HashMap::new(),
+            duplicate_suffix_sources: HashSet::new(),
             stem_index: HashMap::new(),
             basename_index: HashMap::new(),
             edges: Vec::new(),
@@ -315,6 +318,15 @@ impl UnitGraph {
         self.by_source.entry(source.to_string()).or_default();
         self.stem_index.entry(source.to_string()).or_default();
         self.basename_index.entry(source.to_string()).or_default();
+    }
+
+    /// Marks `source` as one whose units `name (2)`, `name (3)`... are
+    /// duplicates of `name` (a Google Drive folder, E9): a link to the plain
+    /// name is then ambiguous between them, and a link to `name (2)` reaches
+    /// only that one. Call it before the source's units are added.
+    pub fn set_duplicate_suffix_source(&mut self, source: &str) {
+        self.register_source(source);
+        self.duplicate_suffix_sources.insert(source.to_string());
     }
 
     /// Marks `source` offline/online (E2/P4) and recomputes every

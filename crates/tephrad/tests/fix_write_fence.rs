@@ -146,6 +146,8 @@ fn f2_the_rpc_method_list_is_the_one_before_this_pr_plus_fix_list_rename_event_p
         "cache.status",
         "cache.set_limit",
         "source.set_cache",
+        // atlas-27 PR-10: the one method that PR adds.
+        "source.add_drive",
     ]
     .iter()
     .map(|s| s.to_string())

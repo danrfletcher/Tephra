@@ -1270,3 +1270,175 @@ impl DriveRig {
             .state
     }
 }
+
+// ---- Google Drive sources (PR-10) ----------------------------------------------------
+
+/// A signed-in daemon on a fake clock in front of the fake Drive of PR-3:
+/// `build` puts files in the Drive, then the test adds a Drive source. No
+/// poll is due unless the test moves the clock.
+pub struct DriveDaemon {
+    pub drive: FakeDrive,
+    pub clock: Arc<FakeClock>,
+    pub d: Daemon,
+    pub store: Arc<MemStore>,
+    // The fake Drive's server runs on this runtime.
+    _rt: tokio::runtime::Runtime,
+    /// The data dir once a restart has taken it from the first daemon.
+    dir: Option<tempfile::TempDir>,
+}
+
+impl DriveDaemon {
+    pub fn start(build: impl FnOnce(&FakeDrive)) -> DriveDaemon {
+        Self::start_with(MemStore::signed_in(), build)
+    }
+
+    pub fn start_with(store: Arc<MemStore>, build: impl FnOnce(&FakeDrive)) -> DriveDaemon {
+        let rt = tokio::runtime::Runtime::new().expect("a runtime");
+        let clock = Arc::new(FakeClock::at_epoch_2026());
+        let drive = rt.block_on(FakeDrive::start_with_clock(clock.clone()));
+        build(&drive);
+        let fake = Fake::start_with_clock(clock.clone());
+        let d = Daemon::start_tuned(
+            &fake,
+            store.clone(),
+            None,
+            clock.clone(),
+            AdapterOptions::default(),
+            None,
+            Some(drive.base_url()),
+            Tuning::default(),
+        );
+        DriveDaemon {
+            drive,
+            clock,
+            d,
+            store,
+            _rt: rt,
+            dir: None,
+        }
+    }
+
+    /// `source.add_drive`, the whole reply.
+    pub fn add_raw(&self, name: &str, folder: &str) -> Value {
+        self.d.rpc(
+            "source.add_drive",
+            json!({ "name": name, "folder": folder }),
+        )
+    }
+
+    /// `source.add_drive` that must succeed.
+    pub fn add(&self, name: &str, folder: &str) -> Value {
+        self.d.ok(
+            "source.add_drive",
+            json!({ "name": name, "folder": folder }),
+        )
+    }
+
+    /// Adds the source and waits until its first index is done.
+    pub fn add_active(&self, name: &str, folder: &str) -> Value {
+        self.add(name, folder);
+        let row = self.d.wait_active(name);
+        self.d.connect().drain_graph_changed(QUIET);
+        row
+    }
+
+    /// Moves the clock one poll interval and waits until the poller has
+    /// finished one poll of the source.
+    pub fn poll(&self) {
+        let before = self.d.registry.remote_polls_done();
+        self.clock.advance(INTERVAL);
+        self.d.wait_for("a poll", || {
+            (self.d.registry.remote_polls_done() > before).then_some(())
+        });
+    }
+
+    /// [`DriveDaemon::poll`] for a poll that changes the index, returning
+    /// once the daemon's in-memory graph shows it. The poller commits the
+    /// index and announces; the daemon then rebuilds the graph and only
+    /// then pushes `graph:changed`, so `graph.*` and `unit.resolve_link`
+    /// answer from the old graph until that push. A test that asks the
+    /// graph right after `poll` races the rebuild.
+    pub fn poll_applied(&self) {
+        let mut client = self.d.connect();
+        self.poll();
+        client
+            .next_graph_changed(WAIT)
+            .expect("a graph:changed after a poll that changed the index");
+    }
+
+    /// The user signs in to Google again with another token.
+    pub fn sign_in_again(&self, token: &str) {
+        self.store
+            .set(Provider::Google, &Secret::new(token.to_string()))
+            .expect("store the new token");
+    }
+
+    /// The items of `source`: `(path, kind)`, sorted.
+    pub fn listing(&self, source: &str) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = item_rows(&self.d.cache_path, source)
+            .into_iter()
+            .map(|r| (r.path, r.kind.unwrap_or_default()))
+            .collect();
+        out.sort();
+        out
+    }
+
+    pub fn paths(&self, source: &str) -> Vec<String> {
+        self.listing(source).into_iter().map(|(p, _)| p).collect()
+    }
+
+    pub fn media_reads(&self) -> usize {
+        self.drive.request_log().matching("alt=media").len()
+    }
+
+    pub fn exports(&self) -> usize {
+        self.drive.request_log().matching("/export").len()
+    }
+
+    /// A fresh start of the daemon on the same data dir, clock and Drive.
+    pub fn restart(self) -> DriveDaemon {
+        self.restart_after(|_| {})
+    }
+
+    /// [`DriveDaemon::restart`] that runs `between` on the cache file once
+    /// the first daemon is stopped and before the next one starts: a test
+    /// leaves the state a kill would have left.
+    pub fn restart_after(self, between: impl FnOnce(&Path)) -> DriveDaemon {
+        let DriveDaemon {
+            drive,
+            clock,
+            d,
+            store,
+            _rt,
+            dir,
+        } = self;
+        let cache_path = d.cache_path.clone();
+        let dir = match dir {
+            Some(dir) => {
+                d.close();
+                dir
+            }
+            None => d.close_keeping_data(),
+        };
+        between(&cache_path);
+        let fake = Fake::start_with_clock(clock.clone());
+        let d = Daemon::start_tuned(
+            &fake,
+            store.clone(),
+            Some(dir.path().to_path_buf()),
+            clock.clone(),
+            AdapterOptions::default(),
+            None,
+            Some(drive.base_url()),
+            Tuning::default(),
+        );
+        DriveDaemon {
+            drive,
+            clock,
+            d,
+            store,
+            _rt,
+            dir: Some(dir),
+        }
+    }
+}

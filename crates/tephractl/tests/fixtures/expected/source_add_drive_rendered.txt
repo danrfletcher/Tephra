@@ -1,0 +1,3 @@
+Registered Google Drive source "gdrive": Notes
+  400 files listed, all remote, 0 bytes cached; nothing is written to disk
+  indexing 120 text files in the background: see `tephractl source list`

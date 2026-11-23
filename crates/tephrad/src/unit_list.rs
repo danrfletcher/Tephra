@@ -256,7 +256,18 @@ fn list_remote(
                     _ => i.reason.clone(),
                 }),
             };
+            let drive_kind = item
+                .filter(|_| !is_folder)
+                .and_then(|i| i.kind.as_deref())
+                .filter(|k| tephra_cache::is_drive_item_kind(k))
+                .map(str::to_string);
             let mut wire = wire_entry(source, e);
+            // A Google file shows what Drive calls it (`gdoc`, `gsheet`,
+            // `gslides`, `gform`, `gdrawing`, `gshortcut`), not the graph
+            // kind it is stored under (`prose`, `binary`).
+            if let Some(kind) = drive_kind {
+                wire.kind = kind;
+            }
             wire.remote = Some(remote);
             wire
         })

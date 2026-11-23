@@ -360,6 +360,17 @@ pub trait SourceBackend: Send + Sync {
             "source.add_github is not supported by this source backend".to_string(),
         ))
     }
+    /// `source.add_drive` (PR-10): one picked Drive folder. The default
+    /// refuses, so a test double needn't implement it.
+    fn register_drive(
+        &self,
+        _name: &str,
+        _folder: &str,
+    ) -> Result<serde_json::Value, PromoteRpcError> {
+        Err(PromoteRpcError::Failed(
+            "source.add_drive is not supported by this source backend".to_string(),
+        ))
+    }
     /// `unit.fetch` (G10): puts the file of a remote unit in the content
     /// cache and answers where it is. Blocks until it is there. The default
     /// refuses, so a test double needn't implement it.
@@ -483,6 +494,25 @@ impl SourceBackend for SourceRegistry {
     ) -> Result<serde_json::Value, PromoteRpcError> {
         SourceRegistry::register_github(self, name, repo, branch)
             .map(|added| serde_json::to_value(added).expect("RemoteAddWire always serializes"))
+            .map_err(|e| match e {
+                RegistryError::Remote(crate::remote_github::RemoteAddError::Refused {
+                    reason,
+                    message,
+                }) => PromoteRpcError::Refused { reason, message },
+                RegistryError::Validation(v) => PromoteRpcError::Refused {
+                    reason: v.reason(),
+                    message: v.to_string(),
+                },
+                e => PromoteRpcError::Failed(e.to_string()),
+            })
+    }
+    fn register_drive(
+        &self,
+        name: &str,
+        folder: &str,
+    ) -> Result<serde_json::Value, PromoteRpcError> {
+        SourceRegistry::register_drive(self, name, folder)
+            .map(|added| serde_json::to_value(added).expect("DriveAddWire always serializes"))
             .map_err(|e| match e {
                 RegistryError::Remote(crate::remote_github::RemoteAddError::Refused {
                     reason,

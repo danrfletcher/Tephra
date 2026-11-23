@@ -62,6 +62,7 @@ const MUTATING_SOURCE_METHODS: &[&str] = &[
     "source.register",
     // PR-5: a GitHub source adds its listing, and its links, to the graph.
     "source.add_github",
+    "source.add_drive",
     "source.unregister",
     "source.rescan",
     // FR22: a promote re-owns files and rewrites links; the push it sends

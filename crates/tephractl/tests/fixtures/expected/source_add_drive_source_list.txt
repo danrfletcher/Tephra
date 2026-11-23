@@ -1,0 +1,7 @@
+NAME                 STATUS           PATH
+notes                active           /home/dan/Notes
+gdrive               indexing 120/400 drive:Notes
+                     cache on, cached 0 bytes, last sync never
+gd2                  syncing          drive:Plans
+                     cache off, cached 0 bytes, last sync never
+                     note: Google is rate limiting requests; trying again at 12:04 UTC

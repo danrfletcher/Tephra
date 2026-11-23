@@ -56,6 +56,8 @@ pub const METHOD_NAMES: &[&str] = &[
     "cache.status",
     "cache.set_limit",
     "source.set_cache",
+    // atlas-27 PR-10: the one method that PR adds.
+    "source.add_drive",
 ];
 
 /// The three backends one `dispatch` call reads through, bundled so
@@ -109,6 +111,7 @@ pub fn dispatch(
         "graph.get_edges" => graph_get_edges(backends.graph),
         "source.register" => source_register(params, backends.sources),
         "source.add_github" => source_add_github(params, backends.sources),
+        "source.add_drive" => source_add_drive(params, backends.sources),
         "source.unregister" => source_unregister(params, backends.sources, backends.fixes),
         "source.list" => source_list(backends.sources),
         "source.rescan" => source_rescan(params, backends.sources),
@@ -188,6 +191,15 @@ fn source_add_github(params: &Value, sources: &dyn SourceBackend) -> DispatchRes
     sources
         .register_github(name, repo, branch)
         .map_err(source_refusal)
+}
+
+/// `source.add_drive {name, folder}` (PR-10): one picked Drive folder (a
+/// path, an id or a URL). A refusal is a `SOURCE_ERROR` with the stable
+/// `data.reason`.
+fn source_add_drive(params: &Value, sources: &dyn SourceBackend) -> DispatchResult {
+    let name = require_str(params, "name")?;
+    let folder = require_str(params, "folder")?;
+    sources.register_drive(name, folder).map_err(source_refusal)
 }
 
 /// A refusal or failure of a source call as a dispatch error: always a
@@ -655,6 +667,7 @@ mod tests {
                 "cache.status",
                 "cache.set_limit",
                 "source.set_cache",
+                "source.add_drive",
             ]
         );
     }

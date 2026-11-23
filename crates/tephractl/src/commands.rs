@@ -90,6 +90,7 @@ pub fn execute_with_prompt_writer<R: BufRead, W: Write>(
 ) -> CommandOutcome {
     match command {
         Command::SourceAdd { name, path } => source_add(name, path, json, client),
+        Command::SourceAddDrive { name, folder } => source_add_drive(name, folder, json, client),
         Command::SourceAddGithub { name, repo, branch } => {
             source_add_github(name, repo, branch.as_deref(), json, client)
         }
@@ -206,6 +207,21 @@ fn source_add_github(
         Ok(result) => CommandOutcome::ok(json_or(
             &result,
             || render::render_github_source_added(&result),
+            json,
+        )),
+        Err(e) => CommandOutcome::err(describe_error(&e)),
+    }
+}
+
+/// `source add drive <name> <folder>`: one `source.add_drive` call. The
+/// daemon checks the credential and the folder and lists the whole folder
+/// before it answers; the text index then runs in the background. A refusal
+/// prints the daemon's plain reason and exits 1 with nothing registered.
+fn source_add_drive(name: &str, folder: &str, json: bool, client: &RpcClient) -> CommandOutcome {
+    match client.call("source.add_drive", json!({"name": name, "folder": folder})) {
+        Ok(result) => CommandOutcome::ok(json_or(
+            &result,
+            || render::render_drive_source_added(&result),
             json,
         )),
         Err(e) => CommandOutcome::err(describe_error(&e)),

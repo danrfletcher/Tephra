@@ -16,6 +16,7 @@
 
 use rusqlite::{params, OptionalExtension};
 
+use crate::remote_sync::{encode_cursor, STATUS_SYNCING};
 use crate::sources::SourceStatus;
 use crate::units::NewUnit;
 use crate::{Cache, CacheError, SourceRow};
@@ -33,6 +34,18 @@ pub fn remote_root(kind: &str, name: &str) -> String {
 pub const STATUS_INDEXING: &str = "indexing";
 /// The `remote_sources.status` of a source whose first index ran to the end.
 pub const STATUS_ACTIVE: &str = "active";
+
+/// The `status_reason` a source shows while it is registered with its feed
+/// position but its listing is not stored yet ([`Cache::begin_remote_source`]).
+/// Its status is `syncing`. (A later failure may replace it, so it is not
+/// what marks the source: see [`LISTING_MARK`].)
+pub const REASON_LISTING: &str = "listing the folder";
+/// What marks a source whose listing is not stored yet: the ETag part of
+/// its cursor (a Drive source keeps none otherwise). Written by
+/// [`Cache::begin_remote_source`], cleared by [`Cache::fill_remote_source`].
+/// A source that still has it after a restart was cut off while it was
+/// listed.
+pub const LISTING_MARK: &str = "listing";
 
 /// `remote_items.kind` of a symlink (never followed). A `binary` unit,
 /// listed by name only.
@@ -80,6 +93,32 @@ pub struct NewRemoteSource<'a> {
     pub now: i64,
 }
 
+/// `remote_items.kind` of a native Google Doc: read through the Markdown
+/// export, never downloaded as a file.
+pub const ITEM_KIND_GDOC: &str = "gdoc";
+/// `remote_items.kind` of a Google Sheet, Slides deck, Form, Drawing and
+/// shortcut: listed by name only, never read (F5).
+pub const ITEM_KIND_GSHEET: &str = "gsheet";
+pub const ITEM_KIND_GSLIDES: &str = "gslides";
+pub const ITEM_KIND_GFORM: &str = "gform";
+pub const ITEM_KIND_GDRAWING: &str = "gdrawing";
+pub const ITEM_KIND_GSHORTCUT: &str = "gshortcut";
+
+/// Whether `kind` is one of the kinds only a Drive listing has. `units.kind`
+/// keeps its five values (a Doc is `prose` once read, the rest are
+/// `binary`); these are what the listing says (`unit.list`, `ls`).
+pub fn is_drive_item_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        ITEM_KIND_GDOC
+            | ITEM_KIND_GSHEET
+            | ITEM_KIND_GSLIDES
+            | ITEM_KIND_GFORM
+            | ITEM_KIND_GDRAWING
+            | ITEM_KIND_GSHORTCUT
+    )
+}
+
 /// One file of a remote listing.
 #[derive(Debug, Clone, Copy)]
 pub struct NewRemoteItem<'a> {
@@ -89,9 +128,15 @@ pub struct NewRemoteItem<'a> {
     /// knew of it from its name. Fixed at listing, even if reading the
     /// file later finds it is binary (the unit row then says so).
     pub kind: &'a str,
-    /// The git blob sha (the commit sha for a submodule).
+    /// The git blob sha (the commit sha for a submodule). Empty for a Drive
+    /// file (a listing has no git sha; it is stored as NULL).
     pub sha: &'a str,
     pub size: Option<i64>,
+    /// A Drive file id: what recognises a file after a rename or a move.
+    pub file_id: Option<&'a str>,
+    /// A Drive file's revision (head revision id, checksum or version):
+    /// what changes when its content does.
+    pub revision: Option<&'a str>,
 }
 
 /// A `remote_items` row.
@@ -101,6 +146,8 @@ pub struct RemoteItemRow {
     pub kind: Option<String>,
     pub sha: Option<String>,
     pub size: Option<i64>,
+    pub file_id: Option<String>,
+    pub revision: Option<String>,
     pub state: String,
     pub reason: Option<String>,
 }
@@ -122,13 +169,20 @@ pub struct IndexProgress {
 /// Whether the index reads a file of this listing kind: a text kind, not
 /// a symlink, a submodule or a known binary.
 pub fn is_text_item_kind(kind: &str) -> bool {
-    matches!(kind, "prose" | "code" | "document" | "text-other")
+    matches!(
+        kind,
+        "prose" | "code" | "document" | "text-other" | ITEM_KIND_GDOC
+    )
 }
 
 /// The `units.kind` a listing kind is stored as.
 fn unit_kind_of_item(kind: &str) -> &str {
     match kind {
         ITEM_KIND_SYMLINK | ITEM_KIND_SUBMODULE => "binary",
+        // A Doc is Markdown once read; the other Google kinds are never read.
+        ITEM_KIND_GDOC => "prose",
+        ITEM_KIND_GSHEET | ITEM_KIND_GSLIDES | ITEM_KIND_GFORM | ITEM_KIND_GDRAWING
+        | ITEM_KIND_GSHORTCUT => "binary",
         other => other,
     }
 }
@@ -209,18 +263,136 @@ impl Cache {
              VALUES (?1, ?2, 0, ?3)",
             params![new.name, new.cursor, new.now],
         )?;
-        {
-            let mut stmt = self.connection().prepare(
-                "INSERT INTO remote_items (source, path, kind, sha, size, state) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'remote')",
-            )?;
-            for item in items {
-                stmt.execute(params![new.name, item.path, item.kind, item.sha, item.size])?;
-                insert_unit_for_item(self, source_id, item, max_indexed_bytes)?;
-            }
-        }
+        self.insert_remote_items(new.name, source_id, items, max_indexed_bytes)?;
         tx.commit()?;
         Ok(source_id)
+    }
+
+    /// The first half of adding a source whose feed position must be kept
+    /// BEFORE its listing is taken (a Drive source, E8): the `sources` row,
+    /// the `remote_sources` row (status `syncing`, reason
+    /// [`REASON_LISTING`]) and the cursor (`new.cursor`, marked
+    /// [`LISTING_MARK`], index not complete), in one transaction, with no
+    /// item. The listing follows in
+    /// [`Cache::fill_remote_source`]; a listing that fails is undone by
+    /// [`Cache::abandon_remote_source`]. A name already in `sources` is
+    /// [`CacheError::DuplicateSource`].
+    pub fn begin_remote_source(&self, new: &NewRemoteSource<'_>) -> Result<i64, CacheError> {
+        let tx = self.connection().unchecked_transaction()?;
+        let source_id = self.register_source(
+            new.name,
+            &remote_root(new.kind, new.name),
+            SourceStatus::Active,
+        )?;
+        self.connection().execute(
+            "INSERT INTO remote_sources \
+             (name, kind, target, branch, cache, status, status_reason, created_at, last_sync_at) \
+             VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?7)",
+            params![
+                new.name,
+                new.kind,
+                new.target,
+                new.branch,
+                STATUS_SYNCING,
+                REASON_LISTING,
+                new.now
+            ],
+        )?;
+        self.connection().execute(
+            "INSERT INTO remote_cursors (source, cursor, index_complete, updated_at) \
+             VALUES (?1, ?2, 0, ?3)",
+            params![
+                new.name,
+                encode_cursor(new.cursor, Some(LISTING_MARK)),
+                new.now
+            ],
+        )?;
+        tx.commit()?;
+        Ok(source_id)
+    }
+
+    /// Whether `name` was registered by [`Cache::begin_remote_source`] and
+    /// its listing is not stored yet (a start-up that finds this one was cut
+    /// off while the folder was listed).
+    pub fn remote_listing_pending(&self, name: &str) -> Result<bool, CacheError> {
+        Ok(self
+            .remote_poll_state(name)?
+            .is_some_and(|s| !s.index_complete && s.etag.as_deref() == Some(LISTING_MARK)))
+    }
+
+    /// The second half of [`Cache::begin_remote_source`]: the whole listing
+    /// as one `units` row and one `remote_items` row (state `remote`) per
+    /// file, and the source `indexing` with no reason, in one transaction.
+    /// The cursor keeps its commit and loses [`LISTING_MARK`].
+    /// [`CacheError::SourceNotFound`] when the source is not registered (or
+    /// already filled): nothing is written.
+    pub fn fill_remote_source(
+        &self,
+        name: &str,
+        items: &[NewRemoteItem<'_>],
+        max_indexed_bytes: u64,
+    ) -> Result<i64, CacheError> {
+        let state = self.remote_poll_state(name)?;
+        let source = self.get_source(name)?;
+        let (Some(state), Some(source)) = (state, source) else {
+            return Err(CacheError::SourceNotFound(name.to_string()));
+        };
+        if state.etag.as_deref() != Some(LISTING_MARK) || state.index_complete {
+            return Err(CacheError::SourceNotFound(name.to_string()));
+        }
+        let tx = self.connection().unchecked_transaction()?;
+        self.insert_remote_items(name, source.id, items, max_indexed_bytes)?;
+        if let Some(commit) = &state.commit {
+            self.connection().execute(
+                "UPDATE remote_cursors SET cursor = ?2 WHERE source = ?1",
+                params![name, encode_cursor(commit, None)],
+            )?;
+        }
+        self.set_remote_status(name, STATUS_INDEXING, None, None)?;
+        tx.commit()?;
+        Ok(source.id)
+    }
+
+    /// Undoes [`Cache::begin_remote_source`] for a listing that failed:
+    /// the `sources`, `remote_sources`, `remote_cursors` and `remote_items`
+    /// rows of `name` are deleted, in one transaction. Idempotent.
+    pub fn abandon_remote_source(&self, name: &str) -> Result<(), CacheError> {
+        let tx = self.connection().unchecked_transaction()?;
+        self.connection()
+            .execute("DELETE FROM remote_items WHERE source = ?1", [name])?;
+        self.connection()
+            .execute("DELETE FROM remote_cursors WHERE source = ?1", [name])?;
+        self.connection()
+            .execute("DELETE FROM remote_sources WHERE name = ?1", [name])?;
+        self.delete_source(name)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn insert_remote_items(
+        &self,
+        name: &str,
+        source_id: i64,
+        items: &[NewRemoteItem<'_>],
+        max_indexed_bytes: u64,
+    ) -> Result<(), CacheError> {
+        let mut stmt = self.connection().prepare(
+            "INSERT INTO remote_items (source, path, kind, sha, size, file_id, revision, state) \
+             VALUES (?1, ?2, ?3, NULLIF(?4, ''), ?5, ?6, ?7, 'remote')",
+        )?;
+        for item in items {
+            stmt.execute(params![
+                name,
+                item.path,
+                item.kind,
+                item.sha,
+                item.size,
+                item.file_id,
+                item.revision
+            ])?;
+            insert_unit_for_item(self, source_id, item, max_indexed_bytes)?;
+        }
+        Ok(())
     }
 
     /// The remote source `name`, if it is one.
@@ -249,7 +421,7 @@ impl Cache {
     /// Every item of the remote source `name`, in path order. Read-only.
     pub fn remote_items(&self, name: &str) -> Result<Vec<RemoteItemRow>, CacheError> {
         let mut stmt = self.connection().prepare(
-            "SELECT path, kind, sha, size, state, reason FROM remote_items \
+            "SELECT path, kind, sha, size, state, reason, file_id, revision FROM remote_items \
              WHERE source = ?1 ORDER BY path",
         )?;
         let rows = stmt
@@ -261,6 +433,8 @@ impl Cache {
                     size: r.get(3)?,
                     state: r.get(4)?,
                     reason: r.get(5)?,
+                    file_id: r.get(6)?,
+                    revision: r.get(7)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -426,6 +600,8 @@ impl Cache {
                     kind: item.kind.as_deref().unwrap_or("text-other"),
                     sha: item.sha.as_deref().unwrap_or(""),
                     size: item.size,
+                    file_id: item.file_id.as_deref(),
+                    revision: item.revision.as_deref(),
                 },
                 max_indexed_bytes,
             )?;

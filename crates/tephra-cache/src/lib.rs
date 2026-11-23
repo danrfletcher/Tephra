@@ -68,8 +68,10 @@ pub use remote_fetch::{
     ITEM_STATE_PINNED, ITEM_STATE_REMOTE,
 };
 pub use remote_ops::{
-    is_text_item_kind, remote_root, IndexProgress, NewRemoteItem, NewRemoteSource, RemoteCursor,
-    RemoteItemRow, RemoteSourceRow, ITEM_KIND_SUBMODULE, ITEM_KIND_SYMLINK, REASON_LFS_POINTER,
+    is_drive_item_kind, is_text_item_kind, remote_root, IndexProgress, NewRemoteItem,
+    NewRemoteSource, RemoteCursor, RemoteItemRow, RemoteSourceRow, ITEM_KIND_GDOC,
+    ITEM_KIND_GDRAWING, ITEM_KIND_GFORM, ITEM_KIND_GSHEET, ITEM_KIND_GSHORTCUT, ITEM_KIND_GSLIDES,
+    ITEM_KIND_SUBMODULE, ITEM_KIND_SYMLINK, LISTING_MARK, REASON_LFS_POINTER, REASON_LISTING,
     REMOTE_ROOT_PREFIX, STATUS_ACTIVE, STATUS_INDEXING,
 };
 pub use remote_sync::{

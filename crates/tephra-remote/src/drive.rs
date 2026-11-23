@@ -28,7 +28,16 @@ pub const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
 /// What a native Doc is exported as.
 pub const MARKDOWN_MIME: &str = "text/markdown";
 
-const FILE_FIELDS: &str = "id,name,mimeType,parents,headRevisionId,size";
+/// What a listing and the changes feed ask of every file. No Shared Drive
+/// field is asked for here: a listing never reaches into one (F7).
+const FILE_FIELDS: &str =
+    "id,name,mimeType,parents,headRevisionId,md5Checksum,version,createdTime,trashed,size";
+
+/// What the one read of a folder the person picked asks for: every field.
+/// The answer says whether the folder is in a Shared Drive (it then has a
+/// `driveId`), so the daemon can refuse it with a reason. No request names
+/// a Shared Drive or asks to look into one (F7).
+const PICKED_FOLDER_FIELDS: &str = "*";
 
 /// Who the token belongs to.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -60,6 +69,19 @@ pub struct DriveFile {
     pub parents: Vec<String>,
     /// Absent for native Google files and folders.
     pub head_revision_id: Option<String>,
+    /// Absent for native Google files and folders.
+    pub md5_checksum: Option<String>,
+    /// Drive's version number of the file (it rises with every change,
+    /// native files included), as the decimal string Drive sends.
+    pub version: Option<String>,
+    /// RFC 3339.
+    pub created_time: Option<String>,
+    #[serde(default)]
+    pub trashed: bool,
+    /// Set for a file in a Shared Drive. Only the read of a picked folder
+    /// asks for it, to refuse such a folder; it is never a request
+    /// parameter.
+    pub drive_id: Option<String>,
     #[serde(default, deserialize_with = "size_from_text")]
     pub size: Option<u64>,
 }
@@ -71,6 +93,15 @@ impl DriveFile {
 
     pub fn is_native_doc(&self) -> bool {
         self.mime_type == GOOGLE_DOC_MIME
+    }
+
+    /// What changes when the content changes: the head revision id (binary
+    /// files), else the checksum, else the version number (native files).
+    pub fn revision(&self) -> Option<&str> {
+        self.head_revision_id
+            .as_deref()
+            .or(self.md5_checksum.as_deref())
+            .or(self.version.as_deref())
     }
 }
 
@@ -266,7 +297,7 @@ impl DriveAdapter for DriveClient {
             self.json(
                 Request {
                     path: format!("/files/{id}"),
-                    query: vec![("fields", FILE_FIELDS.to_string())],
+                    query: vec![("fields", PICKED_FOLDER_FIELDS.to_string())],
                     ..Request::default()
                 },
                 "file",

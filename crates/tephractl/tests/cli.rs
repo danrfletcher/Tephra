@@ -59,3 +59,6 @@ mod source_add_github;
 
 #[path = "cli/fetch_commands.rs"]
 mod fetch_commands;
+
+#[path = "cli/source_add_drive.rs"]
+mod source_add_drive;

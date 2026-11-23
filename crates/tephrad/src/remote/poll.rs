@@ -32,6 +32,8 @@
 //! The index, links and `unit.list` rows are untouched by all of them; the
 //! next good poll returns the source to `active` with no re-index.
 
+mod drive;
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -127,16 +129,27 @@ impl SourceRegistry {
         {
             return;
         }
+        // A Drive source cut off while its folder was listed is listed again
+        // at once; any other source is first polled one interval after it
+        // was started.
+        let listing_cut_off = {
+            let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+            cache.remote_listing_pending(name).unwrap_or(false)
+        };
         let job = PollJob {
-            // Fixed here, not when the task first runs: the first poll is
-            // one interval after the source was started.
-            first_due: hub.clock.now() + POLL_INTERVAL,
+            // Fixed here, not when the task first runs.
+            first_due: if listing_cut_off {
+                hub.clock.now()
+            } else {
+                hub.clock.now() + POLL_INTERVAL
+            },
             name: name.to_string(),
             cache_path: self.cache_path.clone(),
             conn: Arc::new(Mutex::new(None)),
             gate: self.gate.clone(),
             events_tx: self.events_tx.clone(),
             hub,
+            folders: std::sync::Mutex::new(None),
         };
         self.runtime.spawn(job.run());
     }
@@ -243,6 +256,9 @@ struct PollJob {
     gate: Arc<WriterGate>,
     events_tx: tokio::sync::broadcast::Sender<DaemonEvent>,
     hub: Arc<RemoteHub>,
+    /// A Drive source's folders as the last listing saw them (see
+    /// `drive.rs`); unused by a GitHub source.
+    folders: drive::FolderMap,
 }
 
 /// What a tree changed, against the items the index has.
@@ -382,6 +398,14 @@ impl PollJob {
                 return Step::Next(None);
             }
         };
+        // A Drive source cut off while its folder was being listed has the
+        // feed position but no listing (E8): it is listed again from
+        // scratch, with a fresh start token, before anything is read.
+        if source.kind == crate::remote_github::DRIVE_KIND
+            && state.etag.as_deref() == Some(tephra_cache::LISTING_MARK)
+        {
+            return self.recover_drive(&source).await;
+        }
         // The first index is not finished: it is what brings the source up
         // to date. If a job is reading, look again soon. If none is (it
         // stopped on a network failure, or on the token), the poller runs
@@ -399,6 +423,9 @@ impl PollJob {
                 RunEnd::Skipped => Step::Again(INDEX_RECHECK),
                 RunEnd::Finished | RunEnd::Stopped => Step::Next(None),
             };
+        }
+        if source.kind == crate::remote_github::DRIVE_KIND {
+            return self.poll_drive(&source, &state).await;
         }
         let Ok(repo) = RepoRef::parse(&source.target) else {
             return Step::Next(None);

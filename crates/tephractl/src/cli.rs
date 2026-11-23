@@ -21,6 +21,7 @@ tephractl - command-line client for the tephrad daemon
 USAGE:
     tephractl source add <name> <path> [--json]
     tephractl source add github <name> <owner/repo> [--branch <b>] [--json]
+    tephractl source add drive <name> <folder> [--json]
     tephractl source promote <name> <path> [--json]
     tephractl source unpromote <name> [--json]
     tephractl source rename <old> <new> [--json]
@@ -64,6 +65,21 @@ GITHUB SOURCES:
                           (ONE argument after `github`) adds the folder <path> as the source
                           named github; TWO arguments after `github` are always the GitHub
                           form.
+
+DRIVE SOURCES:
+    source add drive <name> <folder>
+                          Register ONE Google Drive folder from My Drive. <folder> is its path
+                          from My Drive (Notes/2026), its id, or its drive.google.com URL;
+                          quote it when it has spaces. Needs `tephractl auth google` first.
+                          The listing shows within seconds, every file `remote` with 0 bytes
+                          cached; nothing is written to disk. Text files and Google Docs are
+                          then read once in the background (`source list` shows indexing
+                          done/total, then active) and the bytes are dropped; Sheets, Slides,
+                          Forms, Drawings, shortcuts, binaries and files over 20 MB are listed
+                          by name only. A folder in a Shared Drive, or all of Drive, is refused.
+                          Two files with one name: the later one is `name (2)`.
+                          A local source literally named drive: `source add drive <path>`
+                          (ONE argument after `drive`); TWO arguments are always the Drive form.
 
 LS:
     ls <source> [folder]  List one folder of a source: kind, size, modified time and name.
@@ -239,6 +255,12 @@ pub enum Command {
         name: String,
         repo: String,
         branch: Option<String>,
+    },
+    /// `source add drive <name> <folder>`: one Drive folder (a path from My
+    /// Drive, an id or a URL).
+    SourceAddDrive {
+        name: String,
+        folder: String,
     },
     SourceRemove {
         name: String,
@@ -544,6 +566,9 @@ fn parse_source<'a>(
             if name == "github" {
                 return parse_source_add_github(iter);
             }
+            if name == "drive" {
+                return parse_source_add_drive(iter);
+            }
             validate_source_name(&name)?;
             let path = iter
                 .next()
@@ -667,6 +692,51 @@ fn parse_source_add_github<'a>(
         }
         _ => Err(ArgsError(
             "source add github takes <name> <owner/repo>: pick one repo".to_string(),
+        )),
+    }
+}
+
+/// What follows `source add drive`: the Drive form (`<name> <folder>`) when
+/// two positional arguments come before any flag, otherwise a local source
+/// literally named `drive` (`source add drive <path>`). Like the GitHub
+/// form, the argument list alone decides: no daemon is asked.
+fn parse_source_add_drive<'a>(
+    iter: &mut impl Iterator<Item = &'a str>,
+) -> Result<(Command, bool, Option<String>), ArgsError> {
+    let rest: Vec<&str> = iter.collect();
+    let positionals = rest.iter().take_while(|t| !t.starts_with("--")).count();
+    match positionals {
+        0 => Err(ArgsError(
+            "source add requires <name> <path> (or `source add drive <name> <folder>`)".to_string(),
+        )),
+        1 => {
+            let mut tail = rest[1..].iter().copied();
+            let (json, addr) = parse_trailing_flags(&mut tail)?;
+            Ok((
+                Command::SourceAdd {
+                    name: "drive".to_string(),
+                    path: rest[0].to_string(),
+                },
+                json,
+                addr,
+            ))
+        }
+        2 => {
+            let name = rest[0].to_string();
+            validate_source_name(&name)?;
+            let folder = rest[1].to_string();
+            if folder.trim().is_empty() || folder.chars().any(char::is_control) {
+                return Err(ArgsError(
+                    "source add drive needs the folder as a path from My Drive, an id or a URL"
+                        .to_string(),
+                ));
+            }
+            let mut tail = rest[2..].iter().copied();
+            let (json, addr) = parse_trailing_flags(&mut tail)?;
+            Ok((Command::SourceAddDrive { name, folder }, json, addr))
+        }
+        _ => Err(ArgsError(
+            "source add drive takes <name> <folder>: quote a folder that has spaces".to_string(),
         )),
     }
 }

@@ -1,0 +1,11 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "error": {
+    "code": -32011,
+    "message": "no such folder in your Drive (a folder in a Shared Drive, or one shared with you and not added to My Drive, cannot be added)",
+    "data": {
+      "reason": "not_found"
+    }
+  }
+}

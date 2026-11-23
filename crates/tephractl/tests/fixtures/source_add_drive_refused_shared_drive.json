@@ -1,0 +1,11 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "error": {
+    "code": -32011,
+    "message": "that folder is in a Shared Drive; only folders of My Drive can be added",
+    "data": {
+      "reason": "shared_drive"
+    }
+  }
+}

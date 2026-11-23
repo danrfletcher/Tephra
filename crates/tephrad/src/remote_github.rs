@@ -101,7 +101,7 @@ impl std::fmt::Display for RemoteAddError {
 
 impl std::error::Error for RemoteAddError {}
 
-fn refused(reason: &'static str, message: impl Into<String>) -> RegistryError {
+pub(crate) fn refused(reason: &'static str, message: impl Into<String>) -> RegistryError {
     RegistryError::Remote(RemoteAddError::Refused {
         reason,
         message: message.into(),
@@ -113,11 +113,11 @@ fn refused(reason: &'static str, message: impl Into<String>) -> RegistryError {
 /// content cache would live.
 pub struct RemoteHub {
     pub(crate) adapter: Arc<dyn GithubAdapter>,
-    /// The Drive adapter `unit.fetch` reads a Drive file through (it reads
-    /// the Google token from `store` on every call). It lists nothing on
-    /// its own: Drive sources are added and synced by PR-10.
+    /// The Drive adapter: `unit.fetch` reads a Drive file through it, a
+    /// Drive source is added, indexed and polled through it (it reads the
+    /// Google token from `store` on every call).
     pub(crate) drive: Arc<dyn DriveAdapter>,
-    store: Arc<dyn CredentialStore>,
+    pub(crate) store: Arc<dyn CredentialStore>,
     options: AdapterOptions,
     pub(crate) clock: Arc<dyn Clock>,
     data_dir: PathBuf,
@@ -474,6 +474,8 @@ impl TreeItem {
             kind: self.kind,
             sha: &self.sha,
             size: self.size,
+            file_id: None,
+            revision: None,
         }
     }
 }
@@ -700,6 +702,18 @@ impl SourceRegistry {
             }
         };
         for row in rows {
+            // A Drive source cut off while its folder was listed has its
+            // feed position and no listing: the poller lists it again from
+            // scratch (`recover_drive`), so nothing is reset here.
+            let listing_cut_off = {
+                let cache = self.cache.lock().unwrap();
+                cache.remote_listing_pending(&row.name).unwrap_or(false)
+            };
+            if row.kind == DRIVE_KIND && listing_cut_off {
+                tracing::info!(source = %row.name, "the listing was cut short; the source is listed again from scratch");
+                self.spawn_remote_poll(&row.name);
+                continue;
+            }
             // A source whose cursor row is lost, or whose first index was
             // cut short (a kill), is read again from scratch: nothing it
             // has read is trusted to be current.
@@ -715,8 +729,21 @@ impl SourceRegistry {
                 let now = self.remote.get().map_or(0, |h| now_secs(&*h.clock));
                 let reset = {
                     let cache = self.cache.lock().unwrap();
+                    // A Drive source's feed position was stored before its
+                    // first listing and is still good after a cut-short
+                    // index: it is kept, so what changed meanwhile is in the
+                    // feed once the index is done (E8). A lost cursor row
+                    // has none to keep.
+                    let kept = (row.kind == DRIVE_KIND)
+                        .then(|| cache.remote_poll_state(&row.name).ok().flatten())
+                        .flatten()
+                        .and_then(|s| s.commit);
                     retry_cache_on_busy(&self.gate, || {
-                        cache.reset_remote_index(&row.name, now, MAX_INDEXED_BYTES)
+                        let done = cache.reset_remote_index(&row.name, now, MAX_INDEXED_BYTES)?;
+                        if let (true, Some(token)) = (done, &kept) {
+                            cache.set_remote_poll_state(&row.name, token, None, now)?;
+                        }
+                        Ok(done)
                     })
                 };
                 match reset {
@@ -786,17 +813,17 @@ impl SourceRegistry {
 /// One background first index (and the catch-up of a poll that left files
 /// unread).
 pub(crate) struct IndexJob {
-    name: String,
+    pub(crate) name: String,
     cache_path: PathBuf,
     /// The job's one connection, opened on first use (a connection per
     /// file would cost more than the file's rows).
     conn: Arc<std::sync::Mutex<Option<Cache>>>,
     /// A reason is set on the source (a rate-limit wait): the next
     /// successful read clears it, and only then is there a write to do.
-    reason_set: std::sync::atomic::AtomicBool,
+    pub(crate) reason_set: std::sync::atomic::AtomicBool,
     gate: Arc<WriterGate>,
     events_tx: tokio::sync::broadcast::Sender<DaemonEvent>,
-    hub: Arc<RemoteHub>,
+    pub(crate) hub: Arc<RemoteHub>,
 }
 
 /// How a pass over the pending files ended.
@@ -892,7 +919,7 @@ impl IndexJob {
 
     /// Runs `f` with a fresh cache connection on the blocking pool, under
     /// the writer gate (retried on a busy database).
-    async fn db<T: Send + 'static>(
+    pub(crate) async fn db<T: Send + 'static>(
         &self,
         f: impl Fn(&Cache, &str) -> Result<T, tephra_cache::CacheError> + Send + 'static,
     ) -> Result<T, String> {
@@ -912,7 +939,7 @@ impl IndexJob {
         .map_err(|e| e.to_string())?
     }
 
-    fn announce(&self) {
+    pub(crate) fn announce(&self) {
         let _ = self.events_tx.send(DaemonEvent::SourceChanged {
             source: self.name.clone(),
             paths: Vec::new(),
@@ -925,6 +952,13 @@ impl IndexJob {
             .db(|c, n| c.remote_source(n))
             .await?
             .ok_or_else(|| "the source is gone".to_string())?;
+        if source.kind == DRIVE_KIND {
+            return Ok(if self.index_drive(&source).await? {
+                PassEnd::Done
+            } else {
+                PassEnd::Stopped
+            });
+        }
         let repo = RepoRef::parse(&source.target).map_err(|e| e.to_string())?;
         // A run after a stop starts on a source that says `offline` or
         // `auth_required`: its first good read puts `indexing` back.
@@ -994,7 +1028,7 @@ impl IndexJob {
     /// clients when that is news. Nothing is written for a status the source
     /// already has: a poller that tries again every interval while the
     /// remote stays away leaves the index and the row alone.
-    async fn stop_with(
+    pub(crate) async fn stop_with(
         &self,
         source: &RemoteSourceRow,
         status: &'static str,
@@ -1098,7 +1132,7 @@ impl IndexJob {
         }
     }
 
-    async fn source_gone(&self) -> bool {
+    pub(crate) async fn source_gone(&self) -> bool {
         matches!(self.db(|c, n| c.remote_source(n)).await, Ok(None))
     }
 }

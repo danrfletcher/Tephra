@@ -592,6 +592,7 @@ fn render_source_table_remote(rows: &[Value], format_time: &dyn Fn(i64) -> Strin
         }
         let status = remote_status(row);
         out.push_str(&format!("{name:<20} {status:<status_width$} {path}\n"));
+        let drive = str_field(row, "kind") == "drive";
         let branch = row
             .get("branch")
             .and_then(Value::as_str)
@@ -606,12 +607,21 @@ fn render_source_table_remote(rows: &[Value], format_time: &dyn Fn(i64) -> Strin
             .get("last_scanned_at")
             .and_then(Value::as_i64)
             .map_or_else(|| "never".to_string(), format_time);
-        out.push_str(&format!(
-            "{:<20} branch {branch}, cache {cache}, cached {} bytes, .git {} bytes, last sync {synced}\n",
-            "",
-            bytes("cache_bytes"),
-            bytes("git_bytes"),
-        ));
+        if drive {
+            // A Drive folder has no branch and no clone.
+            out.push_str(&format!(
+                "{:<20} cache {cache}, cached {} bytes, last sync {synced}\n",
+                "",
+                bytes("cache_bytes"),
+            ));
+        } else {
+            out.push_str(&format!(
+                "{:<20} branch {branch}, cache {cache}, cached {} bytes, .git {} bytes, last sync {synced}\n",
+                "",
+                bytes("cache_bytes"),
+                bytes("git_bytes"),
+            ));
+        }
         // The clone's own work (G13, G15): nothing is printed for 0.
         let changes = row.get("not_pushed").and_then(Value::as_u64).unwrap_or(0);
         if changes > 0 {
@@ -647,6 +657,30 @@ pub fn render_github_source_added(result: &Value) -> String {
         format!("commit {commit}")
     };
     let mut out = format!("Registered GitHub source \"{name}\": {repo} @ {branch} ({at})\n");
+    out.push_str(&format!(
+        "  {files} files listed, all remote, 0 bytes cached; nothing is written to disk\n"
+    ));
+    if total == 0 {
+        out.push_str("  no text files to index\n");
+    } else {
+        out.push_str(&format!(
+            "  indexing {total} text files in the background: see `tephractl source list`\n"
+        ));
+    }
+    out
+}
+
+/// `source add drive` success: the folder, what was listed, and that the
+/// text index carries on in the background.
+pub fn render_drive_source_added(result: &Value) -> String {
+    let name = printable(str_field(result, "name"));
+    let folder = printable(str_field(result, "folder_name"));
+    let files = result.get("files").and_then(Value::as_u64).unwrap_or(0);
+    let total = result
+        .get("index_total")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let mut out = format!("Registered Google Drive source \"{name}\": {folder}\n");
     out.push_str(&format!(
         "  {files} files listed, all remote, 0 bytes cached; nothing is written to disk\n"
     ));
