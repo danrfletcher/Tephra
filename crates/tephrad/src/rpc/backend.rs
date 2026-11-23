@@ -269,6 +269,12 @@ pub struct RemoteRowWire {
     /// Text files read so far, and the text files to read.
     pub index_done: usize,
     pub index_total: usize,
+    /// Files of the clone that differ from the remote tip (G13): edits, new
+    /// and deleted files and files only in unpushed commits. 0 with no clone.
+    pub not_pushed: u64,
+    /// Commits of the tracked branch the clone has not got (G15). 0 with no
+    /// clone.
+    pub behind: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status_reason: Option<String>,
 }
@@ -305,6 +311,8 @@ impl From<SourceListing> for SourceRowWire {
                 git_bytes: remote.git_bytes,
                 index_done: remote.index_done,
                 index_total: remote.index_total,
+                not_pushed: remote.not_pushed,
+                behind: remote.behind,
                 status_reason: remote.status_reason,
             });
         }

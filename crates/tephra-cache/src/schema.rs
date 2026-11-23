@@ -293,6 +293,21 @@ const CREATE_REMOTE_COPY_STAMPS: &str = "\
         PRIMARY KEY (source, path) \
     )";
 
+/// What the daemon knows of a GitHub source's git clone (atlas-27 PR-9): one
+/// row per source. `tip` is the tip of the tracked branch the last good pass
+/// recorded (a force-push is a new tip that does not descend from it),
+/// `behind` the commits the clone lacks and `not_pushed` the files that
+/// differ from the tip, kept so an unreachable remote still shows them.
+/// Durable and foreign-key free like the remote tables; a bookkeeping table
+/// of the clone, not one of [`crate::REMOTE_TABLES`].
+const CREATE_REMOTE_CLONE_STATE: &str = "\
+    CREATE TABLE IF NOT EXISTS remote_clone_state (\
+        source TEXT PRIMARY KEY, \
+        tip TEXT, \
+        behind INTEGER NOT NULL DEFAULT 0, \
+        not_pushed INTEGER NOT NULL DEFAULT 0 \
+    )";
+
 /// One row per link occurrence. `line` is the link's 1-based line in
 /// its file (what a backlink reports); NULL for a link in a document
 /// and for a row carried over from a cache that had no such column.
@@ -498,6 +513,7 @@ pub(crate) fn create_bootstrap_tables(conn: &Connection) -> Result<(), CacheErro
     conn.execute(CREATE_REMOTE_PINS, [])?;
     conn.execute(CREATE_REMOTE_CURSORS, [])?;
     conn.execute(CREATE_REMOTE_COPY_STAMPS, [])?;
+    conn.execute(CREATE_REMOTE_CLONE_STATE, [])?;
     Ok(())
 }
 

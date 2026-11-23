@@ -1,0 +1,14 @@
+NAME                 STATUS          PATH
+github-atlas         active          github:danrfletcher/atlas
+                     branch main, cache on, cached 120 bytes, .git 4096 bytes, last sync {SYNC}
+github-atlas: 1 change not pushed
+gh-many              active          github:danrfletcher/many
+                     branch main, cache on, cached 0 bytes, .git 4096 bytes, last sync {SYNC}
+gh-many: 3 changes not pushed
+gh-many: behind by 2
+gh-clean             active          github:danrfletcher/clean
+                     branch main, cache on, cached 0 bytes, .git 4096 bytes, last sync {SYNC}
+gh-rewritten         needs_attention github:danrfletcher/rewritten
+                     branch main, cache on, cached 0 bytes, .git 4096 bytes, last sync {SYNC}
+gh-rewritten: behind by 1
+                     note: history rewritten on GitHub; nothing in the clone was changed, run `git pull --rebase` yourself to bring it to the new history

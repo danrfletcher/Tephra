@@ -519,7 +519,9 @@ pub fn render_source_table(rows: &[Value]) -> String {
 ///
 /// A list of local sources only is the table above, byte for byte. A source
 /// with a `kind` (GitHub) shows `indexing done/total` as its status, its
-/// `github:owner/repo` as the path and one detail line under it.
+/// `github:owner/repo` as the path and one detail line under it, then (when
+/// the source has a git clone) `<name>: N changes not pushed` and
+/// `<name>: behind by N`, each only when it is not 0, then the status note.
 pub fn render_source_table_with(rows: &[Value], format_time: &dyn Fn(i64) -> String) -> String {
     if rows.is_empty() {
         return "no sources registered\n".to_string();
@@ -610,6 +612,16 @@ fn render_source_table_remote(rows: &[Value], format_time: &dyn Fn(i64) -> Strin
             bytes("cache_bytes"),
             bytes("git_bytes"),
         ));
+        // The clone's own work (G13, G15): nothing is printed for 0.
+        let changes = row.get("not_pushed").and_then(Value::as_u64).unwrap_or(0);
+        if changes > 0 {
+            let noun = if changes == 1 { "change" } else { "changes" };
+            out.push_str(&format!("{name}: {changes} {noun} not pushed\n"));
+        }
+        let behind = row.get("behind").and_then(Value::as_u64).unwrap_or(0);
+        if behind > 0 {
+            out.push_str(&format!("{name}: behind by {behind}\n"));
+        }
         if let Some(reason) = row.get("status_reason").and_then(Value::as_str) {
             out.push_str(&format!("{:<20} note: {}\n", "", printable(reason)));
         }

@@ -1,0 +1,71 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": [
+    {
+      "name": "github-atlas",
+      "path": "github:danrfletcher/atlas",
+      "status": "active",
+      "last_scanned_at": 1700000000,
+      "kind": "github",
+      "repo": "danrfletcher/atlas",
+      "branch": "main",
+      "cache": true,
+      "cache_bytes": 120,
+      "git_bytes": 4096,
+      "index_done": 3,
+      "index_total": 3,
+      "not_pushed": 1,
+      "behind": 0
+    },
+    {
+      "name": "gh-many",
+      "path": "github:danrfletcher/many",
+      "status": "active",
+      "last_scanned_at": 1700000000,
+      "kind": "github",
+      "repo": "danrfletcher/many",
+      "branch": "main",
+      "cache": true,
+      "cache_bytes": 0,
+      "git_bytes": 4096,
+      "index_done": 2,
+      "index_total": 2,
+      "not_pushed": 3,
+      "behind": 2
+    },
+    {
+      "name": "gh-clean",
+      "path": "github:danrfletcher/clean",
+      "status": "active",
+      "last_scanned_at": 1700000000,
+      "kind": "github",
+      "repo": "danrfletcher/clean",
+      "branch": "main",
+      "cache": true,
+      "cache_bytes": 0,
+      "git_bytes": 4096,
+      "index_done": 1,
+      "index_total": 1,
+      "not_pushed": 0,
+      "behind": 0
+    },
+    {
+      "name": "gh-rewritten",
+      "path": "github:danrfletcher/rewritten",
+      "status": "needs_attention",
+      "last_scanned_at": 1700000000,
+      "kind": "github",
+      "repo": "danrfletcher/rewritten",
+      "branch": "main",
+      "cache": true,
+      "cache_bytes": 0,
+      "git_bytes": 4096,
+      "index_done": 1,
+      "index_total": 1,
+      "not_pushed": 0,
+      "behind": 1,
+      "status_reason": "history rewritten on GitHub; nothing in the clone was changed, run `git pull --rebase` yourself to bring it to the new history"
+    }
+  ]
+}

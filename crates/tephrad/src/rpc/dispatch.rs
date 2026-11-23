@@ -689,6 +689,8 @@ mod tests {
                 offline: false,
                 needs_rescan: false,
                 cache: None,
+                not_pushed: None,
+                behind: None,
                 entries: Vec::new(),
             }))
         }
@@ -812,6 +814,8 @@ mod tests {
             offline: true,
             needs_rescan: true,
             cache: None,
+            not_pushed: None,
+            behind: None,
             entries: vec![
                 UnitEntryWire {
                     id: "@s:d/a.md".into(),

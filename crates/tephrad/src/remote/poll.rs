@@ -38,8 +38,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tephra_cache::{
-    is_kept_deleted, Cache, CacheError, RemoteItemRow, RemoteSourceRow, STATUS_ACTIVE,
-    STATUS_AUTH_REQUIRED, STATUS_NEEDS_ATTENTION, STATUS_OFFLINE, STATUS_SYNCING,
+    is_clone_reason, is_kept_deleted, Cache, CacheError, RemoteItemRow, RemoteSourceRow,
+    STATUS_ACTIVE, STATUS_AUTH_REQUIRED, STATUS_NEEDS_ATTENTION, STATUS_OFFLINE, STATUS_SYNCING,
 };
 use tephra_cache::{PollState, REASON_LFS_POINTER};
 use tephra_remote::github::{full_tree, GitBlobHasher, RefHead, RepoRef};
@@ -47,6 +47,7 @@ use tephra_remote::{Conditional, RemoteError, UnreachableCause};
 
 use crate::file_kind::MAX_INDEXED_BYTES;
 use crate::registry::{retry_cache_on_busy, DaemonEvent, SourceRegistry};
+use crate::remote::clone_sync::{self, CloneCtx, Pass};
 use crate::remote::safe_path;
 use crate::remote_github::{
     hhmm_utc, is_lfs_pointer, now_secs, printable, tree_items, IndexJob, RemoteHub, RunEnd,
@@ -273,10 +274,19 @@ struct Removal {
 impl PollJob {
     async fn run(self) {
         let mut due = self.first_due;
+        // The clone's counts come up at start (no network), and a save in
+        // it is watched from here on.
+        self.look_after_clone(Pass::Recount).await;
         loop {
             self.wait_until(due).await;
             let started = self.hub.clock.now();
             let step = self.poll().await;
+            // After every sync, the source's git clone (if it has one) is
+            // fetched and looked at, whatever the poll found: its rules do
+            // not depend on the API being reachable.
+            if !matches!(step, Step::Again(_) | Step::Gone) {
+                self.look_after_clone(Pass::Sync).await;
+            }
             if !matches!(step, Step::Again(_)) {
                 self.hub
                     .polls_done
@@ -293,11 +303,27 @@ impl PollJob {
                 Step::Again(after) => due = started + after,
             }
         }
+        clone_sync::stop_watch(&self.hub, &self.name);
         self.hub
             .polling
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(&self.name);
+    }
+
+    /// Runs one pass over the source's git clone on the blocking pool, and
+    /// makes sure a save in it is watched. Nothing happens for a source
+    /// whose `clone/` has no `.git`.
+    async fn look_after_clone(&self, pass: Pass) {
+        let ctx = CloneCtx {
+            name: self.name.clone(),
+            cache_path: self.cache_path.clone(),
+            gate: self.gate.clone(),
+            events_tx: self.events_tx.clone(),
+            hub: self.hub.clone(),
+        };
+        clone_sync::ensure_watch(&ctx, &tokio::runtime::Handle::current());
+        let _ = tokio::task::spawn_blocking(move || ctx.run(pass)).await;
     }
 
     /// Returns once the hub's clock is at `due`.
@@ -405,7 +431,10 @@ impl PollJob {
         head: Option<RefHead>,
     ) -> Step {
         let now = now_secs(&*self.hub.clock);
-        let was_active = source.status == STATUS_ACTIVE && source.status_reason.is_none();
+        // A status the clone's pass wrote (a rewritten history, a failed
+        // git fetch) is not the poll's to clear: the pass does.
+        let was_active = (source.status == STATUS_ACTIVE && source.status_reason.is_none())
+            || source.status_reason.as_deref().is_some_and(is_clone_reason);
         let new_etag = head.as_ref().and_then(|h| h.etag.clone());
         let commit = state.commit.clone();
         let etag_moved = head.is_some() && new_etag != state.etag;
@@ -487,7 +516,8 @@ impl PollJob {
 
         // The one transaction.
         let now = now_secs(&*self.hub.clock);
-        let status_changed = source.status != STATUS_ACTIVE || source.status_reason.is_some();
+        let status_changed = (source.status != STATUS_ACTIVE || source.status_reason.is_some())
+            && !source.status_reason.as_deref().is_some_and(is_clone_reason);
         let plan = Arc::new(plan);
         let staged = Arc::new(staged);
         let committed = {
@@ -507,9 +537,14 @@ impl PollJob {
         }
         // A cached copy nobody edited goes with its file. Re-checked right
         // before it is deleted.
+        // A git clone is Dan's working tree: a file gone from GitHub leaves
+        // it when the clone fast-forwards, never by this delete.
         let removals = plan.clone();
         let root = clone_root.clone();
         let _ = tokio::task::spawn_blocking(move || {
+            if clone_sync::is_git_clone(&root) {
+                return;
+            }
             for r in &removals.removed {
                 if let (false, Some(copy), Some(sha)) = (r.keep, &r.copy, &r.sha) {
                     remove_unmodified_copy(&root, copy, sha);
@@ -717,7 +752,16 @@ fn commit_poll(
         }
     }
     cache.set_remote_poll_state(name, &head.sha, head.etag.as_deref(), now)?;
-    cache.set_remote_status(name, STATUS_ACTIVE, None, Some(now))?;
+    // A status the clone's pass wrote stays (see `settle`).
+    match cache
+        .remote_source(name)?
+        .filter(|r| r.status_reason.as_deref().is_some_and(is_clone_reason))
+    {
+        Some(kept) => {
+            cache.set_remote_status(name, &kept.status, kept.status_reason.as_deref(), Some(now))?
+        }
+        None => cache.set_remote_status(name, STATUS_ACTIVE, None, Some(now))?,
+    }
     tx.commit()?;
     Ok(true)
 }
@@ -732,7 +776,7 @@ const NAME_MAX: usize = 255;
 
 /// What is on disk for a repository path.
 #[derive(Debug, PartialEq, Eq)]
-enum CopyState {
+pub(crate) enum CopyState {
     /// Nothing there.
     Absent,
     /// A regular file, reached without a symlink.
@@ -744,7 +788,7 @@ enum CopyState {
 
 /// Looks for the cached copy of `rel` under `clone_root`, at the name
 /// `unit.fetch` writes it under ([`safe_path::safe_segments`]).
-fn clone_copy(clone_root: &Path, rel: &str) -> CopyState {
+pub(crate) fn clone_copy(clone_root: &Path, rel: &str) -> CopyState {
     if rel.is_empty() || rel.starts_with('/') {
         return CopyState::Unsafe;
     }
@@ -786,7 +830,7 @@ fn clone_copy(clone_root: &Path, rel: &str) -> CopyState {
 /// Whether the file's bytes are the git blob `sha`: the copy is what the
 /// remote had, unedited. Any doubt (unreadable, changed while read) is
 /// "no".
-fn file_has_blob_sha(path: &Path, sha: &str) -> bool {
+pub(crate) fn file_has_blob_sha(path: &Path, sha: &str) -> bool {
     use std::io::Read;
     let Ok(mut file) = std::fs::File::open(path) else {
         return false;

@@ -24,6 +24,7 @@ mod listing;
 mod pending_fixes;
 mod promote;
 mod remote;
+mod remote_clone;
 mod remote_evict;
 mod remote_fetch;
 mod remote_ops;
@@ -56,6 +57,11 @@ pub use pending_fixes::{
 };
 pub use promote::{NewPromote, NewUnpromote, Promoted, PromotedRootRow, Unpromoted};
 pub use remote::{REMOTE_ITEM_STATES, REMOTE_SOURCE_KINDS, REMOTE_TABLES};
+pub use remote_clone::{
+    clone_reason_not_on_branch, is_clone_reason, CloneChanges, CloneState,
+    CLONE_FETCH_REASON_PREFIX, CLONE_REASON_DIVERGED, CLONE_REASON_REWRITTEN,
+    REASON_CHANGED_BOTH_SIDES,
+};
 pub use remote_fetch::{
     item_cache_bytes, state_has_copy, RemoteFetchRow, FETCH_REASON_PREFIX, ITEM_STATE_CACHED,
     ITEM_STATE_DOWNLOADING, ITEM_STATE_MISSING, ITEM_STATE_NOT_PUSHED, ITEM_STATE_PENDING_UPLOAD,

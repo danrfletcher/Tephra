@@ -93,6 +93,16 @@ pub struct UnitListWire {
     /// source.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache: Option<bool>,
+    /// A GitHub source with a git clone (G13): the files that differ from
+    /// the remote tip, the number `source.list` reports. Left out for a
+    /// source with no clone. Each such file's entry has `state`
+    /// `not_pushed`, unless it needs attention.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_pushed: Option<u64>,
+    /// Commits of the tracked branch the clone has not got (G15). Left out
+    /// like `not_pushed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub behind: Option<u64>,
     pub entries: Vec<UnitEntryWire>,
 }
 
@@ -198,6 +208,8 @@ pub fn list_units(
         offline,
         needs_rescan: listing.needs_rescan,
         cache: None,
+        not_pushed: None,
+        behind: None,
         entries,
     })
 }
@@ -249,6 +261,7 @@ fn list_remote(
             wire
         })
         .collect();
+    let clone = cache.remote_clone_state(source).ok().flatten();
     Ok(UnitListWire {
         source: source.to_string(),
         folder: folder.to_string(),
@@ -256,6 +269,8 @@ fn list_remote(
         offline: false,
         needs_rescan: false,
         cache: cache.remote_source(source).ok().flatten().map(|s| s.cache),
+        not_pushed: clone.as_ref().map(|c| c.not_pushed),
+        behind: clone.as_ref().map(|c| c.behind),
         entries,
     })
 }

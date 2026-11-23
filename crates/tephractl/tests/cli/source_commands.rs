@@ -734,3 +734,59 @@ fn source_list_json_is_the_daemons_answer_byte_for_byte_and_carries_no_token() {
         );
     }
 }
+
+// ---- PR-9: a clone's changes not pushed, and how far behind it is ---------
+
+fn list_clone(json: bool) -> commands::CommandOutcome {
+    let server = MockServer::start(vec![Behavior::Respond {
+        status: 200,
+        body: load_fixture("source_list_clone"),
+    }]);
+    let client = client_for(&server);
+    let mut stdin: &[u8] = &[];
+    commands::execute(&Command::SourceList, json, &client, &mut stdin)
+}
+
+#[test]
+fn source_list_renders_changes_not_pushed_and_behind_and_nothing_for_zero() {
+    let outcome = list_clone(false);
+    assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
+    assert_eq!(
+        outcome.stdout,
+        with_sync(load_expected("source_list_clone_rendered"))
+    );
+    let text = outcome.stdout;
+    // One is singular, several are plural, zero prints no line at all.
+    assert!(
+        text.contains("github-atlas: 1 change not pushed\n"),
+        "{text}"
+    );
+    assert!(!text.contains("1 changes"), "{text}");
+    assert!(text.contains("gh-many: 3 changes not pushed\n"), "{text}");
+    assert!(text.contains("gh-many: behind by 2\n"), "{text}");
+    assert!(!text.contains("gh-clean: "), "{text}");
+    assert!(!text.contains("github-atlas: behind"), "{text}");
+    // The reason of a rewritten history shows under its source, and points
+    // at Dan's own command.
+    assert!(text.contains("note: history rewritten on GitHub"), "{text}");
+    assert!(text.contains("`git pull --rebase`"), "{text}");
+    for line in text.lines() {
+        assert_eq!(line, line.trim_end(), "{line:?}");
+    }
+}
+
+#[test]
+fn source_list_json_carries_the_counts_byte_for_byte() {
+    let outcome = list_clone(true);
+    assert_eq!(outcome.exit_code, 0);
+    assert_eq!(outcome.stdout, load_expected("source_list_clone_json"));
+    let parsed: serde_json::Value = serde_json::from_str(&outcome.stdout).unwrap();
+    let rows = parsed.as_array().unwrap();
+    assert_eq!(rows[0]["not_pushed"], 1);
+    assert_eq!(rows[1]["not_pushed"], 3);
+    assert_eq!(rows[1]["behind"], 2);
+    assert_eq!(rows[3]["status"], "needs_attention");
+    let reason = rows[3]["status_reason"].as_str().unwrap();
+    assert!(reason.starts_with("history rewritten on GitHub"));
+    assert!(reason.contains("git pull --rebase"), "{reason}");
+}

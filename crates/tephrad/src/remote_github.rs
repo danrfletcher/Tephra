@@ -29,7 +29,7 @@
 //! that runtime's workers): only the cache path, the writer gate, the event
 //! sender and the hub.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -150,6 +150,14 @@ pub struct RemoteHub {
     /// How often the eviction pass looks at the clock. Real time, whatever
     /// the clock is (see `poll_tick`).
     pub(crate) evict_tick: Duration,
+    /// The git program the clone's pass runs (PR-9): `git` on the path, or a
+    /// test's recording wrapper.
+    pub(crate) git_program: PathBuf,
+    /// One lock per source: a pass over its clone holds it, so there is one
+    /// git pass at a time.
+    pub(crate) clone_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// The watchers of the clones of the sources, one each.
+    pub(crate) clone_watchers: Mutex<HashMap<String, crate::watcher::WatcherHandle>>,
 }
 
 /// Saves a cache limit to where the daemon keeps it (its config file).
@@ -215,6 +223,9 @@ impl RemoteHub {
             limit_saver: None,
             idle_secs: tephra_cache::DEFAULT_IDLE_SECS,
             evict_tick: crate::remote::evict::DEFAULT_EVICT_TICK,
+            git_program: PathBuf::from("git"),
+            clone_locks: Mutex::new(HashMap::new()),
+            clone_watchers: Mutex::new(HashMap::new()),
         })
     }
 
@@ -275,6 +286,13 @@ impl RemoteHub {
         self
     }
 
+    /// The git program a clone's pass runs (default `git` on the path; a test
+    /// gives a wrapper that records what it is asked).
+    pub fn with_git_program(mut self, program: PathBuf) -> Self {
+        self.git_program = program;
+        self
+    }
+
     /// The cap now, in bytes.
     pub(crate) fn limit_bytes(&self) -> u64 {
         self.cache_limit
@@ -329,6 +347,11 @@ pub struct RemoteListing {
     pub index_done: usize,
     pub index_total: usize,
     pub last_sync_at: Option<i64>,
+    /// Files of the clone that differ from the remote tip (G13); 0 for a
+    /// source with no clone.
+    pub not_pushed: u64,
+    /// Commits of the tracked branch the clone lacks (G15).
+    pub behind: u64,
 }
 
 pub(crate) fn now_secs(clock: &dyn Clock) -> i64 {
@@ -738,6 +761,7 @@ impl SourceRegistry {
         let progress = cache
             .remote_index_progress(&source.name, MAX_INDEXED_BYTES)
             .ok()?;
+        let clone = cache.remote_clone_state(&source.name).ok().flatten();
         Some(RemoteListing {
             kind: source.kind.clone(),
             repo: source.target.clone(),
@@ -753,6 +777,8 @@ impl SourceRegistry {
             index_done: progress.done,
             index_total: progress.total,
             last_sync_at: source.last_sync_at,
+            not_pushed: clone.as_ref().map_or(0, |c| c.not_pushed),
+            behind: clone.as_ref().map_or(0, |c| c.behind),
         })
     }
 }

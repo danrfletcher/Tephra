@@ -260,6 +260,9 @@ pub struct Tuning {
     /// a test that moves the clock far and then counts requests gives a
     /// tick longer than the test, so no poll can land in between.
     pub poll_tick: Duration,
+    /// The git program a clone's pass runs (PR-9); `None`: `git` on the path.
+    /// A test gives a wrapper that records what it is asked.
+    pub git: Option<&'static str>,
 }
 
 impl Default for Tuning {
@@ -269,6 +272,7 @@ impl Default for Tuning {
             idle_secs: 600,
             gated: false,
             poll_tick: Duration::from_millis(10),
+            git: None,
         }
     }
 }
@@ -405,6 +409,10 @@ impl Daemon {
                 .with_poll_tick(tuning.poll_tick);
         let hub = match disk {
             Some(disk) => hub.with_disk(disk),
+            None => hub,
+        };
+        let hub = match tuning.git {
+            Some(program) => hub.with_git_program(PathBuf::from(program)),
             None => hub,
         };
         // The cap (PR-8). The limit is kept in a file of the data dir, as
