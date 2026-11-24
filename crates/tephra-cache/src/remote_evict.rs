@@ -18,7 +18,7 @@ use crate::{Cache, CacheError};
 /// "Pinned", as SQL over `remote_items` aliased `i`: a pin on the file
 /// itself or on a folder above it (a folder pin with the empty path covers
 /// the whole source).
-const PINNED: &str = "EXISTS (SELECT 1 FROM remote_pins p \
+pub(crate) const PINNED: &str = "EXISTS (SELECT 1 FROM remote_pins p \
      WHERE p.source = i.source AND (p.path = i.path OR (p.is_folder = 1 AND \
        (p.path = '' OR substr(i.path, 1, length(p.path) + 1) = p.path || '/'))))";
 

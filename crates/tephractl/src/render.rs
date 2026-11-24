@@ -521,7 +521,10 @@ pub fn render_source_table(rows: &[Value]) -> String {
 /// with a `kind` (GitHub) shows `indexing done/total` as its status, its
 /// `github:owner/repo` as the path and one detail line under it, then (when
 /// the source has a git clone) `<name>: N changes not pushed` and
-/// `<name>: behind by N`, each only when it is not 0, then the status note.
+/// `<name>: behind by N`, each only when it is not 0, then (a Drive source's
+/// unsent work) `<name>: N pending upload` and one
+/// `<name>: <path>: needs attention: <reason>` line per held file, then the
+/// status note.
 pub fn render_source_table_with(rows: &[Value], format_time: &dyn Fn(i64) -> String) -> String {
     if rows.is_empty() {
         return "no sources registered\n".to_string();
@@ -631,6 +634,33 @@ fn render_source_table_remote(rows: &[Value], format_time: &dyn Fn(i64) -> Strin
         let behind = row.get("behind").and_then(Value::as_u64).unwrap_or(0);
         if behind > 0 {
             out.push_str(&format!("{name}: behind by {behind}\n"));
+        }
+        // A Drive source's unsent work (PR-11, G14): nothing is printed for 0.
+        let pending = row
+            .get("pending_upload")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if pending > 0 {
+            out.push_str(&format!("{name}: {pending} pending upload\n"));
+        }
+        let held = row
+            .get("needs_attention")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let listed = row.get("attention").and_then(Value::as_array);
+        for item in listed.into_iter().flatten() {
+            out.push_str(&format!(
+                "{name}: {}: needs attention: {}\n",
+                printable(str_field(item, "path")),
+                printable(str_field(item, "reason"))
+            ));
+        }
+        let shown = listed.map_or(0, |l| l.len() as u64);
+        if held > shown {
+            out.push_str(&format!(
+                "{name}: and {} more need attention\n",
+                held - shown
+            ));
         }
         if let Some(reason) = row.get("status_reason").and_then(Value::as_str) {
             out.push_str(&format!("{:<20} note: {}\n", "", printable(reason)));
@@ -1098,6 +1128,42 @@ fn pretty(value: &Value) -> String {
 /// `fetch`: the path of the fetched file on a line of its own, nothing else.
 pub fn render_fetched(result: &Value) -> String {
     format!("{}\n", result["path"].as_str().unwrap_or_default())
+}
+
+/// `resolve`: what was done and where the item is now, in plain lines.
+pub fn render_resolved(result: &Value) -> String {
+    let text = |key: &str| result.get(key).and_then(Value::as_str);
+    let unit = text("unit").unwrap_or_default();
+    let state = text("state").unwrap_or_default();
+    let mut out = String::new();
+    if text("keep") == Some("theirs") {
+        if let Some(mine) = text("mine_path") {
+            out.push_str(&format!("kept your edits of {unit} as {mine}\n"));
+        } else {
+            out.push_str(&format!("{unit} had no edited copy on disk to keep\n"));
+        }
+        match (text("path"), text("fetch_failed")) {
+            (Some(path), _) => out.push_str(&format!("refreshed from Drive: {path}\n")),
+            (None, Some(why)) => out.push_str(&format!(
+                "not refreshed yet ({why}); `tephractl fetch {unit}` gets it\n"
+            )),
+            (None, None) => {}
+        }
+    } else {
+        match state {
+            "cached" => out.push_str(&format!(
+                "sent your version of {unit} to Drive as a new revision\n"
+            )),
+            "needs_attention" => out.push_str(&format!(
+                "{unit} is held again: {}\n",
+                text("reason").unwrap_or("needs attention")
+            )),
+            _ => out.push_str(&format!(
+                "your version of {unit} is queued and goes to Drive as a new revision\n"
+            )),
+        }
+    }
+    out
 }
 
 /// A size for people: 1000-based, one decimal, the unit the limit is

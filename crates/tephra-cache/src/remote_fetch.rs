@@ -43,6 +43,9 @@ pub struct RemoteFetchRow {
     /// The git blob sha (GitHub).
     pub sha: Option<String>,
     pub size: Option<i64>,
+    /// The Drive head revision the listing had when the row was read (the
+    /// revision a fetch of the file starts from); `None` for GitHub.
+    pub revision: Option<String>,
     pub state: String,
     pub reason: Option<String>,
     pub last_used: Option<i64>,
@@ -75,7 +78,7 @@ impl Cache {
         Ok(self
             .connection()
             .query_row(
-                "SELECT source, path, kind, file_id, sha, size, state, reason, last_used \
+                "SELECT source, path, kind, file_id, sha, size, state, reason, last_used, revision \
                  FROM remote_items WHERE source = ?1 AND path = ?2",
                 params![source, path],
                 |r| {
@@ -89,6 +92,7 @@ impl Cache {
                         state: r.get(6)?,
                         reason: r.get(7)?,
                         last_used: r.get(8)?,
+                        revision: r.get(9)?,
                     })
                 },
             )

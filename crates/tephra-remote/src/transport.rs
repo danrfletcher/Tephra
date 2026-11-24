@@ -297,7 +297,9 @@ impl Core {
         }
     }
 
-    async fn exchange(&self, request: Request, streaming: bool) -> Result<Answer, RemoteError> {
+    /// Steps 1 to 3 of the call: the token, the latch and the gate. Sends
+    /// nothing.
+    fn preflight(&self) -> Result<Preflight, RemoteError> {
         let token = self.token()?;
         let now = self.clock.now();
         {
@@ -317,6 +319,12 @@ impl Core {
         let mut bearer = HeaderValue::from_str(&format!("Bearer {}", token.expose()))
             .map_err(|_| RemoteError::AuthRejected)?;
         bearer.set_sensitive(true);
+        Ok(Preflight { token, now, bearer })
+    }
+
+    async fn exchange(&self, request: Request, streaming: bool) -> Result<Answer, RemoteError> {
+        let pre = self.preflight()?;
+        let bearer = pre.bearer.clone();
         let conditional = request.if_none_match.is_some();
         let mut builder = self
             .client
@@ -340,6 +348,39 @@ impl Core {
             );
         }
 
+        self.dispatch(builder, pre, streaming, conditional).await
+    }
+
+    /// The one write path of the crate (PR-11): the caller (only
+    /// `crate::upload`) builds a request of its own from the client, the
+    /// base url and the sensitive bearer header; everything around it (the
+    /// token read, the latch, the gate, no redirects and the mapping of the
+    /// answer) is the shared path every read takes. `build` must not read
+    /// the bearer into text.
+    pub(crate) async fn send_built(
+        &self,
+        build: impl FnOnce(
+            &reqwest::Client,
+            &str,
+            HeaderValue,
+        ) -> Result<reqwest::RequestBuilder, RemoteError>,
+    ) -> Result<Reply, RemoteError> {
+        let pre = self.preflight()?;
+        let builder = build(&self.client, &self.base, pre.bearer.clone())?;
+        match self.dispatch(builder, pre, false, false).await? {
+            Answer::Whole(reply) => Ok(reply),
+            Answer::Stream(_) => unreachable!("a whole answer was asked for"),
+        }
+    }
+
+    async fn dispatch(
+        &self,
+        builder: reqwest::RequestBuilder,
+        pre: Preflight,
+        streaming: bool,
+        conditional: bool,
+    ) -> Result<Answer, RemoteError> {
+        let Preflight { token, now, .. } = pre;
         let response = builder.send().await.map_err(|e| {
             let cause = classify_transport(&e);
             tracing::debug!(cause = cause.as_str(), "request did not complete");
@@ -415,6 +456,14 @@ impl Core {
         state.gate.record_success();
         state.latched = None;
     }
+}
+
+/// What steps 1 to 3 hand to the send: the token (for the latch), the time
+/// of the check (for the gate) and the sensitive bearer header.
+struct Preflight {
+    token: Secret,
+    now: std::time::SystemTime,
+    bearer: HeaderValue,
 }
 
 /// The start of an error body (at most 64 KiB), enough to classify it.

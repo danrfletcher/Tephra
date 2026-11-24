@@ -142,7 +142,9 @@ impl Cache {
     /// that was gone) is cleared: the file is read again. An item whose
     /// edited copy was kept when the remote deleted the file stays
     /// `needs_attention`, with [`REASON_READDED_AFTER_DELETE`]: an edited
-    /// copy is never overwritten or hidden.
+    /// copy is never overwritten or hidden. A held upload (PR-11:
+    /// `changed on Drive`, or Drive's own refusal) keeps its reason: only
+    /// `resolve` or a new save clears it.
     pub fn upsert_remote_item(
         &self,
         source: &str,
@@ -155,7 +157,11 @@ impl Cache {
                 kind = excluded.kind, sha = excluded.sha, size = excluded.size, \
                 file_id = excluded.file_id, revision = excluded.revision, \
                 state = CASE WHEN remote_items.reason = ?8 THEN ?9 ELSE remote_items.state END, \
-                reason = CASE WHEN remote_items.reason = ?8 THEN ?10 ELSE NULL END",
+                reason = CASE WHEN remote_items.reason = ?8 THEN ?10 \
+                              WHEN remote_items.state = ?9 \
+                                   AND (remote_items.reason = ?11 OR remote_items.reason LIKE ?12) \
+                                THEN remote_items.reason \
+                              ELSE NULL END",
             params![
                 source,
                 item.path,
@@ -167,6 +173,8 @@ impl Cache {
                 REASON_DELETED_ON_REMOTE,
                 ITEM_STATE_NEEDS_ATTENTION,
                 REASON_READDED_AFTER_DELETE,
+                crate::REASON_CHANGED_ON_DRIVE,
+                format!("{}%", crate::UPLOAD_REFUSED_PREFIX),
             ],
         )?;
         Ok(())
@@ -195,6 +203,10 @@ impl Cache {
                 "UPDATE units SET rel_path = ?3 WHERE source_id = ?1 AND rel_path = ?2",
                 params![source_id, old, temp],
             )?;
+            conn.execute(
+                "UPDATE remote_copy_revisions SET path = ?3 WHERE source = ?1 AND path = ?2",
+                params![source, old, temp],
+            )?;
         }
         for (n, (_, new)) in moves.iter().enumerate() {
             let temp = format!("\u{0}moving:{n}");
@@ -205,6 +217,10 @@ impl Cache {
             conn.execute(
                 "UPDATE units SET rel_path = ?3 WHERE source_id = ?1 AND rel_path = ?2",
                 params![source_id, temp, new],
+            )?;
+            conn.execute(
+                "UPDATE remote_copy_revisions SET path = ?3 WHERE source = ?1 AND path = ?2",
+                params![source, temp, new],
             )?;
         }
         Ok(())
@@ -220,6 +236,10 @@ impl Cache {
         )?;
         self.connection().execute(
             "DELETE FROM remote_pins WHERE source = ?1 AND path = ?2 AND is_folder = 0",
+            params![source, path],
+        )?;
+        self.connection().execute(
+            "DELETE FROM remote_copy_revisions WHERE source = ?1 AND path = ?2",
             params![source, path],
         )?;
         Ok(())

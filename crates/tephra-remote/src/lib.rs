@@ -1,5 +1,5 @@
-//! Typed, read-side access to GitHub and Google Drive, and the fakes to
-//! test it against.
+//! Typed access to GitHub and Google Drive (reads, and the one Drive upload
+//! of PR-11), and the fakes to test it against.
 //!
 //! - [`credentials`]: the credential-store trait, its Keychain store and
 //!   the test-only file store. Adapters read the token from it on every
@@ -7,7 +7,8 @@
 //! - [`github`] / [`drive`]: the [`github::GithubAdapter`] and
 //!   [`drive::DriveAdapter`] traits (read side only: nothing that writes,
 //!   deletes, moves or renames, and nothing that lists every repo or Drive
-//!   of an account) and their real HTTP implementations.
+//!   of an account) and their real HTTP implementations. The only write is
+//!   [`drive::DriveUploader`]: new content for a Drive file that exists.
 //! - [`error`], [`rate_limit`], [`health`], [`clock`]: the failure
 //!   vocabulary (rate limit E1, rejected token E2, unreachable, moved) and
 //!   the pure rules around it. Adapters never sleep.
@@ -30,6 +31,7 @@ pub mod github;
 pub mod health;
 pub mod rate_limit;
 mod transport;
+mod upload;
 
 #[cfg(feature = "test-support")]
 pub mod testing;

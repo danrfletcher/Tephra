@@ -1,4 +1,6 @@
-//! F2, F3, F4, F10 and F12 as a fence on the read-side adapter surface.
+//! F2, F3, F4, F10 and F12 as a fence on the read-side adapter surface, and
+//! (PR-11) on the one write Tephra makes: new content for a Drive file that
+//! exists.
 //!
 //! The source checks read the text of the trait modules (above their unit
 //! tests), so a later change that adds a write method, a list-everything
@@ -206,6 +208,85 @@ fn f2_f3_the_transport_only_ever_sends_get() {
     }
 }
 
+/// PR-11: the spec has Dan's saved edits of a Drive file go to Drive as a
+/// new revision, so there is one write. It is fenced as tightly as the
+/// reads: its own trait with one method, its own module with one `PATCH` to
+/// one route, and nothing that deletes, trashes, moves, renames or creates.
+#[test]
+fn pr11_the_only_write_is_new_content_for_a_drive_file_that_exists() {
+    let drive = source("src/drive.rs");
+    let up = fn_names(&trait_body(&drive, "DriveUploader"));
+    assert_eq!(up, ["replace_media"], "one method, on its own trait");
+    assert_no_word(
+        "DriveUploader",
+        &up,
+        &[
+            "delete",
+            "remove",
+            "trash",
+            "move",
+            "rename",
+            "create",
+            "copy",
+            "share",
+            "permission",
+        ],
+        "a write other than new content",
+    );
+
+    // The one module that builds a write request.
+    let upload = source("src/upload.rs");
+    assert_eq!(upload.matches(".patch(").count(), 1, "one PATCH");
+    for forbidden in [
+        ".post(",
+        ".put(",
+        ".delete(",
+        ".head(",
+        ".request(",
+        "Method::",
+        ".multipart(",
+    ] {
+        assert!(
+            !upload.contains(forbidden),
+            "upload.rs must not use `{forbidden}`"
+        );
+    }
+    let code: String = upload
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        code.matches("/upload/drive/v3/files/{id}?uploadType=media")
+            .count(),
+        1,
+        "one route: media for a file id"
+    );
+    assert!(!upload.contains("uploadType=multipart") && !upload.contains("uploadType=resumable"));
+
+    // Nothing else sends a write: not the transport, not the read adapters,
+    // not GitHub (whose writes are PR-9's and go through git).
+    for rel in [
+        "src/transport.rs",
+        "src/github.rs",
+        "src/drive.rs",
+        "src/rate_limit.rs",
+    ] {
+        let text = source(rel);
+        for forbidden in [".patch(", ".put(", ".post(", ".delete(", "Method::PATCH"] {
+            assert!(
+                !text.contains(forbidden),
+                "{rel} must not use `{forbidden}`"
+            );
+        }
+    }
+    assert!(!source("src/github.rs").contains("Uploader"));
+    // The write path is reached only through the shared transport: no
+    // client of its own.
+    assert!(!upload.contains("reqwest::Client"));
+    assert!(upload.contains("send_built"));
+}
+
 #[test]
 fn f4_neither_trait_can_list_every_repo_or_every_drive_of_an_account() {
     let gh_trait = trait_body(&source("src/github.rs"), "GithubAdapter");
@@ -231,7 +312,12 @@ fn f4_neither_trait_can_list_every_repo_or_every_drive_of_an_account() {
     assert!(dr_trait.contains("folder_id") || dr_trait.contains("file_id"));
 
     // No route that names the account's repos or drives is built anywhere.
-    for rel in ["src/github.rs", "src/drive.rs", "src/transport.rs"] {
+    for rel in [
+        "src/github.rs",
+        "src/drive.rs",
+        "src/transport.rs",
+        "src/upload.rs",
+    ] {
         let text = source(rel);
         for route in [
             "\"/user/repos\"",
@@ -257,6 +343,7 @@ fn f10_the_real_adapters_open_no_listener() {
         "src/github.rs",
         "src/drive.rs",
         "src/transport.rs",
+        "src/upload.rs",
         "src/rate_limit.rs",
         "src/base_url.rs",
         "src/health.rs",

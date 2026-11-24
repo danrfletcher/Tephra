@@ -58,6 +58,8 @@ pub const METHOD_NAMES: &[&str] = &[
     "source.set_cache",
     // atlas-27 PR-10: the one method that PR adds.
     "source.add_drive",
+    // atlas-27 PR-11: the one method that PR adds.
+    "resolve",
 ];
 
 /// The three backends one `dispatch` call reads through, bundled so
@@ -123,6 +125,7 @@ pub fn dispatch(
         "unit.list" => unit_list(params, backends.sources),
         "unit.search" => unit_search(params, backends.sources),
         "unit.fetch" => unit_fetch(params, backends.sources),
+        "resolve" => resolve(params, backends.sources),
         "cache.status" => cache_status(backends.sources),
         "cache.set_limit" => cache_set_limit(params, backends.sources),
         "source.set_cache" => source_set_cache(params, backends.sources),
@@ -353,6 +356,28 @@ fn unit_fetch(params: &Value, sources: &dyn SourceBackend) -> DispatchResult {
     sources
         .fetch_unit(unit)
         .map(|wire| serde_json::to_value(wire).expect("FetchWire always serializes"))
+        .map_err(|e| (SOURCE_ERROR, e.message.clone(), Some(e.data())))
+}
+
+/// `resolve {unit, keep}` (atlas-27 PR-11, G21). `unit` is a unit id,
+/// `@source:path`; `keep` is `mine` (the edit uploads as a new revision) or
+/// `theirs` (the edit is kept as `<name>.mine` and the file is fetched from
+/// Drive). An id that is not a held Drive conflict is a `SOURCE_ERROR` with
+/// `data.reason` (`nothing_to_resolve`, `unknown_unit`, `not_drive`) and
+/// nothing changes.
+fn resolve(params: &Value, sources: &dyn SourceBackend) -> DispatchResult {
+    let unit = require_str(params, "unit")?;
+    if !unit.starts_with('@') || !unit.contains(':') {
+        return Err(invalid_params("\"unit\" must be a unit id, @source:path"));
+    }
+    let keep = match require_str(params, "keep")? {
+        "mine" => crate::remote::upload::Keep::Mine,
+        "theirs" => crate::remote::upload::Keep::Theirs,
+        _ => return Err(invalid_params("\"keep\" must be \"mine\" or \"theirs\"")),
+    };
+    sources
+        .resolve_conflict(unit, keep)
+        .map(|wire| serde_json::to_value(wire).expect("ResolveWire always serializes"))
         .map_err(|e| (SOURCE_ERROR, e.message.clone(), Some(e.data())))
 }
 
@@ -668,6 +693,7 @@ mod tests {
                 "cache.set_limit",
                 "source.set_cache",
                 "source.add_drive",
+                "resolve",
             ]
         );
     }

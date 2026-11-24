@@ -116,6 +116,7 @@ pub fn execute_with_prompt_writer<R: BufRead, W: Write>(
         Command::BlockId { unit, target } => block_id(unit, target, json, client),
         Command::Backlinks { id } => backlinks(id, json, client),
         Command::Fetch { unit } => fetch(unit, json, client),
+        Command::Resolve { unit, keep } => resolve(unit, keep, json, client),
         Command::CacheStatus => cache_status(json, client),
         Command::CacheSetLimit { limit } => cache_set_limit(limit, json, client),
         Command::CacheSet { source, on } => cache_set(source, *on, json, client),
@@ -518,6 +519,18 @@ fn fetch(unit: &str, json: bool, client: &RpcClient) -> CommandOutcome {
     match client.call("unit.fetch", json!({"unit": unit})) {
         Ok(result) => {
             CommandOutcome::ok(json_or(&result, || render::render_fetched(&result), json))
+        }
+        Err(e) => CommandOutcome::err(describe_error(&e)),
+    }
+}
+
+/// `resolve <id> --mine|--theirs`: one `resolve`. The daemon refuses an id
+/// that is not a held Drive conflict and changes nothing: exit 1 with its
+/// reason on stderr.
+fn resolve(unit: &str, keep: &str, json: bool, client: &RpcClient) -> CommandOutcome {
+    match client.call("resolve", json!({"unit": unit, "keep": keep})) {
+        Ok(result) => {
+            CommandOutcome::ok(json_or(&result, || render::render_resolved(&result), json))
         }
         Err(e) => CommandOutcome::err(describe_error(&e)),
     }

@@ -47,7 +47,7 @@ mod github;
 mod google_oauth;
 mod link_gate;
 
-pub use drive::{DriveLimit, FakeDrive};
+pub use drive::{DriveLimit, FakeDrive, UploadHold};
 pub use github::{FakeGithub, GithubLimit};
 pub use google_oauth::{AuthorizeRequest, FakeGoogleOAuth, TokenRequest};
 pub use link_gate::LinkGate;
@@ -233,6 +233,19 @@ async fn control<S: Send + Sync + 'static>(
     request: Request,
     next: Next,
 ) -> Response {
+    // A request that carries a body (an upload) is read to its end before
+    // anything answers it, as a real server does: an error answered with the
+    // body half-sent would reach the client as a reset connection, not as
+    // the status the test scripted.
+    let request = if request.method() == axum::http::Method::GET {
+        request
+    } else {
+        let (parts, body) = request.into_parts();
+        let bytes = axum::body::to_bytes(body, 64 * 1024 * 1024)
+            .await
+            .unwrap_or_default();
+        Request::from_parts(parts, Body::from(bytes))
+    };
     let sent = request
         .headers()
         .get(header::AUTHORIZATION)

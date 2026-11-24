@@ -35,6 +35,7 @@ USAGE:
     tephractl block-id <unit-id> --line <n> | --symbol <name> [--json]
     tephractl backlinks <id> [--json]
     tephractl fetch <id> [--json]
+    tephractl resolve <id> --mine | --theirs [--json]
     tephractl cache status [--json]
     tephractl cache set-limit <limit> [--json]
     tephractl cache on <source> [--json]
@@ -130,6 +131,21 @@ FETCH:
                           fetched (Google Docs, Sheets, Slides, Forms and Drawings, shortcuts,
                           symlinks, submodules and Git LFS pointers: the message says where to
                           open it).
+
+RESOLVE:
+    resolve <id> --mine|--theirs
+                          Settle a Google Drive file that you edited and that was also changed on
+                          Drive (`ls` shows it as needs_attention: changed on Drive). Nothing was
+                          sent to Drive for it, and your edits are still on disk. <id> is
+                          @source:path/to/file (the @ may be left off: gdrive:Plan.md).
+                          --mine    your version is sent to Drive as a new revision on top of what
+                                    Drive has now; the other change stays in Drive's history.
+                          --theirs  your edits are kept beside the file as <name>.mine (a number
+                                    is added if that name is taken) and the file is refreshed from
+                                    Drive.
+                          Exactly one of the two is required. An id that is not a file of a Drive
+                          source, or a file with no change on Drive to settle, exits 1 with the
+                          reason on stderr and nothing is changed.
 
 CACHE:
     cache status          What Tephra's content cache of remote files takes, against its limit:
@@ -336,6 +352,12 @@ pub enum Command {
     Fetch {
         unit: String,
     },
+    /// `resolve <id> --mine|--theirs`: `resolve`. `unit` is a unit id,
+    /// `@source:path`; `keep` is `mine` or `theirs`.
+    Resolve {
+        unit: String,
+        keep: String,
+    },
     /// `cache status`: `cache.status`.
     CacheStatus,
     /// `cache set-limit <limit>`: `cache.set_limit`. `limit` goes to the
@@ -504,6 +526,7 @@ where
         "block-id" => parse_block_id(&mut iter)?,
         "backlinks" => parse_backlinks(&mut iter)?,
         "fetch" => parse_fetch(&mut iter)?,
+        "resolve" => parse_resolve(&mut iter)?,
         "cache" => parse_cache(&mut iter)?,
         "fixes" => parse_fixes(&mut iter)?,
         "daemon" => parse_daemon(&mut iter)?,
@@ -1253,6 +1276,75 @@ fn parse_fetch<'a>(
         }
     }
     Ok((Command::Fetch { unit }, json, addr))
+}
+
+/// `resolve <id> --mine|--theirs [--json] [--addr <addr>]`. The id may come
+/// without its `@` (`gdrive:Plan.md`); it is sent with one. Exactly one of
+/// the two flags: a usage error otherwise, before any request.
+fn parse_resolve<'a>(
+    iter: &mut impl Iterator<Item = &'a str>,
+) -> Result<(Command, bool, Option<String>), ArgsError> {
+    let mut unit: Option<String> = None;
+    let mut keep: Option<&'static str> = None;
+    let mut json = false;
+    let mut addr = None;
+
+    while let Some(arg) = iter.next() {
+        match arg {
+            "--json" => json = true,
+            "--addr" => addr = Some(take_value(iter, "--addr")?),
+            "--mine" | "--theirs" => {
+                let this = if arg == "--mine" { "mine" } else { "theirs" };
+                if keep.is_some() {
+                    return Err(ArgsError(
+                        "resolve takes --mine or --theirs, not both and not twice".to_string(),
+                    ));
+                }
+                keep = Some(this);
+            }
+            other if other.starts_with('-') && other.len() > 1 => {
+                return Err(ArgsError(format!("unrecognized argument: {other}")))
+            }
+            other if unit.is_none() => unit = Some(other.to_string()),
+            other => {
+                return Err(ArgsError(format!(
+                    "resolve takes one id; unexpected extra argument: {other}"
+                )))
+            }
+        }
+    }
+
+    let unit = unit.ok_or_else(|| {
+        ArgsError("resolve requires an <id> like \"@source:path/to/file\"".to_string())
+    })?;
+    let keep = keep.ok_or_else(|| {
+        ArgsError(
+            "resolve needs --mine (send your version to Drive) or --theirs (keep yours as \
+             <name>.mine and take Drive's)"
+                .to_string(),
+        )
+    })?;
+    let unit = if unit.starts_with('@') {
+        unit
+    } else {
+        format!("@{unit}")
+    };
+    match unit.strip_prefix('@').and_then(|r| r.split_once(':')) {
+        Some((source, path)) if !source.is_empty() && !path.is_empty() => {}
+        _ => {
+            return Err(ArgsError(format!(
+                "resolve needs an id like \"@source:path/to/file\", got \"{unit}\""
+            )))
+        }
+    }
+    Ok((
+        Command::Resolve {
+            unit,
+            keep: keep.to_string(),
+        },
+        json,
+        addr,
+    ))
 }
 
 /// `cache status | set-limit <limit> | on <source> | off <source>`, each

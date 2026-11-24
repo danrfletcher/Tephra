@@ -1,9 +1,12 @@
-//! Google Drive, read side: the [`DriveAdapter`] trait and
-//! [`DriveClient`], its HTTP implementation.
+//! Google Drive: the read-side [`DriveAdapter`] trait, the one-method
+//! [`DriveUploader`] trait, and [`DriveClient`], their HTTP implementation.
 //!
-//! The trait lists the children of one named folder and follows the
+//! [`DriveAdapter`] lists the children of one named folder and follows the
 //! changes feed; it has no method that lists the Drives or all the files
-//! of an account, and none that writes. The secret read from the
+//! of an account, and none that writes. The only write Tephra makes to
+//! Drive is [`DriveUploader::replace_media`]: new content for a file that
+//! exists, which Drive records as a new revision. Nothing here deletes,
+//! trashes, moves or renames a file, or creates one. The secret read from the
 //! credential store for provider `Google` is sent as the bearer token as
 //! it is; turning a stored refresh token into an access token belongs to
 //! the sign-in work (PR-4), not here.
@@ -19,6 +22,7 @@ use crate::credentials::{CredentialStore, Provider};
 use crate::error::RemoteError;
 use crate::rate_limit::Api;
 use crate::transport::{AdapterOptions, BodyStream, Core, Request};
+pub use crate::upload::UploadBody;
 use crate::{BoxFut, RemoteResult};
 
 /// The `mimeType` of a native Google Doc.
@@ -105,6 +109,38 @@ impl DriveFile {
     }
 }
 
+/// The MD5 of a file's bytes, as the lowercase hex Drive reports in
+/// `md5Checksum`. Fed in pieces, so a file of any size is hashed without
+/// being held whole.
+pub struct Md5Hasher(md5::Md5);
+
+impl Default for Md5Hasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Md5Hasher {
+    pub fn new() -> Self {
+        use md5::Digest;
+        Md5Hasher(md5::Md5::new())
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) {
+        use md5::Digest;
+        self.0.update(bytes);
+    }
+
+    pub fn finish(self) -> String {
+        use md5::Digest;
+        self.0
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+}
+
 /// One page of a folder's children.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -185,6 +221,24 @@ pub trait DriveAdapter: Send + Sync {
     /// The changes since `page_token`: follow `next_page_token` until
     /// `new_start_page_token` appears.
     fn list_changes<'a>(&'a self, page_token: &'a str) -> BoxFut<'a, RemoteResult<ChangesPage>>;
+}
+
+/// The one write Tephra makes to Drive (PR-11): the bytes of a file of the
+/// content cache become the new content of a Drive file that exists. It is
+/// its own trait, so [`DriveAdapter`] stays read-only and a place that only
+/// reads cannot be handed the means to write.
+pub trait DriveUploader: Send + Sync {
+    /// Sends `body` as the new content of `file_id` (one `PATCH` to the
+    /// upload route, `uploadType=media`) and returns the file as it is
+    /// after: its new head revision. The caller has just checked the head
+    /// revision; Drive has no precondition for a media upload, so a change
+    /// in between is a lost race the caller accepts (and a later check
+    /// finds). The bytes are read from `body.path` as they are sent.
+    fn replace_media<'a>(
+        &'a self,
+        file_id: &'a str,
+        body: UploadBody,
+    ) -> BoxFut<'a, RemoteResult<DriveFile>>;
 }
 
 /// The real Drive adapter. Never sleeps, never follows a redirect, never
@@ -268,6 +322,20 @@ impl DriveClient {
     ) -> RemoteResult<T> {
         let reply = self.core.get(request).await?;
         serde_json::from_slice(&reply.body).map_err(|_| RemoteError::BadResponse(what))
+    }
+}
+
+impl DriveUploader for DriveClient {
+    fn replace_media<'a>(
+        &'a self,
+        file_id: &'a str,
+        body: UploadBody,
+    ) -> BoxFut<'a, RemoteResult<DriveFile>> {
+        Box::pin(async move {
+            let id = check_id(file_id)?;
+            let reply = crate::upload::send_media(&self.core, id, FILE_FIELDS, body).await?;
+            serde_json::from_slice(&reply).map_err(|_| RemoteError::BadResponse("upload"))
+        })
     }
 }
 

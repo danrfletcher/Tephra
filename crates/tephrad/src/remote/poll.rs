@@ -136,6 +136,20 @@ impl SourceRegistry {
             let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
             cache.remote_listing_pending(name).unwrap_or(false)
         };
+        // A Drive source also has its upload job: edits of its cached files
+        // go back to Drive (PR-11). One per source, started with the poller
+        // so it also comes back after a restart.
+        let is_drive = {
+            let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+            cache
+                .remote_source(name)
+                .ok()
+                .flatten()
+                .is_some_and(|row| row.kind == crate::remote_github::DRIVE_KIND)
+        };
+        if is_drive {
+            self.spawn_drive_upload(name);
+        }
         let job = PollJob {
             // Fixed here, not when the task first runs.
             first_due: if listing_cut_off {

@@ -35,12 +35,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tephra_cache::{
-    encode_cursor, Cache, NewRemoteItem, NewRemoteSource, RemoteSourceRow, ITEM_KIND_SUBMODULE,
-    ITEM_KIND_SYMLINK, REASON_LFS_POINTER, STATUS_ACTIVE, STATUS_AUTH_REQUIRED, STATUS_INDEXING,
-    STATUS_OFFLINE,
+    encode_cursor, Cache, DriveHolds, NewRemoteItem, NewRemoteSource, RemoteSourceRow,
+    ITEM_KIND_SUBMODULE, ITEM_KIND_SYMLINK, REASON_LFS_POINTER, STATUS_ACTIVE,
+    STATUS_AUTH_REQUIRED, STATUS_INDEXING, STATUS_OFFLINE,
 };
 use tephra_remote::credentials::{credential_state, CredentialState, CredentialStore, Provider};
-use tephra_remote::drive::{DriveAdapter, DriveClient};
+use tephra_remote::drive::{DriveAdapter, DriveClient, DriveUploader};
 use tephra_remote::github::{
     full_tree, GithubAdapter, GithubClient, RepoRef, TreeEntry, TreeEntryKind,
 };
@@ -158,6 +158,15 @@ pub struct RemoteHub {
     pub(crate) clone_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// The watchers of the clones of the sources, one each.
     pub(crate) clone_watchers: Mutex<HashMap<String, crate::watcher::WatcherHandle>>,
+    /// The one call that writes to Drive (PR-11): new content for a file
+    /// that exists. Kept apart from `drive`, which only reads.
+    pub(crate) drive_uploader: Arc<dyn DriveUploader>,
+    /// The upload jobs of the Drive sources, one each.
+    pub(crate) uploaders: Mutex<HashMap<String, Arc<crate::remote::upload::UploadSlot>>>,
+    /// The watchers of the content caches of the Drive sources, one each.
+    pub(crate) drive_watchers: Mutex<HashMap<String, crate::watcher::WatcherHandle>>,
+    /// One `resolve` at a time.
+    pub(crate) resolve_lock: Mutex<()>,
 }
 
 /// Saves a cache limit to where the daemon keeps it (its config file).
@@ -200,11 +209,14 @@ impl RemoteHub {
         let client =
             GithubClient::with_options(github_api_url, store.clone(), clock.clone(), options)
                 .map_err(|e| e.to_string())?;
-        let drive = DriveClient::with_options(None, store.clone(), clock.clone(), options)
-            .map_err(|e| e.to_string())?;
+        let drive = Arc::new(
+            DriveClient::with_options(None, store.clone(), clock.clone(), options)
+                .map_err(|e| e.to_string())?,
+        );
         Ok(RemoteHub {
             adapter: Arc::new(client),
-            drive: Arc::new(drive),
+            drive_uploader: drive.clone(),
+            drive,
             store,
             options,
             clock,
@@ -226,6 +238,9 @@ impl RemoteHub {
             git_program: PathBuf::from("git"),
             clone_locks: Mutex::new(HashMap::new()),
             clone_watchers: Mutex::new(HashMap::new()),
+            uploaders: Mutex::new(HashMap::new()),
+            drive_watchers: Mutex::new(HashMap::new()),
+            resolve_lock: Mutex::new(()),
         })
     }
 
@@ -239,7 +254,9 @@ impl RemoteHub {
             self.options,
         )
         .map_err(|e| e.to_string())?;
-        self.drive = Arc::new(client);
+        let client = Arc::new(client);
+        self.drive_uploader = client.clone();
+        self.drive = client;
         Ok(self)
     }
 
@@ -352,6 +369,8 @@ pub struct RemoteListing {
     pub not_pushed: u64,
     /// Commits of the tracked branch the clone lacks (G15).
     pub behind: u64,
+    /// A Drive source's unsent work (PR-11, G14); empty for any other.
+    pub holds: DriveHolds,
 }
 
 pub(crate) fn now_secs(clock: &dyn Clock) -> i64 {
@@ -806,6 +825,11 @@ impl SourceRegistry {
             last_sync_at: source.last_sync_at,
             not_pushed: clone.as_ref().map_or(0, |c| c.not_pushed),
             behind: clone.as_ref().map_or(0, |c| c.behind),
+            holds: if source.kind == "drive" {
+                cache.drive_holds(&source.name).unwrap_or_default()
+            } else {
+                DriveHolds::default()
+            },
         })
     }
 }

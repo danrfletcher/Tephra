@@ -275,8 +275,31 @@ pub struct RemoteRowWire {
     /// Commits of the tracked branch the clone has not got (G15). 0 with no
     /// clone.
     pub behind: u64,
+    /// A Drive source's items waiting to be uploaded (PR-11, G14). Left out
+    /// when there are none, so a GitHub row keeps its wire shape.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub pending_upload: u64,
+    /// A Drive source's items that need attention (`changed on Drive`, a
+    /// refused upload): the whole number. Left out when there are none.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub needs_attention: u64,
+    /// The first few of them with their reason (see `needs_attention` for
+    /// how many there are). Left out when there are none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub attention: Vec<HeldItemWire>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status_reason: Option<String>,
+}
+
+/// One item of a Drive source that needs attention, in a `source.list` row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HeldItemWire {
+    pub path: String,
+    pub reason: String,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 impl From<SourceRow> for SourceRowWire {
@@ -313,6 +336,14 @@ impl From<SourceListing> for SourceRowWire {
                 index_total: remote.index_total,
                 not_pushed: remote.not_pushed,
                 behind: remote.behind,
+                pending_upload: remote.holds.pending_upload,
+                needs_attention: remote.holds.needs_attention,
+                attention: remote
+                    .holds
+                    .attention
+                    .into_iter()
+                    .map(|(path, reason)| HeldItemWire { path, reason })
+                    .collect(),
                 status_reason: remote.status_reason,
             });
         }
@@ -383,6 +414,18 @@ pub trait SourceBackend: Send + Sync {
             message: "unit.fetch is not supported by this source backend".to_string(),
             url: None,
             kind: None,
+        })
+    }
+    /// `resolve` (PR-11): clears the Drive conflict of a unit. Blocks. The
+    /// default refuses.
+    fn resolve_conflict(
+        &self,
+        _unit: &str,
+        _keep: crate::remote::upload::Keep,
+    ) -> Result<crate::remote::upload::ResolveWire, crate::remote::upload::ResolveRpcError> {
+        Err(crate::remote::upload::ResolveRpcError {
+            reason: "resolve_unavailable",
+            message: "resolve is not supported by this source backend".to_string(),
         })
     }
     /// `cache.status` (PR-8): what the remote content cache takes, against
@@ -551,6 +594,13 @@ impl SourceBackend for SourceRegistry {
         unit: &str,
     ) -> Result<crate::remote::fetch::FetchWire, crate::remote::fetch::FetchRpcError> {
         SourceRegistry::fetch_unit(self, unit)
+    }
+    fn resolve_conflict(
+        &self,
+        unit: &str,
+        keep: crate::remote::upload::Keep,
+    ) -> Result<crate::remote::upload::ResolveWire, crate::remote::upload::ResolveRpcError> {
+        SourceRegistry::resolve_conflict(self, unit, keep)
     }
     fn cache_status(&self) -> Result<crate::remote::evict::CacheStatusWire, PromoteRpcError> {
         SourceRegistry::cache_status(self)

@@ -5,10 +5,11 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::response::Response;
-use axum::routing::get;
+use axum::routing::{get, patch};
 use axum::Router;
 use serde_json::{json, Value};
 
@@ -97,6 +98,13 @@ impl Entry {
         self.mime.starts_with("application/vnd.google-apps.")
     }
 
+    /// What Drive reports as `md5Checksum`: the real MD5 of the bytes.
+    fn md5(&self) -> String {
+        let mut h = crate::drive::Md5Hasher::new();
+        h.update(&self.content);
+        h.finish()
+    }
+
     fn metadata(&self) -> Value {
         let mut v = json!({
             "id": self.id,
@@ -112,7 +120,7 @@ impl Entry {
         }
         if !self.native() {
             v["headRevisionId"] = json!(format!("rev-{}-{}", self.id, self.revision));
-            v["md5Checksum"] = json!(format!("md5-{}-{}", self.id, self.revision));
+            v["md5Checksum"] = json!(self.md5());
             v["size"] = json!(self
                 .claimed_size
                 .unwrap_or(self.content.len() as u64)
@@ -120,6 +128,17 @@ impl Entry {
         }
         v
     }
+}
+
+/// Where the fake holds a media upload (see [`FakeDrive::hold_uploads`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadHold {
+    /// Before the bytes are applied: a daemon killed now has changed
+    /// nothing on Drive.
+    BeforeApply,
+    /// After the bytes are applied and the new revision exists, before the
+    /// answer is sent: a daemon killed now never hears it landed.
+    AfterApply,
 }
 
 /// Holds the content reads (`alt=media` and export) of the fake once a
@@ -135,14 +154,63 @@ struct Gate {
     /// `(reads still to fail, status)`: the next content reads are answered
     /// with `status` (in Google's error format) instead of the file.
     failing: Mutex<Option<(u32, u16)>>,
+    /// Where media uploads wait, until [`FakeDrive::release_uploads`].
+    upload_hold: Mutex<Option<UploadHold>>,
+    upload_changed: tokio::sync::Notify,
+    /// `(uploads still to fail, status)`: the next media uploads are
+    /// answered with `status` and change nothing.
+    upload_failing: Mutex<Option<(u32, u16)>>,
+    /// How many uploads are waiting at the hold right now.
+    uploads_waiting: std::sync::atomic::AtomicUsize,
 }
 
 impl Gate {
+    /// Waits while the hold is `at`.
+    async fn hold_upload(&self, at: UploadHold) {
+        use std::sync::atomic::Ordering;
+        // Counted while waiting, and not any more once the wait ends or the
+        // request is dropped (a daemon killed in the middle of the call).
+        struct Waiting<'a>(&'a Gate, bool);
+        impl Drop for Waiting<'_> {
+            fn drop(&mut self) {
+                if self.1 {
+                    self.0.uploads_waiting.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+        }
+        let mut waiting = Waiting(self, false);
+        loop {
+            let notified = self.upload_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let held = *self.upload_hold.lock().unwrap_or_else(|e| e.into_inner()) == Some(at);
+            if !held {
+                return;
+            }
+            if !waiting.1 {
+                waiting.1 = true;
+                self.uploads_waiting.fetch_add(1, Ordering::SeqCst);
+            }
+            notified.await;
+        }
+    }
+
     /// The error answer a failing content read gets, once per read.
     fn failure(&self) -> Option<Response> {
         let mut failing = self.failing.lock().unwrap_or_else(|e| e.into_inner());
         let (left, status) = (*failing)?;
-        *failing = (left > 1).then_some((left - 1, status));
+        *failing = (left > 1).then_some((left.saturating_sub(1), status));
+        Some(error_body(status))
+    }
+
+    /// The error answer a failing upload gets, once per upload.
+    fn upload_failure(&self) -> Option<Response> {
+        let mut failing = self
+            .upload_failing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (left, status) = (*failing)?;
+        *failing = (left > 1).then_some((left.saturating_sub(1), status));
         Some(error_body(status))
     }
 
@@ -197,6 +265,8 @@ struct State_ {
     /// is answered with `status` once.
     fail_changes_page: Option<(u32, u16)>,
     created_counter: u64,
+    /// Media uploads applied, by file id.
+    uploads: BTreeMap<String, u64>,
 }
 
 type Shared = (Arc<Mutex<State_>>, Arc<Gate>);
@@ -239,12 +309,17 @@ impl FakeDrive {
             reject_tokens_below: 0,
             fail_changes_page: None,
             created_counter: 0,
+            uploads: BTreeMap::new(),
         }));
         let gate = Arc::new(Gate {
             budget: Mutex::new(None),
             listing_budget: Mutex::new(None),
             released: tokio::sync::Notify::new(),
             failing: Mutex::new(None),
+            upload_hold: Mutex::new(None),
+            upload_changed: tokio::sync::Notify::new(),
+            upload_failing: Mutex::new(None),
+            uploads_waiting: std::sync::atomic::AtomicUsize::new(0),
         });
         let common = Arc::new(Common::new(
             clock,
@@ -258,6 +333,10 @@ impl FakeDrive {
             .route("/drive/v3/about", get(about))
             .route("/drive/v3/files", get(list_files))
             .route("/drive/v3/files/{id}", get(file))
+            .route(
+                "/upload/drive/v3/files/{id}",
+                patch(upload).layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)),
+            )
             .route("/drive/v3/files/{id}/export", get(export))
             .route("/drive/v3/changes/startPageToken", get(start_token))
             .route("/drive/v3/changes", get(list_changes))
@@ -460,13 +539,64 @@ impl FakeDrive {
     /// Answers the next `n` content reads (`alt=media` or export) with
     /// `status`; listings and the feed are not touched.
     pub fn fail_content_reads(&self, n: u32, status: u16) {
-        *self.gate.failing.lock().unwrap_or_else(|e| e.into_inner()) = Some((n, status));
+        *self.gate.failing.lock().unwrap_or_else(|e| e.into_inner()) =
+            (n > 0).then_some((n, status));
+    }
+
+    /// Answers the next `n` media uploads with `status` (in Google's error
+    /// format); nothing is applied, and the metadata reads are not touched.
+    pub fn fail_uploads(&self, n: u32, status: u16) {
+        *self
+            .gate
+            .upload_failing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = (n > 0).then_some((n, status));
     }
 
     /// Lets the held content reads, and every later one, through.
     pub fn release_content(&self) {
         *self.gate.budget.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.gate.released.notify_waiters();
+    }
+
+    /// Holds every media upload (`PATCH /upload/drive/v3/files/{id}`) at
+    /// `at` until [`FakeDrive::release_uploads`]: a test looks at, or kills
+    /// the daemon in, the middle of an upload.
+    pub fn hold_uploads(&self, at: UploadHold) {
+        *self
+            .gate
+            .upload_hold
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(at);
+        self.gate.upload_changed.notify_waiters();
+    }
+
+    /// Lets the held uploads go, and holds no more.
+    pub fn release_uploads(&self) {
+        *self
+            .gate
+            .upload_hold
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        self.gate.upload_changed.notify_waiters();
+    }
+
+    /// How many uploads wait at the hold now.
+    pub fn uploads_held(&self) -> usize {
+        self.gate
+            .uploads_waiting
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many media uploads the fake has applied to a file (each made a
+    /// new revision).
+    pub fn upload_count(&self, id: &str) -> u64 {
+        self.state().uploads.get(id).copied().unwrap_or(0)
+    }
+
+    /// The bytes the fake holds for a file.
+    pub fn content(&self, id: &str) -> Vec<u8> {
+        self.state().files[id].content.clone()
     }
 
     /// The head revision id the fake reports for a file.
@@ -585,6 +715,44 @@ async fn file(
         "application/json",
         e.metadata().to_string().into_bytes(),
     )
+}
+
+/// `PATCH /upload/drive/v3/files/{id}?uploadType=media`: the new content of
+/// a file that exists. Applied whole, a new head revision, a change.
+async fn upload(
+    State(shared): State<Shared>,
+    Path(id): Path<String>,
+    Query(query): Query<BTreeMap<String, String>>,
+    body: Bytes,
+) -> Response {
+    if query.get("uploadType").map(String::as_str) != Some("media") {
+        return google_error(400, "badRequest", "Only uploadType=media is served");
+    }
+    shared.1.hold_upload(UploadHold::BeforeApply).await;
+    if let Some(failed) = shared.1.upload_failure() {
+        return failed;
+    }
+    let metadata = {
+        let mut state = lock(&shared);
+        let Some(e) = state.files.get_mut(&id) else {
+            return not_found();
+        };
+        if e.native() || e.mime == FOLDER_MIME {
+            return google_error(
+                403,
+                "fileNotWritable",
+                "This file's content cannot be replaced.",
+            );
+        }
+        e.content = body.to_vec();
+        e.revision += 1;
+        let metadata = e.metadata();
+        state.record(&id, false);
+        *state.uploads.entry(id.clone()).or_default() += 1;
+        metadata
+    };
+    shared.1.hold_upload(UploadHold::AfterApply).await;
+    json_response(200, &metadata)
 }
 
 async fn export(

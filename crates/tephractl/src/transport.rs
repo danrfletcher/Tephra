@@ -48,6 +48,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// reported as "aborted" by the staleness guard while files were
 /// already changed (R1).
 const MUTATING_METHODS: &[&str] = &[
+    // `resolve` is not replayed after a lost reply: the second try would
+    // answer "nothing to resolve" to a first that worked.
+    "resolve",
     "source.register",
     "source.add_github",
     "source.add_drive",
@@ -69,6 +72,8 @@ const MUTATING_METHODS: &[&str] = &[
 /// one runs joins it.
 const LONG_RUNNING_METHODS: &[&str] = &[
     "unit.fetch",
+    // `--mine` waits for the upload it queued; `--theirs` fetches the file.
+    "resolve",
     "source.register",
     "source.add_github",
     "source.add_drive",

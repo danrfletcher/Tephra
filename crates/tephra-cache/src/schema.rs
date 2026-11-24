@@ -293,6 +293,23 @@ const CREATE_REMOTE_COPY_STAMPS: &str = "\
         PRIMARY KEY (source, path) \
     )";
 
+/// The Drive revision the bytes of a local copy came from (atlas-27 PR-11):
+/// one row per source and path. Set when a fetch writes the copy and when
+/// an upload lands, so it says "these bytes are Drive's revision R". It is
+/// not moved by a poll (which only says what Drive's head is now) and it is
+/// kept when the cache drops the copy, so an edit saved on a stale copy, or
+/// a file re-created after an eviction, is queued on the revision it was
+/// read at and is refused if Drive has moved since. A missing row means
+/// "unknown": the item's own revision is used. Durable and foreign-key free
+/// like the remote tables; not one of [`crate::REMOTE_TABLES`].
+const CREATE_REMOTE_COPY_REVISIONS: &str = "\
+    CREATE TABLE IF NOT EXISTS remote_copy_revisions (\
+        source TEXT NOT NULL, \
+        path TEXT NOT NULL, \
+        revision TEXT NOT NULL, \
+        PRIMARY KEY (source, path) \
+    )";
+
 /// What the daemon knows of a GitHub source's git clone (atlas-27 PR-9): one
 /// row per source. `tip` is the tip of the tracked branch the last good pass
 /// recorded (a force-push is a new tip that does not descend from it),
@@ -513,6 +530,7 @@ pub(crate) fn create_bootstrap_tables(conn: &Connection) -> Result<(), CacheErro
     conn.execute(CREATE_REMOTE_PINS, [])?;
     conn.execute(CREATE_REMOTE_CURSORS, [])?;
     conn.execute(CREATE_REMOTE_COPY_STAMPS, [])?;
+    conn.execute(CREATE_REMOTE_COPY_REVISIONS, [])?;
     conn.execute(CREATE_REMOTE_CLONE_STATE, [])?;
     Ok(())
 }

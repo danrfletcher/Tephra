@@ -17,6 +17,21 @@
 //!                      never a token)
 //!   quit               stop
 //!
+//! With a third argument, `edits`, it serves a small tree for
+//! `scripts/verify/pr-11.sh` instead (the folder `Notes` with `Plan.md`, id
+//! `plan`, and `Other.md`, id `other`) and also takes these commands (an
+//! answer is `ok <value>`; a newline in a text is written `\n`):
+//!
+//!   text ID            the bytes Drive holds for a file
+//!   head ID            its head revision id
+//!   uploads ID         how many uploads Drive has applied to it
+//!   edit ID TEXT       somebody else changes the file (a new revision)
+//!   fail-uploads N S   answer the next N uploads with status S
+//!   hold-upload WHEN   hold uploads `before` the bytes are applied or `after`
+//!   release-uploads    let the held uploads go
+//!   held               how many uploads wait at the hold
+//!   writes             how many requests that were not a GET were seen
+//!
 //! The tree: 395 filler notes `n001.md` .. `n395.md`, `Roadmap.md`, the
 //! Google Doc `Meeting` (which links `[[Roadmap]]`), two files called
 //! `Plan.md` (ids `plan1`, older, and `plan2`), an empty `brief.pdf`, the
@@ -26,7 +41,7 @@
 
 use std::io::BufRead;
 
-use tephra_remote::testing::FakeDrive;
+use tephra_remote::testing::{FakeDrive, UploadHold};
 
 const MD: &str = "text/markdown";
 
@@ -34,11 +49,30 @@ const MD: &str = "text/markdown";
 async fn main() {
     let mut args = std::env::args().skip(1);
     let (Some(url_file), Some(log_file)) = (args.next(), args.next()) else {
-        eprintln!("usage: drive_fake URL_FILE REQUEST_LOG");
+        eprintln!("usage: drive_fake URL_FILE REQUEST_LOG [edits]");
         std::process::exit(2);
     };
+    let edits = args.next().as_deref() == Some("edits");
 
     let drive = FakeDrive::start().await;
+    if edits {
+        drive.add_folder("notes", "Notes", None);
+        drive.add_file(
+            "plan",
+            "Plan.md",
+            MD,
+            Some("notes"),
+            b"# Plan\n\nfirst version\n",
+        );
+        drive.add_file("other", "Other.md", MD, Some("notes"), b"# Other\n");
+    } else {
+        full_tree(&drive);
+    }
+    std::fs::write(&url_file, drive.base_url()).expect("write the URL file");
+    serve(drive, log_file).await;
+}
+
+fn full_tree(drive: &FakeDrive) {
     drive.add_folder("notes", "Notes", None);
     for n in 1..=395 {
         let text = if n == 1 {
@@ -79,8 +113,9 @@ async fn main() {
         Some("notes"),
         &[0x89, b'P', b'N', b'G'],
     );
-    std::fs::write(&url_file, drive.base_url()).expect("write the URL file");
+}
 
+async fn serve(drive: FakeDrive, log_file: String) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     std::thread::spawn(move || {
         for line in std::io::stdin().lock().lines().map_while(Result::ok) {
@@ -141,6 +176,49 @@ async fn main() {
                 std::fs::write(&log_file, text).expect("write the request log");
                 "ok dump".to_string()
             }
+            "text" if !a.is_empty() => format!(
+                "ok {}",
+                String::from_utf8_lossy(&drive.content(a)).replace('\n', "\\n")
+            ),
+            "head" if !a.is_empty() => format!("ok {}", drive.head_revision(a)),
+            "uploads" if !a.is_empty() => format!("ok {}", drive.upload_count(a)),
+            "edit" if !a.is_empty() => {
+                let text = format!("{b} {c}").trim().replace("\\n", "\n");
+                drive.update_file(a, format!("{text}\n").as_bytes());
+                format!("ok edit {a}")
+            }
+            "fail-uploads" => match (a.trim().parse::<u32>(), b.trim().parse::<u16>()) {
+                (Ok(n), Ok(status)) => {
+                    drive.fail_uploads(n, status);
+                    format!("ok fail-uploads {n}")
+                }
+                _ => "error: fail-uploads N STATUS".to_string(),
+            },
+            "hold-upload" => match a.trim() {
+                "before" => {
+                    drive.hold_uploads(UploadHold::BeforeApply);
+                    "ok hold-upload before".to_string()
+                }
+                "after" => {
+                    drive.hold_uploads(UploadHold::AfterApply);
+                    "ok hold-upload after".to_string()
+                }
+                _ => "error: hold-upload before|after".to_string(),
+            },
+            "release-uploads" => {
+                drive.release_uploads();
+                "ok release-uploads".to_string()
+            }
+            "held" => format!("ok {}", drive.uploads_held()),
+            "writes" => format!(
+                "ok {}",
+                drive
+                    .request_log()
+                    .all()
+                    .iter()
+                    .filter(|r| r.method != "GET")
+                    .count()
+            ),
             "quit" => {
                 println!("ok quit");
                 return;

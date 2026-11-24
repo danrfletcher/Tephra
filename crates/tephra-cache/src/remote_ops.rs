@@ -606,13 +606,20 @@ impl Cache {
                 max_indexed_bytes,
             )?;
         }
+        // A reason that says why an item is held is kept with its state: a
+        // Drive upload that was refused (`changed on Drive`, or Drive's own
+        // refusal) still has its edit and its queue row, and `resolve` needs
+        // the reason to find the conflict. Every other reason is about work
+        // the next index redoes.
         self.connection().execute(
             "UPDATE remote_items SET reason = NULL WHERE source = ?1 \
-             AND (reason IS NULL OR reason NOT IN (?2, ?3))",
+             AND (reason IS NULL OR (reason NOT IN (?2, ?3, ?4) AND reason NOT LIKE ?5))",
             params![
                 name,
                 crate::remote_sync::REASON_DELETED_ON_REMOTE,
-                crate::remote_sync::REASON_READDED_AFTER_DELETE
+                crate::remote_sync::REASON_READDED_AFTER_DELETE,
+                crate::REASON_CHANGED_ON_DRIVE,
+                format!("{}%", crate::UPLOAD_REFUSED_PREFIX),
             ],
         )?;
         self.set_remote_index_complete(name, false, 0)?;

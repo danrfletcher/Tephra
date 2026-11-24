@@ -698,6 +698,15 @@ impl SourceRegistry {
                         tracing::warn!(source = %row.source, error = %e.message, "could not note what a Drive copy was when it was written; it will not be dropped from the cache");
                     }
                 }
+                // The revision the bytes are noted at is the one the row had
+                // before the download began: if Drive moved meanwhile, the
+                // copy is older than it says, and a later edit of it is
+                // refused rather than sent over the newer file.
+                if let Err(e) = self.fetch_db(|c| {
+                    c.record_remote_copy_revision(&row.source, &row.path, row.revision.as_deref())
+                }) {
+                    tracing::warn!(source = %row.source, error = %e.message, "could not note which Drive revision a copy came from");
+                }
                 let finished = self.fetch_db(|c| {
                     c.finish_remote_download(
                         &row.source,

@@ -29,6 +29,7 @@ mod remote_evict;
 mod remote_fetch;
 mod remote_ops;
 mod remote_sync;
+mod remote_upload;
 mod schema;
 mod search;
 mod source_rename;
@@ -78,6 +79,10 @@ pub use remote_sync::{
     decode_cursor, encode_cursor, is_kept_deleted, PollState, ITEM_STATE_NEEDS_ATTENTION,
     REASON_DELETED_ON_REMOTE, REASON_READDED_AFTER_DELETE, STATUS_AUTH_REQUIRED,
     STATUS_NEEDS_ATTENTION, STATUS_OFFLINE, STATUS_SYNCING,
+};
+pub use remote_upload::{
+    upload_backoff_secs, DriveConflict, DriveHolds, QueuedEdit, UploadEntry, UploadLanded,
+    HELD_ITEMS_LISTED, REASON_CHANGED_ON_DRIVE, UPLOAD_BACKOFF_CAP_SECS, UPLOAD_REFUSED_PREFIX,
 };
 pub use schema::KindInferrer;
 pub use search::{compare_hits, file_stem, resolve_title, NameCandidate, NameHit, NAME_SEARCH_SQL};

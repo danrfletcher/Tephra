@@ -1442,3 +1442,107 @@ impl DriveDaemon {
         }
     }
 }
+
+// ---- Drive edits go back to Drive (PR-11) ---------------------------------------------
+
+/// The Drive of the upload tests: a folder `fld` with `Plan.md` (id `p1`),
+/// `Other.md` (`o1`) and a Google Doc (`d1`).
+pub fn edits_drive(drive: &FakeDrive) {
+    drive.add_folder("fld", "Notes", None);
+    drive.add_file(
+        "p1",
+        "Plan.md",
+        "text/markdown",
+        Some("fld"),
+        b"# Plan\nfirst\n",
+    );
+    drive.add_file("o1", "Other.md", "text/markdown", Some("fld"), b"# Other\n");
+    drive.add_doc("d1", "Doc", Some("fld"), "# Doc\n");
+}
+
+/// What a person saves into the content cache: the bytes, in place.
+pub fn save(path: &Path, bytes: &[u8]) {
+    std::fs::write(path, bytes).expect("save a file of the cache");
+}
+
+impl DriveDaemon {
+    /// A daemon with the source `gdrive` on [`edits_drive`], indexed.
+    pub fn start_edits() -> DriveDaemon {
+        let dd = DriveDaemon::start(edits_drive);
+        dd.add_active("gdrive", "fld");
+        dd
+    }
+
+    /// `unit.fetch` of `@gdrive:<path>`: where the file is.
+    pub fn fetch_file(&self, path: &str) -> PathBuf {
+        let result = self
+            .d
+            .ok("unit.fetch", json!({ "unit": format!("@gdrive:{path}") }));
+        PathBuf::from(result["path"].as_str().expect("a path"))
+    }
+
+    pub fn row(&self, path: &str) -> tephra_cache::RemoteItemRow {
+        item_rows(&self.d.cache_path, "gdrive")
+            .into_iter()
+            .find(|r| r.path == path)
+            .unwrap_or_else(|| panic!("{path} has a row"))
+    }
+
+    /// Waits until `path` is in `state`; returns the row.
+    pub fn wait_state(&self, path: &str, state: &str) -> tephra_cache::RemoteItemRow {
+        self.d.wait_for(&format!("{path} to be {state}"), || {
+            Some(self.row(path)).filter(|r| r.state == state)
+        })
+    }
+
+    /// The upload queue of `gdrive`.
+    pub fn queue(&self) -> Vec<tephra_cache::UploadEntry> {
+        Cache::open_read_only(&self.d.cache_path)
+            .expect("open the cache")
+            .upload_entries("gdrive")
+            .expect("the queue")
+    }
+
+    /// Waits until the queue row of `path` has been tried `attempts` times.
+    pub fn wait_attempts(&self, path: &str, attempts: u32) -> tephra_cache::UploadEntry {
+        self.d.wait_for(&format!("{attempts} tries of {path}"), || {
+            self.queue()
+                .into_iter()
+                .find(|e| e.path == path && e.attempts >= attempts)
+        })
+    }
+
+    /// The fake clock moves; nothing sleeps.
+    pub fn advance(&self, by: Duration) {
+        self.clock.advance(by);
+    }
+
+    pub fn now_secs(&self) -> i64 {
+        stamp(&self.clock)
+    }
+
+    /// Every request the fake Drive saw that is not a GET, as
+    /// `METHOD path`.
+    pub fn writes(&self) -> Vec<String> {
+        self.drive
+            .request_log()
+            .all()
+            .into_iter()
+            .filter(|r| r.method != "GET")
+            .map(|r| format!("{} {}", r.method, r.path))
+            .collect()
+    }
+
+    /// `resolve`, the whole reply.
+    pub fn resolve(&self, path: &str, keep: &str) -> Value {
+        self.d.rpc(
+            "resolve",
+            json!({ "unit": format!("@gdrive:{path}"), "keep": keep }),
+        )
+    }
+
+    /// The content root of `gdrive`.
+    pub fn root(&self) -> PathBuf {
+        self.d.data_dir.join("remote").join("gdrive")
+    }
+}
