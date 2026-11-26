@@ -28,6 +28,7 @@ mod remote_clone;
 mod remote_evict;
 mod remote_fetch;
 mod remote_ops;
+mod remote_pins;
 mod remote_sync;
 mod remote_upload;
 mod schema;
@@ -75,6 +76,7 @@ pub use remote_ops::{
     ITEM_KIND_SUBMODULE, ITEM_KIND_SYMLINK, LISTING_MARK, REASON_LFS_POINTER, REASON_LISTING,
     REMOTE_ROOT_PREFIX, STATUS_ACTIVE, STATUS_INDEXING,
 };
+pub use remote_pins::{pin_covers, PinWrite, RemotePin};
 pub use remote_sync::{
     decode_cursor, encode_cursor, is_kept_deleted, PollState, ITEM_STATE_NEEDS_ATTENTION,
     REASON_DELETED_ON_REMOTE, REASON_READDED_AFTER_DELETE, STATUS_AUTH_REQUIRED,

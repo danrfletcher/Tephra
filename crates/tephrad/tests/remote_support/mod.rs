@@ -1293,6 +1293,17 @@ impl DriveDaemon {
     }
 
     pub fn start_with(store: Arc<MemStore>, build: impl FnOnce(&FakeDrive)) -> DriveDaemon {
+        Self::start_custom(store, Tuning::default(), None, build)
+    }
+
+    /// [`DriveDaemon::start_with`] with the cache cap's settings and the
+    /// disk a fetch writes to given (PR-12's pin tests).
+    pub fn start_custom(
+        store: Arc<MemStore>,
+        tuning: Tuning,
+        disk: Option<Arc<dyn Disk>>,
+        build: impl FnOnce(&FakeDrive),
+    ) -> DriveDaemon {
         let rt = tokio::runtime::Runtime::new().expect("a runtime");
         let clock = Arc::new(FakeClock::at_epoch_2026());
         let drive = rt.block_on(FakeDrive::start_with_clock(clock.clone()));
@@ -1304,9 +1315,9 @@ impl DriveDaemon {
             None,
             clock.clone(),
             AdapterOptions::default(),
-            None,
+            disk,
             Some(drive.base_url()),
-            Tuning::default(),
+            tuning,
         );
         DriveDaemon {
             drive,

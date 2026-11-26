@@ -287,22 +287,49 @@ fn an_uncontended_multi_chunk_scan_pays_no_fixed_per_chunk_tax() {
         elapsed
     }
 
-    let low = timed_scan(CALIBRATION_LOW).as_secs_f64();
-    let high = timed_scan(CALIBRATION_HIGH).as_secs_f64();
-    // Marginal tax-free per-file cost, derived from two points that
-    // both ran with zero interior chunk boundaries — any fixed setup
-    // cost common to both runs cancels out of this slope.
-    let marginal_per_file = (high - low) / (CALIBRATION_HIGH as f64 - CALIBRATION_LOW as f64);
-    let projected = high + marginal_per_file * (MANY_CHUNK_COUNT as f64 - CALIBRATION_HIGH as f64);
+    /// A reintroduced per-chunk sleep inflates the ratio on every
+    /// attempt; a loaded host (other processes taking the CPU and the
+    /// disk, which hits the short calibration scans and the long one
+    /// unevenly) inflates it on some. So the test passes when any of
+    /// these attempts is inside the bound, and fails only when all of
+    /// them are over it.
+    const ATTEMPTS: usize = 3;
 
-    let actual = timed_scan(MANY_CHUNK_COUNT).as_secs_f64();
-    let ratio = actual / projected;
+    /// Each calibration point is the faster of two runs: the minimum is
+    /// the run that load disturbed least.
+    fn calibration(file_count: usize) -> f64 {
+        timed_scan(file_count)
+            .min(timed_scan(file_count))
+            .as_secs_f64()
+    }
 
-    assert!(
-        ratio < TAX_RATIO_BOUND,
-        "a {MANY_CHUNK_COUNT}-file uncontended scan (~40 chunks) took {actual:.3}s against a \
-         tax-free projection of {projected:.3}s (ratio {ratio:.2}, bound {TAX_RATIO_BOUND}); a \
-         fixed per-chunk sleep reintroduced into walk_and_write would show up here as a ratio \
-         scaled by chunk count, not as ordinary machine-speed variance"
+    let mut report = Vec::new();
+    for attempt in 1..=ATTEMPTS {
+        let low = calibration(CALIBRATION_LOW);
+        let high = calibration(CALIBRATION_HIGH);
+        // Marginal tax-free per-file cost, derived from two points that
+        // both ran with zero interior chunk boundaries — any fixed setup
+        // cost common to both runs cancels out of this slope.
+        let marginal_per_file = (high - low) / (CALIBRATION_HIGH as f64 - CALIBRATION_LOW as f64);
+        let projected =
+            high + marginal_per_file * (MANY_CHUNK_COUNT as f64 - CALIBRATION_HIGH as f64);
+
+        let actual = timed_scan(MANY_CHUNK_COUNT).as_secs_f64();
+        let ratio = actual / projected;
+        if ratio < TAX_RATIO_BOUND {
+            return;
+        }
+        report.push(format!(
+            "attempt {attempt}: {actual:.3}s against a projection of {projected:.3}s \
+             (ratio {ratio:.2})"
+        ));
+    }
+
+    panic!(
+        "a {MANY_CHUNK_COUNT}-file uncontended scan (~40 chunks) was over the bound \
+         {TAX_RATIO_BOUND} on all {ATTEMPTS} attempts ({}); a fixed per-chunk sleep \
+         reintroduced into walk_and_write would show up here as a ratio scaled by chunk \
+         count on every attempt, not as ordinary machine-speed variance",
+        report.join("; ")
     );
 }

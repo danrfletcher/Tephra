@@ -51,6 +51,10 @@ const MUTATING_METHODS: &[&str] = &[
     // `resolve` is not replayed after a lost reply: the second try would
     // answer "nothing to resolve" to a first that worked.
     "resolve",
+    // The same for a pin and an unpin (PR-12): a second try would answer
+    // "already pinned" (or "not pinned") to a first that worked.
+    "unit.pin",
+    "unit.unpin",
     "source.register",
     "source.add_github",
     "source.add_drive",

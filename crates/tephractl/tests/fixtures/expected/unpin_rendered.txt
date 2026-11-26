@@ -1,0 +1,2 @@
+unpinned @gdrive:Trip Plans/
+the files stay cached and may be dropped again when the cache needs room

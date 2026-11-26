@@ -1,0 +1,2 @@
+@gdrive:Trip Plans/ is already pinned; nothing changed
+folder @gdrive:Trip Plans/: 40 files, 1234567 bytes (1.2 MB); cache limit 10000000000 bytes (10.0 GB)

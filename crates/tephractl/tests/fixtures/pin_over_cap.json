@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":1,"result":{"unit":"@g:big/","status":"pinned","kind":"folder","files":2,"total_bytes":2000000,"skipped":{},"cap_bytes":1000000,"warning":"pinned files will take 2000000 bytes, more than the cache limit of 1000000: pinned files are never dropped, so the cache stays over it (unpinned files are dropped first)"}}

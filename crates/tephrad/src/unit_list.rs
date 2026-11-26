@@ -69,6 +69,11 @@ pub struct RemoteEntryWire {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
     pub cache_bytes: u64,
+    /// A pin covers this file or folder (PR-12): a file shows it from the
+    /// moment the pin is stored, before its bytes are down. Absent when no
+    /// pin covers it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
     /// Why a file is listed by name only (`symlink`, `submodule`,
     /// `lfs_pointer`, `not_found`), when it is.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -238,13 +243,18 @@ fn list_remote(
         .into_iter()
         .map(|i| (i.path.clone(), i))
         .collect();
+    let pins = cache.remote_pins(source).map_err(source_error)?;
     let entries = listing
         .entries
         .into_iter()
         .map(|e| {
             let item = items.get(&e.rel_path);
             let is_folder = e.is_folder();
+            let pinned = pins
+                .iter()
+                .any(|p| tephra_cache::pin_covers(&p.path, p.is_folder, &e.rel_path));
             let remote = RemoteEntryWire {
+                pinned,
                 state: item.map(|i| i.state.clone()).filter(|_| !is_folder),
                 cache_bytes: item
                     .filter(|_| !is_folder)

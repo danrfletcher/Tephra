@@ -13,8 +13,24 @@ members = [
 # single-line sources). Unoptimised SHA-256 and tree-sitter C code make
 # those tests CPU-hungry enough to starve the timing-sensitive tests that
 # run beside them, so these dependencies are built optimised even in dev.
-# Only dependencies are affected; the workspace crates keep debug info
-# and overflow checks.
+# The prose parser (tephra-parser and its pulldown-cmark) is optimised too:
+# its multi-megabyte budget tests (tests/unit/large_file.rs) and every scan
+# that parses a file run it hot, and unoptimised it took 9-13 s on a 10 MB
+# file, so a loaded host failed those budgets and starved the timing tests
+# beside them. SQLite (libsqlite3-sys, the bundled C amalgamation) is
+# optimised for the same reason: the tephra-cache budget tests
+# (tests/fts_query.rs: 500 ms queries over 100,000 rows) run almost
+# entirely inside it. Optimising changes only speed, not behaviour. The
+# other workspace crates keep debug info and overflow checks.
+
+[profile.dev.package.tephra-parser]
+opt-level = 3
+
+[profile.dev.package.pulldown-cmark]
+opt-level = 3
+[profile.dev.package.libsqlite3-sys]
+opt-level = 3
+
 [profile.dev.package.sha2]
 opt-level = 3
 

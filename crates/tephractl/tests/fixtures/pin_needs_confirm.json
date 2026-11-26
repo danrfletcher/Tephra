@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":1,"result":{"unit":"@gdrive:Trip Plans/","status":"needs_confirm","kind":"folder","files":40,"total_bytes":3000000000,"skipped":{"gsheet":2},"cap_bytes":10000000000}}

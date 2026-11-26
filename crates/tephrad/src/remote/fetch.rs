@@ -1,5 +1,7 @@
 //! `unit.fetch` (PR-7): the one call that puts a remote file's bytes on disk
-//! (the first index's single read and pins, later, are the others).
+//! (the first index's single read is the other; the pin downloader, PR-12,
+//! goes through this same path, so a pin and a fetch of one file are one
+//! download).
 //!
 //! A file is streamed from the adapter into Tephra's own content cache,
 //! `<data_dir>/remote/<source>/` (GitHub files under `clone/`, Drive files
@@ -40,7 +42,7 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use tephra_cache::{
     Cache, CacheError, RemoteFetchRow, RemoteSourceRow, ITEM_STATE_CACHED, ITEM_STATE_DOWNLOADING,
-    ITEM_STATE_NEEDS_ATTENTION, ITEM_STATE_REMOTE, REASON_LFS_POINTER,
+    ITEM_STATE_NEEDS_ATTENTION, ITEM_STATE_PINNED, ITEM_STATE_REMOTE, REASON_LFS_POINTER,
 };
 use tephra_remote::github::{GitBlobHasher, RepoRef};
 use tephra_remote::BodyStream;
@@ -447,7 +449,21 @@ fn google_url(kind: &str, file_id: &str) -> Option<String> {
 /// The refusal for an item whose bytes are never fetched, or `None` for one
 /// that can be.
 fn not_fetchable(row: &RemoteFetchRow) -> Option<FetchRpcError> {
-    let kind = row.kind.as_deref().unwrap_or("");
+    not_fetchable_item(
+        row.kind.as_deref(),
+        row.file_id.as_deref(),
+        row.reason.as_deref(),
+    )
+}
+
+/// [`not_fetchable`] from the three facts it reads (the pin planner has an
+/// index row, not a fetch row).
+pub(crate) fn not_fetchable_item(
+    kind: Option<&str>,
+    file_id: Option<&str>,
+    reason: Option<&str>,
+) -> Option<FetchRpcError> {
+    let kind = kind.unwrap_or("");
     let (what, name) = match kind {
         "gdoc" => ("a Google Doc", "Doc"),
         "gsheet" => ("a Google Sheet", "Sheet"),
@@ -457,12 +473,10 @@ fn not_fetchable(row: &RemoteFetchRow) -> Option<FetchRpcError> {
         "gshortcut" => ("a Drive shortcut", "shortcut"),
         "symlink" => ("a symbolic link", "symlink"),
         "submodule" => ("a git submodule", "submodule"),
-        _ if row.reason.as_deref() == Some(REASON_LFS_POINTER) => {
-            ("a Git LFS pointer", "Git LFS pointer")
-        }
+        _ if reason == Some(REASON_LFS_POINTER) => ("a Git LFS pointer", "Git LFS pointer"),
         _ => return None,
     };
-    let url = row.file_id.as_deref().and_then(|id| google_url(kind, id));
+    let url = file_id.and_then(|id| google_url(kind, id));
     let message = match &url {
         Some(url) => format!("{what} has no file to download; open it at {url}"),
         None if kind == "gshortcut" => {
@@ -667,7 +681,8 @@ impl SourceRegistry {
         }
     }
 
-    /// Runs one download as its leader: `remote -> downloading -> cached`,
+    /// Runs one download as its leader: `remote -> downloading -> cached` (or
+    /// `pinned`),
     /// or back to `remote` with the reason.
     fn lead(
         &self,
@@ -717,11 +732,25 @@ impl SourceRegistry {
                     )
                 });
                 match finished {
-                    Ok(true) => Lead::Finished(Ok(Arc::new(FetchDone {
-                        path,
-                        size,
-                        state: ITEM_STATE_CACHED.to_string(),
-                    }))),
+                    Ok(true) => {
+                        // `pinned` when a pin covers the file (the cache
+                        // decided that when the download finished).
+                        let pinned = self
+                            .fetch_db(|c| c.remote_fetch_row(&row.source, &row.path))
+                            .ok()
+                            .flatten()
+                            .is_some_and(|r| r.state == ITEM_STATE_PINNED);
+                        Lead::Finished(Ok(Arc::new(FetchDone {
+                            path,
+                            size,
+                            state: if pinned {
+                                ITEM_STATE_PINNED
+                            } else {
+                                ITEM_STATE_CACHED
+                            }
+                            .to_string(),
+                        })))
+                    }
                     // A sync listed the file anew while its old bytes came
                     // down: those bytes are stale. They go if this fetch
                     // renamed them into place; a copy that was already there

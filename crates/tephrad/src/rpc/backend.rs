@@ -416,6 +416,32 @@ pub trait SourceBackend: Send + Sync {
             kind: None,
         })
     }
+    /// `unit.pin` (PR-12, G11): stores a pin and starts the background
+    /// download; does not wait for the files. The default refuses.
+    fn pin_unit(
+        &self,
+        _unit: &str,
+        _confirm: bool,
+    ) -> Result<crate::remote::pin::PinWire, crate::remote::fetch::FetchRpcError> {
+        Err(crate::remote::fetch::FetchRpcError {
+            reason: "pin_unavailable",
+            message: "unit.pin is not supported by this source backend".to_string(),
+            url: None,
+            kind: None,
+        })
+    }
+    /// `unit.unpin` (PR-12): removes a pin. The default refuses.
+    fn unpin_unit(
+        &self,
+        _unit: &str,
+    ) -> Result<crate::remote::pin::UnpinWire, crate::remote::fetch::FetchRpcError> {
+        Err(crate::remote::fetch::FetchRpcError {
+            reason: "pin_unavailable",
+            message: "unit.unpin is not supported by this source backend".to_string(),
+            url: None,
+            kind: None,
+        })
+    }
     /// `resolve` (PR-11): clears the Drive conflict of a unit. Blocks. The
     /// default refuses.
     fn resolve_conflict(
@@ -594,6 +620,19 @@ impl SourceBackend for SourceRegistry {
         unit: &str,
     ) -> Result<crate::remote::fetch::FetchWire, crate::remote::fetch::FetchRpcError> {
         SourceRegistry::fetch_unit(self, unit)
+    }
+    fn pin_unit(
+        &self,
+        unit: &str,
+        confirm: bool,
+    ) -> Result<crate::remote::pin::PinWire, crate::remote::fetch::FetchRpcError> {
+        SourceRegistry::pin_unit(self, unit, confirm)
+    }
+    fn unpin_unit(
+        &self,
+        unit: &str,
+    ) -> Result<crate::remote::pin::UnpinWire, crate::remote::fetch::FetchRpcError> {
+        SourceRegistry::unpin_unit(self, unit)
     }
     fn resolve_conflict(
         &self,

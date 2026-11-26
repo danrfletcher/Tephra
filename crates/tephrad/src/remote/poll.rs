@@ -317,6 +317,12 @@ impl PollJob {
             if !matches!(step, Step::Again(_) | Step::Gone) {
                 self.look_after_clone(Pass::Sync).await;
             }
+            // After every sync the pins are looked at (PR-12): a file added
+            // under a pinned folder is fetched, and a pin that could not
+            // download while the source was away starts again.
+            if matches!(step, Step::Next(_)) {
+                crate::remote::pin::wake(&self.hub, &self.name);
+            }
             if !matches!(step, Step::Again(_)) {
                 self.hub
                     .polls_done

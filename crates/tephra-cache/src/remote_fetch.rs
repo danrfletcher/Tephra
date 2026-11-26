@@ -9,6 +9,7 @@
 
 use rusqlite::{params, OptionalExtension};
 
+use crate::remote_evict::PINNED;
 use crate::{Cache, CacheError};
 
 /// `remote_items.state` of a file that is not on disk.
@@ -152,9 +153,12 @@ impl Cache {
         Ok(n > 0)
     }
 
-    /// `downloading -> cached`, provided the row still has the `sha` and
-    /// `size` the download was checked against (a poll that re-listed the
-    /// file meanwhile makes the bytes stale). `false` when it does not.
+    /// `downloading -> cached`, or `downloading -> pinned` when a pin
+    /// covers the file (a pin is decided here, at the end, so a pin made or
+    /// dropped while the bytes came down is honoured). Only if the row
+    /// still has the `sha` and `size` the download was checked against (a
+    /// poll that re-listed the file meanwhile makes the bytes stale).
+    /// `false` when it does not.
     ///
     /// `last_used` is set to `now` in the same statement: a download that
     /// took longer than the cache's idle window must not be dropped by an
@@ -167,9 +171,13 @@ impl Cache {
         size: Option<i64>,
         now: i64,
     ) -> Result<bool, CacheError> {
+        let sql = format!(
+            "UPDATE remote_items AS i \
+             SET state = CASE WHEN {PINNED} THEN ?8 ELSE ?3 END, last_used = ?7 \
+             WHERE i.source = ?1 AND i.path = ?2 AND i.state = ?4 AND i.sha IS ?5 AND i.size IS ?6"
+        );
         let n = self.connection().execute(
-            "UPDATE remote_items SET state = ?3, last_used = ?7 \
-             WHERE source = ?1 AND path = ?2 AND state = ?4 AND sha IS ?5 AND size IS ?6",
+            &sql,
             params![
                 source,
                 path,
@@ -177,7 +185,8 @@ impl Cache {
                 ITEM_STATE_DOWNLOADING,
                 sha,
                 size,
-                now
+                now,
+                ITEM_STATE_PINNED
             ],
         )?;
         Ok(n > 0)

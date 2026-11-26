@@ -10,9 +10,11 @@
 //! and `link refactor --apply` without `--yes`, which (R3) first
 //! calls `link.preview_refactor` to render the affected files/lines
 //! ahead of the confirmation prompt, then `link.apply_refactor` once
-//! confirmed — `--yes` still issues exactly one RPC.
+//! confirmed — `--yes` still issues exactly one RPC. `pin` (PR-12) is the
+//! other: it calls `unit.pin`, and when the daemon answers `needs_confirm`
+//! it asks on a terminal and calls again with `confirm`.
 
-use std::io::{BufRead, Write};
+use std::io::{BufRead, IsTerminal, Write};
 
 use serde_json::{json, Value};
 
@@ -74,7 +76,14 @@ pub fn execute<R: BufRead>(
     client: &RpcClient,
     stdin: &mut R,
 ) -> CommandOutcome {
-    execute_with_prompt_writer(command, json, client, stdin, &mut std::io::stderr())
+    execute_with_terminal(
+        command,
+        json,
+        client,
+        stdin,
+        &mut std::io::stderr(),
+        std::io::stdin().is_terminal(),
+    )
 }
 
 /// Same as [`execute`], but writes the interactive confirmation
@@ -87,6 +96,22 @@ pub fn execute_with_prompt_writer<R: BufRead, W: Write>(
     client: &RpcClient,
     stdin: &mut R,
     prompt_out: &mut W,
+) -> CommandOutcome {
+    // The caller supplies the answers, so they count as typed.
+    execute_with_terminal(command, json, client, stdin, prompt_out, true)
+}
+
+/// Same as [`execute_with_prompt_writer`], told whether `stdin` is a
+/// terminal. A question that needs a person (a large `pin` without
+/// `--yes`) is asked only then: from a pipe or a file the command exits 1
+/// and changes nothing, so a script never confirms by accident.
+pub fn execute_with_terminal<R: BufRead, W: Write>(
+    command: &Command,
+    json: bool,
+    client: &RpcClient,
+    stdin: &mut R,
+    prompt_out: &mut W,
+    stdin_is_terminal: bool,
 ) -> CommandOutcome {
     match command {
         Command::SourceAdd { name, path } => source_add(name, path, json, client),
@@ -116,6 +141,16 @@ pub fn execute_with_prompt_writer<R: BufRead, W: Write>(
         Command::BlockId { unit, target } => block_id(unit, target, json, client),
         Command::Backlinks { id } => backlinks(id, json, client),
         Command::Fetch { unit } => fetch(unit, json, client),
+        Command::Pin { unit, yes } => pin(
+            unit,
+            *yes,
+            json,
+            client,
+            stdin,
+            prompt_out,
+            stdin_is_terminal,
+        ),
+        Command::Unpin { unit } => unpin(unit, json, client),
         Command::Resolve { unit, keep } => resolve(unit, keep, json, client),
         Command::CacheStatus => cache_status(json, client),
         Command::CacheSetLimit { limit } => cache_set_limit(limit, json, client),
@@ -519,6 +554,71 @@ fn fetch(unit: &str, json: bool, client: &RpcClient) -> CommandOutcome {
     match client.call("unit.fetch", json!({"unit": unit})) {
         Ok(result) => {
             CommandOutcome::ok(json_or(&result, || render::render_fetched(&result), json))
+        }
+        Err(e) => CommandOutcome::err(describe_error(&e)),
+    }
+}
+
+/// `pin <id> [--yes]`: `unit.pin`. With `--yes` it is one call with
+/// `confirm: true`. Without it the first call asks the daemon for the size
+/// only when the pin is large: `needs_confirm` writes nothing, the size
+/// and the question go to `prompt_out` (stderr, so `--json` stays valid),
+/// and a yes on a terminal makes the second call with `confirm: true`.
+/// Anything else, or no terminal, exits 1 with nothing pinned.
+fn pin<R: BufRead, W: Write>(
+    unit: &str,
+    yes: bool,
+    json: bool,
+    client: &RpcClient,
+    stdin: &mut R,
+    prompt_out: &mut W,
+    stdin_is_terminal: bool,
+) -> CommandOutcome {
+    let mut params = json!({"unit": unit});
+    if yes {
+        params["confirm"] = json!(true);
+    }
+    let mut result = match client.call("unit.pin", params) {
+        Ok(result) => result,
+        Err(e) => return CommandOutcome::err(describe_error(&e)),
+    };
+    if result.get("status").and_then(Value::as_str) == Some("needs_confirm") {
+        let size = render::render_pin_size(&result);
+        if !stdin_is_terminal {
+            return CommandOutcome::err(format!(
+                "{size}\nnot pinned: this pin is large and there is no terminal to ask on; \
+                 run it again with --yes to pin it"
+            ));
+        }
+        let _ = writeln!(prompt_out, "{size}");
+        let _ = write!(prompt_out, "Pin it and download these files? [y/N]: ");
+        let _ = prompt_out.flush();
+        let mut line = String::new();
+        let answered_yes = match stdin.read_line(&mut line) {
+            Ok(0) | Err(_) => false,
+            Ok(_) => matches!(line.trim().to_lowercase().as_str(), "y" | "yes"),
+        };
+        if !answered_yes {
+            return CommandOutcome {
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: "aborted: not pinned\n".to_string(),
+            };
+        }
+        result = match client.call("unit.pin", json!({"unit": unit, "confirm": true})) {
+            Ok(result) => result,
+            Err(e) => return CommandOutcome::err(describe_error(&e)),
+        };
+    }
+    CommandOutcome::ok(json_or(&result, || render::render_pinned(&result), json))
+}
+
+/// `unpin <id>`: one `unit.unpin`. Unpinning what is not pinned is exit 0
+/// and says so.
+fn unpin(unit: &str, json: bool, client: &RpcClient) -> CommandOutcome {
+    match client.call("unit.unpin", json!({"unit": unit})) {
+        Ok(result) => {
+            CommandOutcome::ok(json_or(&result, || render::render_unpinned(&result), json))
         }
         Err(e) => CommandOutcome::err(describe_error(&e)),
     }

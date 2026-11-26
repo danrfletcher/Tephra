@@ -1130,6 +1130,81 @@ pub fn render_fetched(result: &Value) -> String {
     format!("{}\n", result["path"].as_str().unwrap_or_default())
 }
 
+/// The size line of a pin, before anything is downloaded: how many files,
+/// how many bytes (exact, and in 1000-based units), the cache limit, and
+/// what is skipped because it is never downloaded.
+pub fn render_pin_size(result: &Value) -> String {
+    let n = |key: &str| result.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let files = n("files");
+    let total = n("total_bytes");
+    let mut out = format!(
+        "{} {}: {files} {}, {total} bytes ({})",
+        if result.get("kind").and_then(Value::as_str) == Some("folder") {
+            "folder"
+        } else {
+            "file"
+        },
+        printable(str_field(result, "unit")),
+        if files == 1 { "file" } else { "files" },
+        human_bytes(total),
+    );
+    let cap = n("cap_bytes");
+    if cap > 0 {
+        out.push_str(&format!("; cache limit {cap} bytes ({})", human_bytes(cap)));
+    }
+    if let Some(skipped) = result.get("skipped").and_then(Value::as_object) {
+        let parts: Vec<String> = skipped
+            .iter()
+            .filter_map(|(kind, count)| Some(format!("{} {}", count.as_u64()?, printable(kind))))
+            .collect();
+        if !parts.is_empty() {
+            out.push_str(&format!(
+                "\nskipped, not fetchable (not counted): {}",
+                parts.join(", ")
+            ));
+        }
+    }
+    out
+}
+
+/// `pin`: what was stored and how much will come down, or that it already
+/// was. The files download in the background, so this says where to look.
+pub fn render_pinned(result: &Value) -> String {
+    let unit = printable(str_field(result, "unit"));
+    let size = render_pin_size(result);
+    let mut out = if str_field(result, "status") == "already_pinned" {
+        format!("{unit} is already pinned; nothing changed\n{size}\n")
+    } else {
+        format!(
+            "pinned {unit}\n{size}\nthe files download in the background; `tephractl ls` shows \
+             them as downloading, then pinned\n"
+        )
+    };
+    if let Some(warning) = result.get("warning").and_then(Value::as_str) {
+        out.push_str(&format!("warning: {}\n", printable(warning)));
+    }
+    out
+}
+
+/// `unpin`: that the pin is gone and the files stay cached, or that there
+/// was nothing to remove (and which folder pin still keeps the file).
+pub fn render_unpinned(result: &Value) -> String {
+    let unit = printable(str_field(result, "unit"));
+    if str_field(result, "status") == "unpinned" {
+        return format!(
+            "unpinned {unit}\nthe files stay cached and may be dropped again when the cache \
+             needs room\n"
+        );
+    }
+    match result.get("covered_by").and_then(Value::as_str) {
+        Some(folder) => format!(
+            "{unit} is not pinned itself; the pin on the folder {} still keeps it; nothing changed\n",
+            printable(folder)
+        ),
+        None => format!("{unit} is not pinned; nothing changed\n"),
+    }
+}
+
 /// `resolve`: what was done and where the item is now, in plain lines.
 pub fn render_resolved(result: &Value) -> String {
     let text = |key: &str| result.get(key).and_then(Value::as_str);

@@ -1,0 +1,4 @@
+pinned @g:big/
+folder @g:big/: 2 files, 2000000 bytes (2.0 MB); cache limit 1000000 bytes (1.0 MB)
+the files download in the background; `tephractl ls` shows them as downloading, then pinned
+warning: pinned files will take 2000000 bytes, more than the cache limit of 1000000: pinned files are never dropped, so the cache stays over it (unpinned files are dropped first)

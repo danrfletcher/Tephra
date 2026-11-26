@@ -30,9 +30,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tephra_cache::{
-    is_text_item_kind, Cache, CacheError, NewFixLog, PollState, RemoteItemRow, RemoteSourceRow,
-    ITEM_STATE_NEEDS_ATTENTION, ITEM_STATE_NOT_PUSHED, ITEM_STATE_PENDING_UPLOAD,
-    ITEM_STATE_REMOTE, STATUS_ACTIVE, STATUS_AUTH_REQUIRED, STATUS_OFFLINE, STATUS_SYNCING,
+    is_kept_deleted, is_text_item_kind, pin_covers, Cache, CacheError, NewFixLog, PollState,
+    RemoteItemRow, RemotePin, RemoteSourceRow, ITEM_STATE_NEEDS_ATTENTION, ITEM_STATE_NOT_PUSHED,
+    ITEM_STATE_PENDING_UPLOAD, ITEM_STATE_REMOTE, STATUS_ACTIVE, STATUS_AUTH_REQUIRED,
+    STATUS_OFFLINE, STATUS_SYNCING,
 };
 use tephra_remote::drive::{Change, DriveFile};
 use tephra_remote::RemoteError;
@@ -270,8 +271,83 @@ fn diff(rows: &[RemoteItemRow], wanted: &Wanted) -> DrivePlan {
     plan
 }
 
+/// The pins that follow what they name when Drive renamed or moved it, as
+/// `(pin, new path)`. A file pin follows its file. A folder pin follows its
+/// folder: Drive says nothing of a folder but the move of each file in it,
+/// so the folder counts as renamed when every file that was under it moved
+/// to one other folder, keeping its place below it, and that folder held
+/// nothing else before. A folder with a file that stayed, left alone or
+/// was removed is not renamed (a file moved out of it is just moved).
+fn moved_pins(
+    pins: &[RemotePin],
+    rows: &HashMap<String, RemoteItemRow>,
+    plan: &DrivePlan,
+) -> Vec<(RemotePin, String)> {
+    let moves: HashMap<&str, &str> = plan
+        .upserts
+        .iter()
+        .filter_map(|u| Some((u.old_path.as_deref()?, u.item.path.as_str())))
+        .collect();
+    let removed: HashSet<&str> = plan.removed.iter().map(String::as_str).collect();
+    let mut out = Vec::new();
+    for pin in pins {
+        if !pin.is_folder {
+            if let Some(new) = moves.get(pin.path.as_str()) {
+                out.push((pin.clone(), (*new).to_string()));
+            }
+            continue;
+        }
+        if pin.path.is_empty() {
+            continue;
+        }
+        let members: Vec<&RemoteItemRow> = rows
+            .values()
+            .filter(|r| {
+                !is_kept_deleted(r) && r.path != pin.path && pin_covers(&pin.path, true, &r.path)
+            })
+            .collect();
+        let mut target: Option<String> = None;
+        let mut whole = !members.is_empty();
+        for r in &members {
+            let renamed = moves.get(r.path.as_str()).and_then(|new| {
+                let suffix = r.path.strip_prefix(&pin.path)?;
+                new.strip_suffix(suffix).filter(|q| !q.is_empty())
+            });
+            match renamed {
+                Some(q) if target.as_deref().is_none_or(|t| t == q) => {
+                    target = Some(q.to_string());
+                }
+                _ => {
+                    whole = false;
+                    break;
+                }
+            }
+        }
+        let Some(target) = target.filter(|t| whole && *t != pin.path) else {
+            continue;
+        };
+        let was_there = |path: &str| {
+            path == target
+                || path
+                    .strip_prefix(target.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+        };
+        let taken = rows.values().any(|r| {
+            was_there(&r.path)
+                && !is_kept_deleted(r)
+                && !moves.contains_key(r.path.as_str())
+                && !removed.contains(r.path.as_str())
+        });
+        if !taken {
+            out.push((pin.clone(), target));
+        }
+    }
+    out
+}
+
 /// Applies `plan` in the caller's transaction: files gone, files moved,
-/// files added or edited (with the text read for them), the rename record.
+/// files added or edited (with the text read for them), the rename record,
+/// and the pins that follow a renamed or moved file or folder.
 /// `None` when the source is gone; otherwise the cached copies (below
 /// `cache_dir`) of files that left, for the caller to delete once the
 /// transaction has committed.
@@ -296,6 +372,9 @@ fn apply_plan(
         .map(|r| (r.path.clone(), r))
         .collect();
     let mut stale_copies: Vec<PathBuf> = Vec::new();
+    // Pins that follow a rename or a move (see `moved_pins`), found before
+    // any row changes.
+    let pins_moved = moved_pins(&cache.remote_pins(name)?, &rows, plan);
 
     // Renames and moves that carry their row along go first, by a name
     // nobody has, so two files that swap names do not collide.
@@ -375,6 +454,15 @@ fn apply_plan(
                 detail_json: Some(detail.to_json()),
             })?;
         }
+    }
+    if !pins_moved.is_empty() {
+        // Last, with every row in place: a file pin on a moved file went
+        // with its old row above and is written back at the new path. Then
+        // the states follow the pins: a moved file whose copy was dropped is
+        // `remote` at its new path and the pin job fetches it after this
+        // sync; a pin that covers nothing any more frees what it held.
+        cache.move_remote_pins(name, &pins_moved)?;
+        cache.reconcile_remote_pins(name)?;
     }
     Ok(Some(stale_copies))
 }

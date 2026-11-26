@@ -1,0 +1,4 @@
+pinned @gdrive:Trip Plans/
+folder @gdrive:Trip Plans/: 40 files, 1234567 bytes (1.2 MB); cache limit 10000000000 bytes (10.0 GB)
+skipped, not fetchable (not counted): 1 gdoc, 2 gsheet
+the files download in the background; `tephractl ls` shows them as downloading, then pinned

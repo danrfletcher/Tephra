@@ -35,6 +35,8 @@ USAGE:
     tephractl block-id <unit-id> --line <n> | --symbol <name> [--json]
     tephractl backlinks <id> [--json]
     tephractl fetch <id> [--json]
+    tephractl pin <id> [--yes] [--json]
+    tephractl unpin <id> [--json]
     tephractl resolve <id> --mine | --theirs [--json]
     tephractl cache status [--json]
     tephractl cache set-limit <limit> [--json]
@@ -131,6 +133,28 @@ FETCH:
                           fetched (Google Docs, Sheets, Slides, Forms and Drawings, shortcuts,
                           symlinks, submodules and Git LFS pointers: the message says where to
                           open it).
+
+PIN:
+    pin <id>              Keep a remote file or folder downloaded (unit.pin). <id> is
+                          @source:path/to/file or @source:path/to/folder/ (a Drive folder with a
+                          space in it needs quotes). It is stored as a path prefix, so a folder
+                          pin covers the files in it now and the ones added later. Prints how
+                          many files and how many bytes (1000-based) will be downloaded, and
+                          which kinds are skipped because they are never downloaded (Google
+                          Docs, Sheets, Slides and Forms, symlinks, submodules, Git LFS
+                          pointers). The files come down in the background as the pin is
+                          stored, then are never dropped by the cache: `ls` shows them as
+                          downloading, then pinned. A pin larger than a fifth of the cache
+                          limit asks first on a terminal (`[y/N]`, on stderr); --yes skips the
+                          question. Without a terminal and without --yes a pin that needs the
+                          question exits 1 and pins nothing. A pin over the limit itself only
+                          warns. Pinning what is already pinned exits 0, changes nothing and
+                          says so. Pinning a Google Doc or Sheet exits 1 with where to open
+                          it. Nothing is written to the remote.
+    unpin <id>            Remove a pin. The files stay cached but may be dropped again when the
+                          cache needs room, and stay listed. A file under a pinned folder stays
+                          pinned while the folder is. Unpinning what is not pinned exits 0,
+                          changes nothing and says so.
 
 RESOLVE:
     resolve <id> --mine|--theirs
@@ -352,6 +376,16 @@ pub enum Command {
     Fetch {
         unit: String,
     },
+    /// `pin <id> [--yes]`: `unit.pin`. `unit` is a unit id, `@source:path`.
+    /// `yes` skips the confirmation a large pin asks for.
+    Pin {
+        unit: String,
+        yes: bool,
+    },
+    /// `unpin <id>`: `unit.unpin`.
+    Unpin {
+        unit: String,
+    },
     /// `resolve <id> --mine|--theirs`: `resolve`. `unit` is a unit id,
     /// `@source:path`; `keep` is `mine` or `theirs`.
     Resolve {
@@ -526,6 +560,8 @@ where
         "block-id" => parse_block_id(&mut iter)?,
         "backlinks" => parse_backlinks(&mut iter)?,
         "fetch" => parse_fetch(&mut iter)?,
+        "pin" => parse_pin(&mut iter, true)?,
+        "unpin" => parse_pin(&mut iter, false)?,
         "resolve" => parse_resolve(&mut iter)?,
         "cache" => parse_cache(&mut iter)?,
         "fixes" => parse_fixes(&mut iter)?,
@@ -1276,6 +1312,58 @@ fn parse_fetch<'a>(
         }
     }
     Ok((Command::Fetch { unit }, json, addr))
+}
+
+/// `pin <id> [--yes] [--json] [--addr <addr>]` and `unpin <id> [--json]
+/// [--addr <addr>]`. A bad id is a usage error, decided here, before any
+/// request. An id may name a folder (`@g:docs/`), and its path may hold
+/// spaces: it is one argument.
+fn parse_pin<'a>(
+    iter: &mut impl Iterator<Item = &'a str>,
+    pin: bool,
+) -> Result<(Command, bool, Option<String>), ArgsError> {
+    let verb = if pin { "pin" } else { "unpin" };
+    let mut unit: Option<String> = None;
+    let mut yes = false;
+    let mut json = false;
+    let mut addr = None;
+
+    while let Some(arg) = iter.next() {
+        match arg {
+            "--json" => json = true,
+            "--yes" if pin => yes = true,
+            "--addr" => addr = Some(take_value(iter, "--addr")?),
+            other if other.starts_with('-') && other.len() > 1 => {
+                return Err(ArgsError(format!("unrecognized argument: {other}")))
+            }
+            other if unit.is_none() => unit = Some(other.to_string()),
+            other => {
+                return Err(ArgsError(format!(
+                    "{verb} takes one id; unexpected extra argument: {other}"
+                )))
+            }
+        }
+    }
+
+    let unit = unit.ok_or_else(|| {
+        ArgsError(format!(
+            "{verb} requires an <id> like \"@source:path/to/file\" or \"@source:path/to/folder/\""
+        ))
+    })?;
+    match unit.strip_prefix('@').and_then(|r| r.split_once(':')) {
+        Some((source, path)) if !source.is_empty() && !path.is_empty() => {}
+        _ => {
+            return Err(ArgsError(format!(
+                "{verb} needs an id like \"@source:path/to/file\", got \"{unit}\""
+            )))
+        }
+    }
+    let command = if pin {
+        Command::Pin { unit, yes }
+    } else {
+        Command::Unpin { unit }
+    };
+    Ok((command, json, addr))
 }
 
 /// `resolve <id> --mine|--theirs [--json] [--addr <addr>]`. The id may come

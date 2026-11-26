@@ -1,0 +1,12 @@
+{
+  "cap_bytes": 10000000000,
+  "files": 40,
+  "kind": "folder",
+  "skipped": {
+    "gdoc": 1,
+    "gsheet": 2
+  },
+  "status": "pinned",
+  "total_bytes": 1234567,
+  "unit": "@gdrive:Trip Plans/"
+}

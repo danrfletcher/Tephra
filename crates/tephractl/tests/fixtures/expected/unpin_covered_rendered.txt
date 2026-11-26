@@ -1,0 +1,1 @@
+@gdrive:Trip Plans/a.md is not pinned itself; the pin on the folder Trip Plans still keeps it; nothing changed

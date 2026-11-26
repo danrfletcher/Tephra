@@ -1,0 +1,3 @@
+tephractl: folder @gdrive:Trip Plans/: 40 files, 3000000000 bytes (3.0 GB); cache limit 10000000000 bytes (10.0 GB)
+skipped, not fetchable (not counted): 2 gsheet
+not pinned: this pin is large and there is no terminal to ask on; run it again with --yes to pin it

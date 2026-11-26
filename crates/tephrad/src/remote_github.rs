@@ -167,6 +167,12 @@ pub struct RemoteHub {
     pub(crate) drive_watchers: Mutex<HashMap<String, crate::watcher::WatcherHandle>>,
     /// One `resolve` at a time.
     pub(crate) resolve_lock: Mutex<()>,
+    /// The pin downloads running now (PR-12), one per source.
+    pub(crate) pin_jobs: crate::remote::pin::PinJobs,
+    /// The registry the pin downloads fetch through: set by
+    /// [`SourceRegistry::set_remote_hub`]. Weak, so the hub never keeps a
+    /// registry alive.
+    pub(crate) registry: std::sync::OnceLock<std::sync::Weak<SourceRegistry>>,
 }
 
 /// Saves a cache limit to where the daemon keeps it (its config file).
@@ -241,6 +247,8 @@ impl RemoteHub {
             uploaders: Mutex::new(HashMap::new()),
             drive_watchers: Mutex::new(HashMap::new()),
             resolve_lock: Mutex::new(()),
+            pin_jobs: Mutex::new(HashMap::new()),
+            registry: std::sync::OnceLock::new(),
         })
     }
 
@@ -532,7 +540,8 @@ pub(crate) fn tree_items(tree: &[TreeEntry]) -> Vec<TreeItem> {
 impl SourceRegistry {
     /// Gives the registry what it needs to add and index remote sources.
     /// Set once; a second call is ignored.
-    pub fn set_remote_hub(&self, hub: Arc<RemoteHub>) {
+    pub fn set_remote_hub(self: &Arc<Self>, hub: Arc<RemoteHub>) {
+        let _ = hub.registry.set(Arc::downgrade(self));
         if self.remote.set(hub.clone()).is_ok() {
             // The cache cap is enforced from here on (PR-8).
             self.start_eviction(hub);
@@ -710,6 +719,8 @@ impl SourceRegistry {
             self.clean_up_after_downloads(hub);
             self.reconcile_cache_copies();
         }
+        // The pins' downloads go on where a restart cut them off (PR-12).
+        self.resume_pin_downloads();
         let rows = {
             let cache = self.cache.lock().unwrap();
             match cache.remote_sources() {

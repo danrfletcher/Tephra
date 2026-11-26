@@ -60,6 +60,9 @@ pub const METHOD_NAMES: &[&str] = &[
     "source.add_drive",
     // atlas-27 PR-11: the one method that PR adds.
     "resolve",
+    // atlas-27 PR-12: the two methods that PR adds.
+    "unit.pin",
+    "unit.unpin",
 ];
 
 /// The three backends one `dispatch` call reads through, bundled so
@@ -126,6 +129,8 @@ pub fn dispatch(
         "unit.search" => unit_search(params, backends.sources),
         "unit.fetch" => unit_fetch(params, backends.sources),
         "resolve" => resolve(params, backends.sources),
+        "unit.pin" => unit_pin(params, backends.sources),
+        "unit.unpin" => unit_unpin(params, backends.sources),
         "cache.status" => cache_status(backends.sources),
         "cache.set_limit" => cache_set_limit(params, backends.sources),
         "source.set_cache" => source_set_cache(params, backends.sources),
@@ -356,6 +361,45 @@ fn unit_fetch(params: &Value, sources: &dyn SourceBackend) -> DispatchResult {
     sources
         .fetch_unit(unit)
         .map(|wire| serde_json::to_value(wire).expect("FetchWire always serializes"))
+        .map_err(|e| (SOURCE_ERROR, e.message.clone(), Some(e.data())))
+}
+
+/// `unit.pin {unit, confirm?}` (atlas-27 PR-12, G11). `unit` is a unit id,
+/// `@source:path`, naming a file or (with a trailing slash, or when no file
+/// has the name) a folder. The pin is stored and the call returns; the
+/// files download in the background. A pin over a fifth of the cache limit
+/// answers `status: "needs_confirm"` with the file count, total bytes and
+/// cap, and writes nothing until it is asked again with `"confirm": true`.
+/// A refusal (`unknown_unit`, `not_remote`, `not_found`, `invalid_path`,
+/// `not_fetchable`, `pin_conflict`) is a `SOURCE_ERROR` whose `data` says
+/// `reason`; nothing is written.
+fn unit_pin(params: &Value, sources: &dyn SourceBackend) -> DispatchResult {
+    let unit = require_str(params, "unit")?;
+    if !unit.starts_with('@') || !unit.contains(':') {
+        return Err(invalid_params("\"unit\" must be a unit id, @source:path"));
+    }
+    let confirm = match params.get("confirm") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err(invalid_params("\"confirm\" must be a boolean")),
+    };
+    sources
+        .pin_unit(unit, confirm)
+        .map(|wire| serde_json::to_value(wire).expect("PinWire always serializes"))
+        .map_err(|e| (SOURCE_ERROR, e.message.clone(), Some(e.data())))
+}
+
+/// `unit.unpin {unit}` (atlas-27 PR-12, G11): removes the pin the unit
+/// names. A unit with no pin answers `status: "not_pinned"` and changes
+/// nothing. The files stay on disk and can be evicted again.
+fn unit_unpin(params: &Value, sources: &dyn SourceBackend) -> DispatchResult {
+    let unit = require_str(params, "unit")?;
+    if !unit.starts_with('@') || !unit.contains(':') {
+        return Err(invalid_params("\"unit\" must be a unit id, @source:path"));
+    }
+    sources
+        .unpin_unit(unit)
+        .map(|wire| serde_json::to_value(wire).expect("UnpinWire always serializes"))
         .map_err(|e| (SOURCE_ERROR, e.message.clone(), Some(e.data())))
 }
 
@@ -694,6 +738,8 @@ mod tests {
                 "source.set_cache",
                 "source.add_drive",
                 "resolve",
+                "unit.pin",
+                "unit.unpin",
             ]
         );
     }

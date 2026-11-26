@@ -5,6 +5,7 @@ pub mod clone_state;
 pub mod clone_sync;
 pub mod evict;
 pub mod fetch;
+pub mod pin;
 pub mod poll;
 pub mod safe_path;
 pub mod upload;

@@ -353,16 +353,23 @@ fn a_clean_clone_shows_no_changes_and_no_behind() {
 }
 
 #[test]
-fn a_saved_edit_is_one_change_within_two_seconds_and_nothing_is_committed() {
+fn a_saved_edit_is_one_change_seen_by_the_watcher_and_nothing_is_committed() {
     let r = CloneRig::start();
     let before = r.identity();
     let reflog_before = r.dan(&["reflog"]);
 
+    // The clock is the test's own and stands still, so no poll can run
+    // between the save and the count: the watcher saw the edit. How long
+    // that took on the wall clock is not asserted (a loaded host
+    // stretched it past any fixed bound); `wait_not_pushed` fails at the
+    // rig's WAIT if the watcher never delivers.
+    let polls_before = r.rig.d.registry.remote_polls_done();
     write(&r.clone(), "README.md", b"# Atlas\n\nedited by Dan\n");
-    let took = r.wait_not_pushed(1);
-    assert!(
-        took < Duration::from_secs(5),
-        "the watcher's debounce: {took:?}"
+    r.wait_not_pushed(1);
+    assert_eq!(
+        r.rig.d.registry.remote_polls_done(),
+        polls_before,
+        "the change was noticed by the watcher, not by a sync"
     );
     assert_eq!(r.state("README.md"), "not_pushed");
     assert_ne!(
