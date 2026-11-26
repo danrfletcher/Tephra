@@ -169,6 +169,8 @@ pub struct RemoteHub {
     pub(crate) resolve_lock: Mutex<()>,
     /// The pin downloads running now (PR-12), one per source.
     pub(crate) pin_jobs: crate::remote::pin::PinJobs,
+    /// What the removal of a source (PR-13) shares with its workers.
+    pub(crate) removal: crate::remote::remove::Removal,
     /// The registry the pin downloads fetch through: set by
     /// [`SourceRegistry::set_remote_hub`]. Weak, so the hub never keeps a
     /// registry alive.
@@ -248,6 +250,7 @@ impl RemoteHub {
             drive_watchers: Mutex::new(HashMap::new()),
             resolve_lock: Mutex::new(()),
             pin_jobs: Mutex::new(HashMap::new()),
+            removal: crate::remote::remove::Removal::default(),
             registry: std::sync::OnceLock::new(),
         })
     }
@@ -556,6 +559,16 @@ impl SourceRegistry {
         })
     }
 
+    /// Test-only (PR-13): `f` runs in every removal of a remote source that
+    /// is not forced, after its workers are paused and before the unsent
+    /// work is looked at for the last time. Does nothing with no hub.
+    #[doc(hidden)]
+    pub fn set_removal_pause_hook(&self, f: impl Fn() + Send + Sync + 'static) {
+        if let Some(hub) = self.remote.get() {
+            hub.set_removal_pause_hook(f);
+        }
+    }
+
     /// `source.add_github`: registers ONE repository on ONE branch and takes
     /// its listing at one commit (see the module doc). Blocking: call it
     /// from a blocking thread.
@@ -711,11 +724,16 @@ impl SourceRegistry {
     /// short or whose cursor row is lost. A source whose index is complete
     /// costs no adapter call.
     ///
+    /// A directory under `remote/` that no source owns (a removal cut short
+    /// after its rows went) is deleted.
+    ///
     /// No download survives a restart: an item that says `downloading` is
     /// `remote` again and the temporary files of a fetch that was cut off
     /// are swept ([`SourceRegistry::clean_up_after_downloads`]).
     pub fn resume_remote_sources(&self) {
         if let Some(hub) = self.remote.get() {
+            // A removal cut short between its two deletes (PR-13).
+            self.remove_orphan_remote_dirs(hub);
             self.clean_up_after_downloads(hub);
             self.reconcile_cache_copies();
         }

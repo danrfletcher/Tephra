@@ -150,7 +150,9 @@ impl SourceRegistry {
         if is_drive {
             self.spawn_drive_upload(name);
         }
+        let generation = hub.generation(name);
         let job = PollJob {
+            generation,
             // Fixed here, not when the task first runs.
             first_due: if listing_cut_off {
                 hub.clock.now()
@@ -262,6 +264,10 @@ enum Phase {
 }
 
 struct PollJob {
+    /// The source's generation when this poller started: a removal moves it
+    /// and the poller ends, leaving the maps to the poller of a source added
+    /// under the same name later.
+    generation: u64,
     first_due: SystemTime,
     name: String,
     cache_path: PathBuf,
@@ -309,8 +315,14 @@ impl PollJob {
         self.look_after_clone(Pass::Recount).await;
         loop {
             self.wait_until(due).await;
+            if self.superseded() {
+                return;
+            }
             let started = self.hub.clock.now();
             let step = self.poll().await;
+            if self.superseded() {
+                return;
+            }
             // After every sync, the source's git clone (if it has one) is
             // fetched and looked at, whatever the poll found: its rules do
             // not depend on the API being reachable.
@@ -362,9 +374,17 @@ impl PollJob {
         let _ = tokio::task::spawn_blocking(move || ctx.run(pass)).await;
     }
 
-    /// Returns once the hub's clock is at `due`.
+    /// The source was removed since this poller started.
+    fn superseded(&self) -> bool {
+        self.hub.generation(&self.name) != self.generation
+    }
+
+    /// Returns once the hub's clock is at `due`, or the source was removed.
     async fn wait_until(&self, due: SystemTime) {
         loop {
+            if self.superseded() {
+                return;
+            }
             match due.duration_since(self.hub.clock.now()) {
                 Ok(left) if !left.is_zero() => {
                     tokio::time::sleep(left.min(self.hub.poll_tick)).await
@@ -405,6 +425,11 @@ impl PollJob {
     }
 
     async fn poll(&self) -> Step {
+        // A removal of the source is under way: no request, no write. The
+        // poller looks again soon (the removal may be refused).
+        if self.hub.is_removing(&self.name) {
+            return Step::Again(self.hub.poll_tick);
+        }
         let loaded = self
             .db(|c, n| Ok((c.remote_source(n)?, c.remote_poll_state(n)?)))
             .await;

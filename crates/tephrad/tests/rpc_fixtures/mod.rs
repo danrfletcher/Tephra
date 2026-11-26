@@ -124,6 +124,10 @@ impl GraphBackend for MockGraph {
 pub struct MockSources {
     register: Mutex<HashMap<String, Result<ScanStatsWire, String>>>,
     unregister: Mutex<HashMap<String, Result<(), String>>>,
+    /// What `unregister_checked` answers by name (PR-13), and the `force`
+    /// each call carried.
+    unregister_checked: Mutex<HashMap<String, Result<(), tephrad::rpc::backend::UnregisterError>>>,
+    unregister_forces: Mutex<Vec<(String, bool)>>,
     list: Mutex<Option<Result<Vec<SourceRowWire>, String>>>,
     rescan: Mutex<HashMap<String, Result<ScanStatsWire, String>>>,
     search: Mutex<Option<Result<Vec<SearchHitWire>, SearchError>>>,
@@ -150,6 +154,23 @@ impl MockSources {
             .unwrap()
             .insert(name.to_string(), result);
         self
+    }
+
+    pub fn with_unregister_checked(
+        self,
+        name: &str,
+        result: Result<(), tephrad::rpc::backend::UnregisterError>,
+    ) -> Self {
+        self.unregister_checked
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), result);
+        self
+    }
+
+    /// `(name, force)` of every `source.unregister` that reached the backend.
+    pub fn unregister_forces(&self) -> Vec<(String, bool)> {
+        self.unregister_forces.lock().unwrap().clone()
     }
 
     pub fn with_list(self, result: Result<Vec<SourceRowWire>, String>) -> Self {
@@ -204,6 +225,23 @@ impl SourceBackend for MockSources {
             })
     }
 
+    fn unregister_checked(
+        &self,
+        name: &str,
+        force: bool,
+    ) -> Result<(), tephrad::rpc::backend::UnregisterError> {
+        self.unregister_forces
+            .lock()
+            .unwrap()
+            .push((name.to_string(), force));
+        match self.unregister_checked.lock().unwrap().get(name).cloned() {
+            Some(answer) => answer,
+            None => self
+                .unregister(name)
+                .map_err(tephrad::rpc::backend::UnregisterError::Failed),
+        }
+    }
+
     fn list(&self) -> Result<Vec<SourceRowWire>, String> {
         self.list.lock().unwrap().clone().unwrap_or(Ok(Vec::new()))
     }
@@ -251,6 +289,13 @@ impl tephrad::rpc::backend::SourceBackend for SharedMock {
     }
     fn unregister(&self, n: &str) -> Result<(), String> {
         self.0.unregister(n)
+    }
+    fn unregister_checked(
+        &self,
+        n: &str,
+        force: bool,
+    ) -> Result<(), tephrad::rpc::backend::UnregisterError> {
+        self.0.unregister_checked(n, force)
     }
     fn list(&self) -> Result<Vec<tephrad::rpc::backend::SourceRowWire>, String> {
         self.0.list()

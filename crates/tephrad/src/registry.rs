@@ -670,6 +670,13 @@ pub enum RegistryError {
     Fix(String),
     /// A remote (GitHub) source call refused or failed.
     Remote(crate::remote_github::RemoteAddError),
+    /// `source.unregister` of a remote source refused (PR-13): it holds
+    /// work the remote does not have, and `force` was not given. Nothing
+    /// was changed.
+    UnsentWork {
+        name: String,
+        work: tephra_cache::UnsentWork,
+    },
 }
 
 impl fmt::Display for RegistryError {
@@ -686,6 +693,9 @@ impl fmt::Display for RegistryError {
             RegistryError::Rename(e) => write!(f, "{e}"),
             RegistryError::Fix(m) => write!(f, "{m}"),
             RegistryError::Remote(e) => write!(f, "{e}"),
+            RegistryError::UnsentWork { name, work } => {
+                f.write_str(&crate::remote::remove::unsent_work_message(name, work))
+            }
         }
     }
 }
@@ -2095,8 +2105,35 @@ impl SourceRegistry {
     /// returns `Ok(())` both times rather than erroring. Only a call that
     /// really removed a registered source announces it (G16): one `removed`
     /// event, and none for an unknown name, since nothing changed.
+    ///
+    /// A remote source with work the remote does not have is refused
+    /// ([`RegistryError::UnsentWork`]); [`SourceRegistry::unregister_with`]
+    /// with `force` removes it anyway.
     pub fn unregister(&self, name: &str) -> Result<(), RegistryError> {
-        self.refuse_if_remote(name, "be removed yet")?;
+        self.unregister_with(name, false)
+    }
+
+    /// [`SourceRegistry::unregister`] with `force` (PR-13): a remote source
+    /// is removed even when it holds work the remote does not have, and
+    /// that work is discarded with the rest of what Tephra keeps for it
+    /// (see `remote/remove.rs`). `force` changes nothing for a local source.
+    /// A remote source that another removal took away first is
+    /// [`RegistryError::NotFound`]; any other unknown name is still `Ok`.
+    pub fn unregister_with(&self, name: &str, force: bool) -> Result<(), RegistryError> {
+        let remote = {
+            let cache = self.cache.lock().unwrap();
+            cache.get_source(name)?.is_some_and(|row| row.is_remote())
+        };
+        if remote {
+            let Some(hub) = self.remote.get().cloned() else {
+                return Err(RegistryError::Remote(
+                    crate::remote_github::RemoteAddError::Failed(format!(
+                        "\"{name}\" is a remote source and this daemon has no remote support"
+                    )),
+                ));
+            };
+            return self.remove_remote_source(&hub, name, force);
+        }
         if let Some(running) = self.running.lock().unwrap().remove(name) {
             running.handle.stop();
             // A batch already running for this source can no longer send
@@ -2237,6 +2274,13 @@ impl SourceRegistry {
     /// Whether `name` is currently marked `permission_denied`.
     pub fn is_permission_denied(&self, name: &str) -> bool {
         self.permission_denied.lock().unwrap().contains(name)
+    }
+
+    /// Drops what the registry keeps in memory for the source `name`: its
+    /// rename-guard entries and its permission-denied mark.
+    pub(crate) fn forget_runtime_state(&self, name: &str) {
+        self.renames.remove_source(name);
+        self.set_permission_denied(name, false);
     }
 
     fn set_permission_denied(&self, name: &str, denied: bool) {

@@ -30,6 +30,7 @@ mod remote_fetch;
 mod remote_ops;
 mod remote_pins;
 mod remote_sync;
+mod remote_unsent;
 mod remote_upload;
 mod schema;
 mod search;
@@ -58,7 +59,7 @@ pub use pending_fixes::{
     NewPendingFix, PendingFixRow, PendingOp, STATE_NEEDS_MANUAL_FIX, STATE_PENDING,
 };
 pub use promote::{NewPromote, NewUnpromote, Promoted, PromotedRootRow, Unpromoted};
-pub use remote::{REMOTE_ITEM_STATES, REMOTE_SOURCE_KINDS, REMOTE_TABLES};
+pub use remote::{REMOTE_ITEM_STATES, REMOTE_SOURCE_KINDS, REMOTE_SOURCE_TABLES, REMOTE_TABLES};
 pub use remote_clone::{
     clone_reason_not_on_branch, is_clone_reason, CloneChanges, CloneState,
     CLONE_FETCH_REASON_PREFIX, CLONE_REASON_DIVERGED, CLONE_REASON_REWRITTEN,
@@ -82,6 +83,7 @@ pub use remote_sync::{
     REASON_DELETED_ON_REMOTE, REASON_READDED_AFTER_DELETE, STATUS_AUTH_REQUIRED,
     STATUS_NEEDS_ATTENTION, STATUS_OFFLINE, STATUS_SYNCING,
 };
+pub use remote_unsent::UnsentWork;
 pub use remote_upload::{
     upload_backoff_secs, DriveConflict, DriveHolds, QueuedEdit, UploadEntry, UploadLanded,
     HELD_ITEMS_LISTED, REASON_CHANGED_ON_DRIVE, UPLOAD_BACKOFF_CAP_SECS, UPLOAD_REFUSED_PREFIX,

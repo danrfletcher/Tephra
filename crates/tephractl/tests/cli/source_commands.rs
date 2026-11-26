@@ -117,6 +117,7 @@ fn source_remove_sends_list_then_unregister_and_confirms_removal() {
     let outcome = commands::execute(
         &Command::SourceRemove {
             name: "notes".to_string(),
+            force: false,
         },
         false,
         &client,
@@ -148,6 +149,7 @@ fn source_remove_on_an_unknown_name_reports_not_found_without_calling_unregister
     let outcome = commands::execute(
         &Command::SourceRemove {
             name: "ghost".to_string(),
+            force: false,
         },
         false,
         &client,
@@ -624,6 +626,7 @@ fn source_remove_of_a_promoted_name_still_lists_first_then_unregisters() {
     let outcome = commands::execute(
         &Command::SourceRemove {
             name: "tephrad".to_string(),
+            force: false,
         },
         false,
         &client,
@@ -789,4 +792,122 @@ fn source_list_json_carries_the_counts_byte_for_byte() {
     let reason = rows[3]["status_reason"].as_str().unwrap();
     assert!(reason.starts_with("history rewritten on GitHub"));
     assert!(reason.contains("git pull --rebase"), "{reason}");
+}
+
+fn remove_g(
+    force: bool,
+    json: bool,
+    second: Behavior,
+) -> (commands::CommandOutcome, Vec<serde_json::Value>) {
+    let list = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": [
+        {"name": "g", "root": "/r", "status": "active", "kind": "github", "files": 5},
+    ]});
+    let server = MockServer::start(vec![
+        Behavior::Respond {
+            status: 200,
+            body: list,
+        },
+        second,
+    ]);
+    let client = client_for(&server);
+    let mut stdin: &[u8] = &[];
+    let outcome = commands::execute(
+        &Command::SourceRemove {
+            name: "g".to_string(),
+            force,
+        },
+        json,
+        &client,
+        &mut stdin,
+    );
+    let sent = server.received().into_iter().map(|r| r.body).collect();
+    (outcome, sent)
+}
+
+#[test]
+fn source_remove_refused_for_unsent_work_prints_the_counts_and_the_force_hint() {
+    let (outcome, sent) = remove_g(
+        false,
+        false,
+        Behavior::Respond {
+            status: 200,
+            body: load_fixture("source_unregister_unsent_work"),
+        },
+    );
+    assert_eq!(outcome.exit_code, 1);
+    assert_eq!(outcome.stdout, "");
+    assert_eq!(
+        outcome.stderr,
+        load_expected("source_remove_refused_rendered")
+    );
+    assert!(
+        sent[1]["params"].get("force").is_none(),
+        "no force unless asked"
+    );
+}
+
+#[test]
+fn source_remove_refused_json_is_one_object_on_stdout_with_exit_1() {
+    let (outcome, _) = remove_g(
+        false,
+        true,
+        Behavior::Respond {
+            status: 200,
+            body: load_fixture("source_unregister_unsent_work"),
+        },
+    );
+    assert_eq!(outcome.exit_code, 1);
+    assert_eq!(outcome.stderr, "");
+    assert_eq!(outcome.stdout, load_expected("source_remove_refused_json"));
+}
+
+#[test]
+fn source_remove_force_sends_the_json_boolean_true() {
+    let (outcome, sent) = remove_g(
+        true,
+        false,
+        Behavior::Respond {
+            status: 200,
+            body: load_fixture("source_unregister_success"),
+        },
+    );
+    assert_eq!(outcome.exit_code, 0, "stderr: {}", outcome.stderr);
+    assert_eq!(outcome.stdout, "Removed source \"g\"\n");
+    assert_eq!(sent[1]["method"], "source.unregister");
+    assert_eq!(
+        sent[1]["params"],
+        serde_json::json!({"name": "g", "force": true})
+    );
+}
+
+#[test]
+fn source_remove_prints_only_the_kinds_that_hold_something() {
+    let body = serde_json::json!({"jsonrpc": "2.0", "id": 1, "error": {
+        "code": -32011,
+        "message": "x",
+        "data": {"reason": "unsent_work", "not_pushed": 1, "pending_upload": 0, "needs_attention": 0}
+    }});
+    let (outcome, _) = remove_g(false, false, Behavior::Respond { status: 200, body });
+    assert_eq!(outcome.exit_code, 1);
+    assert!(
+        outcome.stderr.contains("  1 not pushed\n"),
+        "{}",
+        outcome.stderr
+    );
+    assert!(!outcome.stderr.contains("pending upload"));
+    assert!(!outcome.stderr.contains("needs attention"));
+}
+
+#[test]
+fn source_remove_other_refusals_still_read_as_errors() {
+    let body = serde_json::json!({"jsonrpc": "2.0", "id": 1, "error": {
+        "code": -32011, "message": "could not delete the files Tephra keeps for \"g\" (permission denied); the source is still registered, try again"
+    }});
+    let (outcome, _) = remove_g(true, false, Behavior::Respond { status: 200, body });
+    assert_eq!(outcome.exit_code, 1);
+    assert!(
+        outcome.stderr.starts_with("tephractl: could not delete"),
+        "{}",
+        outcome.stderr
+    );
 }

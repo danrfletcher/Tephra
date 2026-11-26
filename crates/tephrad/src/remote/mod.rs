@@ -7,5 +7,6 @@ pub mod evict;
 pub mod fetch;
 pub mod pin;
 pub mod poll;
+pub mod remove;
 pub mod safe_path;
 pub mod upload;

@@ -377,6 +377,15 @@ pub trait SourceBackend: Send + Sync {
         self.register(name, root).map_err(PromoteRpcError::Failed)
     }
     fn unregister(&self, name: &str) -> Result<(), String>;
+
+    /// [`SourceBackend::unregister`] with `force` (PR-13), and a refusal that
+    /// carries its counts: what the dispatcher calls. A remote source that
+    /// holds work the remote does not have is [`UnregisterError::UnsentWork`]
+    /// unless `force`. The default has no refusals to give (a test double):
+    /// it unregisters the plain way and ignores `force`.
+    fn unregister_checked(&self, name: &str, _force: bool) -> Result<(), UnregisterError> {
+        self.unregister(name).map_err(UnregisterError::Failed)
+    }
     fn list(&self) -> Result<Vec<SourceRowWire>, String>;
     fn rescan(&self, name: &str) -> Result<ScanStatsWire, String>;
     /// `source.add_github` (PR-5): one repository on one branch. The
@@ -538,6 +547,25 @@ pub trait SourceBackend: Send + Sync {
     }
 }
 
+/// Why `source.unregister` did not remove the source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnregisterError {
+    /// The source holds work the remote does not have, and `force` was not
+    /// given (PR-13). Nothing was changed.
+    UnsentWork {
+        message: String,
+        work: tephra_cache::UnsentWork,
+    },
+    /// Refused for another reason, with its stable `reason`.
+    Refused {
+        reason: &'static str,
+        message: String,
+    },
+    /// No such source (another removal got there first).
+    NotFound(String),
+    Failed(String),
+}
+
 impl SourceBackend for SourceRegistry {
     fn register(&self, name: &str, root: &str) -> Result<ScanStatsWire, String> {
         SourceRegistry::register(self, name, root)
@@ -596,6 +624,20 @@ impl SourceBackend for SourceRegistry {
     }
     fn unregister(&self, name: &str) -> Result<(), String> {
         SourceRegistry::unregister(self, name).map_err(registry_err_to_string)
+    }
+    fn unregister_checked(&self, name: &str, force: bool) -> Result<(), UnregisterError> {
+        SourceRegistry::unregister_with(self, name, force).map_err(|e| match e {
+            RegistryError::UnsentWork { work, .. } => UnregisterError::UnsentWork {
+                message: e.to_string(),
+                work,
+            },
+            RegistryError::Remote(crate::remote_github::RemoteAddError::Refused {
+                reason,
+                message,
+            }) => UnregisterError::Refused { reason, message },
+            e @ RegistryError::NotFound(_) => UnregisterError::NotFound(e.to_string()),
+            e => UnregisterError::Failed(registry_err_to_string(e)),
+        })
     }
     fn list(&self) -> Result<Vec<SourceRowWire>, String> {
         SourceRegistry::list_with_runtime_status(self)

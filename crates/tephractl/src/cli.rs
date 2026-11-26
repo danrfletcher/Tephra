@@ -25,7 +25,7 @@ USAGE:
     tephractl source promote <name> <path> [--json]
     tephractl source unpromote <name> [--json]
     tephractl source rename <old> <new> [--json]
-    tephractl source remove <name> [--json]
+    tephractl source remove <name> [--force] [--json]
     tephractl source list [--json]
     tephractl status [--json]
     tephractl ls <source> [folder] [-r] [--json]
@@ -302,8 +302,12 @@ pub enum Command {
         name: String,
         folder: String,
     },
+    /// `source remove <name> [--force]`. A GitHub or Drive source that
+    /// holds work the remote does not have is refused unless `force`,
+    /// which discards that work and the cache (never the remote).
     SourceRemove {
         name: String,
+        force: bool,
     },
     /// `source promote <name> <path>`: a folder of a registered source
     /// becomes the source `name`.
@@ -677,8 +681,18 @@ fn parse_source<'a>(
                 .next()
                 .ok_or_else(|| ArgsError("source remove requires <name>".to_string()))?
                 .to_string();
-            let (json, addr) = parse_trailing_flags(iter)?;
-            Ok((Command::SourceRemove { name }, json, addr))
+            let mut force = false;
+            let mut json = false;
+            let mut addr = None;
+            while let Some(arg) = iter.next() {
+                match arg {
+                    "--force" => force = true,
+                    "--json" => json = true,
+                    "--addr" => addr = Some(take_value(iter, "--addr")?),
+                    other => return Err(ArgsError(format!("unrecognized argument: {other}"))),
+                }
+            }
+            Ok((Command::SourceRemove { name, force }, json, addr))
         }
         "list" => {
             let (json, addr) = parse_trailing_flags(iter)?;
@@ -1853,9 +1867,41 @@ mod tests {
         assert_eq!(
             parsed.command,
             Command::SourceRemove {
-                name: "notes".to_string()
+                name: "notes".to_string(),
+                force: false
             }
         );
+    }
+
+    #[test]
+    fn source_remove_force_parses_before_or_after_json_and_addr() {
+        for argv in [
+            &["source", "remove", "g", "--force"][..],
+            &["source", "remove", "g", "--force", "--json"],
+            &["source", "remove", "g", "--json", "--force"],
+            &["source", "remove", "g", "--addr", "127.0.0.1:1", "--force"],
+            &["source", "remove", "g", "--force", "--addr", "127.0.0.1:1"],
+        ] {
+            let parsed = run(argv).unwrap();
+            assert_eq!(
+                parsed.command,
+                Command::SourceRemove {
+                    name: "g".to_string(),
+                    force: true
+                },
+                "{argv:?}"
+            );
+        }
+        assert!(run(&["source", "remove", "g", "--json"]).is_ok());
+        assert!(run(&["source", "remove", "g", "--forced"]).is_err());
+        assert!(run(&["source", "remove", "g", "extra"]).is_err());
+        assert!(run(&["source", "remove", "--force"])
+            .map(|p| p.command)
+            .is_ok_and(|c| c
+                == Command::SourceRemove {
+                    name: "--force".to_string(),
+                    force: false
+                }));
     }
 
     #[test]

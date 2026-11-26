@@ -152,6 +152,20 @@ impl CloneCtx {
         }
     }
 
+    /// One [`Pass::Recount`] with no lock taken: the caller holds the
+    /// clone's lock (a removal, which looks at the clone for the last time
+    /// with every pass held off). No network. Errors are logged, as in
+    /// [`CloneCtx::run`].
+    pub(crate) fn recount_locked(&self) -> Outcome {
+        match self.pass(Pass::Recount) {
+            Ok(outcome) => outcome,
+            Err(why) => {
+                tracing::warn!(source = %self.name, why, "the clone was not looked at");
+                Outcome::Skipped
+            }
+        }
+    }
+
     fn db<T>(&self, f: impl Fn() -> Result<T, tephra_cache::CacheError>) -> Result<T, String> {
         retry_cache_on_busy(&self.gate, f).map_err(|e| e.to_string())
     }

@@ -122,7 +122,7 @@ pub fn execute_with_terminal<R: BufRead, W: Write>(
         Command::SourcePromote { name, path } => source_promote(name, path, json, client),
         Command::SourceUnpromote { name } => source_unpromote(name, json, client),
         Command::SourceRename { old, new } => source_rename(old, new, json, client),
-        Command::SourceRemove { name } => source_remove(name, json, client),
+        Command::SourceRemove { name, force } => source_remove(name, *force, json, client),
         Command::SourceList => source_list(json, client),
         Command::Status => status(json, client),
         Command::Ls {
@@ -347,7 +347,7 @@ fn source_rename(old: &str, new: &str, json: bool, client: &RpcClient) -> Comman
     }
 }
 
-fn source_remove(name: &str, json: bool, client: &RpcClient) -> CommandOutcome {
+fn source_remove(name: &str, force: bool, json: bool, client: &RpcClient) -> CommandOutcome {
     // T1: tephrad's `source.unregister` is intentionally idempotent
     // (`registry::Registry::unregister`'s doc comment: "calling this
     // twice on an already-removed source returns Ok(()) both times
@@ -375,12 +375,41 @@ fn source_remove(name: &str, json: bool, client: &RpcClient) -> CommandOutcome {
         Err(e) => return CommandOutcome::err(describe_error(&e)),
     }
 
-    match client.call("source.unregister", json!({"name": name})) {
+    // `force` is sent only when given, and as the JSON boolean the daemon
+    // requires. The call is never retried on a lost connection (R1).
+    let params = if force {
+        json!({"name": name, "force": true})
+    } else {
+        json!({"name": name})
+    };
+    match client.call("source.unregister", params) {
         Ok(result) => CommandOutcome::ok(json_or(
             &result,
             || render::render_source_removed(name),
             json,
         )),
+        Err(RpcCallError::Rpc { data, .. })
+            if data
+                .as_ref()
+                .and_then(|d| d.get("reason"))
+                .and_then(Value::as_str)
+                == Some("unsent_work") =>
+        {
+            let data = data.unwrap_or(Value::Null);
+            if json {
+                CommandOutcome {
+                    exit_code: 1,
+                    stdout: render::render_source_remove_refused_json(name, &data),
+                    stderr: String::new(),
+                }
+            } else {
+                CommandOutcome {
+                    exit_code: 1,
+                    stdout: String::new(),
+                    stderr: render::render_source_remove_refused(name, &data),
+                }
+            }
+        }
         Err(RpcCallError::Rpc { message, .. }) if render::error_means_not_found(&message) => {
             CommandOutcome {
                 exit_code: 1,

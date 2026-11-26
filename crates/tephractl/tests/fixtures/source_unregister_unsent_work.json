@@ -1,0 +1,14 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "error": {
+    "code": -32011,
+    "message": "\"g\" holds work that has not reached the remote (3 not pushed, 1 pending upload, 2 needs attention); removing it with force discards your local edits and the cache and never touches the remote",
+    "data": {
+      "reason": "unsent_work",
+      "not_pushed": 3,
+      "pending_upload": 1,
+      "needs_attention": 2
+    }
+  }
+}

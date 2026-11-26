@@ -7,7 +7,9 @@
 use serde_json::json;
 use tephra_graph::{Edge, EdgeTarget, ResolveError, ResolveResult, UnitMetadata};
 
-use crate::rpc_fixtures::{spawn, MockGraph, MockSources};
+use crate::rpc_fixtures::{
+    spawn, spawn_with_token_and_any_sources, MockGraph, MockSources, SharedMock,
+};
 
 fn sample_unit() -> UnitMetadata {
     UnitMetadata {
@@ -298,4 +300,142 @@ async fn source_list_and_source_register_route_through_the_mock_registry_over_ht
         .await
         .unwrap();
     assert_eq!(register["result"]["units_written"], json!(3));
+}
+
+async fn call(
+    server: &crate::rpc_fixtures::TestServer,
+    params: serde_json::Value,
+) -> serde_json::Value {
+    reqwest::Client::new()
+        .post(server.http_url())
+        .bearer_auth(&server.token)
+        .json(
+            &json!({ "jsonrpc": "2.0", "id": 1, "method": "source.unregister", "params": params }),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn source_unregister_force_is_a_json_boolean_and_reaches_the_backend() {
+    let sources = std::sync::Arc::new(MockSources::new().with_unregister("vault", Ok(())));
+    let server = spawn_with_token_and_any_sources(
+        MockGraph::new(),
+        SharedMock(sources.clone()),
+        "force-token",
+    )
+    .await;
+
+    for bad in [
+        json!("true"),
+        json!(1),
+        json!(null),
+        json!([true]),
+        json!({}),
+    ] {
+        let reply = call(&server, json!({ "name": "vault", "force": bad })).await;
+        assert_eq!(reply["error"]["code"], json!(-32602), "{bad}: {reply}");
+    }
+    assert_eq!(
+        sources.unregister_forces(),
+        Vec::<(String, bool)>::new(),
+        "an invalid force never reaches the backend, so nothing is removed"
+    );
+
+    assert!(call(&server, json!({ "name": "vault" }))
+        .await
+        .get("error")
+        .is_none());
+    assert!(call(&server, json!({ "name": "vault", "force": false }))
+        .await
+        .get("error")
+        .is_none());
+    assert!(call(&server, json!({ "name": "vault", "force": true }))
+        .await
+        .get("error")
+        .is_none());
+    assert_eq!(
+        sources.unregister_forces(),
+        vec![
+            ("vault".to_string(), false),
+            ("vault".to_string(), false),
+            ("vault".to_string(), true),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn source_unregister_unsent_work_is_a_source_error_with_the_counts() {
+    use tephrad::rpc::backend::UnregisterError;
+    let work = tephra_cache::UnsentWork {
+        not_pushed: 2,
+        pending_upload: 1,
+        needs_attention: 3,
+    };
+    let sources = MockSources::new().with_unregister_checked(
+        "g",
+        Err(UnregisterError::UnsentWork {
+            message: "\"g\" holds work that has not reached the remote".to_string(),
+            work,
+        }),
+    );
+    let server = spawn(MockGraph::new(), sources).await;
+    let reply = call(&server, json!({ "name": "g" })).await;
+    assert_eq!(reply["error"]["code"], json!(-32011), "{reply}");
+    assert_eq!(
+        reply["error"]["data"],
+        json!({
+            "reason": "unsent_work",
+            "not_pushed": 2,
+            "pending_upload": 1,
+            "needs_attention": 3,
+        })
+    );
+}
+
+/// The `removed` event of a `source.unregister` made over HTTP reaches a
+/// WebSocket client, and the HTTP answer itself carries no event (HTTP has
+/// no push channel). The server here has a mock registry and so no
+/// forwarder: the push is built by the forwarder's own payload function from
+/// the event the registry sends. The whole chain, from a real removal to the
+/// pushes, is `tests/remote_source_remove.rs`
+/// (`a_removal_over_http_and_one_over_websocket_each_send_one_removed_event`).
+#[tokio::test]
+async fn source_unregister_over_http_answers_null_and_the_removed_event_reaches_a_websocket_client()
+{
+    use futures_util::StreamExt;
+    use tephrad::registry::{DaemonEvent, SourceChange, SourceChangeKind};
+
+    let sources = MockSources::new().with_unregister("g", Ok(()));
+    let server = spawn(MockGraph::new(), sources).await;
+    let mut ws = crate::rpc_fixtures::connect_ws(&server.ws_url(), &server.token)
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let reply = call(&server, json!({ "name": "g" })).await;
+    assert_eq!(reply["result"], json!(null), "{reply}");
+    assert!(reply.get("error").is_none(), "{reply}");
+    assert!(reply.get("sources_changed").is_none());
+
+    server.broadcast_graph_changed(tephrad::forward::payload(&DaemonEvent::SourceListChanged {
+        changes: vec![SourceChange::new(SourceChangeKind::Removed, "g")],
+        fixes: Vec::new(),
+    }));
+    let pushed = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
+        .await
+        .expect("the push arrives")
+        .expect("stream not closed")
+        .expect("not a transport error");
+    let push: serde_json::Value = serde_json::from_str(&pushed.into_text().unwrap()).unwrap();
+    assert!(push.get("id").is_none(), "a notification has no id");
+    assert_eq!(push["method"], json!("graph:changed"));
+    assert_eq!(
+        push["params"]["sources_changed"],
+        json!([{ "kind": "removed", "name": "g" }])
+    );
 }

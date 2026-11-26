@@ -273,3 +273,29 @@ fn unpromote_is_named_and_the_docs_say_it_is_not_an_undo() {
         "unpromote is built"
     );
 }
+
+#[test]
+fn the_docs_say_source_remove_takes_force_and_how_a_refusal_looks() {
+    let readme = doc("README.md");
+    let architecture = doc("docs/ARCHITECTURE.md");
+    assert!(readme.contains("`source remove <name> [--force]`"));
+    assert!(architecture.contains("`tephractl source remove <name> [--force]`"));
+    for (name, text) in [
+        ("README.md", &readme),
+        ("docs/ARCHITECTURE.md", &architecture),
+    ] {
+        for needle in [
+            "unsent_work",
+            "not_pushed",
+            "pending_upload",
+            "needs_attention",
+        ] {
+            assert!(text.contains(needle), "{name} never mentions {needle}");
+        }
+    }
+    assert!(
+        !readme.contains("cannot be removed yet")
+            && !architecture.contains("cannot be removed yet"),
+        "removal is built"
+    );
+}

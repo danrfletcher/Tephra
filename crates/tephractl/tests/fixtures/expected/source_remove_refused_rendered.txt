@@ -1,0 +1,5 @@
+tephractl: "g" holds work that has not reached the remote; nothing was removed
+  3 not pushed
+  1 pending upload
+  2 needs attention
+Run it again with --force to discard your local edits and the cache. The remote is never touched.

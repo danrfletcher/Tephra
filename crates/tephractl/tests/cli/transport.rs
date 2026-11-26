@@ -202,6 +202,28 @@ fn source_unregister_is_never_retried_on_a_dropped_connection() {
     assert_eq!(server.call_count(), 1);
 }
 
+/// PR-13: the same with `force`: a removal that discards work is never
+/// sent twice, whatever its parameters.
+#[test]
+fn source_unregister_with_force_is_never_retried_on_a_dropped_connection() {
+    let server = MockServer::start(vec![
+        Behavior::Drop,
+        Behavior::Respond {
+            status: 200,
+            body: ok_envelope(serde_json::Value::Null),
+        },
+    ]);
+    let client = RpcClient::new(server.addr.clone(), "token".to_string());
+
+    let result = client.call(
+        "source.unregister",
+        serde_json::json!({"name": "g", "force": true}),
+    );
+
+    assert!(matches!(result, Err(RpcCallError::Ambiguous(_))));
+    assert_eq!(server.call_count(), 1);
+}
+
 /// R1: a long-running method (`source.register`) gets a longer
 /// per-attempt timeout than an ordinary method, so a daemon that is
 /// merely slow (not hung forever) on a big scan succeeds instead of

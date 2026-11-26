@@ -485,6 +485,56 @@ pub fn render_source_removed(name: &str) -> String {
     format!("Removed source \"{name}\"\n")
 }
 
+/// The counts of a refused `source remove`, from the `data` of the
+/// daemon's `unsent_work` error: `(label, count)` for every kind that
+/// holds something, in the order `source list` shows them.
+fn unsent_counts(data: &Value) -> Vec<(&'static str, u64)> {
+    [
+        ("not_pushed", "not pushed"),
+        ("pending_upload", "pending upload"),
+        ("needs_attention", "needs attention"),
+    ]
+    .into_iter()
+    .filter_map(|(key, label)| {
+        let n = data.get(key).and_then(Value::as_u64).unwrap_or(0);
+        (n > 0).then_some((label, n))
+    })
+    .collect()
+}
+
+/// What `source remove` prints (to stderr) when the daemon refuses
+/// because the source holds work the remote does not have.
+pub fn render_source_remove_refused(name: &str, data: &Value) -> String {
+    let mut out = format!(
+        "tephractl: \"{name}\" holds work that has not reached the remote; nothing was removed\n"
+    );
+    for (label, n) in unsent_counts(data) {
+        out.push_str(&format!("  {n} {label}\n"));
+    }
+    out.push_str(
+        "Run it again with --force to discard your local edits and the cache. \
+         The remote is never touched.\n",
+    );
+    out
+}
+
+/// `--json` of the same refusal: one object on stdout, exit 1.
+pub fn render_source_remove_refused_json(name: &str, data: &Value) -> String {
+    let count = |key: &str| data.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let value = serde_json::json!({
+        "removed": false,
+        "name": name,
+        "reason": "unsent_work",
+        "not_pushed": count("not_pushed"),
+        "pending_upload": count("pending_upload"),
+        "needs_attention": count("needs_attention"),
+    });
+    format!(
+        "{}\n",
+        serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())
+    )
+}
+
 pub fn render_source_not_found(name: &str) -> String {
     format!("source \"{name}\" not found\n")
 }

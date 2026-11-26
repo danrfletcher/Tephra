@@ -352,6 +352,25 @@ impl FetchEngine {
     fn next_serial(&self) -> u64 {
         self.serial.fetch_add(1, Ordering::Relaxed)
     }
+
+    /// Waits, at most `bound`, until no download of `source` is running.
+    /// A removal calls it after it has told the downloads to stop (they
+    /// look at [`RemoteHub::is_removing`] at every chunk).
+    pub(crate) fn wait_idle(&self, source: &str, bound: std::time::Duration) {
+        let until = std::time::Instant::now() + bound;
+        loop {
+            let running = self
+                .flights
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .keys()
+                .any(|(s, _)| s == source);
+            if !running || std::time::Instant::now() >= until {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
 }
 
 pub(crate) enum Role {
@@ -494,6 +513,14 @@ pub(crate) fn not_fetchable_item(
     Some(error)
 }
 
+/// What a fetch of a file of a source that is being removed answers.
+fn removing_refusal() -> FetchRpcError {
+    FetchRpcError::new(
+        "source_removing",
+        "the source is being removed; nothing is fetched for it",
+    )
+}
+
 // ---- the registry's side -------------------------------------------------------------
 
 impl SourceRegistry {
@@ -562,6 +589,9 @@ impl SourceRegistry {
         // A lost race (the row changed between reading and acting) reads
         // the row again; three goes are more than a race needs.
         for _ in 0..3 {
+            if hub.is_removing(source) {
+                return Err(removing_refusal());
+            }
             // First, before the row is read: the eviction pass's claim is
             // conditional on `last_used`, so from here the file counts as
             // used and cannot be dropped under this call.
@@ -660,6 +690,7 @@ impl SourceRegistry {
             }),
             Role::Lead(guard) => {
                 let outcome = self.lead(hub, source, row, &layout);
+                self.sweep_dir_of_gone_source(hub, &row.source);
                 let outcome = match outcome {
                     Lead::Lost => {
                         // The row is not ours to change any more. Wake the
@@ -785,6 +816,16 @@ impl SourceRegistry {
         }
     }
 
+    /// A download that ends after its source was removed (one that did not
+    /// stop within the removal's wait) leaves no directory behind: the
+    /// removal deleted `remote/<name>/` and this keeps the download from
+    /// making it again.
+    fn sweep_dir_of_gone_source(&self, hub: &RemoteHub, source: &str) {
+        if matches!(self.fetch_db(|c| c.remote_source(source)), Ok(None)) {
+            let _ = crate::remote::remove::remove_dir_safely(&hub.cache_dir(source));
+        }
+    }
+
     fn fail(&self, row: &RemoteFetchRow, f: FetchFailure) -> Lead {
         let reason = f.message.clone();
         if let Err(e) = self.fetch_db(|c| c.fail_remote_download(&row.source, &row.path, &reason)) {
@@ -803,6 +844,12 @@ impl SourceRegistry {
         row: &RemoteFetchRow,
         layout: &Layout,
     ) -> Result<Downloaded, FetchFailure> {
+        if hub.is_removing(&row.source) {
+            return Err(failure(
+                "interrupted",
+                "the source is being removed; nothing is downloaded for it",
+            ));
+        }
         let origin = Origin::of(source, row)?;
 
         // A GitHub copy already there is never replaced: its bytes can be
@@ -896,6 +943,12 @@ impl SourceRegistry {
                 .block_on(body.chunk())
                 .map_err(|e| remote_failure(&e, now_secs_val, service))?;
             let Some(piece) = piece else { break };
+            if hub.is_removing(&row.source) {
+                return Err(failure(
+                    "interrupted",
+                    "the source is being removed; the download stopped",
+                ));
+            }
             written += piece.len() as u64;
             if listed.is_some_and(|size| written > size) {
                 return Err(mismatch(row, written, listed));

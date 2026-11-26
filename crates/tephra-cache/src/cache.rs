@@ -516,6 +516,9 @@ impl Cache {
     /// (not an error) if no source with this name exists, so
     /// `source.unregister` can be called twice on an already-removed
     /// source without erroring.
+    ///
+    /// The remote tables are not touched: a local source's removal leaves
+    /// them alone. [`Cache::delete_remote_source`] removes a remote source.
     pub fn delete_source(&self, name: &str) -> Result<(), CacheError> {
         if let Some(row) = self.get_source(name)? {
             units::delete_units_for_source(&self.conn, row.id)?;
@@ -523,6 +526,32 @@ impl Cache {
                 .execute("DELETE FROM scan_state WHERE source_id = ?1", [row.id])?;
             self.conn
                 .execute("DELETE FROM sources WHERE id = ?1", [row.id])?;
+        }
+        Ok(())
+    }
+
+    /// Deletes a remote source: [`Cache::delete_source`], and every row of
+    /// the remote tables ([`crate::REMOTE_SOURCE_TABLES`]: the listing, the
+    /// upload buffer, the pins, the cursor and the rest) kept for `name`,
+    /// all in one transaction (inside a caller's open one, the statements
+    /// join it). All or nothing: a failure leaves every row in place.
+    /// Idempotent. The rows of a name with no `sources` row go too, so
+    /// what a crash left behind is removed by the next call. Only the
+    /// named source's rows are deleted; the link fixes (`fix_log`,
+    /// `pending_fixes`, `promoted_roots`) are the vault's history and stay.
+    pub fn delete_remote_source(&self, name: &str) -> Result<(), CacheError> {
+        let own_tx = if self.conn.is_autocommit() {
+            Some(self.conn.unchecked_transaction()?)
+        } else {
+            None
+        };
+        self.delete_source(name)?;
+        for (table, column) in crate::REMOTE_SOURCE_TABLES {
+            self.conn
+                .execute(&format!("DELETE FROM {table} WHERE {column} = ?1"), [name])?;
+        }
+        if let Some(tx) = own_tx {
+            tx.commit()?;
         }
         Ok(())
     }

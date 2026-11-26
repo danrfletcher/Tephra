@@ -207,7 +207,7 @@ fn f1_f12_nothing_is_written_under_the_data_dir_remote_and_the_only_reads_are_th
 }
 
 #[test]
-fn f2_remote_sources_cannot_be_renamed_or_removed_in_this_slice() {
+fn f2_remote_sources_cannot_be_renamed_but_can_be_removed_since_pr_13() {
     let fake = Fake::start();
     fake.atlas();
     let d = Daemon::start(&fake);
@@ -215,9 +215,15 @@ fn f2_remote_sources_cannot_be_renamed_or_removed_in_this_slice() {
     d.wait_active("g");
     let rename = d.rpc("source.rename", json!({"name": "g", "new_name": "h"}));
     assert!(rename.get("error").is_some(), "{rename}");
+    assert!(
+        d.source_row("g").is_some(),
+        "a refused rename changes nothing"
+    );
+    // Removal is PR-13: a source with no unsent work goes (see
+    // `remote_source_remove.rs` for everything else about it).
     let remove = d.rpc("source.unregister", json!({"name": "g"}));
-    assert!(remove.get("error").is_some(), "{remove}");
-    assert!(d.source_row("g").is_some(), "still registered");
+    assert!(remove.get("error").is_none(), "{remove}");
+    assert!(d.source_row("g").is_none(), "removed");
     d.close();
 }
 

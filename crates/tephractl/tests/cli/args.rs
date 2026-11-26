@@ -301,3 +301,53 @@ fn auth_usage_errors_do_not_echo_the_argument() {
         assert!(!err.0.contains("SENTINEL"), "{args:?}: {err}");
     }
 }
+
+/// PR-13: `source remove <name> --force`, with `--json` and `--addr` on
+/// either side of it.
+#[test]
+fn source_remove_force_parses_around_json_and_addr() {
+    for argv in [
+        &["source", "remove", "g", "--force"][..],
+        &["source", "remove", "g", "--force", "--json"],
+        &["source", "remove", "g", "--json", "--force"],
+        &["source", "remove", "g", "--force", "--addr", "127.0.0.1:9"],
+        &["source", "remove", "g", "--addr", "127.0.0.1:9", "--force"],
+        &["--json", "source", "remove", "g", "--force"],
+    ] {
+        let parsed = run(argv).unwrap_or_else(|e| panic!("{argv:?}: {}", e.0));
+        assert_eq!(
+            parsed.command,
+            Command::SourceRemove {
+                name: "g".to_string(),
+                force: true
+            },
+            "{argv:?}"
+        );
+    }
+}
+
+#[test]
+fn source_remove_without_force_is_not_forced_and_still_needs_a_name() {
+    let parsed = run(&["source", "remove", "g"]).unwrap();
+    assert_eq!(
+        parsed.command,
+        Command::SourceRemove {
+            name: "g".to_string(),
+            force: false
+        }
+    );
+    assert!(cli::parse_args(["source", "remove"])
+        .unwrap_err()
+        .0
+        .contains("requires <name>"));
+    assert!(cli::parse_args(["source", "remove", "g", "--forse"]).is_err());
+}
+
+#[test]
+fn the_usage_text_names_force_for_source_remove() {
+    let line = cli::USAGE
+        .lines()
+        .find(|l| l.contains("source remove"))
+        .expect("a usage line for source remove");
+    assert!(line.contains("--force"), "{line}");
+}

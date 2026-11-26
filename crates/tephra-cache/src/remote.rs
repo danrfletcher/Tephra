@@ -22,6 +22,24 @@ pub const REMOTE_TABLES: [&str; 5] = [
     "remote_cursors",
 ];
 
+/// Every table that holds rows of one remote source, with the column that
+/// names the source: the five of [`REMOTE_TABLES`] and the three
+/// bookkeeping tables beside them (`remote_copy_stamps`,
+/// `remote_copy_revisions`, `remote_clone_state`). [`crate::Cache::delete_remote_source`]
+/// deletes a source's rows from every one of them; `tests/remote_source_remove.rs`
+/// finds the tables itself (every table with a `source` column, and
+/// `remote_sources`) and fails when one is missing here.
+pub const REMOTE_SOURCE_TABLES: [(&str, &str); 8] = [
+    ("remote_sources", "name"),
+    ("remote_items", "source"),
+    ("upload_queue", "source"),
+    ("remote_pins", "source"),
+    ("remote_cursors", "source"),
+    ("remote_copy_stamps", "source"),
+    ("remote_copy_revisions", "source"),
+    ("remote_clone_state", "source"),
+];
+
 /// The values `remote_sources.kind` accepts.
 pub const REMOTE_SOURCE_KINDS: [&str; 2] = ["github", "drive"];
 

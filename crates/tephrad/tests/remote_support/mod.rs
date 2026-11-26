@@ -661,6 +661,11 @@ impl Client {
     }
 
     pub fn request(&mut self, method: &str, params: Value) -> Value {
+        self.reply(method, params)["result"].clone()
+    }
+
+    /// The whole reply to a request (an error's `code` and `data` too).
+    pub fn reply(&mut self, method: &str, params: Value) -> Value {
         let id = self.next_id;
         self.next_id += 1;
         let body = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
@@ -670,7 +675,7 @@ impl Client {
         loop {
             let frame = self.frame(WAIT).expect("a reply");
             if frame.get("id") == Some(&json!(id)) {
-                return frame["result"].clone();
+                return frame;
             }
         }
     }

@@ -225,18 +225,33 @@ fn source_refusal(e: crate::rpc::backend::PromoteRpcError) -> DispatchError {
     }
 }
 
-/// `source.unregister {name}` (G1). A promoted source is folded back into
-/// its parent, exactly as `source.unpromote` does it (G12); any other
-/// source (or an unknown or already removed name) is unregistered the
-/// plain way.
+/// `source.unregister {name, force?}` (G1, PR-13). A promoted source is
+/// folded back into its parent, exactly as `source.unpromote` does it (G12);
+/// any other source (or an unknown or already removed name) is unregistered
+/// the plain way.
+///
+/// `force` is absent, or the JSON boolean `true` or `false`; any other value
+/// is an invalid-params error and nothing is removed. A remote source that
+/// holds work the remote does not have is refused without `force`: a
+/// `SOURCE_ERROR` whose `data` is `{reason: "unsent_work", not_pushed,
+/// pending_upload, needs_attention}`.
 fn source_unregister(
     params: &Value,
     sources: &dyn SourceBackend,
     fixes: &dyn FixBackend,
 ) -> DispatchResult {
-    use crate::rpc::backend::PromoteRpcError;
+    use crate::rpc::backend::{PromoteRpcError, UnregisterError};
 
     let name = require_str(params, "name")?;
+    let force = match params.get("force") {
+        None => false,
+        Some(Value::Bool(force)) => *force,
+        Some(_) => {
+            return Err(invalid_params(
+                "\"force\" must be the boolean true or false".to_string(),
+            ))
+        }
+    };
     match fixes.unregister_promoted(name) {
         Ok(true) => return Ok(Value::Null),
         Ok(false) => {}
@@ -250,9 +265,23 @@ fn source_unregister(
         Err(PromoteRpcError::Failed(message)) => return Err((SOURCE_ERROR, message, None)),
     }
     sources
-        .unregister(name)
+        .unregister_checked(name, force)
         .map(|_| Value::Null)
-        .map_err(|e| (SOURCE_ERROR, e, None))
+        .map_err(|e| match e {
+            UnregisterError::UnsentWork { message, work } => (
+                SOURCE_ERROR,
+                message,
+                Some(crate::remote::remove::unsent_work_data(&work)),
+            ),
+            UnregisterError::Refused { reason, message } => (
+                SOURCE_ERROR,
+                message,
+                Some(serde_json::json!({ "reason": reason })),
+            ),
+            UnregisterError::NotFound(message) | UnregisterError::Failed(message) => {
+                (SOURCE_ERROR, message, None)
+            }
+        })
 }
 
 fn source_list(sources: &dyn SourceBackend) -> DispatchResult {

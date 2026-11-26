@@ -212,6 +212,10 @@ struct UploadJob {
     /// modification time then. A file that still has them is not hashed
     /// again.
     clean: Arc<Mutex<CleanMarks>>,
+    /// The source's generation when this job started: a removal moves it and
+    /// the job ends without touching what a source of the same name added
+    /// later has.
+    generation: u64,
 }
 
 /// What came of one try at a queue row.
@@ -237,6 +241,7 @@ impl SourceRegistry {
             jobs.insert(name.to_string(), slot.clone());
             slot
         };
+        let generation = hub.generation(name);
         let job = UploadJob {
             name: name.to_string(),
             cache_path: self.cache_path.clone(),
@@ -246,8 +251,37 @@ impl SourceRegistry {
             slot,
             conn: Arc::new(Mutex::new(None)),
             clean: Arc::new(Mutex::new(HashMap::new())),
+            generation,
         };
         self.runtime.spawn(job.run());
+    }
+}
+
+impl SourceRegistry {
+    /// Looks at the cache of the Drive source `name` now and queues every
+    /// edit it finds: the upload job's own scan, run on the caller's thread
+    /// so a removal does not miss a save the watcher has not reported yet.
+    /// Makes no request. Returns how many edits were queued.
+    pub(crate) fn scan_drive_edits_now(&self, name: &str) -> Result<usize, String> {
+        let hub = self
+            .remote
+            .get()
+            .cloned()
+            .ok_or_else(|| "no remote support".to_string())?;
+        let generation = hub.generation(name);
+        let job = UploadJob {
+            name: name.to_string(),
+            cache_path: self.cache_path.clone(),
+            gate: self.gate.clone(),
+            events_tx: self.events_tx.clone(),
+            hub,
+            slot: Arc::new(UploadSlot::new()),
+            conn: Arc::new(Mutex::new(None)),
+            clean: Arc::new(Mutex::new(HashMap::new())),
+            generation,
+        };
+        let cache = Cache::open(&self.cache_path).map_err(|e| e.to_string())?;
+        job.scan(&cache)
     }
 }
 
@@ -256,9 +290,14 @@ impl UploadJob {
         let started = tokio::time::Instant::now();
         let mut last_safety = started;
         loop {
+            // The source was removed (and may be added again): this job is
+            // not its job any more, and leaves its maps to the new one.
+            if self.superseded() {
+                return;
+            }
             // Edits first: what a save left is in the queue before the
             // queue is looked at.
-            if self.slot.dirty.swap(false, Ordering::SeqCst) {
+            if self.slot.dirty.swap(false, Ordering::SeqCst) && !self.removing() {
                 let queued = self.blocking(|job, cache| job.scan(cache)).await;
                 if let Ok(Ok(n)) = queued {
                     if n > 0 {
@@ -270,6 +309,9 @@ impl UploadJob {
                 Pass::Gone => break,
                 Pass::Done => {}
             }
+            if self.superseded() {
+                return;
+            }
             self.slot.passes.fetch_add(1, Ordering::SeqCst);
             self.start_watch();
             if last_safety.elapsed() >= SAFETY_SCAN_EVERY {
@@ -280,6 +322,9 @@ impl UploadJob {
                 _ = self.slot.wake.notified() => {}
                 _ = tokio::time::sleep(self.hub.poll_tick) => {}
             }
+        }
+        if self.superseded() {
+            return;
         }
         stop_watch(&self.hub, &self.name);
         self.hub
@@ -297,6 +342,16 @@ impl UploadJob {
         });
     }
 
+    /// The source was removed since this job started.
+    fn superseded(&self) -> bool {
+        self.hub.generation(&self.name) != self.generation
+    }
+
+    /// The source's removal is under way: nothing is sent or queued.
+    fn removing(&self) -> bool {
+        self.hub.is_removing(&self.name)
+    }
+
     /// Runs `f` on the blocking pool with the job's own connection.
     async fn blocking<T: Send + 'static>(
         &self,
@@ -311,6 +366,7 @@ impl UploadJob {
             slot: self.slot.clone(),
             conn: self.conn.clone(),
             clean: self.clean.clone(),
+            generation: self.generation,
         };
         tokio::task::spawn_blocking(move || {
             let conn = job.conn.clone();
@@ -346,12 +402,29 @@ impl UploadJob {
             slot: self.slot.clone(),
             conn: self.conn.clone(),
             clean: self.clean.clone(),
+            generation: self.generation,
         };
         tokio::task::spawn_blocking(move || {
             if !job.ensure_watch() {
                 job.slot.watching.store(false, Ordering::SeqCst);
             }
         });
+    }
+
+    /// The source still has its row. Reads through the job's connection.
+    fn source_exists(&self) -> bool {
+        let mut slot = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.is_none() {
+            match Cache::open(&self.cache_path) {
+                Ok(cache) => *slot = Some(cache),
+                Err(_) => return false,
+            }
+        }
+        let cache = slot.as_ref().expect("opened above");
+        matches!(
+            busy(&self.gate, || cache.remote_source(&self.name)),
+            Ok(Some(_))
+        )
     }
 
     /// True when the watcher is running afterwards. A save in the cache
@@ -365,6 +438,11 @@ impl UploadJob {
             .contains_key(&self.name)
         {
             return true;
+        }
+        // A source that is gone (or going) has no directory to make: this
+        // would bring back the one its removal deleted.
+        if self.removing() || self.superseded() || !self.source_exists() {
+            return false;
         }
         let dir = hub.cache_dir(&self.name);
         // The directory is made now, so the watcher is already running when
@@ -524,6 +602,9 @@ impl UploadJob {
     // ---- 2. sending them ------------------------------------------------
 
     async fn pass(&self) -> Pass {
+        if self.removing() {
+            return Pass::Done;
+        }
         let now = self.now();
         let name = self.name.clone();
         let loaded = self
@@ -542,6 +623,9 @@ impl UploadJob {
             }
         };
         for entry in due {
+            if self.removing() {
+                break;
+            }
             match self.attempt(&source, entry).await {
                 Attempt::Settled | Attempt::Failed => {}
             }
@@ -621,6 +705,11 @@ impl UploadJob {
         }
         if !based_on_head {
             self.conflict(&entry, head_rev).await;
+            return Attempt::Settled;
+        }
+
+        // A removal began since the check above: nothing is sent.
+        if self.removing() {
             return Attempt::Settled;
         }
 
